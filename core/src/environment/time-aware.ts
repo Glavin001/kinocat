@@ -8,6 +8,8 @@
 
 import type { Environment, EdgeRef, Node } from './types';
 import type { MovingObstacle } from '../predict/types';
+import type { AffordanceRegistry } from '../predict/affordance-registry';
+import type { VehicleState } from '../agent/types';
 
 export interface TimeAwareOptions {
   obstacles?: MovingObstacle[];
@@ -18,6 +20,10 @@ export interface TimeAwareOptions {
   /** Per-level time-bucket divisors (coarse → fine); length = base.levels.
    *  Defaults to coupled halving (2^(levels-1-L)). */
   levelTimeDivisors?: number[];
+  /** Lazily-generated affordance edges (ramps/jumps/boosts/…). */
+  affordances?: AffordanceRegistry;
+  /** Proximity radius for affordance queries (world units). */
+  affordanceRadius?: number;
 }
 
 type HasXZT = { x: number; z: number; t: number };
@@ -30,6 +36,8 @@ export class TimeAwareEnvironment<State extends HasXZT>
   private readonly agentRadius: number;
   private readonly timeQuantum: number;
   private readonly divisors: number[];
+  private readonly affordances?: AffordanceRegistry;
+  private readonly affordanceRadius: number;
 
   constructor(
     private readonly base: Environment<State>,
@@ -42,6 +50,8 @@ export class TimeAwareEnvironment<State extends HasXZT>
     this.divisors =
       opts.levelTimeDivisors ??
       Array.from({ length: this.levels }, (_, L) => 2 ** (this.levels - 1 - L));
+    this.affordances = opts.affordances;
+    this.affordanceRadius = opts.affordanceRadius ?? 15;
   }
 
   private augment(node: Node<State>): Node<State> {
@@ -81,7 +91,37 @@ export class TimeAwareEnvironment<State extends HasXZT>
       if (this.collides(c.state)) continue;
       out.push(this.augment(c));
     }
+    this.addAffordanceEdges(node, goal, out);
     return out;
+  }
+
+  /** Lazily generate affordance successors usable from `node` at its time. */
+  private addAffordanceEdges(
+    node: Node<State>,
+    goal: Node<State>,
+    out: Node<State>[],
+  ): void {
+    const reg = this.affordances;
+    if (!reg) return;
+    const st = node.state;
+    if (!('speed' in st)) return; // affordances are vehicle-typed for now
+    const vs = st as unknown as VehicleState;
+    for (const aff of reg.queryNearby(st.x, st.z, st.t, this.affordanceRadius)) {
+      const r = aff.tryUse(vs, st.t);
+      if (!r) continue;
+      const resState = r.resultState as unknown as State;
+      if (this.collides(resState)) continue;
+      const edge: EdgeRef = {
+        cost: r.cost,
+        kind: 'affordance',
+        data: { affordanceId: aff.id, type: aff.type },
+      };
+      const n = this.createNode(resState, node, edge);
+      n.g = node.g + r.cost;
+      n.h = this.base.heuristic(r.resultState as unknown as State, goal.state);
+      n.f = n.g + n.h;
+      out.push(n);
+    }
   }
 
   heuristic(from: State, to: State): number {
