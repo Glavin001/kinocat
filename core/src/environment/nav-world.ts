@@ -38,6 +38,24 @@ export interface NavWorld {
   offMeshFrom(poly: PolygonRef): ReadonlyArray<OffMeshLink>;
   /** Bumps when geometry changes (tile rebuild) — cache invalidation. */
   readonly revision: number;
+
+  /** Optional fast clearance oracle (e.g. a CompactHeightfield distance
+   *  field). Distance in world units from (x,z) to the nearest obstacle /
+   *  boundary, or null if unavailable / off-field. A return ≥ r guarantees a
+   *  disk of radius r centred at (x,z) is collision-free, so a caller may
+   *  skip the exact footprint check (early-ACCEPT only — never reject). */
+  clearanceAt?(x: number, z: number, queryY?: number): number | null;
+
+  /** Optional admissible obstacle-aware distance-to-goal oracle factory.
+   *  Returns a function giving a lower bound (world units) on the remaining
+   *  path length from (x,z) to (gx,gz), or null when unavailable. The bound
+   *  must never exceed the true shortest obstacle-avoiding path length so the
+   *  planner's heuristic stays admissible. */
+  buildGoalLowerBound?(
+    gx: number,
+    gz: number,
+    gy?: number,
+  ): ((x: number, z: number, y?: number) => number | null) | null;
 }
 
 export interface NavPolygon {
