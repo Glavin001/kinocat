@@ -1,2 +1,9 @@
-// kinocat/execute — pure-pursuit tracker & replan logic. Filled in M6.
-export {};
+// kinocat/execute — curvature-aware pure-pursuit tracker + replan logic.
+export type {
+  PurePursuitConfig,
+  TrackingCommand,
+  ReplanTrigger,
+  PlanPath,
+} from './types';
+export { purePursuit } from './pure-pursuit';
+export { ReplanState, planPoseAt } from './replan';
