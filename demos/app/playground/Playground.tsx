@@ -1,17 +1,16 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { plan } from 'kinocat/planner';
-import { InMemoryNavWorld, VehicleEnvironment } from 'kinocat/environment';
 import type { VehicleState } from 'kinocat/agent';
-import { buildVehicle, PALETTE } from '../lib/vehicle';
+import { planPlayground, PALETTE, DEMO_MAX_EXPANSIONS } from '../lib/scenarios';
 
 const BW = 44;
 const BH = 22; // world z in [-11, 11]
 const SCALE = 18;
 const W = BW * SCALE;
 const H = BH * SCALE;
-const OB = 2.4; // obstacle half-size
+const OB = 2.4;
+const BOUNDS = { x0: 0, z0: -BH / 2, x1: BW, z1: BH / 2 };
 
 type Obstacle = { x: number; z: number };
 type Drag =
@@ -19,8 +18,6 @@ type Drag =
   | { kind: 'goal' }
   | { kind: 'obstacle'; i: number }
   | null;
-
-const { agent, lib } = buildVehicle();
 
 function toWorld(px: number, py: number): [number, number] {
   return [px / SCALE, py / SCALE - BH / 2];
@@ -34,7 +31,7 @@ export default function Playground() {
   const [start, setStart] = useState<VehicleState>({ x: 4, z: 0, heading: 0, speed: 0, t: 0 });
   const [goal, setGoal] = useState<VehicleState>({ x: 40, z: 0, heading: 0, speed: 0, t: 0 });
   const [obstacles, setObstacles] = useState<Obstacle[]>([{ x: 22, z: 0 }]);
-  const [deadline, setDeadline] = useState(40);
+  const [budget, setBudget] = useState(DEMO_MAX_EXPANSIONS);
   const [reverseCost, setReverseCost] = useState(2);
   const [info, setInfo] = useState('');
   const drag = useRef<Drag>(null);
@@ -43,31 +40,18 @@ export default function Playground() {
   const replanAndDraw = useCallback(() => {
     const ctx = canvasRef.current?.getContext('2d');
     if (!ctx) return;
-    const obPolys = obstacles.map((o) => [
-      [o.x - OB, o.z - OB],
-      [o.x + OB, o.z - OB],
-      [o.x + OB, o.z + OB],
-      [o.x - OB, o.z + OB],
-    ] as [number, number][]);
-    const world = new InMemoryNavWorld(
-      [{ id: 1, y: 0, ring: [[0, -BH / 2], [BW, -BH / 2], [BW, BH / 2], [0, BH / 2]] }],
-      obPolys,
-    );
-    const env = new VehicleEnvironment(
-      world,
-      { ...agent, reverseCostMultiplier: reverseCost },
-      lib,
-      { goalRadius: 1.5, goalHeadingTol: Infinity },
-    );
     const t0 = performance.now();
-    const r = plan(
-      { start, goal, environment: env, options: { maxExpansions: 120000 } },
-      deadline,
-    );
+    const r = planPlayground({
+      start,
+      goal,
+      obstacles,
+      obstacleHalf: OB,
+      reverseCost,
+      maxExpansions: budget,
+      bounds: BOUNDS,
+    });
     const ms = (performance.now() - t0).toFixed(1);
 
-    ctx.fillStyle = PALETTE.bg;
-    ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = PALETTE.floor;
     ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = PALETTE.obstacle;
@@ -84,9 +68,7 @@ export default function Playground() {
         i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
       });
       ctx.stroke();
-      // mark reverse segments
       ctx.strokeStyle = '#ff6688';
-      ctx.lineWidth = 3;
       ctx.beginPath();
       r.nodes.forEach((n, i) => {
         if (i === 0 || n.edge?.kind !== 'drive-reverse') return;
@@ -109,10 +91,10 @@ export default function Playground() {
     }
     setInfo(
       r.found
-        ? `found in ${ms} ms · cost ${r.cost.toFixed(2)} · ${r.stats.expansions} expansions · ${r.path.length} states${r.stats.deadlineHit ? ' · deadline hit' : ''}`
-        : `no plan (${ms} ms, ${r.stats.expansions} expansions) — try a larger deadline or move obstacles`,
+        ? `found in ${ms} ms · cost ${r.cost.toFixed(2)} · ${r.stats.expansions} expansions · ${r.path.length} states`
+        : `no plan (${ms} ms, ${r.stats.expansions} expansions) — raise the budget or move obstacles`,
     );
-  }, [start, goal, obstacles, deadline, reverseCost]);
+  }, [start, goal, obstacles, budget, reverseCost]);
 
   useEffect(() => {
     replanAndDraw();
@@ -121,14 +103,15 @@ export default function Playground() {
   const evtWorld = (e: React.PointerEvent): [number, number] => {
     const c = canvasRef.current!;
     const rect = c.getBoundingClientRect();
-    const sx = c.width / rect.width;
-    const sy = c.height / rect.height;
-    return toWorld((e.clientX - rect.left) * sx, (e.clientY - rect.top) * sy);
+    return toWorld(
+      ((e.clientX - rect.left) * c.width) / rect.width,
+      ((e.clientY - rect.top) * c.height) / rect.height,
+    );
   };
 
   const pick = (wx: number, wz: number): Drag => {
     if (Math.hypot(wx - start.x, wz - start.z) < 1.6) return { kind: 'start' };
-    if (Math.hypot(wx - goal.x, wz - goal.z) < 1.2) return { kind: 'goal' };
+    if (Math.hypot(wx - goal.x, wz - goal.z) < 1.6) return { kind: 'goal' };
     for (let i = 0; i < obstacles.length; i++) {
       if (Math.abs(wx - obstacles[i]!.x) < OB && Math.abs(wz - obstacles[i]!.z) < OB)
         return { kind: 'obstacle', i };
@@ -157,8 +140,7 @@ export default function Playground() {
     const d = drag.current;
     if (d.kind === 'start') setStart((s) => ({ ...s, x: wx, z: wz }));
     else if (d.kind === 'goal') setGoal((s) => ({ ...s, x: wx, z: wz }));
-    else
-      setObstacles((o) => o.map((ob, i) => (i === d.i ? { x: wx, z: wz } : ob)));
+    else setObstacles((o) => o.map((ob, i) => (i === d.i ? { x: wx, z: wz } : ob)));
     cancelAnimationFrame(raf.current);
     raf.current = requestAnimationFrame(replanAndDraw);
   };
@@ -183,7 +165,7 @@ export default function Playground() {
       <h1 style={{ fontSize: 18 }}>Interactive 2D playground</h1>
       <p style={{ opacity: 0.75, marginTop: 0 }}>
         Drag the green start / yellow goal. Tap empty space to drop an obstacle;
-        drag obstacles to move them; shift-tap (or use Clear) to remove. Red
+        drag obstacles to move them; shift-tap (or Clear) to remove. Red
         segments are reverse maneuvers.
       </p>
       <canvas
@@ -215,14 +197,15 @@ export default function Playground() {
       </div>
       <div style={{ display: 'flex', gap: 32, marginTop: 12, flexWrap: 'wrap' }}>
         <label>
-          anytime deadline: {deadline} ms
+          anytime budget: {budget} expansions
           <br />
           <input
             type="range"
-            min={1}
-            max={200}
-            value={deadline}
-            onChange={(e) => setDeadline(+e.target.value)}
+            min={500}
+            max={DEMO_MAX_EXPANSIONS}
+            step={500}
+            value={budget}
+            onChange={(e) => setBudget(+e.target.value)}
           />
         </label>
         <label>

@@ -1,143 +1,10 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { plan } from 'kinocat/planner';
-import { InMemoryNavWorld, VehicleEnvironment, TimeAwareEnvironment } from 'kinocat/environment';
-import { linearObstacle, asObstacle, PlanRegistry, AffordanceRegistry, createJumpAffordance } from 'kinocat/predict';
 import { planPoseAt } from 'kinocat/execute';
-import type { VehicleState } from 'kinocat/agent';
-import { buildVehicle, PALETTE } from '../lib/vehicle';
+import { buildDynamic, PALETTE, type Scenario } from '../lib/scenarios';
 
 const SCALE = 19;
-const { agent, lib } = buildVehicle();
-type Scenario = 'moving' | 'coop' | 'jump';
-
-interface Built {
-  bounds: { x0: number; z0: number; x1: number; z1: number };
-  islands: [number, number, number, number][];
-  path: VehicleState[];
-  duration: number;
-  start: VehicleState;
-  goal: VehicleState;
-  ghostAt?: (t: number) => { x: number; z: number } | null;
-  ghostLabel?: string;
-  affordanceHop?: [VehicleState, VehicleState] | null;
-  info: string;
-}
-
-function floor(x0: number, z0: number, x1: number, z1: number) {
-  return { id: 1, y: 0, ring: [[x0, z0], [x1, z0], [x1, z1], [x0, z1]] as [number, number][] };
-}
-
-function build(scn: Scenario): Built {
-  const start: VehicleState = { x: 3, z: 0, heading: 0, speed: 0, t: 0 };
-
-  if (scn === 'moving') {
-    const goal: VehicleState = { x: 37, z: 0, heading: 0, speed: 0, t: 0 };
-    const world = new InMemoryNavWorld([floor(0, -12, 40, 12)]);
-    const obstacle = linearObstacle(20, -12, 0, 4, 2.5, 0, 60);
-    const env = new TimeAwareEnvironment(
-      new VehicleEnvironment(world, agent, lib, { goalRadius: 1.5, goalHeadingTol: Infinity }),
-      { obstacles: [obstacle], agentRadius: 1.4 },
-    );
-    const r = plan({ start, goal, environment: env, options: { maxExpansions: 500000 } }, Infinity);
-    const dur = r.found ? r.path[r.path.length - 1]!.t : 0;
-    return {
-      bounds: { x0: 0, z0: -12, x1: 40, z1: 12 },
-      islands: [[0, -12, 40, 12]],
-      path: r.path,
-      duration: dur,
-      start,
-      goal,
-      ghostAt: (t) => obstacle.predict(t),
-      ghostLabel: 'moving obstacle (r=2.5)',
-      info: r.found
-        ? `avoids a linearly-moving obstacle; path time ${dur.toFixed(1)} s, ${r.path.length} states`
-        : 'no plan',
-    };
-  }
-
-  if (scn === 'coop') {
-    const goal: VehicleState = { x: 37, z: 2, heading: 0, speed: 0, t: 0 };
-    const world = new InMemoryNavWorld([floor(0, -12, 40, 12)]);
-    const reg = new PlanRegistry();
-    // NPC A cruises slowly straight along z=0 across the corridor.
-    const aPlan: VehicleState[] = [];
-    for (let i = 0; i <= 10; i++) {
-      aPlan.push({ x: 6 + i * 3, z: 0, heading: 0, speed: 4, t: i * 0.75 });
-    }
-    reg.publish('A', aPlan);
-    const env = new TimeAwareEnvironment(
-      new VehicleEnvironment(world, agent, lib, { goalRadius: 1.5, goalHeadingTol: Infinity }),
-      { obstacles: [asObstacle(reg.predictNPC('A'), 2.5)], agentRadius: 1.4 },
-    );
-    const r = plan({ start, goal, environment: env, options: { maxExpansions: 500000 } }, Infinity);
-    const dur = r.found ? r.path[r.path.length - 1]!.t : 0;
-    return {
-      bounds: { x0: 0, z0: -12, x1: 40, z1: 12 },
-      islands: [[0, -12, 40, 12]],
-      path: r.path,
-      duration: Math.max(dur, aPlan[aPlan.length - 1]!.t),
-      start,
-      goal,
-      ghostAt: (t) => {
-        const p = reg.predictNPC('A')(t);
-        return p ? { x: p.x, z: p.z } : null;
-      },
-      ghostLabel: "NPC A's published plan (B routes around it)",
-      info: r.found
-        ? `NPC B reads NPC A's plan from the registry and weaves around it — emergent coordination, no negotiation`
-        : 'no plan',
-    };
-  }
-
-  // jump
-  const goal: VehicleState = { x: 36, z: 0, heading: 0, speed: 0, t: 0 };
-  const world = new InMemoryNavWorld([floor(0, -6, 16, 6), floor(0, -6, 16, 6)]);
-  const w2 = new InMemoryNavWorld(
-    [
-      { id: 1, y: 0, ring: [[0, -6], [16, -6], [16, 6], [0, 6]] },
-      { id: 2, y: 0, ring: [[24, -6], [40, -6], [40, 6], [24, 6]] },
-    ],
-    [],
-  );
-  const reg = new AffordanceRegistry();
-  reg.add(
-    createJumpAffordance({
-      id: 'gap',
-      launch: { x: 15, z: 0 },
-      entryRadius: 3,
-      land: { x: 25, z: 0, heading: 0, speed: 0, t: 0 },
-      duration: 1,
-      cost: 1.5,
-    }),
-  );
-  const env = new TimeAwareEnvironment(
-    new VehicleEnvironment(w2, agent, lib, { goalRadius: 1.5, goalHeadingTol: Infinity }),
-    { affordances: reg, affordanceRadius: 12 },
-  );
-  void world;
-  const r = plan({ start, goal, environment: env, options: { maxExpansions: 500000 } }, Infinity);
-  const dur = r.found ? r.path[r.path.length - 1]!.t : 0;
-  let hop: [VehicleState, VehicleState] | null = null;
-  const hi = r.nodes.findIndex((n) => n.edge?.kind === 'affordance');
-  if (hi > 0) hop = [r.path[hi - 1]!, r.path[hi]!];
-  return {
-    bounds: { x0: 0, z0: -6, x1: 40, z1: 6 },
-    islands: [
-      [0, -6, 16, 6],
-      [24, -6, 40, 6],
-    ],
-    path: r.path,
-    duration: dur,
-    start,
-    goal,
-    affordanceHop: hop,
-    info: r.found
-      ? `drive primitives cannot cross the gap — the planner uses a registered jump affordance`
-      : 'no plan',
-  };
-}
 
 export default function Dynamic() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -145,7 +12,8 @@ export default function Dynamic() {
   const [t, setT] = useState(0);
   const [playing, setPlaying] = useState(true);
   const raf = useRef(0);
-  const built = useMemo(() => build(scn), [scn]);
+  const built = useMemo(() => buildDynamic(scn), [scn]);
+  const path = built.result.path;
 
   useEffect(() => {
     setT(0);
@@ -172,13 +40,13 @@ export default function Dynamic() {
     if (!ctx) return;
     const b = built.bounds;
     const W = (b.x1 - b.x0) * SCALE;
-    const H = (b.z1 - b.z0) * SCALE;
+    const Hp = (b.z1 - b.z0) * SCALE;
     const px = (x: number, z: number): [number, number] => [
       (x - b.x0) * SCALE,
       (z - b.z0) * SCALE,
     ];
     ctx.fillStyle = PALETTE.bg;
-    ctx.fillRect(0, 0, W, H);
+    ctx.fillRect(0, 0, W, Hp);
     ctx.fillStyle = PALETTE.floor;
     for (const [x0, z0, x1, z1] of built.islands) {
       const [ax, ay] = px(x0, z0);
@@ -196,11 +64,11 @@ export default function Dynamic() {
       ctx.stroke();
       ctx.setLineDash([]);
     }
-    if (built.path.length) {
+    if (path.length) {
       ctx.strokeStyle = PALETTE.path;
       ctx.lineWidth = 3;
       ctx.beginPath();
-      built.path.forEach((s, i) => {
+      path.forEach((s, i) => {
         const p = px(s.x, s.z);
         i === 0 ? ctx.moveTo(p[0], p[1]) : ctx.lineTo(p[0], p[1]);
       });
@@ -226,7 +94,7 @@ export default function Dynamic() {
       ctx.arc(p[0], p[1], 7, 0, Math.PI * 2);
       ctx.fill();
     }
-    const pose = built.path.length ? planPoseAt(built.path, t) : null;
+    const pose = path.length ? planPoseAt(path, t) : null;
     if (pose) {
       const p = px(pose.x, pose.z);
       ctx.fillStyle = PALETTE.agent;
@@ -239,7 +107,7 @@ export default function Dynamic() {
       ctx.lineTo(p[0] + Math.cos(pose.heading) * 16, p[1] + Math.sin(pose.heading) * 16);
       ctx.stroke();
     }
-  }, [built, t]);
+  }, [built, t, path]);
 
   const b = built.bounds;
   const cw = (b.x1 - b.x0) * SCALE;
