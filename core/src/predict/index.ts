@@ -18,6 +18,8 @@ export {
   AffordanceRegistry,
   AffordanceType,
   createJumpAffordance,
+  createBoostAffordance,
+  createMisdirectAffordance,
   type Affordance,
   type AffordanceUseResult,
 } from './affordance-registry';

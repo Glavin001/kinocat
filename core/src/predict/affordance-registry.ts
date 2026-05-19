@@ -12,6 +12,10 @@ export enum AffordanceType {
   Elevator = 'elevator',
   MovingPlatform = 'moving_platform',
   Teleporter = 'teleporter',
+  /** A decoy: spatially looks like a shortcut but its honest cost makes the
+   *  honest route cheaper. The planner rejects it on its own (no special
+   *  code) — emergent intelligence. Distinct type so demos can render it. */
+  Decoy = 'decoy',
 }
 
 export interface AffordanceUseResult {
@@ -88,6 +92,111 @@ export function createJumpAffordance(opts: {
   return {
     id: opts.id,
     type: AffordanceType.BallisticJump,
+    validFrom,
+    validTo,
+    spatialBound: { x: opts.launch.x, z: opts.launch.z, radius: opts.entryRadius },
+    predict: (t) =>
+      t < validFrom || t > validTo
+        ? null
+        : { position: { x: opts.launch.x, y: 0, z: opts.launch.z } },
+    tryUse(agentState, useTime) {
+      if (useTime < validFrom || useTime > validTo) return null;
+      const dx = agentState.x - opts.launch.x;
+      const dz = agentState.z - opts.launch.z;
+      if (dx * dx + dz * dz > opts.entryRadius * opts.entryRadius) return null;
+      const land: VehicleState = { ...opts.land, t: useTime + opts.duration };
+      return {
+        resultState: land,
+        duration: opts.duration,
+        cost: opts.cost,
+        trajectory: [
+          { x: agentState.x, y: 0, z: agentState.z, t: useTime },
+          {
+            x: (agentState.x + land.x) / 2,
+            y: apexY,
+            z: (agentState.z + land.z) / 2,
+            t: useTime + opts.duration / 2,
+          },
+          { x: land.x, y: 0, z: land.z, t: land.t },
+        ],
+      };
+    },
+  };
+}
+
+/**
+ * A genuine shortcut: a boost pad that flings the agent to `exit` (typically
+ * further along, at higher `exit.speed`) for a deliberately LOW `cost`, so
+ * the true route cost through it beats driving — IGHA* adopts it.
+ */
+export function createBoostAffordance(opts: {
+  id: string;
+  pad: { x: number; z: number };
+  entryRadius: number;
+  exit: VehicleState;
+  duration: number;
+  cost: number;
+  validFrom?: number;
+  validTo?: number;
+}): Affordance {
+  const validFrom = opts.validFrom ?? -Infinity;
+  const validTo = opts.validTo ?? Infinity;
+  return {
+    id: opts.id,
+    type: AffordanceType.BoostPad,
+    validFrom,
+    validTo,
+    spatialBound: { x: opts.pad.x, z: opts.pad.z, radius: opts.entryRadius },
+    predict: (t) =>
+      t < validFrom || t > validTo
+        ? null
+        : { position: { x: opts.pad.x, y: 0, z: opts.pad.z } },
+    tryUse(agentState, useTime) {
+      if (useTime < validFrom || useTime > validTo) return null;
+      const dx = agentState.x - opts.pad.x;
+      const dz = agentState.z - opts.pad.z;
+      if (dx * dx + dz * dz > opts.entryRadius * opts.entryRadius) return null;
+      const out: VehicleState = { ...opts.exit, t: useTime + opts.duration };
+      return {
+        resultState: out,
+        duration: opts.duration,
+        cost: opts.cost,
+        trajectory: [
+          { x: agentState.x, y: 0, z: agentState.z, t: useTime },
+          { x: out.x, y: 0, z: out.z, t: out.t },
+        ],
+      };
+    },
+  };
+}
+
+/**
+ * A *misdirect*: spatially it looks like a tempting shortcut (place `launch`
+ * near the optimal route and `land` toward the goal), but its honest `cost`
+ * and/or dead-end `land` make the no-affordance route cheaper. The factory
+ * reports the real cost — so with an admissible heuristic IGHA*'s
+ * branch-and-bound prunes the branch with NO special-case logic. This is the
+ * emergent-intelligence demonstrator; do not special-case it elsewhere.
+ */
+export function createMisdirectAffordance(opts: {
+  id: string;
+  launch: { x: number; z: number };
+  entryRadius: number;
+  /** Where it actually drops the agent (a trap / dead-end / detour). */
+  land: VehicleState;
+  duration: number;
+  /** The true (high) cost — reported honestly so the planner rejects it. */
+  cost: number;
+  apexY?: number;
+  validFrom?: number;
+  validTo?: number;
+}): Affordance {
+  const apexY = opts.apexY ?? 2;
+  const validFrom = opts.validFrom ?? -Infinity;
+  const validTo = opts.validTo ?? Infinity;
+  return {
+    id: opts.id,
+    type: AffordanceType.Decoy,
     validFrom,
     validTo,
     spatialBound: { x: opts.launch.x, z: opts.launch.z, radius: opts.entryRadius },
