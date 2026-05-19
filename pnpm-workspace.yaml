@@ -2,3 +2,6 @@ packages:
   - 'core'
   - 'three'
   - 'demos'
+
+onlyBuiltDependencies:
+  - sharp
