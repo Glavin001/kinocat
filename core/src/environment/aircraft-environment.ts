@@ -39,6 +39,14 @@ export interface AircraftEnvOptions {
   rollFractions?: number[];
   /** Target speeds; default `[maxSpeed]`. */
   speeds?: number[];
+  /** Per-edge penalty added to cost as `rollCost · |roll| · primDuration` (in
+   *  cost units per radian per second). Biases the planner toward wings-level
+   *  flight; banking is still chosen when geometry demands it (the alternative
+   *  is collision rejection). Default 0.5: a full ±π/2 bank for 1 s costs
+   *  ~0.79, roughly doubling the edge cost of wings-level cruise. Kept
+   *  admissible w.r.t. the 3D-Euclidean / maxSpeed heuristic because edge
+   *  cost stays ≥ primDuration ≥ h-decrease. */
+  rollCost?: number;
 }
 
 interface ControlQuad {
@@ -67,6 +75,7 @@ export class AircraftEnvironment implements Environment<AircraftState> {
   private readonly goalHeadingTol: number;
   private readonly primDuration: number;
   private readonly substeps: number;
+  private readonly rollCost: number;
   private readonly controls: ControlQuad[];
   private readonly sim: ForwardSim<AircraftState>;
   private readonly invMaxSpeed: number;
@@ -88,6 +97,7 @@ export class AircraftEnvironment implements Environment<AircraftState> {
     this.goalHeadingTol = opts.goalHeadingTol ?? Infinity;
     this.primDuration = opts.primDuration ?? 1;
     this.substeps = opts.substeps ?? 6;
+    this.rollCost = opts.rollCost ?? 0.5;
     this.sim = aircraftForwardSim(agent);
     this.invMaxSpeed = 1 / agent.maxSpeed;
     this.half = [agent.halfLength, agent.halfSpan, agent.halfHeight];
@@ -190,7 +200,8 @@ export class AircraftEnvironment implements Environment<AircraftState> {
         }
       }
       if (!clear) continue;
-      const cost = this.primDuration;
+      const cost =
+        this.primDuration + this.rollCost * Math.abs(c.roll) * this.primDuration;
       const edge: EdgeRef = {
         cost,
         kind: 'fly',
