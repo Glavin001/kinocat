@@ -5,68 +5,219 @@
 kinocat is a pure-TypeScript, tree-shakeable, web-native motion planner that
 gives browser-based 3D games F.E.A.R.-grade emergent NPC navigation: reverse
 maneuvers, ballistic jumps, anticipatory routing over *predicted* future world
-states, opportunistic affordance use, and emergent multi-agent cooperation.
+states, opportunistic affordance use, and emergent multi-agent cooperation —
+for NPC vehicles **and** humanoids, with the same planner.
 
 The planner core is a TypeScript port of **IGHA\*** (Incremental Generalized
-Hybrid A\*, Talia/Salzman/Srinivasa, RA-L 2025), extended with **time as a
+Hybrid A\*, Talia / Salzman / Srinivasa, RA-L 2025), extended with **time as a
 state dimension** participating in multi-resolution dominance — the novel
 kinocat contribution. It builds on
-[navcat](https://github.com/isaac-mason/navcat) as its topology/collision
+[navcat](https://github.com/isaac-mason/navcat) as its topology / collision
 substrate, but the core never imports a physics or rendering library.
 
-> Status: under active implementation. Algorithmic core (curves, planner,
-> environments, prediction, execution) is built and tested with zero external
-> dependencies; navcat / Rapier / three.js integrations live behind optional
-> adapters.
+## Why
+
+The capability bar is not "competent game AI." It is
+autonomous-racing-research-meets-multi-robot-coordination, adapted to
+web-realtime budgets. NPCs should be genuinely *anticipatory* — pre-committing
+to plans that depend on predicted future world states: the future positions of
+moving ramps, the future trajectories of other agents, the future geometry of
+destructible environments.
+
+The spiritual reference is F.E.A.R. (Monolith, 2005), whose emergent tactical
+AI came from Jeff Orkin's GOAP planner finding action combinations the
+designers never scripted. kinocat applies the same *planner-as-substrate*
+principle to navigation: motion primitives are the actions, moving affordances
+and ramps are the smart objects, time-varying spatial targets are the goals,
+and time-extended Hybrid A\* over kinodynamic state is the planner. Intelligence
+emerges because the planner finds combinations — *arrive at ramp X at time T
+with velocity V to launch over barrier B, knowing NPC Y will be at P at T+0.8s
+to land on, knowing the player will be at Q at T+2.1s to cut off.*
+
+A high-level tactical layer (GOAP-style, **outside** kinocat's scope) selects
+the goal. kinocat finds the physically-feasible trajectory that achieves it.
+
+## What it does
+
+- **Kinodynamic planning** for any agent with a characterizable forward model —
+  reverse maneuvers and parking pockets fall out of the search, no special-case
+  logic.
+- **3D, not 2.5D** — planning on navcat's 3D polygon graph: multi-floor,
+  overhangs, ramps, tilted surfaces. Vehicle state lives *on* polygons; Y is
+  derived from polygon containment.
+- **Time-aware** — `predict(t) → State | null` is the single abstraction for
+  everything dynamic. Collisions are hard constraints (infeasible edges pruned
+  from the search); affordances are extra edges.
+- **Affordances** — ramps, boost pads, moving platforms, elevators. Static ones
+  are Mononen-style pre-baked as navcat off-mesh connections; dynamic ones
+  (carrier-mounted ramps, Mario-Kart-style) are generated lazily at expansion
+  time.
+- **Multi-agent** — NPCs publish plans to a shared registry; others predict via
+  `fromPublishedPlan`. Cooperation (convoys, coordinated jumps, interception)
+  is emergent — no negotiation protocol.
+- **Anytime contract** — `plan(req, deadlineMs)` runs to a deadline and returns
+  its best plan so far. Generous deadline → near-optimal; tight deadline →
+  rough but valid. The NPC always has a plan; replanning is the universal
+  correction mechanism (no execution state machine).
+
+**Anchor use cases:** NPC vehicles in physics-based destruction/sandbox games;
+NPC humanoids in 3D action games (walk / sidestep / jump / climb as
+primitives); mixed scenarios where humanoids and vehicles plan around each
+other and around human players.
+
+## Architecture
+
+Eight components, layered top-to-bottom by dependency direction. All are
+implemented and tested in `core/src` with zero external runtime.
+
+| Layer | Subpath | Responsibility |
+|---|---|---|
+| Curves | `kinocat/curves` | Reeds-Shepp & Dubins analytical curves (heuristics + shot-to-goal) |
+| Primitives | `kinocat/primitives` | Motion-primitive library + characterization harness over a `ForwardSim` |
+| Agent | `kinocat/agent` | Vehicle / humanoid kinematic metadata |
+| Planner | `kinocat/planner` | IGHA\* anytime, time-extended core (agent-agnostic) |
+| Environment | `kinocat/environment` | `Environment` interface, `NavWorld` seam, vehicle / humanoid / time-aware / R² impls |
+| Predict | `kinocat/predict` | `Predict<T>` factories, affordance registry, plan registry |
+| Execute | `kinocat/execute` | Curvature-aware pure-pursuit tracker + divergence / periodic replan |
+| Adapters | `kinocat/adapters/{navcat,rapier,three}` | Optional-peer integrations |
+
+The IGHA\* search loop never changes; everything kinocat adds —
+time-extension, lazy affordances, navcat collision, `predict(t)`-based dynamic
+obstacle avoidance — lives in concrete `Environment` implementations behind a
+five-method interface (`succ`, `heuristic`, `checkValidity`,
+`reachedGoalRegion`, `createNode`). `TimeAwareEnvironment` is a composable
+wrapper, so the static-world env and the time-aware behavior unit-test
+independently.
+
+### Load-bearing design decisions
+
+- **The planner reasons in plans; the executor reasons in physics; replanning
+  bridges them.** No mode logic. "Stuck", "airborne", "recovering" are just
+  states from which IGHA\* produces appropriate plans.
+- **Discretize at build time, search at runtime.** Motion primitives are
+  pre-characterized per agent; static jumps are pre-baked. The runtime planner
+  is graph search over a rich precomputed graph plus on-demand dynamic edges.
+- **One algorithm per problem.** IGHA\* for global planning, pure pursuit for
+  tracking, `predict(t)` for prediction. No alternates "in case."
+- **navcat is a dependency, not a fork.** Extend through metadata, custom
+  `QueryFilter`s, and the existing off-mesh / tile-rebuild mechanisms — never
+  modify navcat internals.
+
+See the in-repo implementation plan (this document's source spec) for the full
+rationale, non-goals, acceptance criteria, and tuning knobs.
+
+## Status
+
+Algorithmic core is built and tested with **zero external dependencies**;
+navcat / Rapier / three.js integrations live behind optional adapters.
+
+| Phase | State |
+|---|---|
+| 1 — Curves (Reeds-Shepp / Dubins) | done, 100% coverage |
+| 2 — IGHA\* port + R² stub environment | done |
+| 3 — Vehicle environment + characterization | done |
+| 4 — Time extension (novel contribution) | done |
+| 5 — Static affordances (Mononen off-mesh) | done (registration + metadata; full boundary auto-scan is a future extension) |
+| 6 — Dynamic affordances (carrier-mounted ramp) | done |
+| 7 — Multi-NPC plan-sharing | done |
+| 8 — Executor + replanning | done |
+| 9 — Humanoid environment | done |
+| 10 — Polish / docs / examples | in progress (demos shipping) |
+
+The core never imports navcat: environments consume a kinocat-owned
+`NavWorld` / `PolygonRef` seam, and `InMemoryNavWorld` (polygon soup, zero
+deps) makes the entire algorithmic core unit-testable with no external runtime.
 
 ## Packages
 
 | Package | Path | What |
 |---|---|---|
 | `kinocat` | `core/` | The library (multi-entry, subpath exports) |
-| `@kinocat/three` | `three/` | three.js debug helpers (demo-oriented) |
-| `@kinocat/demos` | `demos/` | Next.js demo app |
-
-## `kinocat` module map (subpath exports)
-
-| Import | Responsibility |
-|---|---|
-| `kinocat/curves` | Reeds-Shepp & Dubins analytical curves |
-| `kinocat/primitives` | Motion-primitive library + characterization harness |
-| `kinocat/agent` | Vehicle / humanoid agent metadata |
-| `kinocat/planner` | IGHA\* anytime, time-extended planner core |
-| `kinocat/environment` | `Environment` interface, `NavWorld` seam, env impls |
-| `kinocat/predict` | `Predict<T>` factories, affordance & plan registries |
-| `kinocat/execute` | Curvature-aware pure-pursuit tracker + replan logic |
-| `kinocat/adapters/navcat` | `NavWorld` over a navcat `NavMesh` (optional peer) |
-| `kinocat/adapters/rapier` | Rapier `ForwardSim` wrapper (optional peer) |
-| `kinocat/adapters/three` | Debug visualization (optional peer) |
+| `@kinocat/three` | `three/` | three.js helper workspace (foundation stub; the implemented debug helpers ship in `kinocat/adapters/three`) |
+| `@kinocat/demos` | `demos/` | Next.js demo app (deployable on Vercel) |
 
 `sideEffects: false` + per-subpath entry points: importing `kinocat/curves`
-pulls zero planner/environment code. The core is decoupled from navcat behind a
-small `NavWorld`/`PolygonRef` seam, so it is fully unit-testable with an
-in-memory polygon world and no external runtime.
+pulls zero planner/environment code. Peers (`navcat`, `@dimforge/rapier3d-compat`,
+`three`) are optional and externalized from the bundle.
+
+## Demos
+
+`pnpm dev` builds the core and runs the Next.js app:
+
+- **3D navmesh world** — a vehicle plans through a 3D world and drives the path
+  with pure-pursuit; orbit / zoom, click to move the goal.
+- **Time-aware + multi-agent** — a moving obstacle with a time scrubber, a
+  second NPC coordinated via the plan registry, and a jump affordance across a
+  gap.
+- **Interactive 2D playground** — drag start / goal, add and move obstacles,
+  tune the anytime deadline and reverse cost; replans instantly.
+- **Navmesh view** — 3D navmesh debug rendering.
+
+A headless test (`demos/test/scenarios.test.ts`) asserts the exact shipped demo
+configs always find a plan within budget, so a "no plan" regression fails CI.
 
 ## Develop
 
 ```sh
 pnpm install
-pnpm test            # vitest (core)
+pnpm test            # vitest (core + demo scenarios)
 pnpm test:coverage   # 80% gate on core algorithm + environments
 pnpm typecheck       # tsc, all workspaces
-pnpm --filter kinocat build   # tsup -> ESM + .d.ts
+pnpm bench           # planner / curves microbenchmarks
+pnpm --filter kinocat build   # tsup -> ESM + .d.ts per subpath
 pnpm size            # asserts core + navcat-adapter < 100 KB minified
-pnpm dev             # build core, then run the Next.js demo
+pnpm verify          # typecheck + test + build + size (CI gate)
+pnpm dev             # build core, then run the Next.js demos
 ```
 
 Requires Node ≥ 22 and pnpm. No bundler-specific globals; the core is
-browser/Node agnostic.
+browser / Node agnostic. **No ESLint / Prettier / Biome by design** — strict
+`tsc --noEmit` plus vitest are the correctness gates (see `core/README.md`).
+
+## Quick start
+
+```ts
+import { plan } from 'kinocat/planner';
+import { InMemoryNavWorld, VehicleEnvironment } from 'kinocat/environment';
+import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
+import { characterizeVehicle } from 'kinocat/primitives';
+
+const agent = defaultVehicleAgent();
+const lib = characterizeVehicle({
+  forwardSim: kinematicForwardSim(agent),
+  controlSets: [[0, 6], [1 / agent.minTurnRadius, 6], [-1 / agent.minTurnRadius, 6], [0, -4]],
+  duration: 0.5, substeps: 6, startSpeeds: [0],
+});
+const world = new InMemoryNavWorld([{ id: 1, y: 0, ring: [[0,-10],[40,-10],[40,10],[0,10]] }]);
+const env = new VehicleEnvironment(world, agent, lib, { goalRadius: 1.5, goalHeadingTol: Infinity });
+
+const result = plan(
+  {
+    start: { x: 2, z: 0, heading: 0, speed: 0, t: 0 },
+    goal: { x: 30, z: 4, heading: 0, speed: 0, t: 0 },
+    environment: env,
+  },
+  50, // anytime deadline (ms)
+);
+// result.found, result.path, result.cost, result.stats
+```
+
+Wrap `env` in `TimeAwareEnvironment` to add predicted-obstacle avoidance and
+lazy affordance edges; track the plan with `purePursuit` from
+`kinocat/execute`.
 
 ## References
 
-- Talia, Salzman, Srinivasa — *Incremental Generalized Hybrid A\** (RA-L 2025)
+- Talia, Salzman, Srinivasa — *Incremental Generalized Hybrid A\** (RA-L 2025) — planner core
+- Dolgov et al. (2010) — Hybrid A\* (conceptual ancestor)
 - Reeds & Shepp (1990); Dubins (1957) — optimal car curves
-- Dolgov et al. (2010) — Hybrid A\*
+- Folkers, Rick, Büskens (2019) — Time-Dependent Hybrid-State A\*
 - Mononen — Recast Navigation auto-annotation (Paris Game AI 2011)
 - Orkin — *Three States and a Plan: The A.I. of F.E.A.R.* (GDC 2006)
+- Coulter (1992) — Pure Pursuit path tracking
+- Sharon et al. (2015) — Conflict-Based Search (MAPF; simplified plan-sharing variant)
 - navcat — Isaac Mason, https://github.com/isaac-mason/navcat
+
+## License
+
+BSD-3-Clause (matches the IGHA\* reference implementation).
