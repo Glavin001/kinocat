@@ -1,3 +1,6 @@
 packages:
   - 'three'
   - 'demos'
+
+onlyBuiltDependencies:
+  - sharp

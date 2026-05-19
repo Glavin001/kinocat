@@ -11,5 +11,8 @@
     "build": "pnpm --filter @kinocat/three build",
     "dev": "pnpm --filter @kinocat/demos dev",
     "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "next": "^15.1.0"
   }
 }
