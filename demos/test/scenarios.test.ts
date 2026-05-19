@@ -26,6 +26,8 @@ import {
   buildRestrictedAirspace,
   buildGauntlet,
   planInteractive,
+  densifyPath,
+  aircraftAirspace,
   INTERACTIVE_BOXES,
   AIRCRAFT_AGENT,
   AIRCRAFT_MAX_EXPANSIONS,
@@ -335,6 +337,32 @@ describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
     expect(atB.length).toBeGreaterThan(0);
     expect(Math.max(...atA.map((p) => p.z))).toBeGreaterThan(6);
     expect(Math.min(...atB.map((p) => p.z))).toBeLessThan(-6);
+  });
+
+  it('densified rendering path stays collision-clear (canyon)', () => {
+    // Renders interpolate over densifyPath, not the coarse planner output —
+    // assert the dense arc itself is collision-free, so the visual plane
+    // can't appear to clip walls between primitive endpoints.
+    const s = buildCanyon();
+    const dense = densifyPath(s.path, 12);
+    expect(dense.length).toBeGreaterThan(s.path.length * 5);
+    const air = aircraftAirspace(s.boxes);
+    for (const p of dense) {
+      expect(air.clear(p.x, p.y, p.z, p.t, AIRCRAFT_AGENT.radius)).toBe(true);
+    }
+  });
+
+  it('densified rendering path clears walls AND the moving zone (gauntlet)', () => {
+    const s = buildGauntlet();
+    const dense = densifyPath(s.path, 12);
+    const zones =
+      s.zoneAt && s.zoneRadius != null
+        ? [{ radius: s.zoneRadius, predict: s.zoneAt }]
+        : [];
+    const air = aircraftAirspace(s.boxes, zones);
+    for (const p of dense) {
+      expect(air.clear(p.x, p.y, p.z, p.t, AIRCRAFT_AGENT.radius)).toBe(true);
+    }
   });
 
   it('gauntlet: weaves both walls, beats the moving zone, climbs the ridge', () => {

@@ -10,6 +10,7 @@ import {
   buildRestrictedAirspace,
   buildGauntlet,
   planInteractive,
+  densifyPath,
   INTERACTIVE_BOXES,
   AIRCRAFT_AGENT,
   AIRCRAFT_BOUNDS as B,
@@ -114,26 +115,29 @@ export default function Plane() {
     scene.add(startMarker, goalMarker);
 
     // ---- the aircraft (nose toward -z so THREE.lookAt aims it) ----
+    // Sized to the collision sphere (radius ≈ 1.6) so the visual footprint
+    // matches what the planner actually checks — oversized wings would clip
+    // walls the collision sphere clears, looking like a planner bug.
     const plane = new THREE.Group();
     const planeMat = new THREE.MeshStandardMaterial({ color: C.plane });
-    const fuse = new THREE.Mesh(new THREE.CylinderGeometry(0.7, 0.7, 6, 12), planeMat);
+    const fuse = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.28, 2.6, 12), planeMat);
     fuse.rotation.x = Math.PI / 2;
-    const nose = new THREE.Mesh(new THREE.ConeGeometry(0.7, 2.4, 12), planeMat);
+    const nose = new THREE.Mesh(new THREE.ConeGeometry(0.28, 1.0, 12), planeMat);
     nose.rotation.x = -Math.PI / 2;
-    nose.position.z = -4.2;
-    const wing = new THREE.Mesh(new THREE.BoxGeometry(11, 0.25, 2.2), planeMat);
-    const tail = new THREE.Mesh(new THREE.BoxGeometry(4, 0.22, 1.4), planeMat);
-    tail.position.z = 2.6;
-    const fin = new THREE.Mesh(new THREE.BoxGeometry(0.22, 2, 1.4), planeMat);
-    fin.position.set(0, 1, 2.6);
+    nose.position.z = -1.8;
+    const wing = new THREE.Mesh(new THREE.BoxGeometry(3.0, 0.10, 0.9), planeMat);
+    const tail = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.09, 0.5), planeMat);
+    tail.position.z = 1.15;
+    const fin = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.65, 0.5), planeMat);
+    fin.position.set(0, 0.35, 1.15);
     plane.add(fuse, nose, wing, tail, fin);
-    plane.scale.setScalar(1.4);
     scene.add(plane);
 
     // ---- dynamic scene content (rebuilt per scenario) ----
     const dyn = new THREE.Group();
     scene.add(dyn);
     let scn: AircraftScene | null = null;
+    let playPath: AircraftState[] = [];
     let goal: AircraftState = {
       x: 150, y: CRUISE_Y, z: 0, heading: 0, pitch: 0, speed: AIRCRAFT_AGENT.maxSpeed, t: 0,
     };
@@ -200,6 +204,7 @@ export default function Plane() {
       }
       startMarker.position.set(s.start.x, s.start.y, s.start.z);
       goalMarker.position.set(s.goal.x, s.goal.y, s.goal.z);
+      playPath = s.found ? densifyPath(s.path, 12) : s.path;
       playT = 0;
       setInfo(s.found ? s.info : `${s.info} — try another scenario`);
     };
@@ -285,10 +290,10 @@ export default function Plane() {
       const now = performance.now();
       const dt = Math.min((now - lastMs) / 1000, 0.05);
       lastMs = now;
-      if (scn && scn.path.length > 0) {
+      if (scn && playPath.length > 0) {
         const dur = Math.max(scn.duration, 0.001);
-        playT = scn.path.length > 1 ? (playT + dt) % (dur + 1.2) : 0;
-        const p = sampleAt(scn.path, playT);
+        playT = playPath.length > 1 ? (playT + dt) % (dur + 1.2) : 0;
+        const p = sampleAt(playPath, playT);
         plane.position.set(p.x, p.y, p.z);
         const cp = Math.cos(p.pitch);
         fwd.set(

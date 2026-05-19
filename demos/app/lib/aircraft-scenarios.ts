@@ -11,7 +11,7 @@ import {
   InMemoryAirspace,
 } from 'kinocat/environment';
 import type { AABB, MovingZone, AircraftEnvOptions } from 'kinocat/environment';
-import { defaultAircraftAgent } from 'kinocat/agent';
+import { defaultAircraftAgent, aircraftForwardSim } from 'kinocat/agent';
 import type { AircraftAgent, AircraftState } from 'kinocat/agent';
 
 export const AIR_PALETTE = {
@@ -297,4 +297,42 @@ export function planInteractive(
   return planAircraftLeg(aircraftAirspace(boxes), start, goal, {
     maxExpansions: AIRCRAFT_MAX_EXPANSIONS,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Densify a planned path for rendering. The planner returns one state per
+// motion primitive (~1 s), so straight-line interpolation between adjacent
+// states cuts the chord of every arc — the rendered plane drifts sideways or
+// even appears to fly backwards on sharp turns. We re-integrate
+// aircraftForwardSim with the controls backed out from each segment so the
+// rendered trajectory IS the arc the planner committed to.
+
+export function densifyPath(
+  path: AircraftState[],
+  substepsPerSegment = 10,
+): AircraftState[] {
+  if (path.length < 2) return [...path];
+  const sim = aircraftForwardSim(AIRCRAFT_AGENT);
+  const out: AircraftState[] = [path[0]!];
+  for (let i = 0; i < path.length - 1; i++) {
+    const a = path[i]!;
+    const b = path[i + 1]!;
+    const dt = b.t - a.t;
+    if (dt <= 1e-9) continue;
+    const speed = a.speed > 1 ? a.speed : AIRCRAFT_AGENT.maxSpeed;
+    // Recover the primitive's curvature from the heading delta and the climb
+    // angle from the next state's pitch (pitch tracks the commanded climb in
+    // a single substep, so b.pitch IS the commanded climb).
+    let dh = ((b.heading - a.heading + Math.PI) % (2 * Math.PI)) - Math.PI;
+    if (dh < -Math.PI) dh += 2 * Math.PI;
+    const k = dh / (speed * dt);
+    const climb = b.pitch;
+    const dtSub = dt / substepsPerSegment;
+    let s = a;
+    for (let j = 0; j < substepsPerSegment; j++) {
+      s = sim(s, [k, climb, speed], dtSub);
+      out.push(s);
+    }
+  }
+  return out;
 }
