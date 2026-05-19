@@ -240,6 +240,7 @@ function dynEnv(world: InMemoryNavWorld) {
     // The time-aware wrapper only collision-checks successor endpoints, so a
     // statically-clear analytic curve could clip a moving obstacle mid-shot.
     analyticExpansion: false,
+    heuristicTable: {},
   });
 }
 
@@ -551,6 +552,7 @@ export function buildAnytime(): AnytimeResult {
       goalHeadingTol: Infinity,
       sweepSegmentCheck: false,
       analyticExpansion: false,
+      heuristicTable: {},
     });
     const r = plan(
       { start, goal, environment: env, options: { maxExpansions: budget } },
@@ -630,6 +632,7 @@ export function planReverse(inp: ReverseInput = {}): ReverseResult {
     goalHeadingTol: Math.PI / 4,
     sweepSegmentCheck: false,
     analyticExpansion: false,
+    heuristicTable: {},
   });
   const start: VehicleState = { x: 30, z: 0, heading: 0, speed: 0, t: 0 };
   const goal: VehicleState = { x: 8, z: 0, heading: 0, speed: 0, t: 0 };
@@ -804,6 +807,7 @@ export function buildSwarm(inp: SwarmInput): SwarmResult {
         goalHeadingTol: Infinity,
         sweepSegmentCheck: false,
         analyticExpansion: false,
+        heuristicTable: {},
       }),
       {
         obstacles: others.map((id) => asObstacle(reg.predictNPC(id), 1.8)),
@@ -902,6 +906,7 @@ export function buildHumanoid(): HumanoidResult {
     goalHeadingTol: Infinity,
     sweepSegmentCheck: false,
     analyticExpansion: false,
+    heuristicTable: {},
   });
   const vr = plan(
     {

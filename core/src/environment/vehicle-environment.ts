@@ -31,6 +31,17 @@ export interface VehicleEnvOptions {
    * `{ everyN, step }`) to enable; `false` is the explicit disable.
    */
   analyticExpansion?: false | { everyN?: number; step?: number };
+  /**
+   * Reeds-Shepp heuristic lookup table (Dolgov et al. Hybrid A*; spec §12.3).
+   * The RS shortest-path heuristic is the dominant per-successor cost. Since
+   * the goal is fixed for a search, caching RS by quantized *source* pose
+   * turns it into an O(1) lookup after the first touch of each cell. A
+   * conservative slack (RS is 1-Lipschitz in translation, R-Lipschitz in
+   * heading) keeps the estimate admissible, so optimality is preserved.
+   * Disabled by default — pass `{}` (or a tuned `{ posCell, headingBuckets }`)
+   * to enable; `false` is the explicit disable.
+   */
+  heuristicTable?: false | { posCell?: number; headingBuckets?: number };
 }
 
 interface DriveEdgeData {
@@ -58,6 +69,14 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   private readonly analyticEveryN: number;
   private readonly analyticStep: number;
   private succCount = 0;
+  private readonly htEnabled: boolean;
+  private readonly htPos: number;
+  private readonly htHead: number;
+  private readonly htSlack: number;
+  private readonly hCache = new Map<string, number>();
+  private hGoalX = NaN;
+  private hGoalZ = NaN;
+  private hGoalH = NaN;
 
   constructor(
     private readonly world: NavWorld,
@@ -76,6 +95,15 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     this.analyticEnabled = ae !== undefined && ae !== false;
     this.analyticEveryN = this.analyticEnabled ? ((ae as { everyN?: number }).everyN ?? 6) : 0;
     this.analyticStep = this.analyticEnabled ? ((ae as { step?: number }).step ?? 0.4) : 0;
+    const ht = opts.heuristicTable; // opt-in: disabled unless provided
+    this.htEnabled = ht !== undefined && ht !== false;
+    this.htPos = this.htEnabled ? ((ht as { posCell?: number }).posCell ?? this.posCell) : 1;
+    this.htHead = this.htEnabled
+      ? ((ht as { headingBuckets?: number }).headingBuckets ?? this.headingBuckets)
+      : 1;
+    this.htSlack = this.htEnabled
+      ? 0.5 * this.htPos * Math.SQRT2 + this.agent.minTurnRadius * (Math.PI / this.htHead)
+      : 0;
     this.levels = this.divisors.length;
   }
 
@@ -238,12 +266,37 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   }
 
   heuristic(from: VehicleState, to: VehicleState): number {
+    const euclid = dist(from.x, from.z, to.x, to.z);
+    if (this.htEnabled) {
+      if (to.x !== this.hGoalX || to.z !== this.hGoalZ || to.heading !== this.hGoalH) {
+        this.hCache.clear();
+        this.hGoalX = to.x;
+        this.hGoalZ = to.z;
+        this.hGoalH = to.heading;
+      }
+      const cx = Math.round(from.x / this.htPos);
+      const cz = Math.round(from.z / this.htPos);
+      const stepH = (2 * Math.PI) / this.htHead;
+      const ch = Math.round(wrapAngle(from.heading) / stepH);
+      const key = `${cx}:${cz}:${ch}`;
+      let rs = this.hCache.get(key);
+      if (rs === undefined) {
+        rs = reedsSheppShortestPath(
+          { x: cx * this.htPos, y: cz * this.htPos, theta: ch * stepH },
+          { x: to.x, y: to.z, theta: to.heading },
+          this.agent.minTurnRadius,
+        ).length;
+        this.hCache.set(key, rs);
+      }
+      // rs is computed at the cell centre; subtract the worst-case in-cell
+      // deviation so the estimate is a true lower bound (admissible).
+      return Math.max(rs - this.htSlack, euclid) / this.agent.maxSpeed;
+    }
     const rs = reedsSheppShortestPath(
       { x: from.x, y: from.z, theta: from.heading },
       { x: to.x, y: to.z, theta: to.heading },
       this.agent.minTurnRadius,
     ).length;
-    const euclid = dist(from.x, from.z, to.x, to.z);
     return Math.max(rs, euclid) / this.agent.maxSpeed;
   }
 
