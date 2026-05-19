@@ -7,6 +7,7 @@ import { pack3 } from '../planner/resolution';
 import { placeFootprint } from '../internal/geom';
 import { angleDiff, dist, wrapAngle } from '../internal/math';
 import { reedsSheppShortestPath } from '../curves/reeds-shepp';
+import { sampleCurve } from '../curves/sample';
 
 export interface VehicleEnvOptions {
   posCell?: number;
@@ -19,11 +20,29 @@ export interface VehicleEnvOptions {
   goalHeadingTol?: number;
   /** Also require straight segments between sweep samples to be clear. */
   sweepSegmentCheck?: boolean;
+  /**
+   * Reeds-Shepp analytic expansion ("shot to goal"): periodically try the
+   * exact RS curve from the current node to the goal and, if its swept
+   * footprint is collision-free, finish in one step. Makes trivial / far
+   * queries terminate immediately and slashes expansions on the common case
+   * (Dolgov et al. Hybrid A*). STATIC collision only — wrap with disabled
+   * analytic expansion, or accept best-effort + replanning, when there are
+   * predicted dynamic obstacles. Disabled by default — pass `{}` (or a tuned
+   * `{ everyN, step }`) to enable; `false` is the explicit disable.
+   */
+  analyticExpansion?: false | { everyN?: number; step?: number };
 }
 
 interface DriveEdgeData {
   primId: number;
   reverse: boolean;
+}
+
+export interface AnalyticEdgeData {
+  reedsShepp: true;
+  reverse: boolean;
+  /** Sampled world-space (x,z) of the curve, for tracking / drawing. */
+  samples: [number, number][];
 }
 
 export class VehicleEnvironment implements Environment<VehicleState> {
@@ -35,6 +54,10 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   private readonly goalRadius: number;
   private readonly goalHeadingTol: number;
   private readonly sweepSegmentCheck: boolean;
+  private readonly analyticEnabled: boolean;
+  private readonly analyticEveryN: number;
+  private readonly analyticStep: number;
+  private succCount = 0;
 
   constructor(
     private readonly world: NavWorld,
@@ -49,6 +72,10 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     this.goalRadius = opts.goalRadius ?? 1.5;
     this.goalHeadingTol = opts.goalHeadingTol ?? Infinity;
     this.sweepSegmentCheck = opts.sweepSegmentCheck ?? true;
+    const ae = opts.analyticExpansion; // opt-in: disabled unless provided
+    this.analyticEnabled = ae !== undefined && ae !== false;
+    this.analyticEveryN = this.analyticEnabled ? ((ae as { everyN?: number }).everyN ?? 6) : 0;
+    this.analyticStep = this.analyticEnabled ? ((ae as { step?: number }).step ?? 0.4) : 0;
     this.levels = this.divisors.length;
   }
 
@@ -132,7 +159,82 @@ export class VehicleEnvironment implements Environment<VehicleState> {
       n.f = n.g + n.h;
       out.push(n);
     }
+
+    if (this.analyticEnabled) {
+      this.succCount++;
+      if (this.succCount === 1 || this.succCount % this.analyticEveryN === 0) {
+        const shot = this.tryAnalyticShot(node, goal);
+        if (shot) out.push(shot);
+      }
+    }
     return out;
+  }
+
+  /** Reeds-Shepp shot from `node` to the goal; a single goal-reaching
+   *  successor if the swept footprint is collision-free, else null. */
+  private tryAnalyticShot(
+    node: Node<VehicleState>,
+    goal: Node<VehicleState>,
+  ): Node<VehicleState> | null {
+    const a = node.state;
+    const b = goal.state;
+    const path = reedsSheppShortestPath(
+      { x: a.x, y: a.z, theta: a.heading },
+      { x: b.x, y: b.z, theta: b.heading },
+      this.agent.minTurnRadius,
+    );
+    if (path.segments.length === 0) return null;
+
+    const poses = sampleCurve(
+      { x: a.x, y: a.z, theta: a.heading },
+      path,
+      this.agent.minTurnRadius,
+      this.analyticStep,
+    );
+    const samples: [number, number][] = [];
+    let px = a.x;
+    let pz = a.z;
+    for (const p of poses) {
+      const fp = placeFootprint(this.agent.footprint, p.x, p.y, p.theta);
+      if (!this.world.footprintClear(fp)) return null;
+      if (this.sweepSegmentCheck && (p.x !== px || p.y !== pz)) {
+        if (!this.world.segmentClear(px, pz, p.x, p.y)) return null;
+      }
+      samples.push([p.x, p.y]);
+      px = p.x;
+      pz = p.y;
+    }
+
+    const parentReverse =
+      (node.edge?.data as DriveEdgeData | undefined)?.reverse === true;
+    let cost = 0;
+    let hasReverse = false;
+    let prevReverse = parentReverse;
+    for (const seg of path.segments) {
+      const rev = seg.gear < 0;
+      hasReverse ||= rev;
+      cost += (seg.length * (rev ? this.agent.reverseCostMultiplier : 1)) / this.agent.maxSpeed;
+      if (rev !== prevReverse) cost += this.agent.directionChangePenalty;
+      prevReverse = rev;
+    }
+
+    const next: VehicleState = {
+      x: b.x,
+      z: b.z,
+      heading: b.heading,
+      speed: 0,
+      t: a.t + path.length / this.agent.maxSpeed,
+    };
+    const edge: EdgeRef = {
+      cost,
+      kind: 'reeds-shepp',
+      data: { reedsShepp: true, reverse: hasReverse, samples } satisfies AnalyticEdgeData,
+    };
+    const n = this.createNode(next, node, edge);
+    n.g = node.g + cost;
+    n.h = this.heuristic(next, b);
+    n.f = n.g + n.h;
+    return n;
   }
 
   heuristic(from: VehicleState, to: VehicleState): number {

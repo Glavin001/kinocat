@@ -23,8 +23,10 @@ describe('playground demo config is always solvable', () => {
       obstacles: [],
     });
     expect(r.found).toBe(true);
-    expect(r.stats.expansions).toBeLessThan(DEMO_MAX_EXPANSIONS);
-    expect(r.path.length).toBeGreaterThan(2);
+    // analytic shot-to-goal solves the trivial straight in a few expansions
+    expect(r.stats.expansions).toBeLessThan(20);
+    expect(r.path.length).toBeGreaterThanOrEqual(2);
+    expect(r.nodes.some((n) => n.edge?.kind === 'reeds-shepp')).toBe(true);
   });
 
   it('with a central obstacle: detours and still finds a plan', () => {
@@ -35,6 +37,19 @@ describe('playground demo config is always solvable', () => {
     });
     expect(r.found).toBe(true);
     expect(r.stats.expansions).toBeLessThan(DEMO_MAX_EXPANSIONS);
+  });
+
+  it('trivial-but-far straight solves even at a tiny budget (analytic shot)', () => {
+    const r = planPlayground({
+      start: { x: 4, z: 0, heading: 0, speed: 0, t: 0 },
+      goal: { x: 200, z: 0, heading: 0, speed: 0, t: 0 },
+      obstacles: [],
+      bounds: { x0: 0, z0: -11, x1: 220, z1: 11 },
+      maxExpansions: 50,
+    });
+    expect(r.found).toBe(true);
+    expect(r.stats.expansions).toBeLessThan(20);
+    expect(r.nodes.some((n) => n.edge?.kind === 'reeds-shepp')).toBe(true);
   });
 
   it('low anytime budget degrades gracefully (never throws)', () => {

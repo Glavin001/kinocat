@@ -107,9 +107,87 @@ describe('VehicleEnvironment', () => {
       Infinity,
     );
     expect(r.found).toBe(true);
-    const reversed = r.nodes.some((n) => n.edge?.kind === 'drive-reverse');
+    const reversed = r.nodes.some(
+      (n) =>
+        n.edge?.kind === 'drive-reverse' ||
+        (n.edge?.kind === 'reeds-shepp' &&
+          (n.edge.data as { reverse?: boolean }).reverse === true),
+    );
     expect(reversed).toBe(true);
     for (const s of r.path) expect(Math.abs(s.heading)).toBeLessThan(0.35);
     expect(footprintsClear(world, r.path)).toBe(true);
+  });
+});
+
+describe('VehicleEnvironment Reeds-Shepp analytic expansion', () => {
+  it('solves a long open straight in a handful of expansions', () => {
+    const world = new InMemoryNavWorld([rect(1, 0, -20, 300, 20)]);
+    const env = new VehicleEnvironment(world, agent, lib, {
+      goalRadius: 1.5,
+      goalHeadingTol: Infinity,
+      analyticExpansion: {},
+    });
+    const start: VehicleState = { x: 5, z: 0, heading: 0, speed: 0, t: 0 };
+    const goal: VehicleState = { x: 280, z: 0, heading: 0, speed: 0, t: 0 };
+    const r = plan(
+      { start, goal, environment: env, options: { maxExpansions: 100000 } },
+      Infinity,
+    );
+    expect(r.found).toBe(true);
+    expect(r.stats.expansions).toBeLessThan(20); // analytic shot, not 90+ prims
+    expect(r.nodes.some((n) => n.edge?.kind === 'reeds-shepp')).toBe(true);
+    const last = r.path[r.path.length - 1]!;
+    expect(Math.hypot(last.x - goal.x, last.z - goal.z)).toBeLessThanOrEqual(1.5);
+  });
+
+  it('never shoots through an obstacle (static collision-checked)', () => {
+    const obstacle = [
+      [12, -3],
+      [18, -3],
+      [18, 3],
+      [12, 3],
+    ] as [number, number][];
+    const world = new InMemoryNavWorld([rect(1, 0, -10, 30, 10)], [obstacle]);
+    const env = new VehicleEnvironment(world, agent, lib, {
+      goalRadius: 1.5,
+      goalHeadingTol: Infinity,
+      analyticExpansion: {},
+    });
+    const start: VehicleState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
+    const goal: VehicleState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
+    const r = plan(
+      { start, goal, environment: env, options: { maxExpansions: 400000 } },
+      Infinity,
+    );
+    expect(r.found).toBe(true);
+    // every analytic edge's sampled curve stays out of the obstacle
+    for (const n of r.nodes) {
+      if (n.edge?.kind !== 'reeds-shepp') continue;
+      const samples = (n.edge.data as { samples: [number, number][] }).samples;
+      for (const [x, z] of samples) {
+        const inObstacle = x > 12 && x < 18 && z > -3 && z < 3;
+        expect(inObstacle).toBe(false);
+      }
+    }
+  });
+
+  it('can be disabled (no analytic edges, still solves)', () => {
+    const world = new InMemoryNavWorld([rect(1, 0, -20, 60, 20)]);
+    const env = new VehicleEnvironment(world, agent, lib, {
+      goalRadius: 1.5,
+      goalHeadingTol: Infinity,
+      analyticExpansion: false,
+    });
+    const r = plan(
+      {
+        start: { x: 4, z: 0, heading: 0, speed: 0, t: 0 },
+        goal: { x: 50, z: 0, heading: 0, speed: 0, t: 0 },
+        environment: env,
+        options: { maxExpansions: 300000 },
+      },
+      Infinity,
+    );
+    expect(r.found).toBe(true);
+    expect(r.nodes.every((n) => n.edge?.kind !== 'reeds-shepp')).toBe(true);
   });
 });

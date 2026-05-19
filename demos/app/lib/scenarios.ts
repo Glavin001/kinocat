@@ -92,6 +92,8 @@ function vehicleEnv(world: InMemoryNavWorld, reverseCost = 2) {
       goalRadius: 2,
       goalHeadingTol: Infinity,
       sweepSegmentCheck: false,
+      // RS shot-to-goal: trivial/far queries terminate immediately.
+      analyticExpansion: {},
     },
   );
 }
@@ -216,6 +218,9 @@ function dynEnv(world: InMemoryNavWorld) {
   return new VehicleEnvironment(world, DYN_AGENT, DYN_LIB, {
     goalRadius: 1.5,
     goalHeadingTol: Infinity,
+    // The time-aware wrapper only collision-checks successor endpoints, so a
+    // statically-clear analytic curve could clip a moving obstacle mid-shot.
+    analyticExpansion: false,
   });
 }
 
@@ -406,6 +411,7 @@ export function planNavmesh(
     goalRadius: 2,
     goalHeadingTol: Infinity,
     sweepSegmentCheck: false,
+    analyticExpansion: {},
   });
   return plan(
     { start: { ...start, t: 0 }, goal, environment: env, options: { maxExpansions: DEMO_MAX_EXPANSIONS } },

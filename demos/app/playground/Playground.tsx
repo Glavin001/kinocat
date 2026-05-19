@@ -60,23 +60,45 @@ export default function Playground() {
       ctx.fillRect(px, py, OB * 2 * SCALE, OB * 2 * SCALE);
     }
     if (r.found) {
+      // expand analytic (Reeds-Shepp) edges into their sampled curve
+      const fwd: [number, number][] = [];
+      const rev: [number, number][][] = [];
+      r.nodes.forEach((n, i) => {
+        if (i === 0) {
+          fwd.push([n.state.x, n.state.z]);
+          return;
+        }
+        const e = n.edge;
+        if (e?.kind === 'reeds-shepp') {
+          const d = e.data as { samples: [number, number][]; reverse: boolean };
+          for (const s of d.samples) fwd.push(s);
+          if (d.reverse) rev.push(d.samples);
+        } else {
+          fwd.push([n.state.x, n.state.z]);
+          if (e?.kind === 'drive-reverse') {
+            rev.push([
+              [r.path[i - 1]!.x, r.path[i - 1]!.z],
+              [n.state.x, n.state.z],
+            ]);
+          }
+        }
+      });
       ctx.strokeStyle = PALETTE.path;
       ctx.lineWidth = 3;
       ctx.beginPath();
-      r.path.forEach((s, i) => {
-        const [px, py] = toPx(s.x, s.z);
+      fwd.forEach(([x, z], i) => {
+        const [px, py] = toPx(x, z);
         i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
       });
       ctx.stroke();
       ctx.strokeStyle = '#ff6688';
       ctx.beginPath();
-      r.nodes.forEach((n, i) => {
-        if (i === 0 || n.edge?.kind !== 'drive-reverse') return;
-        const a = toPx(r.path[i - 1]!.x, r.path[i - 1]!.z);
-        const b = toPx(r.path[i]!.x, r.path[i]!.z);
-        ctx.moveTo(a[0], a[1]);
-        ctx.lineTo(b[0], b[1]);
-      });
+      for (const seg of rev) {
+        seg.forEach(([x, z], i) => {
+          const [px, py] = toPx(x, z);
+          i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+        });
+      }
       ctx.stroke();
     }
     for (const [pt, c] of [
