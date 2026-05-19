@@ -1,35 +1,34 @@
-// Multi-resolution dominance bookkeeping + integer cell packing helpers used
-// by Environment implementations to build Node.index.
+// Multi-resolution dominance bookkeeping + cell-key packing helpers used by
+// Environment implementations to build Node.index. Keys are strings so
+// composite multi-dimensional keys (incl. the time dimension, M4) compose
+// without integer-overflow concerns.
 
-const OFFSET = 1 << 20; // shift coords non-negative; supports ±~1e6 cells
-const STRIDE = 1 << 22;
+export type CellKey = string;
 
-/** Pack 2 small signed integers into one safe JS integer (< 2^53). */
-export function pack2(a: number, b: number): number {
-  return (a + OFFSET) * STRIDE + (b + OFFSET);
+/** Pack 2 integer cell coordinates into a dominance key. */
+export function pack2(a: number, b: number): CellKey {
+  return `${a}:${b}`;
 }
 
-/** Pack 3 small signed integers. Range per field ~±2^16 to stay < 2^53. */
-export function pack3(a: number, b: number, c: number): number {
-  const S = 1 << 17;
-  const O = 1 << 16;
-  return ((a + O) * S + (b + O)) * S + (c + O);
+/** Pack 3 integer cell coordinates into a dominance key. */
+export function pack3(a: number, b: number, c: number): CellKey {
+  return `${a}:${b}:${c}`;
 }
 
 /** Best g-cost seen per (level, cell) — the dominance front per resolution. */
 export class DominanceTable {
-  private readonly maps: Map<number, number>[];
+  private readonly maps: Map<CellKey, number>[];
 
   constructor(levels: number) {
-    this.maps = Array.from({ length: Math.max(1, levels) }, () => new Map<number, number>());
+    this.maps = Array.from({ length: Math.max(1, levels) }, () => new Map<CellKey, number>());
   }
 
-  best(level: number, key: number): number {
+  best(level: number, key: CellKey): number {
     return this.maps[level]?.get(key) ?? Infinity;
   }
 
   /** Record `g` for (level, key) if it strictly improves; report improvement. */
-  relax(level: number, key: number, g: number, eps = 1e-9): boolean {
+  relax(level: number, key: CellKey, g: number, eps = 1e-9): boolean {
     const m = this.maps[level];
     if (!m) return false;
     const cur = m.get(key);

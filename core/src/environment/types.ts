@@ -18,7 +18,7 @@ export interface Node<State> {
   f: number;
   parent: Node<State> | null;
   edge: EdgeRef | null;
-  index: number[];
+  index: string[];
   hash: string;
   level: number;
   active: boolean;

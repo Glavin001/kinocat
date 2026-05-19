@@ -6,7 +6,7 @@ export function makeNode<State>(
   state: State,
   parent: Node<State> | null,
   edge: EdgeRef | null,
-  index: number[],
+  index: string[],
   hash: string,
 ): Node<State> {
   return {

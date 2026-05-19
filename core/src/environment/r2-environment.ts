@@ -79,7 +79,7 @@ export class R2Environment implements Environment<R2State> {
     edge: EdgeRef | null,
   ): Node<R2State> {
     const [cx, cy] = this.cellOf(state);
-    const index: number[] = [];
+    const index: string[] = [];
     for (const d of this.divisors) {
       index.push(pack2(Math.floor(cx / d), Math.floor(cy / d)));
     }

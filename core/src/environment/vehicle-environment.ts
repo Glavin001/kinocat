@@ -67,7 +67,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     const ih = this.headingBucket(state.heading);
     const isp = Math.round(state.speed / this.speedQuant);
     const it = Math.round(state.t / 0.25);
-    const index: number[] = [];
+    const index: string[] = [];
     for (const d of this.divisors) {
       index.push(pack3(Math.floor(ix / d), Math.floor(iz / d), ih));
     }
