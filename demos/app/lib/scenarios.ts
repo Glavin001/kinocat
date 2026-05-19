@@ -21,7 +21,8 @@ import {
   createBoostAffordance,
   createMisdirectAffordance,
 } from 'kinocat/predict';
-import { planPoseAt } from 'kinocat/execute';
+import type { Predict } from 'kinocat/predict';
+import { planPoseAt, purePursuit, ReplanState } from 'kinocat/execute';
 import {
   defaultVehicleAgent,
   defaultHumanoidAgent,
@@ -1421,4 +1422,696 @@ export function solveFlagship(
  *  The scenario test calls this with the default (stable) config. */
 export function buildFlagship(inp: FlagshipInput = {}): FlagshipResult {
   return solveFlagship(buildFlagshipWorld(inp.crossTraffic ?? false), inp);
+}
+
+// ---------------------------------------------------------------------------
+// Cat & Mouse pursuit — time-aware target prediction + multi-cat coordination
+// + opportunistic affordances. Cats observe the mouse, build a Predict<{x,z}>
+// from its motion history, and plan to the INTERCEPTION pose (mouse position
+// at predicted arrival time), not the mouse's current position. Cats share
+// plans via PlanRegistry → emergent flanking. Mouse is a non-cooperative
+// humanoid darting around with simple wander+flee AI; it is NOT in the
+// registry. Visually compelling pursuit you can leave at defaults.
+
+const CATMOUSE_W = 56;
+const CATMOUSE_D = 56;
+
+/** Vertical canyon down the upper half of the arena (un-meshed strip ⇒ real
+ *  navmesh holes). Forces detour OR jump affordance when chase crosses it. */
+function catMouseBlocked(x: number, z: number): boolean {
+  if (x >= 27 && x < 31 && z >= 20) return true;
+  return false;
+}
+
+/** Procedural terrain: undulating ground tessellated into 2-unit quads with
+ *  the canyon strip carved out. Mirrors flagshipTerrain's pattern. */
+export function catMouseTerrain(): {
+  positions: number[];
+  indices: number[];
+  bounds: { x0: number; z0: number; x1: number; z1: number };
+} {
+  const positions: number[] = [];
+  const indices: number[] = [];
+  const q = 2;
+  const h = (x: number, z: number) =>
+    0.35 * Math.sin(x * 0.08) + 0.3 * Math.cos(z * 0.1);
+  for (let z = 0; z < CATMOUSE_D; z += q) {
+    for (let x = 0; x < CATMOUSE_W; x += q) {
+      if (catMouseBlocked(x + q / 2, z + q / 2)) continue;
+      const b = positions.length / 3;
+      positions.push(
+        x, h(x, z), z,
+        x + q, h(x + q, z), z,
+        x + q, h(x + q, z + q), z + q,
+        x, h(x, z + q), z + q,
+      );
+      indices.push(b, b + 3, b + 2, b, b + 2, b + 1);
+    }
+  }
+  return {
+    positions,
+    indices,
+    bounds: { x0: 0, z0: 0, x1: CATMOUSE_W, z1: CATMOUSE_D },
+  };
+}
+
+// Cats are vehicles — turning-radius-constrained Reeds-Shepp curves look
+// visually cat-like. Slightly faster than the mouse so capture is achievable
+// but not trivial; the chase is winnable.
+const CAT_MAX_SPEED = 9;
+const CAT_AGENT: VehicleAgent = defaultVehicleAgent({
+  minTurnRadius: 2.5,
+  maxSpeed: CAT_MAX_SPEED,
+  maxReverseSpeed: 4,
+  footprint: [
+    [1.0, 0.5],
+    [-1.0, 0.5],
+    [-1.0, -0.5],
+    [1.0, -0.5],
+  ],
+});
+const CAT_K = 1 / CAT_AGENT.minTurnRadius;
+const CAT_LIB = characterizeVehicle({
+  forwardSim: kinematicForwardSim(CAT_AGENT),
+  controlSets: [
+    [0, 6],
+    [CAT_K, 6],
+    [-CAT_K, 6],
+    [CAT_K / 2, 6],
+    [-CAT_K / 2, 6],
+    [0, -3],
+    [CAT_K, -3],
+    [-CAT_K, -3],
+  ],
+  duration: 0.5,
+  substeps: 6,
+  startSpeeds: [0],
+});
+const CAT_FORWARD_SIM = kinematicForwardSim(CAT_AGENT);
+
+const MOUSE_MAX_SPEED = 5;
+
+/** Pure-pursuit config tuned for the cat (small turn radius, brisk speeds). */
+const CAT_PP_CFG = {
+  lookaheadMin: 1.5,
+  lookaheadGain: 0.35,
+  lookaheadMax: 4.5,
+  maxLateralAccel: 8,
+  maxAccel: 8,
+  maxDecel: 8,
+  cruiseSpeed: CAT_MAX_SPEED,
+  goalTolerance: 1.2,
+  minTurnRadius: CAT_AGENT.minTurnRadius,
+};
+
+function catEnv(world: ReturnType<typeof navWorldFromTriangleMesh>['world']) {
+  return new VehicleEnvironment(world, CAT_AGENT, CAT_LIB, {
+    posCell: 0.8,
+    headingBuckets: 16,
+    speedQuant: 4,
+    levelDivisors: [4, 2, 1],
+    goalRadius: 1.5,
+    goalHeadingTol: Infinity,
+    sweepSegmentCheck: false,
+    analyticExpansion: {},
+    heuristicTable: {},
+    clearanceBroadphase: true,
+  });
+}
+
+export interface CatMouseBoostView {
+  id: string;
+  pad: { x: number; z: number };
+  exit: { x: number; z: number };
+  r: number;
+}
+
+export interface CatMouseJumpView {
+  id: string;
+  launch: { x: number; z: number };
+  land: { x: number; z: number };
+  r: number;
+}
+
+export interface CatMouseWorld {
+  bounds: { x0: number; z0: number; x1: number; z1: number };
+  positions: number[];
+  indices: number[];
+  world: ReturnType<typeof navWorldFromTriangleMesh>['world'];
+  affordances: AffordanceRegistry;
+  boosts: CatMouseBoostView[];
+  jumps: CatMouseJumpView[];
+  boostIds: Set<string>;
+  jumpIds: Set<string>;
+}
+
+/** Build the (expensive) navmesh + affordance set ONCE. The UI holds this in
+ *  a ref across re-inits (cat count slider re-inits only the sim state). */
+export function buildCatAndMouseWorld(): CatMouseWorld {
+  const { positions, indices, bounds } = catMouseTerrain();
+  const { world } = navWorldFromTriangleMesh(
+    positions,
+    indices,
+    { cellSize: 0.5, walkableSlopeAngleDegrees: 55, walkableClimbWorld: 1 },
+    { clearanceField: true, horizontalTolerance: 0.6 },
+  );
+
+  const aff = new AffordanceRegistry();
+  const boosts: CatMouseBoostView[] = [];
+  const jumps: CatMouseJumpView[] = [];
+  const boostIds = new Set<string>();
+  const jumpIds = new Set<string>();
+
+  // Boost SOUTH: east→west fling along the open southern corridor (the
+  // natural chase route for cats going from the SE spawn toward an NW prey).
+  const boostS = createBoostAffordance({
+    id: 'boost-south',
+    pad: { x: 40, z: 14 },
+    entryRadius: 4,
+    exit: { x: 16, z: 14, heading: Math.PI, speed: 0, t: 0 },
+    duration: 0.7,
+    cost: 1.5,
+  });
+  aff.add(boostS);
+  boostIds.add(boostS.id);
+  boosts.push({
+    id: boostS.id,
+    pad: { x: 40, z: 14 },
+    exit: { x: 16, z: 14 },
+    r: 4,
+  });
+
+  // Boost NORTH: west→east fling along the northern corridor (useful for the
+  // mirror chase after a capture when the mouse respawns south-east).
+  const boostN = createBoostAffordance({
+    id: 'boost-north',
+    pad: { x: 16, z: 44 },
+    entryRadius: 4,
+    exit: { x: 40, z: 44, heading: 0, speed: 0, t: 0 },
+    duration: 0.7,
+    cost: 1.5,
+  });
+  aff.add(boostN);
+  boostIds.add(boostN.id);
+  boosts.push({
+    id: boostN.id,
+    pad: { x: 16, z: 44 },
+    exit: { x: 40, z: 44 },
+    r: 4,
+  });
+
+  // Jump across the canyon east→west (the only way to cross at z >= 20).
+  const jumpCanyon = createJumpAffordance({
+    id: 'jump-canyon',
+    launch: { x: 33, z: 32 },
+    entryRadius: 3.5,
+    land: { x: 25, z: 32, heading: Math.PI, speed: 0, t: 0 },
+    apexY: 3,
+    duration: 0.9,
+    cost: 3,
+  });
+  aff.add(jumpCanyon);
+  jumpIds.add(jumpCanyon.id);
+  jumps.push({
+    id: jumpCanyon.id,
+    launch: { x: 33, z: 32 },
+    land: { x: 25, z: 32 },
+    r: 3.5,
+  });
+
+  return {
+    bounds,
+    positions,
+    indices,
+    world,
+    affordances: aff,
+    boosts,
+    jumps,
+    boostIds,
+    jumpIds,
+  };
+}
+
+export interface CatMouseAgent {
+  id: string;
+  state: VehicleState;
+  plan: VehicleState[];
+  replan: ReplanState;
+  usedBoost: boolean;
+  usedJump: boolean;
+  /** Latest plan cost (for HUD/tests). */
+  cost: number;
+}
+
+export interface CatMouseSimState {
+  cats: CatMouseAgent[];
+  mouse: {
+    state: HumanoidState;
+    obsHistory: HumanoidState[];
+    waypoint: { x: number; z: number };
+    waypointAge: number;
+  };
+  registry: PlanRegistry;
+  captures: number;
+  simTime: number;
+  capturedFlashUntil: number;
+  /** Min cat-mouse distance observed since last reset (for HUD/tests). */
+  minDistanceEver: number;
+}
+
+export interface CatMouseKnobs {
+  catCount: number;
+  /** Wall-clock budget per plan() call, milliseconds. */
+  deadlineMs: number;
+  /** Seconds; how far ahead the cats predict the mouse. */
+  predictionHorizon: number;
+  /** When false, cats plan to the mouse's CURRENT position (A/B comparison). */
+  predictionEnabled?: boolean;
+}
+
+// Small deterministic LCG so the headless scenario test (and the demo's
+// reset button) produce reproducible mouse wanders. The UI seeds it from
+// the wall clock so successive sessions feel fresh.
+function makeRng(seed: number) {
+  let s = (seed | 0) || 1;
+  return () => {
+    s = (s * 1664525 + 1013904223) | 0;
+    return ((s >>> 0) % 1000000) / 1000000;
+  };
+}
+
+/** Spawn the mouse and N cats on opposite corners. Plans are empty until the
+ *  first step triggers `shouldReplan` (no-plan). */
+export function initCatAndMouseState(
+  world: CatMouseWorld,
+  catCount: number,
+  seed = 1,
+): CatMouseSimState {
+  const rng = makeRng(seed);
+  // Mouse starts NW (across the canyon from the cats).
+  const mouseStart: HumanoidState = { x: 8, z: 48, heading: 0, t: 0 };
+  const cats: CatMouseAgent[] = [];
+  for (let i = 0; i < catCount; i++) {
+    const startX = 46 + (i % 2 === 0 ? -2 : 2);
+    const startZ = 6 + i * 3;
+    const state: VehicleState = {
+      x: startX,
+      z: startZ,
+      heading: Math.PI,
+      speed: 0,
+      t: 0,
+    };
+    cats.push({
+      id: `cat${i}`,
+      state,
+      plan: [state],
+      replan: new ReplanState({
+        // Stagger refresh per cat so all N don't replan on the same frame.
+        divergenceThresholdMeters: 1.5,
+        refreshIntervalMs: 320 + i * 80,
+        switchCostImprovement: 0.1,
+      }),
+      usedBoost: false,
+      usedJump: false,
+      cost: 0,
+    });
+  }
+  return {
+    cats,
+    mouse: {
+      state: mouseStart,
+      obsHistory: [mouseStart],
+      waypoint: pickMouseWaypoint(world, mouseStart, rng),
+      waypointAge: 0,
+    },
+    registry: new PlanRegistry(),
+    captures: 0,
+    simTime: 0,
+    capturedFlashUntil: 0,
+    minDistanceEver: Infinity,
+  };
+}
+
+function pickMouseWaypoint(
+  world: CatMouseWorld,
+  from: { x: number; z: number },
+  rng: () => number,
+): { x: number; z: number } {
+  for (let tries = 0; tries < 30; tries++) {
+    const wx = 4 + rng() * (CATMOUSE_W - 8);
+    const wz = 4 + rng() * (CATMOUSE_D - 8);
+    if (world.world.polygonAt(wx, wz) === null) continue;
+    // Require a meaningful displacement so the mouse doesn't dither in place.
+    if (Math.hypot(wx - from.x, wz - from.z) < 8) continue;
+    return { x: wx, z: wz };
+  }
+  return from;
+}
+
+/** EMA-smoothed constant-velocity predictor over the last few observations.
+ *  Humanoid has no signed forward speed; velocity comes from positional
+ *  deltas. Rebuilt every tick (cheap closure). */
+function buildMousePredictor(
+  obs: HumanoidState[],
+  horizon: number,
+): Predict<{
+  x: number;
+  z: number;
+  heading: number;
+  speed: number;
+  t: number;
+}> {
+  const last = obs[obs.length - 1]!;
+  if (obs.length < 2) {
+    return (t) => {
+      const dt = t - last.t;
+      if (dt < 0 || dt > horizon) return null;
+      return { x: last.x, z: last.z, heading: last.heading, speed: 0, t };
+    };
+  }
+  const alpha = 0.45;
+  let vx = 0;
+  let vz = 0;
+  let init = false;
+  const start = Math.max(0, obs.length - 5);
+  for (let i = start; i < obs.length - 1; i++) {
+    const a = obs[i]!;
+    const b = obs[i + 1]!;
+    const dt = Math.max(0.01, b.t - a.t);
+    const ivx = (b.x - a.x) / dt;
+    const ivz = (b.z - a.z) / dt;
+    if (!init) {
+      vx = ivx;
+      vz = ivz;
+      init = true;
+    } else {
+      vx = alpha * ivx + (1 - alpha) * vx;
+      vz = alpha * ivz + (1 - alpha) * vz;
+    }
+  }
+  return (t) => {
+    const dt = t - last.t;
+    if (dt < 0 || dt > horizon) return null;
+    return {
+      x: last.x + vx * dt,
+      z: last.z + vz * dt,
+      heading: Math.atan2(vz, vx),
+      speed: Math.hypot(vx, vz),
+      t,
+    };
+  };
+}
+
+/** Predictor as a public utility — the headless test asserts the cat plans
+ *  to where the mouse WILL be, so it rebuilds the predictor to score. */
+export function predictMouseFromHistory(
+  obs: HumanoidState[],
+  horizon: number,
+) {
+  return buildMousePredictor(obs, horizon);
+}
+
+/** Step the simulation forward by `dt` seconds. Pure (mutates `state` and
+ *  returns it). Visual layers read directly from the returned state. */
+export function stepCatAndMouse(
+  world: CatMouseWorld,
+  state: CatMouseSimState,
+  dt: number,
+  knobs: CatMouseKnobs & { nowMs: number; rng?: () => number },
+): CatMouseSimState {
+  const tStart = state.simTime;
+  const tEnd = tStart + dt;
+  const nowMs = knobs.nowMs;
+  const rng = knobs.rng ?? Math.random;
+  const predictionEnabled = knobs.predictionEnabled ?? true;
+
+  // 1) Mouse AI: pick a new waypoint occasionally or on reach. Drive toward
+  //    it with a flee blend when a cat gets close.
+  const m = state.mouse;
+  m.waypointAge += dt;
+  const wpDist = Math.hypot(m.state.x - m.waypoint.x, m.state.z - m.waypoint.z);
+  if (wpDist < 2.0 || m.waypointAge > 5) {
+    m.waypoint = pickMouseWaypoint(world, m.state, rng);
+    m.waypointAge = 0;
+  }
+  let dx = m.waypoint.x - m.state.x;
+  let dz = m.waypoint.z - m.state.z;
+  const dmag = Math.hypot(dx, dz) || 1;
+  let hx = dx / dmag;
+  let hz = dz / dmag;
+  let nearestD = Infinity;
+  let nearestCat: CatMouseAgent | null = null;
+  for (const c of state.cats) {
+    const d = Math.hypot(c.state.x - m.state.x, c.state.z - m.state.z);
+    if (d < nearestD) {
+      nearestD = d;
+      nearestCat = c;
+    }
+  }
+  if (nearestCat && nearestD < 8) {
+    // Cap the flee blend so the mouse can't permanently outmanoeuvre the
+    // turn-radius-constrained cats; otherwise captures never happen.
+    const fx = m.state.x - nearestCat.state.x;
+    const fz = m.state.z - nearestCat.state.z;
+    const fm = Math.hypot(fx, fz) || 1;
+    const w = Math.min(0.55, 1 - nearestD / 8);
+    hx = (1 - w) * hx + w * (fx / fm);
+    hz = (1 - w) * hz + w * (fz / fm);
+    const nm = Math.hypot(hx, hz) || 1;
+    hx /= nm;
+    hz /= nm;
+  }
+
+  // 2) Build mouse predictor from observation history (BEFORE integrating
+  //    this tick — the cats see the past and plan for the future).
+  const mousePredict = buildMousePredictor(m.obsHistory, knobs.predictionHorizon);
+
+  // 3) Replan cats (decisions made at tStart). Each cat publishes its plan
+  //    so sibling cats can read it back via PlanRegistry → emergent flanking.
+  //    Cats target FLANKING OFFSETS around the predicted mouse pose rather
+  //    than the exact same point — without this every cat plans to the same
+  //    spot, and since `predictNPC` returns the published plan's final pose
+  //    forever past its end, the second cat's goal would be permanently
+  //    blocked by the first cat's plan endpoint and the planner would
+  //    return no-plan.
+  for (let ci = 0; ci < state.cats.length; ci++) {
+    const cat = state.cats[ci]!;
+    if (!cat.replan.shouldReplan(cat.state, nowMs)) continue;
+
+    // Spread N cats around the target on a small circle so they approach
+    // from different angles. Radius is intentionally bigger than the
+    // per-cat asObstacle radius (1.0) so each cat's intercept point sits
+    // outside any sibling's "tail" obstacle. Decay the offset to zero as
+    // the cat closes in (≤ 4 m) so the final pounce aims at the mouse
+    // itself instead of orbiting around it forever.
+    const n = state.cats.length;
+    const dToMouseNow = Math.hypot(
+      cat.state.x - m.state.x,
+      cat.state.z - m.state.z,
+    );
+    const flankWeight = n > 1 ? Math.min(1, Math.max(0, (dToMouseNow - 3) / 4)) : 0;
+    const flankAngle = n > 1 ? (ci / n) * Math.PI * 2 : 0;
+    const flankR = 2.5 * flankWeight;
+    const flankDx = flankR * Math.cos(flankAngle);
+    const flankDz = flankR * Math.sin(flankAngle);
+
+    let goal: VehicleState;
+    if (predictionEnabled) {
+      const dToMouse = Math.hypot(
+        cat.state.x - m.state.x,
+        cat.state.z - m.state.z,
+      );
+      const eta = (dToMouse / CAT_MAX_SPEED) * 1.1;
+      const interceptT = tStart + Math.min(eta, knobs.predictionHorizon);
+      const ip = mousePredict(interceptT);
+      goal = {
+        x: (ip?.x ?? m.state.x) + flankDx,
+        z: (ip?.z ?? m.state.z) + flankDz,
+        heading: cat.state.heading,
+        speed: 0,
+        t: 0,
+      };
+    } else {
+      // Naïve mode: plan to where the mouse IS right now. The A/B story.
+      goal = {
+        x: m.state.x + flankDx,
+        z: m.state.z + flankDz,
+        heading: cat.state.heading,
+        speed: 0,
+        t: 0,
+      };
+    }
+
+    const others = state.cats.filter((c) => c.id !== cat.id);
+    const env = new TimeAwareEnvironment(catEnv(world.world), {
+      // Lightweight collision avoidance only — cats are 2×1, so 1.0 radius
+      // + 1.0 agentRadius = 2.0 m clearance is enough to prevent overlap
+      // without making the search infeasible.
+      obstacles: [
+        ...others.map((o) => asObstacle(state.registry.predictNPC(o.id), 1.0)),
+      ],
+      agentRadius: 1.0,
+      affordances: world.affordances,
+      affordanceRadius: 14,
+      broadphase: {},
+    });
+
+    const res = plan(
+      {
+        start: cat.state,
+        goal,
+        environment: env,
+        options: { maxExpansions: 100000 },
+      },
+      knobs.deadlineMs,
+    );
+    if (res.found) {
+      // Always adopt: hysteresis is designed for fixed-goal navigation
+      // (preventing flip-flops around symmetric obstacles), but in a pursuit
+      // the goal moves every replan — comparing the new plan's cost against
+      // the now-exhausted committed plan would lock the cat onto a stale
+      // path. setPlan() updates lastReplanMs and clears the dirty flag.
+      // Trivial length-1 plans (cat already at goal radius) are still
+      // adopted; atGoal will mark dirty and the next tick re-plans against
+      // the mouse's new position.
+      cat.replan.setPlan(res.path, nowMs, res.cost);
+      cat.plan = res.path;
+      cat.cost = res.cost;
+      state.registry.publish(cat.id, res.path);
+      cat.usedBoost = res.nodes.some((n) => {
+        const data = n.edge?.data as { affordanceId?: string } | undefined;
+        return data?.affordanceId ? world.boostIds.has(data.affordanceId) : false;
+      });
+      cat.usedJump = res.nodes.some((n) => {
+        const data = n.edge?.data as { affordanceId?: string } | undefined;
+        return data?.affordanceId ? world.jumpIds.has(data.affordanceId) : false;
+      });
+    }
+  }
+
+  // 4) Integrate everyone forward by dt.
+  const mSpeed = MOUSE_MAX_SPEED * 0.92;
+  const nx = m.state.x + hx * mSpeed * dt;
+  const nz = m.state.z + hz * mSpeed * dt;
+  if (world.world.polygonAt(nx, nz) !== null) {
+    m.state = { x: nx, z: nz, heading: Math.atan2(hz, hx), t: tEnd };
+  } else {
+    // Blocked — hold position but advance time and pick a fresh waypoint.
+    m.state = { ...m.state, t: tEnd };
+    m.waypoint = pickMouseWaypoint(world, m.state, rng);
+    m.waypointAge = 0;
+  }
+  m.obsHistory.push(m.state);
+  if (m.obsHistory.length > 20) m.obsHistory.shift();
+
+  for (const cat of state.cats) {
+    if (cat.plan.length < 2) {
+      cat.state = { ...cat.state, t: tEnd };
+      continue;
+    }
+    const cmd = purePursuit(cat.state, cat.plan, CAT_PP_CFG);
+    if (cmd.atGoal) {
+      // The committed plan is exhausted but the mouse keeps moving — request
+      // an immediate replan so the cat doesn't sit braked until the next
+      // periodic refresh.
+      cat.replan.markDirty('plan-end');
+    }
+    const next = CAT_FORWARD_SIM(
+      cat.state,
+      [cmd.steering, cmd.targetSpeed],
+      dt,
+    );
+    if (world.world.polygonAt(next.x, next.z) !== null) {
+      cat.state = next;
+    } else {
+      // Stuck against a wall (pure-pursuit drift) — mark dirty so the next
+      // tick replans from scratch.
+      cat.state = { ...cat.state, t: tEnd, speed: 0 };
+      cat.replan.markDirty('off-mesh');
+    }
+  }
+
+  state.simTime = tEnd;
+
+  // 5) Capture test + min-distance tracking.
+  let curMin = Infinity;
+  for (const cat of state.cats) {
+    const d = Math.hypot(cat.state.x - m.state.x, cat.state.z - m.state.z);
+    if (d < curMin) curMin = d;
+  }
+  if (curMin < state.minDistanceEver) state.minDistanceEver = curMin;
+  if (curMin < 2.2) {
+    state.captures++;
+    const respawn = farthestSpawnFromCats(world, state.cats);
+    m.state = { x: respawn.x, z: respawn.z, heading: 0, t: state.simTime };
+    m.obsHistory = [m.state];
+    m.waypoint = pickMouseWaypoint(world, m.state, rng);
+    m.waypointAge = 0;
+    state.capturedFlashUntil = state.simTime + 0.7;
+    state.minDistanceEver = Infinity;
+    // Force every cat to replan to the new target.
+    for (const cat of state.cats) cat.replan.markDirty('capture');
+  }
+
+  return state;
+}
+
+function farthestSpawnFromCats(
+  world: CatMouseWorld,
+  cats: CatMouseAgent[],
+): { x: number; z: number } {
+  let best = { x: 8, z: 48 };
+  let bestMinDist = -1;
+  for (let z = 4; z < CATMOUSE_D - 4; z += 4) {
+    for (let x = 4; x < CATMOUSE_W - 4; x += 4) {
+      if (world.world.polygonAt(x, z) === null) continue;
+      let minCatDist = Infinity;
+      for (const c of cats) {
+        const d = Math.hypot(c.state.x - x, c.state.z - z);
+        if (d < minCatDist) minCatDist = d;
+      }
+      if (minCatDist > bestMinDist) {
+        bestMinDist = minCatDist;
+        best = { x, z };
+      }
+    }
+  }
+  return best;
+}
+
+/** Headless one-shot for the scenario test (and for sanity-checking in
+ *  isolation). Builds the world, inits state, steps N times at fixed dt with
+ *  a deterministic RNG, returns the final state. */
+export function buildCatAndMouseScenario(
+  catCount = 2,
+  ticks = 14,
+  dt = 0.4,
+): {
+  world: CatMouseWorld;
+  state: CatMouseSimState;
+  distanceTrace: number[];
+} {
+  const world = buildCatAndMouseWorld();
+  const state = initCatAndMouseState(world, catCount, 42);
+  const rng = makeRng(7);
+  const distanceTrace: number[] = [];
+  const knobs: CatMouseKnobs = {
+    catCount,
+    deadlineMs: 200,
+    predictionHorizon: 3,
+  };
+  for (let i = 0; i < ticks; i++) {
+    stepCatAndMouse(world, state, dt, {
+      ...knobs,
+      nowMs: i * 400,
+      rng,
+    });
+    let minD = Infinity;
+    for (const c of state.cats) {
+      const d = Math.hypot(c.state.x - state.mouse.state.x, c.state.z - state.mouse.state.z);
+      if (d < minD) minD = d;
+    }
+    distanceTrace.push(minD);
+  }
+  return { world, state, distanceTrace };
 }

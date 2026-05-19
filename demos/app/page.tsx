@@ -17,6 +17,12 @@ const groups: { heading: string; demos: Demo[] }[] = [
         desc: 'Opposing cross-traffic on a large procedural navcat terrain. Click a vehicle to select it, retarget its goal or drop hazards and watch every NPC replan live. A genuine boost & canyon jump the planner adopts, a misdirect it rejects on its own. Toggleable clearance & moving-obstacle broadphase.',
         tag: '3D · interactive · multi-agent',
       },
+      {
+        href: '/catmouse',
+        title: 'Cat & Mouse pursuit',
+        desc: 'AI cats observe a non-cooperative mouse, build a predictor of its motion, and plan to the interception pose — where the mouse WILL be at arrival time, not where it is. Plans are shared via PlanRegistry so cats flank instead of pile up. Both species can take boost pads; a canyon split forces one cat to detour while another takes the jump affordance. Toggle "naive mode" to watch the cats lag the mouse without prediction.',
+        tag: '3D · prediction · pursuit',
+      },
     ],
   },
   {

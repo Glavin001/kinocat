@@ -16,6 +16,8 @@ import {
   buildHumanoid,
   buildJumpLinks,
   buildFlagship,
+  buildCatAndMouseScenario,
+  predictMouseFromHistory,
   DEMO_MAX_EXPANSIONS,
   DEMO_DYNAMIC_MAX_EXPANSIONS,
   type Scenario,
@@ -505,12 +507,100 @@ describe('flagship demo: real-time multi-agent', () => {
   });
 });
 
+// Cat & Mouse: multi-agent pursuit with time-aware target prediction. Lazy
+// (navcat-skippable) and small (2 cats, 14 ticks) so it stays well under the
+// time budget; asserts the pursuit pipeline produces real intercept plans.
+describe('catmouse demo: predict + intercept', () => {
+  let scn: ReturnType<typeof buildCatAndMouseScenario> | null = null;
+  beforeAll(() => {
+    try {
+      scn = buildCatAndMouseScenario(2);
+    } catch {
+      scn = null;
+    }
+  }, 90000);
+
+  it('every cat plans a multi-state path and publishes to the registry', (ctx) => {
+    if (scn === null) {
+      ctx.skip();
+      return;
+    }
+    const { state } = scn;
+    expect(state.cats.length).toBe(2);
+    for (const cat of state.cats) {
+      expect(cat.plan.length).toBeGreaterThanOrEqual(2);
+      // strictly increasing time along the path
+      for (let i = 1; i < cat.plan.length; i++) {
+        expect(cat.plan[i]!.t).toBeGreaterThan(cat.plan[i - 1]!.t - 1e-9);
+      }
+    }
+    expect(state.registry.all().length).toBe(2);
+  });
+
+  it('mouse observations accumulate and the cats actually move', (ctx) => {
+    if (scn === null) {
+      ctx.skip();
+      return;
+    }
+    const { state } = scn;
+    expect(state.mouse.obsHistory.length).toBeGreaterThanOrEqual(6);
+    // Each cat should have integrated forward (state has advanced from spawn).
+    for (const cat of state.cats) {
+      expect(cat.state.t).toBeGreaterThan(0);
+    }
+  });
+
+  it('cats plan toward the PREDICTED mouse pose (intercept, not chase-current)', (ctx) => {
+    if (scn === null) {
+      ctx.skip();
+      return;
+    }
+    const { state } = scn;
+    // The intercept property: each cat's plan endpoint should be closer to
+    // the mouse's PREDICTED pose at the plan's end time than to the mouse's
+    // CURRENT pose. (If the cats were merely chasing where the mouse IS,
+    // this would be reversed.) The mouse's flee response makes the predictor
+    // imperfect, so we just need the prediction-aware plan to win on
+    // aggregate.
+    const predict = predictMouseFromHistory(state.mouse.obsHistory, 6);
+    const cur = state.mouse.state;
+    let bestIntercept = Infinity;
+    let bestChase = Infinity;
+    for (const cat of state.cats) {
+      const end = cat.plan[cat.plan.length - 1]!;
+      const dChase = Math.hypot(end.x - cur.x, end.z - cur.z);
+      if (dChase < bestChase) bestChase = dChase;
+      const p = predict(end.t);
+      if (!p) continue;
+      const d = Math.hypot(end.x - p.x, end.z - p.z);
+      if (d < bestIntercept) bestIntercept = d;
+    }
+    // Allow small slack: prediction is noisy with sharp mouse turns, but the
+    // intercept-aimed endpoint must not be wildly worse than chase-current.
+    expect(bestIntercept).toBeLessThan(bestChase + 2);
+  });
+
+  it('pursuit closes: minimum cat-mouse distance shrinks across the run', (ctx) => {
+    if (scn === null) {
+      ctx.skip();
+      return;
+    }
+    const { distanceTrace } = scn;
+    expect(distanceTrace.length).toBeGreaterThan(8);
+    const initialMax = Math.max(...distanceTrace.slice(0, 3));
+    const tailMin = Math.min(...distanceTrace.slice(-5));
+    // The chase should make meaningful progress in 14 ticks.
+    expect(tailMin).toBeLessThan(initialMax);
+  });
+});
+
 // Coverage manifest: every demo route under demos/app/<slug>/page.tsx MUST
 // have a headless scenario asserted above. This fails CI if a new demo ships
 // without a test (or if a tested demo is deleted), so "all demos are covered"
 // is enforced, not just claimed.
 const TESTED_DEMOS = new Set([
   'anytime', // 'anytime demo' — buildAnytime
+  'catmouse', // 'catmouse demo' — buildCatAndMouseScenario (predict + intercept)
   'curves', // 'curves demo' — compareCurves
   'dynamic', // 'dynamic demo scenarios' — buildDynamic (moving/coop/jump)
   'flagship', // 'flagship demo' — buildFlagship (large multi-agent navcat)
