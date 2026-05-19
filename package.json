@@ -10,11 +10,13 @@
   "scripts": {
     "build": "pnpm --filter kinocat build && pnpm --filter @kinocat/three build",
     "dev": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos dev",
-    "typecheck": "pnpm -r typecheck",
+    "typecheck": "pnpm --filter kinocat build && pnpm -r typecheck",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "size": "pnpm --filter kinocat size"
+    "bench": "vitest bench --run",
+    "size": "pnpm --filter kinocat size",
+    "verify": "pnpm typecheck && pnpm test && pnpm --filter kinocat build && pnpm size"
   },
   "devDependencies": {
     "@vitest/coverage-v8": "^3.0.0",

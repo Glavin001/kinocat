@@ -4,6 +4,38 @@ The kinocat library. Pure TypeScript, tree-shakeable, zero runtime
 dependencies; navcat / Rapier / three.js are **optional peer dependencies**
 used only by the `adapters/*` subpaths.
 
+## Quick start
+
+```ts
+import { plan } from 'kinocat/planner';
+import { InMemoryNavWorld, VehicleEnvironment } from 'kinocat/environment';
+import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
+import { characterizeVehicle } from 'kinocat/primitives';
+
+const agent = defaultVehicleAgent();
+const lib = characterizeVehicle({
+  forwardSim: kinematicForwardSim(agent),
+  controlSets: [[0, 6], [1 / agent.minTurnRadius, 6], [-1 / agent.minTurnRadius, 6], [0, -4]],
+  duration: 0.5, substeps: 6, startSpeeds: [0],
+});
+const world = new InMemoryNavWorld([{ id: 1, y: 0, ring: [[0,-10],[40,-10],[40,10],[0,10]] }]);
+const env = new VehicleEnvironment(world, agent, lib, { goalRadius: 1.5, goalHeadingTol: Infinity });
+
+const result = plan(
+  {
+    start: { x: 2, z: 0, heading: 0, speed: 0, t: 0 },
+    goal: { x: 30, z: 4, heading: 0, speed: 0, t: 0 },
+    environment: env,
+  },
+  50, // anytime deadline (ms)
+);
+// result.found, result.path (VehicleState[]), result.cost, result.stats
+```
+
+Wrap `env` in `TimeAwareEnvironment` (from `kinocat/environment`) to add
+predicted-obstacle avoidance and lazy affordance edges; track the plan with
+`purePursuit` from `kinocat/execute`.
+
 ## Layout
 
 ```

@@ -1,5 +1,5 @@
-import Scene from './Scene';
+import Planner from './Planner';
 
 export default function Page() {
-  return <Scene />;
+  return <Planner />;
 }

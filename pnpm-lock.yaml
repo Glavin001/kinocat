@@ -44,6 +44,9 @@ importers:
       '@kinocat/three':
         specifier: workspace:*
         version: link:../three
+      kinocat:
+        specifier: workspace:*
+        version: link:../core
       next:
         specifier: ^15.1.0
         version: 15.5.18(react-dom@19.2.6(react@19.2.6))(react@19.2.6)

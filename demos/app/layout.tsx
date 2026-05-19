@@ -2,7 +2,7 @@ import type { ReactNode } from 'react';
 
 export const metadata = {
   title: 'kinocat demos',
-  description: 'Monorepo foundation demo — simplest possible three.js scene',
+  description: 'In-browser IGHA* time-extended kinodynamic planning',
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
