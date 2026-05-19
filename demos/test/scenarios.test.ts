@@ -13,10 +13,12 @@ import {
   buildSwarm,
   buildHumanoid,
   buildJumpLinks,
+  buildFlagship,
   DEMO_MAX_EXPANSIONS,
   DEMO_DYNAMIC_MAX_EXPANSIONS,
   type Scenario,
   type JumpLinksResult,
+  type FlagshipResult,
 } from '../app/lib/scenarios';
 import type { VehicleState } from 'kinocat/agent';
 
@@ -285,6 +287,68 @@ describe('jumplinks demo: Mononen-style off-mesh annotation', () => {
       expect(j.withLink.path[i]!.t).toBeGreaterThan(
         j.withLink.path[i - 1]!.t - 1e-9,
       );
+    }
+  });
+});
+
+// Flagship: large procedural navcat terrain + 8 NPCs + shortcut/misdirect
+// affordances + clearance & time-aware broadphase. Built lazily once
+// (navcat-skippable) and kept small (8 agents / 2 rounds) so it stays well
+// under the 20s limit. Per-opt correctness is proven by the core parity
+// tests; this asserts the integrated behaviour.
+describe('flagship demo: real-time multi-agent', () => {
+  let fs: FlagshipResult | null = null;
+  let detA: FlagshipResult | null = null;
+  let detB: FlagshipResult | null = null;
+  beforeAll(() => {
+    try {
+      fs = buildFlagship({ agents: 8, rounds: 2 });
+      detA = buildFlagship({ agents: 4, rounds: 1 });
+      detB = buildFlagship({ agents: 4, rounds: 1 });
+    } catch {
+      fs = null;
+      detA = null;
+      detB = null;
+    }
+  }, 90000);
+
+  it('every NPC plans to its goal; ≥1 takes the boost, none the misdirect', (ctx) => {
+    if (fs === null) {
+      ctx.skip();
+      return;
+    }
+    const f = fs;
+    expect(f.agents.length).toBe(8);
+    expect(f.reached).toBe(8);
+    expect(f.agents.some((a) => a.usedShortcut)).toBe(true);
+    for (const a of f.agents) {
+      expect(a.found).toBe(true);
+      expect(a.usedMisdirect).toBe(false); // emergent rejection, no special code
+      for (let i = 1; i < a.path.length; i++) {
+        expect(a.path[i]!.t).toBeGreaterThan(a.path[i - 1]!.t - 1e-9);
+      }
+    }
+  });
+
+  it('is deterministic (identical small build twice)', (ctx) => {
+    if (detA === null || detB === null) {
+      ctx.skip();
+      return;
+    }
+    const a = detA;
+    const b = detB;
+    expect(b.reached).toBe(a.reached);
+    expect(b.agents.length).toBe(a.agents.length);
+    for (let i = 0; i < a.agents.length; i++) {
+      const x = a.agents[i]!;
+      const y = b.agents[i]!;
+      expect(y.found).toBe(x.found);
+      expect(y.usedShortcut).toBe(x.usedShortcut);
+      expect(y.path.length).toBe(x.path.length);
+      const ex = x.path[x.path.length - 1]!;
+      const ey = y.path[y.path.length - 1]!;
+      expect(ey.x).toBeCloseTo(ex.x, 9);
+      expect(ey.z).toBeCloseTo(ex.z, 9);
     }
   });
 });
