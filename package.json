@@ -1,0 +1,15 @@
+{
+  "name": "kinocat-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Monorepo foundation for kinocat — kinodynamic planning for the web",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm --filter @kinocat/three build",
+    "dev": "pnpm --filter @kinocat/demos dev",
+    "typecheck": "pnpm -r typecheck"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "@kinocat/three",
+  "version": "0.0.0",
+  "description": "three.js helpers for kinocat (foundation stub — not yet implemented)",
+  "type": "module",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "three": ">=0.160.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.171.0",
+    "three": "^0.171.0",
+    "typescript": "^5.7.0"
+  }
+}
