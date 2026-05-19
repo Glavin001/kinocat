@@ -34,34 +34,31 @@ function len(w: Word | null): number {
   return w ? w.t + w.p + w.q : Infinity;
 }
 
-function dubinsLSL(d: number, a: number, b: number): Word | null {
+// CSC words. `tmp >= 0` for all finite (d,a,b): minimizing over d gives
+// 2-2cos(a-b)-(sa-sb)^2 >= 0 since (sa-sb)^2 <= 2(1-cos(a-b)). So LSL/RSR are
+// always valid — no nullable guard needed (Math.max clamps float dust).
+function dubinsLSL(d: number, a: number, b: number): Word {
   const ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b);
   const tmp = 2 + d * d - 2 * (ca * cb + sa * sb - d * (sa - sb));
-  if (tmp >= DUBINS_ZERO) {
-    const theta = Math.atan2(cb - ca, d + sa - sb);
-    return {
-      typeIndex: 0,
-      t: mod2pi(-a + theta),
-      p: Math.sqrt(Math.max(tmp, 0)),
-      q: mod2pi(b - theta),
-    };
-  }
-  return null;
+  const theta = Math.atan2(cb - ca, d + sa - sb);
+  return {
+    typeIndex: 0,
+    t: mod2pi(-a + theta),
+    p: Math.sqrt(Math.max(tmp, 0)),
+    q: mod2pi(b - theta),
+  };
 }
 
-function dubinsRSR(d: number, a: number, b: number): Word | null {
+function dubinsRSR(d: number, a: number, b: number): Word {
   const ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b);
   const tmp = 2 + d * d - 2 * (ca * cb + sa * sb - d * (sb - sa));
-  if (tmp >= DUBINS_ZERO) {
-    const theta = Math.atan2(ca - cb, d - sa + sb);
-    return {
-      typeIndex: 1,
-      t: mod2pi(a - theta),
-      p: Math.sqrt(Math.max(tmp, 0)),
-      q: mod2pi(-b + theta),
-    };
-  }
-  return null;
+  const theta = Math.atan2(ca - cb, d - sa + sb);
+  return {
+    typeIndex: 1,
+    t: mod2pi(a - theta),
+    p: Math.sqrt(Math.max(tmp, 0)),
+    q: mod2pi(-b + theta),
+  };
 }
 
 function dubinsRSL(d: number, a: number, b: number): Word | null {
@@ -120,7 +117,9 @@ function dubinsWord(d: number, a: number, b: number): Word {
     const w = f(d, a, b);
     if (w && len(w) < len(best)) best = w;
   }
-  // Reachable for any finite query; fall back to a degenerate straight.
+  // At least one word is always valid for a finite query; the fallback is a
+  // defensive degenerate straight.
+  /* v8 ignore next -- unreachable defensive fallback */
   return best ?? { typeIndex: 0, t: 0, p: d, q: 0 };
 }
 

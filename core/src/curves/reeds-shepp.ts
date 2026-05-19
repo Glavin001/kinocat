@@ -59,7 +59,8 @@ function pathLen(typeIndex: number, values: readonly number[]): number {
   const tmpl = TYPES[typeIndex]!;
   let len = 0;
   for (let i = 0; i < tmpl.length; i++) {
-    if (tmpl[i] !== N) len += Math.abs(values[i] ?? 0);
+    // every non-N slot always has a value (callers pass full value arrays)
+    if (tmpl[i] !== N) len += Math.abs(values[i]!);
   }
   return len;
 }
@@ -170,6 +171,9 @@ function tauOmega(
   const B = Math.cos(u) - Math.cos(delta) - 1;
   const t1 = Math.atan2(eta * A - xi * B, xi * A + eta * B);
   const t2 = 2 * (Math.cos(delta) - Math.cos(v) - Math.cos(u)) + 3;
+  // t2 >= 0 at both call sites (v = ±u with u in [-pi/2, pi/2]); the t2 < 0
+  // branch is defensive, faithful to OMPL.
+  /* v8 ignore next */
   const tau = t2 < 0 ? mod2pi(t1 + PI) : mod2pi(t1);
   const omega = mod2pi(tau - u + v - phi);
   return { tau, omega };
