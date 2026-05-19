@@ -138,6 +138,28 @@ describe.skipIf(!CLR_OK)('CompactHeightfield clearance field (Opt 1)', () => {
   });
 });
 
+describe.skipIf(!CLR_OK)('grid-Dijkstra goal lower bound (Opt 2)', () => {
+  it('is a non-negative lower bound, ~0 at the goal, null off-grid', () => {
+    const w = clr!.world;
+    const lb = w.buildGoalLowerBound!(25, 10);
+    expect(lb).not.toBeNull();
+    const atGoal = lb!(25, 10);
+    expect(atGoal).not.toBeNull();
+    expect(atGoal!).toBeGreaterThanOrEqual(0);
+    expect(atGoal!).toBeLessThan(2);
+    const far = lb!(3, 10); // true straight distance ~22
+    expect(far).not.toBeNull();
+    expect(far!).toBeGreaterThan(0);
+    expect(far!).toBeLessThanOrEqual(22 + 1e-6); // lower bound, never over
+    expect(far!).toBeGreaterThan(atGoal!); // farther ⇒ larger
+    expect(lb!(-50, -50)).toBeNull(); // off-grid
+  });
+
+  it('buildGoalLowerBound returns null for an off-mesh goal', () => {
+    expect(clr!.world.buildGoalLowerBound!(-100, -100)).toBeNull();
+  });
+});
+
 it('reports navmesh availability', () => {
   // Surfaces in CI logs whether the real-navcat path ran or was skipped.
   expect(typeof NAVMESH_OK).toBe('boolean');

@@ -332,3 +332,79 @@ describe('VehicleEnvironment clearance broadphase', () => {
     expect(r.found).toBe(true);
   });
 });
+
+// --- Opt 2: obstacle-aware grid-Dijkstra dual heuristic -----------------
+class LBWorld implements NavWorld {
+  readonly revision = 0;
+  constructor(private readonly lb: ((x: number, z: number) => number | null) | null) {}
+  polygonAt(x: number, z: number): PolygonRef | null {
+    return { id: 1, cx: x, cz: z, y: 0 };
+  }
+  heightAt(): number {
+    return 0;
+  }
+  footprintClear(): boolean {
+    return true;
+  }
+  segmentClear(): boolean {
+    return true;
+  }
+  offMeshFrom(): ReadonlyArray<OffMeshLink> {
+    return [];
+  }
+  buildGoalLowerBound(): ((x: number, z: number) => number | null) | null {
+    return this.lb;
+  }
+}
+
+describe('VehicleEnvironment grid-Dijkstra dual heuristic', () => {
+  const to: VehicleState = { x: 30, z: 0, heading: 0, speed: 0, t: 0 };
+  const from: VehicleState = { x: 4, z: 6, heading: 0.3, speed: 0, t: 0 };
+  const mkEnv = (world: NavWorld, gridHeuristic: false | Record<string, never>) =>
+    new VehicleEnvironment(world, agent, lib, { gridHeuristic });
+
+  it('combines via max(): bigger obstacle-aware bound dominates', () => {
+    const base = mkEnv(new LBWorld(null), false);
+    const baseH = base.heuristic(from, to);
+    // a detour bound much larger than the straight RS/Euclid term
+    const big = mkEnv(new LBWorld(() => 999), {});
+    expect(big.heuristic(from, to)).toBeCloseTo(999 / agent.maxSpeed, 9);
+    expect(big.heuristic(from, to)).toBeGreaterThan(baseH);
+  });
+
+  it('falls back to the RS term when the bound is unavailable', () => {
+    const base = mkEnv(new LBWorld(null), false);
+    const nullLB = mkEnv(new LBWorld(() => null), {});
+    const noFactory = mkEnv(new LBWorld(null), {});
+    for (const f of [from, { ...from, x: 12, z: -3 }]) {
+      expect(nullLB.heuristic(f, to)).toBeCloseTo(base.heuristic(f, to), 9);
+      expect(noFactory.heuristic(f, to)).toBeCloseTo(base.heuristic(f, to), 9);
+    }
+  });
+
+  it('a smaller (still admissible) bound never lowers the RS estimate', () => {
+    const base = mkEnv(new LBWorld(null), false);
+    const tiny = mkEnv(new LBWorld(() => 0.1), {});
+    expect(tiny.heuristic(from, to)).toBeCloseTo(base.heuristic(from, to), 9);
+  });
+
+  it('no-ops on a world without buildGoalLowerBound (InMemoryNavWorld)', () => {
+    const world = new InMemoryNavWorld([rect(1, 0, -16, 40, 16)]);
+    const r = plan(
+      {
+        start: { x: 3, z: 0, heading: 0, speed: 0, t: 0 },
+        goal: { x: 37, z: 0, heading: 0, speed: 0, t: 0 },
+        environment: new VehicleEnvironment(world, agent, lib, {
+          goalRadius: 1.5,
+          goalHeadingTol: Infinity,
+          sweepSegmentCheck: false,
+          analyticExpansion: false,
+          gridHeuristic: {},
+        }),
+        options: { maxExpansions: 40000 },
+      },
+      Infinity,
+    );
+    expect(r.found).toBe(true);
+  });
+});

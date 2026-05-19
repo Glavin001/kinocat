@@ -52,6 +52,17 @@ export interface VehicleEnvOptions {
    * Disabled by default. No-op on worlds without `clearanceAt`.
    */
   clearanceBroadphase?: boolean;
+  /**
+   * Obstacle-aware grid-Dijkstra dual heuristic (Opt 2, Dolgov et al.; spec
+   * §10.3). When the `NavWorld` provides `buildGoalLowerBound` (a
+   * `NavcatWorld` with `clearanceField`), max() an admissible obstacle-
+   * respecting distance-to-goal into the Reeds-Shepp heuristic so the search
+   * stops expanding into walls/dead-ends — large win on obstacle-dense
+   * terrain. Stays admissible (max of two lower bounds; the CHF must be
+   * un-eroded — the adapter default). `weight` (default 1, keep ≤ 1 for
+   * admissibility) scales the grid term. Disabled by default; `{}` enables.
+   */
+  gridHeuristic?: false | { weight?: number };
 }
 
 interface DriveEdgeData {
@@ -89,6 +100,11 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   private hGoalH = NaN;
   private readonly cbEnabled: boolean;
   private readonly rCirc: number;
+  private readonly ghEnabled: boolean;
+  private readonly ghWeight: number;
+  private ghGoalX = NaN;
+  private ghGoalZ = NaN;
+  private ghLB: ((x: number, z: number, y?: number) => number | null) | null = null;
 
   constructor(
     private readonly world: NavWorld,
@@ -125,6 +141,12 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     this.cbEnabled =
       opts.clearanceBroadphase === true &&
       typeof this.world.clearanceAt === 'function';
+    const gh = opts.gridHeuristic; // opt-in: disabled unless provided
+    this.ghEnabled =
+      gh !== undefined &&
+      gh !== false &&
+      typeof this.world.buildGoalLowerBound === 'function';
+    this.ghWeight = this.ghEnabled ? ((gh as { weight?: number }).weight ?? 1) : 1;
     this.levels = this.divisors.length;
   }
 
@@ -298,6 +320,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
 
   heuristic(from: VehicleState, to: VehicleState): number {
     const euclid = dist(from.x, from.z, to.x, to.z);
+    let tRS: number;
     if (this.htEnabled) {
       if (to.x !== this.hGoalX || to.z !== this.hGoalZ || to.heading !== this.hGoalH) {
         this.hCache.clear();
@@ -321,14 +344,30 @@ export class VehicleEnvironment implements Environment<VehicleState> {
       }
       // rs is computed at the cell centre; subtract the worst-case in-cell
       // deviation so the estimate is a true lower bound (admissible).
-      return Math.max(rs - this.htSlack, euclid) / this.agent.maxSpeed;
+      tRS = Math.max(rs - this.htSlack, euclid) / this.agent.maxSpeed;
+    } else {
+      const rs = reedsSheppShortestPath(
+        { x: from.x, y: from.z, theta: from.heading },
+        { x: to.x, y: to.z, theta: to.heading },
+        this.agent.minTurnRadius,
+      ).length;
+      tRS = Math.max(rs, euclid) / this.agent.maxSpeed;
     }
-    const rs = reedsSheppShortestPath(
-      { x: from.x, y: from.z, theta: from.heading },
-      { x: to.x, y: to.z, theta: to.heading },
-      this.agent.minTurnRadius,
-    ).length;
-    return Math.max(rs, euclid) / this.agent.maxSpeed;
+    if (this.ghEnabled) {
+      if (to.x !== this.ghGoalX || to.z !== this.ghGoalZ) {
+        this.ghGoalX = to.x;
+        this.ghGoalZ = to.z;
+        this.ghLB = this.world.buildGoalLowerBound!(to.x, to.z);
+      }
+      if (this.ghLB) {
+        const d = this.ghLB(from.x, from.z);
+        if (d !== null) {
+          const tGrid = (d * this.ghWeight) / this.agent.maxSpeed;
+          if (tGrid > tRS) return tGrid;
+        }
+      }
+    }
+    return tRS;
   }
 
   private poseClear(s: VehicleState): boolean {
