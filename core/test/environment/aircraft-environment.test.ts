@@ -210,6 +210,27 @@ describe('AircraftEnvironment + IGHA*', () => {
     expect(env.heuristic(s, g)).toBeLessThanOrEqual(r.cost + 1e-6);
   });
 
+  it('prefers wings-level when banking is not required', () => {
+    // Open airspace, roll-search ENABLED. The roll cost should bias the
+    // planner toward roll=0 even though ±maxBank is in the control set.
+    const air = new InMemoryAirspace({ floor: 0, ceiling: 80 });
+    const env = new AircraftEnvironment(air, agent, {
+      posCell: 4,
+      altCell: 4,
+      goalRadius: 8,
+      rollFractions: [-1, 0, 1],
+    });
+    const s = start();
+    const g = start({ x: 120 });
+    const r = plan(
+      { start: s, goal: g, environment: env, options: { maxExpansions: 40000 } },
+      Infinity,
+    );
+    expect(r.found).toBe(true);
+    // Every state along the plan should be at roll = 0 (no gratuitous bank).
+    expect(Math.max(...r.path.map((p) => Math.abs(p.roll)))).toBeLessThan(1e-6);
+  });
+
   it('reports an invalid start when its OBB intersects an obstacle', () => {
     const box: AABB = { min: [-5, 0, -5], max: [5, 40, 5] };
     const air = new InMemoryAirspace({ floor: 0, ceiling: 80, boxes: [box] });

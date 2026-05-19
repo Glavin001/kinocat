@@ -121,22 +121,22 @@ export default function Plane() {
     const goalMarker = mkSphere(parseInt(C.goal.slice(1), 16));
     scene.add(startMarker, goalMarker);
 
-    // ---- the aircraft (nose toward -z so THREE.lookAt aims it) ----
-    // Sized to the collision sphere (radius ≈ 1.6) so the visual footprint
-    // matches what the planner actually checks — oversized wings would clip
-    // walls the collision sphere clears, looking like a planner bug.
+    // ---- the aircraft (nose toward +z, since Object3D.lookAt on a non-
+    // Camera orients local +Z toward the target). Sized to the OBB so the
+    // visual footprint matches what the planner actually checks — oversized
+    // wings would clip walls the OBB clears, looking like a planner bug.
     const plane = new THREE.Group();
     const planeMat = new THREE.MeshStandardMaterial({ color: C.plane });
     const fuse = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.28, 2.6, 12), planeMat);
     fuse.rotation.x = Math.PI / 2;
     const nose = new THREE.Mesh(new THREE.ConeGeometry(0.28, 1.0, 12), planeMat);
-    nose.rotation.x = -Math.PI / 2;
-    nose.position.z = -1.8;
+    nose.rotation.x = Math.PI / 2;
+    nose.position.z = 1.8;
     const wing = new THREE.Mesh(new THREE.BoxGeometry(3.0, 0.10, 0.9), planeMat);
     const tail = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.09, 0.5), planeMat);
-    tail.position.z = 1.15;
+    tail.position.z = -1.15;
     const fin = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.65, 0.5), planeMat);
-    fin.position.set(0, 0.35, 1.15);
+    fin.position.set(0, 0.35, -1.15);
     plane.add(fuse, nose, wing, tail, fin);
     scene.add(plane);
 
@@ -311,7 +311,11 @@ export default function Plane() {
           p.z + cp * Math.sin(p.heading),
         );
         plane.lookAt(fwd);
-        plane.rotateZ(p.roll);
+        // After lookAt, local +Z is the nose direction (forward). Banking
+        // about that axis: right-hand rule with thumb along +Z would lift
+        // the right wing for positive rotateZ, so negate to match the
+        // aviation convention "positive roll = right wing down".
+        plane.rotateZ(-p.roll);
         const zoneMesh = dyn.getObjectByName('zone');
         if (zoneMesh && scn.zoneAt) {
           const c = scn.zoneAt(playT);
