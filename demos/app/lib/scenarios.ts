@@ -1888,8 +1888,32 @@ export function stepCatAndMouse(
 
   // 3) Replan cats (decisions made at tStart). Each cat publishes its plan
   //    so sibling cats can read it back via PlanRegistry → emergent flanking.
-  for (const cat of state.cats) {
+  //    Cats target FLANKING OFFSETS around the predicted mouse pose rather
+  //    than the exact same point — without this every cat plans to the same
+  //    spot, and since `predictNPC` returns the published plan's final pose
+  //    forever past its end, the second cat's goal would be permanently
+  //    blocked by the first cat's plan endpoint and the planner would
+  //    return no-plan.
+  for (let ci = 0; ci < state.cats.length; ci++) {
+    const cat = state.cats[ci]!;
     if (!cat.replan.shouldReplan(cat.state, nowMs)) continue;
+
+    // Spread N cats around the target on a small circle so they approach
+    // from different angles. Radius is intentionally bigger than the
+    // per-cat asObstacle radius (1.0) so each cat's intercept point sits
+    // outside any sibling's "tail" obstacle. Decay the offset to zero as
+    // the cat closes in (≤ 4 m) so the final pounce aims at the mouse
+    // itself instead of orbiting around it forever.
+    const n = state.cats.length;
+    const dToMouseNow = Math.hypot(
+      cat.state.x - m.state.x,
+      cat.state.z - m.state.z,
+    );
+    const flankWeight = n > 1 ? Math.min(1, Math.max(0, (dToMouseNow - 3) / 4)) : 0;
+    const flankAngle = n > 1 ? (ci / n) * Math.PI * 2 : 0;
+    const flankR = 2.5 * flankWeight;
+    const flankDx = flankR * Math.cos(flankAngle);
+    const flankDz = flankR * Math.sin(flankAngle);
 
     let goal: VehicleState;
     if (predictionEnabled) {
@@ -1901,8 +1925,8 @@ export function stepCatAndMouse(
       const interceptT = tStart + Math.min(eta, knobs.predictionHorizon);
       const ip = mousePredict(interceptT);
       goal = {
-        x: ip?.x ?? m.state.x,
-        z: ip?.z ?? m.state.z,
+        x: (ip?.x ?? m.state.x) + flankDx,
+        z: (ip?.z ?? m.state.z) + flankDz,
         heading: cat.state.heading,
         speed: 0,
         t: 0,
@@ -1910,8 +1934,8 @@ export function stepCatAndMouse(
     } else {
       // Naïve mode: plan to where the mouse IS right now. The A/B story.
       goal = {
-        x: m.state.x,
-        z: m.state.z,
+        x: m.state.x + flankDx,
+        z: m.state.z + flankDz,
         heading: cat.state.heading,
         speed: 0,
         t: 0,
@@ -1920,8 +1944,11 @@ export function stepCatAndMouse(
 
     const others = state.cats.filter((c) => c.id !== cat.id);
     const env = new TimeAwareEnvironment(catEnv(world.world), {
+      // Lightweight collision avoidance only — cats are 2×1, so 1.0 radius
+      // + 1.0 agentRadius = 2.0 m clearance is enough to prevent overlap
+      // without making the search infeasible.
       obstacles: [
-        ...others.map((o) => asObstacle(state.registry.predictNPC(o.id), 1.6)),
+        ...others.map((o) => asObstacle(state.registry.predictNPC(o.id), 1.0)),
       ],
       agentRadius: 1.0,
       affordances: world.affordances,
@@ -1939,19 +1966,26 @@ export function stepCatAndMouse(
       knobs.deadlineMs,
     );
     if (res.found) {
-      if (cat.replan.consider(res.path, res.cost, nowMs)) {
-        cat.plan = res.path;
-        cat.cost = res.cost;
-        state.registry.publish(cat.id, res.path);
-        cat.usedBoost = res.nodes.some((n) => {
-          const data = n.edge?.data as { affordanceId?: string } | undefined;
-          return data?.affordanceId ? world.boostIds.has(data.affordanceId) : false;
-        });
-        cat.usedJump = res.nodes.some((n) => {
-          const data = n.edge?.data as { affordanceId?: string } | undefined;
-          return data?.affordanceId ? world.jumpIds.has(data.affordanceId) : false;
-        });
-      }
+      // Always adopt: hysteresis is designed for fixed-goal navigation
+      // (preventing flip-flops around symmetric obstacles), but in a pursuit
+      // the goal moves every replan — comparing the new plan's cost against
+      // the now-exhausted committed plan would lock the cat onto a stale
+      // path. setPlan() updates lastReplanMs and clears the dirty flag.
+      // Trivial length-1 plans (cat already at goal radius) are still
+      // adopted; atGoal will mark dirty and the next tick re-plans against
+      // the mouse's new position.
+      cat.replan.setPlan(res.path, nowMs, res.cost);
+      cat.plan = res.path;
+      cat.cost = res.cost;
+      state.registry.publish(cat.id, res.path);
+      cat.usedBoost = res.nodes.some((n) => {
+        const data = n.edge?.data as { affordanceId?: string } | undefined;
+        return data?.affordanceId ? world.boostIds.has(data.affordanceId) : false;
+      });
+      cat.usedJump = res.nodes.some((n) => {
+        const data = n.edge?.data as { affordanceId?: string } | undefined;
+        return data?.affordanceId ? world.jumpIds.has(data.affordanceId) : false;
+      });
     }
   }
 
@@ -1976,6 +2010,12 @@ export function stepCatAndMouse(
       continue;
     }
     const cmd = purePursuit(cat.state, cat.plan, CAT_PP_CFG);
+    if (cmd.atGoal) {
+      // The committed plan is exhausted but the mouse keeps moving — request
+      // an immediate replan so the cat doesn't sit braked until the next
+      // periodic refresh.
+      cat.replan.markDirty('plan-end');
+    }
     const next = CAT_FORWARD_SIM(
       cat.state,
       [cmd.steering, cmd.targetSpeed],
