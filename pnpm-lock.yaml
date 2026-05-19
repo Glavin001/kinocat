@@ -50,6 +50,9 @@ importers:
       kinocat:
         specifier: workspace:*
         version: link:../core
+      navcat:
+        specifier: 0.4.1
+        version: 0.4.1(three@0.180.0)
       next:
         specifier: ^15.1.0
         version: 15.5.18(react-dom@19.2.6(react@19.2.6))(react@19.2.6)
@@ -60,8 +63,8 @@ importers:
         specifier: ^19.0.0
         version: 19.2.6(react@19.2.6)
       three:
-        specifier: ^0.171.0
-        version: 0.171.0
+        specifier: ^0.180.0
+        version: 0.180.0
     devDependencies:
       '@types/node':
         specifier: ^22.10.0
@@ -73,8 +76,8 @@ importers:
         specifier: ^19.0.0
         version: 19.2.3(@types/react@19.2.14)
       '@types/three':
-        specifier: ^0.171.0
-        version: 0.171.0
+        specifier: ^0.180.0
+        version: 0.180.0
       typescript:
         specifier: ^5.7.0
         version: 5.9.3
