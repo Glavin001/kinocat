@@ -8,6 +8,7 @@ import {
   buildWaypointCourse,
   buildCanyon,
   buildRestrictedAirspace,
+  buildGauntlet,
   planInteractive,
   INTERACTIVE_BOXES,
   AIRCRAFT_AGENT,
@@ -16,7 +17,7 @@ import {
   type AircraftScene,
 } from '../lib/aircraft-scenarios';
 
-type Mode = 'waypoint' | 'canyon' | 'restricted' | 'interactive';
+type Mode = 'waypoint' | 'canyon' | 'restricted' | 'gauntlet' | 'interactive';
 
 const CRUISE_Y = 32;
 
@@ -229,6 +230,7 @@ export default function Plane() {
       if (m === 'waypoint') scn = buildWaypointCourse();
       else if (m === 'canyon') scn = buildCanyon();
       else if (m === 'restricted') scn = buildRestrictedAirspace();
+      else if (m === 'gauntlet') scn = buildGauntlet();
       else {
         replanInteractive();
         return;
@@ -366,8 +368,8 @@ export default function Plane() {
         demo — but over a genuinely 3D state (x, y, z, heading, pitch, speed,
         t). Altitude is <em>searched</em>, not derived: the plane climbs over
         ridges, weaves a canyon, threads gates, and routes around a moving
-        no-fly zone. Drag to orbit; in interactive mode, tap the ground to
-        retarget and watch it replan.
+        no-fly zone — or all of it at once in the grand tour. Drag to orbit;
+        in interactive mode, tap the ground to retarget and watch it replan.
       </p>
       <div style={{ display: 'flex', gap: 8, margin: '8px 0', flexWrap: 'wrap' }}>
         <button onClick={() => choose('waypoint')} style={btn(mode === 'waypoint')}>
@@ -381,6 +383,12 @@ export default function Plane() {
           style={btn(mode === 'restricted')}
         >
           restricted airspace
+        </button>
+        <button
+          onClick={() => choose('gauntlet')}
+          style={btn(mode === 'gauntlet')}
+        >
+          grand tour
         </button>
         <button
           onClick={() => choose('interactive')}

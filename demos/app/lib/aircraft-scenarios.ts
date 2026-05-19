@@ -110,7 +110,7 @@ function gate(x: number, y: number, z: number): AircraftState {
 // pattern the 2D demos use.
 
 export interface AircraftScene {
-  kind: 'waypoint' | 'canyon' | 'restricted';
+  kind: 'waypoint' | 'canyon' | 'restricted' | 'gauntlet';
   path: AircraftState[];
   found: boolean;
   duration: number;
@@ -234,11 +234,59 @@ export function buildRestrictedAirspace(): AircraftScene {
 }
 
 // ---------------------------------------------------------------------------
-// Interactive — default obstacle field for the tap-to-retarget mode.
+// Grand tour — one combined showcase: weave a full-height wall, dodge a moving
+// no-fly zone in the mid corridor (route around OR climb over it), weave the
+// second wall, then climb the full-width ridge. Restricted airspace + canyon
+// + altitude search + lateral routing, all in a single plan.
 
+export function buildGauntlet(): AircraftScene {
+  const f = AIRCRAFT_BOUNDS.floor;
+  const c = AIRCRAFT_BOUNDS.ceiling;
+  const boxes: AABB[] = [
+    { min: [40, f, -60], max: [47, c, 4] }, // full height; weave right (+z)
+    { min: [95, f, -4], max: [102, c, 60] }, // full height; weave left (-z)
+    { min: [128, f, -60], max: [135, 34, 60] }, // ridge; climb over
+  ];
+  const radius = 15;
+  const zone = { x: 70, y: 26, z0: -46, vz: 8, horizon: 45 };
+  const zoneAt = (t: number) => {
+    if (t < 0 || t > zone.horizon) return null;
+    return { x: zone.x, y: zone.y, z: zone.z0 + zone.vz * t };
+  };
+  const airspace = aircraftAirspace(boxes, [{ radius, predict: zoneAt }]);
+  const start = gate(8, 22, 0);
+  const goal = gate(152, 22, 0);
+  const r = planAircraftLeg(airspace, start, goal, {
+    maxExpansions: AIRCRAFT_DYNAMIC_MAX_EXPANSIONS,
+  });
+  return {
+    kind: 'gauntlet',
+    path: r.found ? r.path : [start],
+    found: r.found,
+    duration: r.found ? r.path[r.path.length - 1]!.t : 0,
+    start,
+    goal,
+    gates: [],
+    boxes,
+    zoneRadius: radius,
+    zoneAt,
+    info: r.found
+      ? `weaved both walls, beat the moving zone, climbed the ridge (${r.path.length} states)`
+      : 'no plan',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Interactive — default obstacle field for the tap-to-retarget mode. Two
+// full-height walls (alternating side gaps) so the plane must weave *between*
+// them on the way to the tapped destination; kept to two walls (no ridge) so
+// every replan stays inside the interactive expansion budget.
+
+const _IF = AIRCRAFT_BOUNDS.floor;
+const _IC = AIRCRAFT_BOUNDS.ceiling;
 export const INTERACTIVE_BOXES: AABB[] = [
-  { min: [56, 0, -60], max: [64, 26, 8] },
-  { min: [100, 0, -8], max: [108, 26, 60] },
+  { min: [54, _IF, -60], max: [62, _IC, 6] },
+  { min: [102, _IF, -6], max: [110, _IC, 60] },
 ];
 
 export function planInteractive(

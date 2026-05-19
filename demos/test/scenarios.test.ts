@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
+import { readdirSync, existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   planPlayground,
   buildDynamic,
@@ -22,6 +24,7 @@ import {
   buildWaypointCourse,
   buildCanyon,
   buildRestrictedAirspace,
+  buildGauntlet,
   planInteractive,
   INTERACTIVE_BOXES,
   AIRCRAFT_AGENT,
@@ -315,7 +318,7 @@ describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
     }
   });
 
-  it('interactive: replans to a tapped destination within budget', () => {
+  it('interactive: replans within budget and weaves the full-height walls', () => {
     const r = planInteractive(
       INTERACTIVE_BOXES,
       { x: 8, y: 30, z: 0, heading: 0, pitch: 0, speed: 18, t: 0 },
@@ -323,27 +326,55 @@ describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
     );
     expect(r.found).toBe(true);
     expect(r.stats.expansions).toBeLessThan(AIRCRAFT_MAX_EXPANSIONS);
+    // INTERACTIVE_BOXES are full-height: the plane cannot fly over them, so
+    // it must pass the first wall on the +z side and the second on the -z
+    // side (regression guard for the "walls too short, flies over" bug).
+    const atA = r.path.filter((p) => p.x >= 50 && p.x <= 66);
+    const atB = r.path.filter((p) => p.x >= 98 && p.x <= 114);
+    expect(atA.length).toBeGreaterThan(0);
+    expect(atB.length).toBeGreaterThan(0);
+    expect(Math.max(...atA.map((p) => p.z))).toBeGreaterThan(6);
+    expect(Math.min(...atB.map((p) => p.z))).toBeLessThan(-6);
+  });
+
+  it('gauntlet: weaves both walls, beats the moving zone, climbs the ridge', () => {
+    const s = buildGauntlet();
+    expect(s.found).toBe(true);
+    const near = (lo: number, hi: number) =>
+      s.path.filter((p) => p.x >= lo && p.x <= hi);
+    const atA = near(34, 53);
+    const atB = near(89, 108);
+    expect(atA.length).toBeGreaterThan(0);
+    expect(atB.length).toBeGreaterThan(0);
+    expect(Math.max(...atA.map((p) => p.z))).toBeGreaterThan(4); // weave +z
+    expect(Math.min(...atB.map((p) => p.z))).toBeLessThan(-4); // weave -z
+    expect(Math.max(...s.path.map((p) => p.y))).toBeGreaterThan(36); // ridge
+    // never inside the moving no-fly zone at the time the plane is there
+    const clear = (s.zoneRadius ?? 0) + AIRCRAFT_AGENT.radius;
+    for (const p of s.path) {
+      const c = s.zoneAt?.(p.t);
+      if (!c) continue;
+      expect(
+        Math.hypot(p.x - c.x, p.y - c.y, p.z - c.z),
+      ).toBeGreaterThan(clear - 1e-6);
+    }
+    for (let i = 1; i < s.path.length; i++) {
+      expect(s.path[i]!.t).toBeGreaterThan(s.path[i - 1]!.t - 1e-9);
+    }
   });
 });
 
 // Built lazily in beforeAll (not at collect time) so test collection stays
-// fast; navcat mesh generation can be environment-sensitive, so a runner
-// without it skips the assertion rather than failing the suite.
+// fast. navcat mesh generation runs in CI (ubuntu/node 22) exactly as it does
+// locally, so a failure here is a real regression — it fails loudly rather
+// than skipping, otherwise CI could be green with this demo unverified.
 describe('jumplinks demo: Mononen-style off-mesh annotation', () => {
-  let jumpLinks: JumpLinksResult | null = null;
+  let jumpLinks: JumpLinksResult;
   beforeAll(() => {
-    try {
-      jumpLinks = buildJumpLinks();
-    } catch {
-      jumpLinks = null;
-    }
+    jumpLinks = buildJumpLinks();
   }, 60000);
 
-  it('the humanoid crosses the gap only once the link is registered', (ctx) => {
-    if (jumpLinks === null) {
-      ctx.skip();
-      return;
-    }
+  it('the humanoid crosses the gap only once the link is registered', () => {
     const j = jumpLinks;
     expect(j.linkMeta.length).toBe(1);
     expect(typeof j.linkMeta[0]!.connectionId).toBe('number');
@@ -355,5 +386,46 @@ describe('jumplinks demo: Mononen-style off-mesh annotation', () => {
         j.withLink.path[i - 1]!.t - 1e-9,
       );
     }
+  });
+});
+
+// Coverage manifest: every demo route under demos/app/<slug>/page.tsx MUST
+// have a headless scenario asserted above. This fails CI if a new demo ships
+// without a test (or if a tested demo is deleted), so "all demos are covered"
+// is enforced, not just claimed.
+const TESTED_DEMOS = new Set([
+  'anytime', // 'anytime demo' — buildAnytime
+  'curves', // 'curves demo' — compareCurves
+  'dynamic', // 'dynamic demo scenarios' — buildDynamic (moving/coop/jump)
+  'humanoid', // 'humanoid demo' — buildHumanoid
+  'jumplinks', // 'jumplinks demo' — buildJumpLinks
+  'navmesh', // 'navmesh demo' — buildNavmesh / planNavmesh
+  'plane', // 'aircraft demo' — waypoint/canyon/restricted/interactive
+  'playground', // 'playground demo' — planPlayground
+  'primitives', // 'primitives demo' — buildPrimitiveFan
+  'reverse', // 'reverse demo' — planReverse
+  'swarm', // 'swarm demo' — buildSwarm
+  'world3d', // 'world3d demo' — planWorld3d
+]);
+
+describe('demo coverage manifest', () => {
+  const appDir = fileURLToPath(new URL('../app', import.meta.url));
+  const routes = readdirSync(appDir, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && existsSync(`${appDir}/${e.name}/page.tsx`))
+    .map((e) => e.name)
+    .sort();
+
+  it('discovers at least every demo we know about', () => {
+    expect(routes.length).toBeGreaterThanOrEqual(TESTED_DEMOS.size);
+  });
+
+  it('every demo route has a headless test (no untested demo ships)', () => {
+    const untested = routes.filter((r) => !TESTED_DEMOS.has(r));
+    expect(untested, `demo route(s) without a headless test: ${untested.join(', ')}`).toEqual([]);
+  });
+
+  it('no stale entries: every tested demo still exists as a route', () => {
+    const missing = [...TESTED_DEMOS].filter((d) => !routes.includes(d));
+    expect(missing, `tested demo(s) with no route: ${missing.join(', ')}`).toEqual([]);
   });
 });

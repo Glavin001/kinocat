@@ -84,7 +84,7 @@ const groups: { heading: string; demos: Demo[] }[] = [
       {
         href: '/plane',
         title: '3D flight planner',
-        desc: 'A fixed-wing aircraft over a genuinely 3D state — altitude is searched, not derived. Same IGHA* core: climbs ridges, weaves a canyon, threads gates, dodges a moving no-fly zone.',
+        desc: 'A fixed-wing aircraft over a genuinely 3D state — altitude is searched, not derived. Same IGHA* core: climbs ridges, weaves a canyon, threads gates, dodges a moving no-fly zone — or all at once in the grand tour.',
         tag: '3D · flight · kinodynamic',
       },
     ],
