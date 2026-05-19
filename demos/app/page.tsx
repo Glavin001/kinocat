@@ -9,6 +9,17 @@ interface Demo {
 
 const groups: { heading: string; demos: Demo[] }[] = [
   {
+    heading: 'Flagship',
+    demos: [
+      {
+        href: '/flagship',
+        title: 'Real-time multi-agent flagship',
+        desc: 'Large procedural navcat terrain, NPC vehicles on a staggered round-robin, a genuine boost shortcut and a misdirect the planner rejects on its own. Toggle the CompactHeightfield clearance & moving-obstacle broadphase and watch the solve time.',
+        tag: '3D · multi-agent',
+      },
+    ],
+  },
+  {
     heading: 'Algorithms & curves',
     demos: [
       {
