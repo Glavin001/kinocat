@@ -18,7 +18,10 @@ import {
   PlanRegistry,
   AffordanceRegistry,
   createJumpAffordance,
+  createBoostAffordance,
+  createMisdirectAffordance,
 } from 'kinocat/predict';
+import { planPoseAt } from 'kinocat/execute';
 import {
   defaultVehicleAgent,
   defaultHumanoidAgent,
@@ -1016,5 +1019,236 @@ export function buildJumpLinks(): JumpLinksResult {
     goal,
     without: { found: before.found },
     withLink: { found: after.found, path: after.path, usedJump },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Flagship — large procedural terrain, many NPCs, shortcut + misdirect
+// affordances, staggered round-robin (main-thread) replanning. Exercises all
+// three opt-in perf optimizations together.
+
+const FLAGSHIP_W = 60;
+const FLAGSHIP_D = 36;
+// Canyon wall x∈[30,36] for z≥11 (a real obstacle); open corridor at z<11 is
+// the long way round. A couple of pillars make the terrain non-trivial.
+const FLAGSHIP_PILLARS: [number, number, number, number][] = [
+  [44, 13, 48, 17],
+  [16, 24, 20, 28],
+];
+function flagshipBlocked(x: number, z: number): boolean {
+  if (x >= 30 && x < 36 && z >= 11) return true; // canyon wall
+  for (const [x0, z0, x1, z1] of FLAGSHIP_PILLARS) {
+    if (x >= x0 && x < x1 && z >= z0 && z < z1) return true;
+  }
+  return false;
+}
+
+/** Deterministic procedural terrain: a gently-undulating ground tessellated
+ *  into 2-unit quads, with the canyon wall and pillars carved out (omitted
+ *  quads ⇒ real navmesh holes). */
+export function flagshipTerrain(): {
+  positions: number[];
+  indices: number[];
+  bounds: { x0: number; z0: number; x1: number; z1: number };
+} {
+  const positions: number[] = [];
+  const indices: number[] = [];
+  const q = 2;
+  const h = (x: number, z: number) =>
+    0.5 * Math.sin(x * 0.07) + 0.4 * Math.cos(z * 0.09);
+  for (let z = 0; z < FLAGSHIP_D; z += q) {
+    for (let x = 0; x < FLAGSHIP_W; x += q) {
+      if (flagshipBlocked(x + q / 2, z + q / 2)) continue;
+      const b = positions.length / 3;
+      positions.push(
+        x, h(x, z), z,
+        x + q, h(x + q, z), z,
+        x + q, h(x + q, z + q), z + q,
+        x, h(x, z + q), z + q,
+      );
+      indices.push(b, b + 3, b + 2, b, b + 2, b + 1);
+    }
+  }
+  return { positions, indices, bounds: { x0: 0, z0: 0, x1: FLAGSHIP_W, z1: FLAGSHIP_D } };
+}
+
+export interface FlagshipInput {
+  agents?: number;
+  rounds?: number;
+  clearanceBroadphase?: boolean;
+  /**
+   * Off by default and intentionally so: the obstacle-aware grid heuristic
+   * (Opt 2) is admissible only for the pure navmesh-geodesic problem. A
+   * cost-reducing affordance shortcut makes it OVER-estimate true
+   * cost-to-go, which is inadmissible; the flagship mixes affordances, so it
+   * does not combine the two. Opt 2 stays first-class & benchmarked for its
+   * valid domain (obstacle planning without cost-reducing shortcuts).
+   */
+  gridHeuristic?: boolean;
+  timeBroadphase?: boolean;
+}
+
+export interface FlagshipAgent {
+  id: string;
+  start: VehicleState;
+  goal: VehicleState;
+  path: VehicleState[];
+  found: boolean;
+  usedShortcut: boolean;
+  usedMisdirect: boolean;
+}
+
+export interface FlagshipResult {
+  bounds: { x0: number; z0: number; x1: number; z1: number };
+  positions: number[];
+  indices: number[];
+  shortcuts: { id: string; launch: { x: number; z: number }; land: { x: number; z: number } }[];
+  misdirects: { id: string; launch: { x: number; z: number }; land: { x: number; z: number } }[];
+  agents: FlagshipAgent[];
+  registry: PlanRegistry;
+  affordances: AffordanceRegistry;
+  rounds: number;
+  reached: number;
+  duration: number;
+}
+
+const FLAGSHIP_ROUND_DT = 2.5;
+
+export function buildFlagship(inp: FlagshipInput = {}): FlagshipResult {
+  const n = Math.max(8, Math.min(12, inp.agents ?? 8));
+  const rounds = inp.rounds ?? 6;
+  const cb = inp.clearanceBroadphase ?? true;
+  const gh = inp.gridHeuristic ?? false; // see FlagshipInput.gridHeuristic
+  const tb = inp.timeBroadphase ?? true;
+  const { positions, indices, bounds } = flagshipTerrain();
+  const { world } = navWorldFromTriangleMesh(
+    positions,
+    indices,
+    { cellSize: 0.5, walkableSlopeAngleDegrees: 55, walkableClimbWorld: 1 },
+    { clearanceField: true, horizontalTolerance: 0.6 },
+  );
+
+  const reg = new PlanRegistry();
+  const aff = new AffordanceRegistry();
+  const shortcut = createBoostAffordance({
+    id: 'boost-canyon',
+    pad: { x: 28, z: 24 },
+    entryRadius: 5,
+    exit: { x: 40, z: 24, heading: 0, speed: 0, t: 0 },
+    duration: 1,
+    cost: 1.2, // genuine: far cheaper than the long bottom detour
+  });
+  const decoy = createMisdirectAffordance({
+    id: 'decoy-pocket',
+    launch: { x: 28, z: 16 }, // also near the wall — tempting
+    entryRadius: 5,
+    land: { x: 20, z: 30, heading: 0, speed: 0, t: 0 }, // back-side pocket
+    duration: 1,
+    cost: 60, // honest & high ⇒ planner rejects it on its own
+  });
+  aff.add(shortcut);
+  aff.add(decoy);
+
+  const agents: FlagshipAgent[] = [];
+  for (let i = 0; i < n; i++) {
+    const z = 6 + (i / (n - 1)) * (FLAGSHIP_D - 12);
+    const start: VehicleState = { x: 4, z, heading: 0, speed: 0, t: 0 };
+    const goal: VehicleState = { x: FLAGSHIP_W - 4, z, heading: 0, speed: 0, t: 0 };
+    agents.push({
+      id: `V${i}`,
+      start,
+      goal,
+      path: [start],
+      found: false,
+      usedShortcut: false,
+      usedMisdirect: false,
+    });
+  }
+
+  const mkEnv = (selfId: string) =>
+    new TimeAwareEnvironment(
+      new VehicleEnvironment(world, AGENT, LIB, {
+        posCell: 0.8,
+        headingBuckets: 16,
+        speedQuant: 4,
+        levelDivisors: [4, 2, 1],
+        goalRadius: 2,
+        goalHeadingTol: Infinity,
+        sweepSegmentCheck: false,
+        // Real-time game-NPC profile (spec §4.1): the Reeds-Shepp shot-to-goal
+        // keeps each replan to a handful of expansions; best-effort + frequent
+        // replanning corrects the static-only analytic curve vs other agents.
+        analyticExpansion: {},
+        heuristicTable: {},
+        clearanceBroadphase: cb,
+        gridHeuristic: gh ? {} : false,
+      }),
+      {
+        obstacles: agents
+          .filter((o) => o.id !== selfId)
+          .map((o) => asObstacle(reg.predictNPC(o.id), 1.8)),
+        agentRadius: 1.4,
+        affordances: aff,
+        affordanceRadius: 14,
+        broadphase: tb ? {} : false,
+      },
+    );
+
+  const cur: VehicleState[] = agents.map((a) => ({ ...a.start }));
+  const arrived: boolean[] = agents.map(() => false);
+  for (let r = 0; r < rounds; r++) {
+    for (let i = 0; i < agents.length; i++) {
+      if (arrived[i]) continue;
+      const ag = agents[i]!;
+      const res = plan(
+        {
+          start: cur[i]!,
+          goal: ag.goal,
+          environment: mkEnv(ag.id),
+          options: { maxExpansions: DEMO_MAX_EXPANSIONS },
+        },
+        Infinity,
+      );
+      if (!res.found) continue;
+      ag.found = true;
+      ag.path = res.path;
+      reg.publish(ag.id, res.path);
+      for (const node of res.nodes) {
+        if (node.edge?.kind !== 'affordance') continue;
+        const id = (node.edge.data as { affordanceId?: string }).affordanceId;
+        if (id === shortcut.id) ag.usedShortcut = true;
+        if (id === decoy.id) ag.usedMisdirect = true;
+      }
+      const next = planPoseAt(res.path, (cur[i]!.t ?? 0) + FLAGSHIP_ROUND_DT);
+      if (next) cur[i] = next;
+      const last = res.path[res.path.length - 1]!;
+      if (Math.hypot(cur[i]!.x - last.x, cur[i]!.z - last.z) <= 2.5) {
+        arrived[i] = true;
+      }
+    }
+  }
+
+  const reached = agents.filter((a) => {
+    if (!a.found) return false;
+    const e = a.path[a.path.length - 1]!;
+    return Math.hypot(e.x - a.goal.x, e.z - a.goal.z) <= 2.5;
+  }).length;
+  const duration = agents.reduce(
+    (m, a) => Math.max(m, a.path[a.path.length - 1]?.t ?? 0),
+    0.1,
+  );
+
+  return {
+    bounds,
+    positions,
+    indices,
+    shortcuts: [{ id: shortcut.id, launch: { x: 28, z: 24 }, land: { x: 40, z: 24 } }],
+    misdirects: [{ id: decoy.id, launch: { x: 28, z: 16 }, land: { x: 20, z: 30 } }],
+    agents,
+    registry: reg,
+    affordances: aff,
+    rounds,
+    reached,
+    duration,
   };
 }

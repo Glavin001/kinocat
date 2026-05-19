@@ -24,6 +24,32 @@ export interface TimeAwareOptions {
   affordances?: AffordanceRegistry;
   /** Proximity radius for affordance queries (world units). */
   affordanceRadius?: number;
+  /**
+   * Moving-obstacle broadphase. `collides()` is O(obstacles) per successor
+   * (O(agents²) in multi-agent scenes). When enabled, each obstacle's
+   * predicted motion is pre-sampled once into a padded AABB + active time
+   * window; `collides()` then cheap-rejects by time/AABB before the exact
+   * predict+circle test. A pure accelerator — it only skips the exact test
+   * where that test would also report no collision (the AABB strictly
+   * contains every sampled position plus the max between-sample motion;
+   * beyond the sampled window the exact test always runs). Assumes each
+   * predictor resolves at `sampleStep` (true for kinocat's continuous
+   * factories). Disabled by default — `{}` enables, `false` disables.
+   */
+  broadphase?: false | { sampleStep?: number; maxSamples?: number };
+}
+
+interface ObstacleBound {
+  active: boolean;
+  tMaxSampled: number;
+  tLo: number;
+  tHi: number;
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+  pad: number;
+  rr: number;
 }
 
 type HasXZT = { x: number; z: number; t: number };
@@ -38,6 +64,7 @@ export class TimeAwareEnvironment<State extends HasXZT>
   private readonly divisors: number[];
   private readonly affordances?: AffordanceRegistry;
   private readonly affordanceRadius: number;
+  private readonly bp: ObstacleBound[] | null;
 
   constructor(
     private readonly base: Environment<State>,
@@ -52,6 +79,79 @@ export class TimeAwareEnvironment<State extends HasXZT>
       Array.from({ length: this.levels }, (_, L) => 2 ** (this.levels - 1 - L));
     this.affordances = opts.affordances;
     this.affordanceRadius = opts.affordanceRadius ?? 15;
+    const bpo = opts.broadphase;
+    this.bp =
+      bpo !== undefined && bpo !== false
+        ? this.buildBroadphase(bpo.sampleStep ?? 0.4, bpo.maxSamples ?? 64)
+        : null;
+  }
+
+  /** Pre-sample each obstacle's predicted motion into a conservative padded
+   *  AABB + active time window (built once; obstacles are fixed for a
+   *  search). The AABB is padded by the largest between-sample displacement
+   *  so a point outside it provably never overlaps the obstacle within the
+   *  sampled window. */
+  private buildBroadphase(step: number, maxSamples: number): ObstacleBound[] {
+    const out: ObstacleBound[] = [];
+    const tMaxSampled = step * (maxSamples - 1);
+    for (const obs of this.obstacles) {
+      let firstT = Infinity;
+      let lastT = -Infinity;
+      let minX = Infinity;
+      let maxX = -Infinity;
+      let minZ = Infinity;
+      let maxZ = -Infinity;
+      let maxStep = 0;
+      let prev: { x: number; z: number } | null = null;
+      for (let k = 0; k < maxSamples; k++) {
+        const t = k * step;
+        const p = obs.predict(t);
+        if (!p) {
+          prev = null;
+          continue;
+        }
+        if (t < firstT) firstT = t;
+        if (t > lastT) lastT = t;
+        if (p.x < minX) minX = p.x;
+        if (p.x > maxX) maxX = p.x;
+        if (p.z < minZ) minZ = p.z;
+        if (p.z > maxZ) maxZ = p.z;
+        if (prev) {
+          const d = Math.hypot(p.x - prev.x, p.z - prev.z);
+          if (d > maxStep) maxStep = d;
+        }
+        prev = p;
+      }
+      const rr = obs.radius + this.agentRadius;
+      out.push(
+        firstT === Infinity
+          ? {
+              active: false,
+              tMaxSampled,
+              tLo: 0,
+              tHi: 0,
+              minX: 0,
+              maxX: 0,
+              minZ: 0,
+              maxZ: 0,
+              pad: 0,
+              rr,
+            }
+          : {
+              active: true,
+              tMaxSampled,
+              tLo: firstT - step,
+              tHi: lastT + step,
+              minX,
+              maxX,
+              minZ,
+              maxZ,
+              pad: rr + maxStep,
+              rr,
+            },
+      );
+    }
+    return out;
   }
 
   private augment(node: Node<State>): Node<State> {
@@ -66,13 +166,40 @@ export class TimeAwareEnvironment<State extends HasXZT>
 
   /** True if `state` overlaps any predicted obstacle at its own time. */
   private collides(state: State): boolean {
-    for (const obs of this.obstacles) {
+    const bp = this.bp;
+    if (!bp) {
+      for (const obs of this.obstacles) {
+        const p = obs.predict(state.t);
+        if (!p) continue;
+        const rr = obs.radius + this.agentRadius;
+        const dx = state.x - p.x;
+        const dz = state.z - p.z;
+        if (dx * dx + dz * dz <= rr * rr) return true;
+      }
+      return false;
+    }
+    for (let i = 0; i < this.obstacles.length; i++) {
+      const obs = this.obstacles[i]!;
+      const b = bp[i]!;
+      if (state.t <= b.tMaxSampled) {
+        // Full knowledge inside the sampled window.
+        if (!b.active) continue; // predictor null across the window
+        if (state.t < b.tLo || state.t > b.tHi) continue; // outside active span
+        if (
+          state.x < b.minX - b.pad ||
+          state.x > b.maxX + b.pad ||
+          state.z < b.minZ - b.pad ||
+          state.z > b.maxZ + b.pad
+        ) {
+          continue; // provably farther than rr from the obstacle
+        }
+      }
+      // Inside the uncertain band, or beyond the sampled window: exact test.
       const p = obs.predict(state.t);
       if (!p) continue;
-      const rr = obs.radius + this.agentRadius;
       const dx = state.x - p.x;
       const dz = state.z - p.z;
-      if (dx * dx + dz * dz <= rr * rr) return true;
+      if (dx * dx + dz * dz <= b.rr * b.rr) return true;
     }
     return false;
   }

@@ -22,6 +22,12 @@ import type {
   OffMeshLink,
   PolygonRef,
 } from '../../environment/nav-world';
+import {
+  ChfClearanceField,
+  type ClearanceFieldOptions,
+} from './compact-heightfield';
+import { ChfGoalDistanceField } from './chf-distance-field';
+import type { CompactHeightfield } from 'navcat';
 
 export interface NavcatWorldOptions {
   queryFilter?: QueryFilter;
@@ -31,6 +37,9 @@ export interface NavcatWorldOptions {
   verticalExtent?: number;
   /** Y used for planar queries (Y is derived from polygon containment). */
   queryHeight?: number;
+  /** Build the O(1) CompactHeightfield clearance field (Opt 1, spec §10.2)
+   *  so `clearanceAt` is available for VehicleEnvironment's broadphase. */
+  clearanceField?: boolean | ClearanceFieldOptions;
 }
 
 export class NavcatWorld implements NavWorld {
@@ -43,6 +52,9 @@ export class NavcatWorld implements NavWorld {
   private readonly hTol: number;
   private readonly vExt: number;
   private readonly qy: number;
+  private chf?: ChfClearanceField;
+  private rawChf?: CompactHeightfield;
+  private goalLB?: { key: string; field: ChfGoalDistanceField };
 
   constructor(
     private readonly navMesh: NavMesh,
@@ -65,6 +77,41 @@ export class NavcatWorld implements NavWorld {
 
   addOffLink(link: OffMeshLink): void {
     this.offLinks.push(link);
+  }
+
+  /** Attach a CompactHeightfield clearance field (from the generator's
+   *  intermediates) so `clearanceAt` becomes available. */
+  attachClearanceField(
+    chf: CompactHeightfield,
+    opts: ClearanceFieldOptions = {},
+  ): void {
+    this.chf = new ChfClearanceField(chf, opts);
+    this.rawChf = chf;
+  }
+
+  /** O(1) lower-bound clearance, or null when no field is attached / the
+   *  point is off-field — callers then fall back to the exact check. */
+  clearanceAt(x: number, z: number, queryY?: number): number | null {
+    return this.chf ? this.chf.clearanceAt(x, z, queryY) : null;
+  }
+
+  /** Admissible obstacle-aware distance-to-goal oracle (Opt 2, spec §10.3),
+   *  memoised per goal. null when no CompactHeightfield is attached or the
+   *  goal is off-mesh — the heuristic then uses the Reeds-Shepp term alone. */
+  buildGoalLowerBound(
+    gx: number,
+    gz: number,
+    gy?: number,
+  ): ((x: number, z: number, y?: number) => number | null) | null {
+    if (!this.rawChf) return null;
+    const key = `${gx},${gz},${gy ?? ''}`;
+    if (!this.goalLB || this.goalLB.key !== key) {
+      const field = new ChfGoalDistanceField(this.rawChf, gx, gz, gy);
+      if (!field.available) return null;
+      this.goalLB = { key, field };
+    }
+    const f = this.goalLB.field;
+    return (x: number, z: number, y?: number) => f.lookup(x, z, y);
   }
 
   polygonAt(x: number, z: number): PolygonRef | null {
@@ -136,6 +183,11 @@ export interface NavWorldFromMeshResult {
   world: NavcatWorld;
   navMesh: NavMesh;
   intermediates: ReturnType<typeof generateSoloNavMesh>['intermediates'];
+  /** The generated CompactHeightfield (distance field) — handy for the
+   *  `navcat/three` `createCompactHeightfieldDistancesHelper` overlay. */
+  compactHeightfield: ReturnType<
+    typeof generateSoloNavMesh
+  >['intermediates']['compactHeightfield'];
 }
 
 /** Build a NavcatWorld from a triangle soup via navcat's solo generator. */
@@ -169,10 +221,19 @@ export function navWorldFromTriangleMesh(
     detailSampleMaxError: options.detailSampleMaxError ?? 1,
   };
   const res = generateSoloNavMesh({ positions, indices }, full);
+  const world = new NavcatWorld(res.navMesh, worldOptions);
+  const cf = worldOptions.clearanceField;
+  if (cf) {
+    world.attachClearanceField(
+      res.intermediates.compactHeightfield,
+      typeof cf === 'object' ? cf : {},
+    );
+  }
   return {
-    world: new NavcatWorld(res.navMesh, worldOptions),
+    world,
     navMesh: res.navMesh,
     intermediates: res.intermediates,
+    compactHeightfield: res.intermediates.compactHeightfield,
   };
 }
 

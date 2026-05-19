@@ -95,3 +95,91 @@ describe('lazy affordance edges', () => {
     expect(Math.hypot(last.x - goal.x, last.z - goal.z)).toBeLessThanOrEqual(1.5);
   });
 });
+
+import {
+  AffordanceType,
+  createBoostAffordance,
+  createMisdirectAffordance,
+} from '../../src/predict/affordance-registry';
+
+describe('shortcut vs misdirect affordances (emergent rejection)', () => {
+  // Open corridor: a normal drive plan exists, so the planner can choose to
+  // ignore an affordance entirely based on cost.
+  const world = new InMemoryNavWorld([rect(1, 0, -10, 60, 10)]);
+  const start: VehicleState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
+  const goal: VehicleState = { x: 56, z: 0, heading: 0, speed: 0, t: 0 };
+  const makeEnv = (reg?: AffordanceRegistry) =>
+    new TimeAwareEnvironment(
+      new VehicleEnvironment(world, agent, lib, {
+        goalRadius: 1.5,
+        goalHeadingTol: Infinity,
+      }),
+      { affordances: reg, affordanceRadius: 12 },
+    );
+  const run = (reg?: AffordanceRegistry) =>
+    plan(
+      { start, goal, environment: makeEnv(reg), options: { maxExpansions: 300000 } },
+      Infinity,
+    );
+  const usedIds = (r: ReturnType<typeof run>) =>
+    r.nodes
+      .filter((n) => n.edge?.kind === 'affordance')
+      .map((n) => (n.edge!.data as { affordanceId: string }).affordanceId);
+
+  const boost = () =>
+    createBoostAffordance({
+      id: 'boost',
+      pad: { x: 6, z: 0 },
+      entryRadius: 4,
+      exit: { x: 50, z: 0, heading: 0, speed: 0, t: 0 },
+      duration: 1,
+      cost: 1,
+    });
+  const misdirect = () =>
+    createMisdirectAffordance({
+      id: 'decoy',
+      launch: { x: 18, z: 0 }, // right on the straight route — tempting
+      entryRadius: 4,
+      land: { x: 8, z: 0, heading: 0, speed: 0, t: 0 }, // a trap (behind)
+      duration: 1,
+      cost: 50, // honest, high — makes the honest route cheaper
+    });
+
+  it('exports the new affordance types', () => {
+    expect(AffordanceType.BoostPad).toBe('boost_pad');
+    expect(AffordanceType.Decoy).toBe('decoy');
+  });
+
+  it('adopts a genuine cheap boost shortcut (lower cost than driving)', () => {
+    const base = run();
+    expect(base.found).toBe(true);
+    const reg = new AffordanceRegistry();
+    reg.add(boost());
+    const r = run(reg);
+    expect(r.found).toBe(true);
+    expect(usedIds(r)).toContain('boost');
+    expect(r.cost).toBeLessThan(base.cost - 1e-6);
+  });
+
+  it('rejects a misdirect on its own — no special-case logic', () => {
+    const base = run();
+    const reg = new AffordanceRegistry();
+    reg.add(misdirect());
+    const r = run(reg);
+    expect(r.found).toBe(true);
+    expect(usedIds(r)).not.toContain('decoy');
+    // identical optimum to the no-affordance plan ⇒ it was truly ignored
+    expect(r.cost).toBeCloseTo(base.cost, 6);
+  });
+
+  it('with both: takes the boost, ignores the misdirect', () => {
+    const reg = new AffordanceRegistry();
+    reg.add(boost());
+    reg.add(misdirect());
+    const r = run(reg);
+    expect(r.found).toBe(true);
+    const ids = usedIds(r);
+    expect(ids).toContain('boost');
+    expect(ids).not.toContain('decoy');
+  });
+});

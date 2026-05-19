@@ -137,3 +137,58 @@ describe('TimeAwareEnvironment: predicted-obstacle avoidance', () => {
     }
   });
 });
+
+describe('TimeAwareEnvironment: moving-obstacle broadphase is a pure accelerator', () => {
+  const world = new InMemoryNavWorld([rect(1, 0, -14, 32, 14)]);
+  const start: VehicleState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
+  const goal: VehicleState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
+  const obstacles = [
+    linearObstacle(15, -12, 0, 4, 2.5, 0, 60),
+    linearObstacle(20, 12, 0, -3, 2.0, 0, 60),
+    linearObstacle(10, 8, 1, -2, 1.8, 0, 60),
+  ];
+  const mk = (broadphase: false | Record<string, never>) => {
+    const base = new VehicleEnvironment(world, agent, lib, {
+      goalRadius: 1.5,
+      goalHeadingTol: Infinity,
+    });
+    return new TimeAwareEnvironment(base, {
+      obstacles,
+      agentRadius: AGENT_R,
+      broadphase,
+    });
+  };
+
+  it('produces an identical plan with broadphase on vs off', () => {
+    const opts = { maxExpansions: 500000 };
+    const off = plan({ start, goal, environment: mk(false), options: opts }, Infinity);
+    const on = plan({ start, goal, environment: mk({}), options: opts }, Infinity);
+    expect(on.found).toBe(off.found);
+    expect(on.cost).toBeCloseTo(off.cost, 9);
+    expect(on.path.length).toBe(off.path.length);
+    for (let i = 0; i < off.path.length; i++) {
+      expect(on.path[i]!.x).toBeCloseTo(off.path[i]!.x, 9);
+      expect(on.path[i]!.z).toBeCloseTo(off.path[i]!.z, 9);
+      expect(on.path[i]!.t).toBeCloseTo(off.path[i]!.t, 9);
+    }
+    expect(on.stats.expansions).toBe(off.stats.expansions);
+  });
+
+  it('still enforces the hard collision constraint', () => {
+    const r = plan(
+      { start, goal, environment: mk({}), options: { maxExpansions: 500000 } },
+      Infinity,
+    );
+    expect(r.found).toBe(true);
+    for (const s of r.path) {
+      for (const obs of obstacles) {
+        const p = obs.predict(s.t);
+        if (p) {
+          expect(Math.hypot(s.x - p.x, s.z - p.z)).toBeGreaterThan(
+            obs.radius + AGENT_R - 1e-6,
+          );
+        }
+      }
+    }
+  });
+});
