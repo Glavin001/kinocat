@@ -92,7 +92,7 @@ function run(gridHeuristic: boolean): void {
     gridHeuristic: gridHeuristic ? {} : false,
   });
   plan(
-    { start, goal, environment: env, options: { maxExpansions: 200000 } },
+    { start, goal, environment: env, options: { maxExpansions: 50000 } },
     Infinity,
   );
 }
