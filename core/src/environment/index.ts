@@ -8,5 +8,14 @@ export { VehicleEnvironment } from './vehicle-environment';
 export type { VehicleEnvOptions, AnalyticEdgeData } from './vehicle-environment';
 export { HumanoidEnvironment } from './humanoid-environment';
 export type { HumanoidEnvOptions } from './humanoid-environment';
+export { AircraftEnvironment } from './aircraft-environment';
+export type { AircraftEnvOptions } from './aircraft-environment';
+export { InMemoryAirspace } from './airspace-world';
+export type {
+  AirspaceWorld,
+  AirspaceOptions,
+  AABB,
+  MovingZone,
+} from './airspace-world';
 export { TimeAwareEnvironment } from './time-aware';
 export type { TimeAwareOptions } from './time-aware';

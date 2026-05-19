@@ -92,6 +92,12 @@ const groups: { heading: string; demos: Demo[] }[] = [
         desc: 'Two islands and a gap; annotateJumpLinks registers a Mononen-style off-mesh connection the humanoid planner crosses.',
         tag: '3D · navcat',
       },
+      {
+        href: '/plane',
+        title: '3D flight planner',
+        desc: 'A fixed-wing aircraft over a genuinely 3D state with OBB collision and searched roll — knife-edges through narrow slots, climbs ridges, weaves canyons, threads gates, dodges moving zones, or all of it at once.',
+        tag: '3D · flight · kinodynamic',
+      },
     ],
   },
   {
