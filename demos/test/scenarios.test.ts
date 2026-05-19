@@ -18,6 +18,15 @@ import {
   type Scenario,
   type JumpLinksResult,
 } from '../app/lib/scenarios';
+import {
+  buildWaypointCourse,
+  buildCanyon,
+  buildRestrictedAirspace,
+  planInteractive,
+  INTERACTIVE_BOXES,
+  AIRCRAFT_AGENT,
+  AIRCRAFT_MAX_EXPANSIONS,
+} from '../app/lib/aircraft-scenarios';
 import type { VehicleState } from 'kinocat/agent';
 
 // These assert the *exact* configuration the demos ship with always finds a
@@ -254,6 +263,56 @@ describe('humanoid demo: omnidirectional vs. turn-radius-constrained', () => {
         h.humanoid.path[i - 1]!.t - 1e-9,
       );
     }
+  });
+});
+
+describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
+  it('waypoint course: flies every gate, monotone time', () => {
+    const s = buildWaypointCourse();
+    expect(s.found).toBe(true);
+    expect(s.path.length).toBeGreaterThanOrEqual(s.gates.length + 1);
+    const end = s.path[s.path.length - 1]!;
+    const g = s.goal;
+    expect(
+      Math.hypot(end.x - g.x, end.y - g.y, end.z - g.z),
+    ).toBeLessThanOrEqual(10);
+    for (let i = 1; i < s.path.length; i++) {
+      expect(s.path[i]!.t).toBeGreaterThan(s.path[i - 1]!.t - 1e-9);
+    }
+  });
+
+  it('canyon: weaves the walls and the path genuinely changes altitude', () => {
+    const s = buildCanyon();
+    expect(s.found).toBe(true);
+    const ys = s.path.map((p) => p.y);
+    // the ridge forces a real climb — altitude is a searched dimension
+    expect(Math.max(...ys) - Math.min(...ys)).toBeGreaterThan(8);
+    for (let i = 1; i < s.path.length; i++) {
+      expect(s.path[i]!.t).toBeGreaterThan(s.path[i - 1]!.t - 1e-9);
+    }
+  });
+
+  it('restricted airspace: routes clear of the moving no-fly zone', () => {
+    const s = buildRestrictedAirspace();
+    expect(s.found).toBe(true);
+    const r = (s.zoneRadius ?? 0) + AIRCRAFT_AGENT.radius;
+    for (const p of s.path) {
+      const c = s.zoneAt?.(p.t);
+      if (!c) continue;
+      expect(
+        Math.hypot(p.x - c.x, p.y - c.y, p.z - c.z),
+      ).toBeGreaterThan(r - 1e-6);
+    }
+  });
+
+  it('interactive: replans to a tapped destination within budget', () => {
+    const r = planInteractive(
+      INTERACTIVE_BOXES,
+      { x: 8, y: 30, z: 0, heading: 0, pitch: 0, speed: 18, t: 0 },
+      { x: 150, y: 30, z: 0, heading: 0, pitch: 0, speed: 18, t: 0 },
+    );
+    expect(r.found).toBe(true);
+    expect(r.stats.expansions).toBeLessThan(AIRCRAFT_MAX_EXPANSIONS);
   });
 });
 
