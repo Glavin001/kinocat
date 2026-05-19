@@ -1,0 +1,181 @@
+// kinocat/adapters/navcat — implements the core's NavWorld seam over a real
+// navcat NavMesh. The core never imports navcat; only this subpath does.
+
+import {
+  createFindNearestPolyResult,
+  findNearestPoly,
+  createGetClosestPointOnPolyResult,
+  getClosestPointOnPoly,
+  raycast,
+  DEFAULT_QUERY_FILTER,
+} from 'navcat';
+import { generateSoloNavMesh } from 'navcat/blocks';
+import type {
+  NavMesh,
+  NodeRef,
+  QueryFilter,
+  FindNearestPolyResult,
+  GetClosestPointOnPolyResult,
+} from 'navcat';
+import type {
+  NavWorld,
+  OffMeshLink,
+  PolygonRef,
+} from '../../environment/nav-world';
+
+export interface NavcatWorldOptions {
+  queryFilter?: QueryFilter;
+  /** Horizontal snap tolerance for treating a point as "on this polygon". */
+  horizontalTolerance?: number;
+  /** Vertical search half-extent for findNearestPoly. */
+  verticalExtent?: number;
+  /** Y used for planar queries (Y is derived from polygon containment). */
+  queryHeight?: number;
+}
+
+export class NavcatWorld implements NavWorld {
+  private _revision = 0;
+  private readonly offLinks: OffMeshLink[] = [];
+  private readonly npResult: FindNearestPolyResult = createFindNearestPolyResult();
+  private readonly cpResult: GetClosestPointOnPolyResult =
+    createGetClosestPointOnPolyResult();
+  private readonly filter: QueryFilter;
+  private readonly hTol: number;
+  private readonly vExt: number;
+  private readonly qy: number;
+
+  constructor(
+    private readonly navMesh: NavMesh,
+    opts: NavcatWorldOptions = {},
+  ) {
+    this.filter = opts.queryFilter ?? DEFAULT_QUERY_FILTER;
+    this.hTol = opts.horizontalTolerance ?? 0.25;
+    this.vExt = opts.verticalExtent ?? 1e4;
+    this.qy = opts.queryHeight ?? 0;
+  }
+
+  get revision(): number {
+    return this._revision;
+  }
+
+  /** Tile-rebuild hook: invalidate caches and bump the revision counter. */
+  bumpRevision(): void {
+    this._revision++;
+  }
+
+  addOffLink(link: OffMeshLink): void {
+    this.offLinks.push(link);
+  }
+
+  polygonAt(x: number, z: number): PolygonRef | null {
+    const r = findNearestPoly(
+      this.npResult,
+      this.navMesh,
+      [x, this.qy, z],
+      [this.hTol, this.vExt, this.hTol],
+      this.filter,
+    );
+    if (!r.success) return null;
+    const dx = r.position[0] - x;
+    const dz = r.position[2] - z;
+    if (dx * dx + dz * dz > this.hTol * this.hTol) return null;
+    return { id: r.nodeRef, cx: r.position[0], cz: r.position[2], y: r.position[1] };
+  }
+
+  heightAt(poly: PolygonRef, x: number, z: number): number {
+    const r = getClosestPointOnPoly(
+      this.cpResult,
+      this.navMesh,
+      poly.id as NodeRef,
+      [x, this.qy, z],
+    );
+    return r.success ? r.position[1] : poly.y;
+  }
+
+  footprintClear(footprint: ReadonlyArray<readonly [number, number]>): boolean {
+    for (const [x, z] of footprint) {
+      if (this.polygonAt(x, z) === null) return false;
+    }
+    for (let i = 0; i < footprint.length; i++) {
+      const a = footprint[i]!;
+      const b = footprint[(i + 1) % footprint.length]!;
+      if (!this.segmentClear(a[0], a[1], b[0], b[1])) return false;
+    }
+    return true;
+  }
+
+  segmentClear(x0: number, z0: number, x1: number, z1: number): boolean {
+    const start = findNearestPoly(
+      this.npResult,
+      this.navMesh,
+      [x0, this.qy, z0],
+      [this.hTol, this.vExt, this.hTol],
+      this.filter,
+    );
+    if (!start.success) return false;
+    const dx = start.position[0] - x0;
+    const dz = start.position[2] - z0;
+    if (dx * dx + dz * dz > this.hTol * this.hTol) return false;
+    const res = raycast(
+      this.navMesh,
+      start.nodeRef,
+      [x0, this.qy, z0],
+      [x1, this.qy, z1],
+      this.filter,
+    );
+    // navcat: t === Number.MAX_VALUE ⇒ no wall hit ⇒ segment stays on-mesh.
+    return res.t === Number.MAX_VALUE;
+  }
+
+  offMeshFrom(poly: PolygonRef): ReadonlyArray<OffMeshLink> {
+    return this.offLinks.filter((l) => l.from.id === poly.id);
+  }
+}
+
+export interface NavWorldFromMeshResult {
+  world: NavcatWorld;
+  navMesh: NavMesh;
+  intermediates: ReturnType<typeof generateSoloNavMesh>['intermediates'];
+}
+
+/** Build a NavcatWorld from a triangle soup via navcat's solo generator. */
+export function navWorldFromTriangleMesh(
+  positions: ArrayLike<number>,
+  indices: ArrayLike<number>,
+  options: Partial<Parameters<typeof generateSoloNavMesh>[1]> = {},
+  worldOptions: NavcatWorldOptions = {},
+): NavWorldFromMeshResult {
+  const cellSize = options.cellSize ?? 0.3;
+  const radiusWorld = options.walkableRadiusWorld ?? 0;
+  const climbWorld = options.walkableClimbWorld ?? 0.5;
+  const heightWorld = options.walkableHeightWorld ?? 2;
+  const full = {
+    cellSize,
+    cellHeight: options.cellHeight ?? 0.2,
+    walkableRadiusWorld: radiusWorld,
+    walkableRadiusVoxels: Math.ceil(radiusWorld / cellSize),
+    walkableClimbWorld: climbWorld,
+    walkableClimbVoxels: Math.ceil(climbWorld / (options.cellHeight ?? 0.2)),
+    walkableHeightWorld: heightWorld,
+    walkableHeightVoxels: Math.ceil(heightWorld / (options.cellHeight ?? 0.2)),
+    walkableSlopeAngleDegrees: options.walkableSlopeAngleDegrees ?? 45,
+    borderSize: options.borderSize ?? 0,
+    minRegionArea: options.minRegionArea ?? 1,
+    mergeRegionArea: options.mergeRegionArea ?? 4,
+    maxSimplificationError: options.maxSimplificationError ?? 1.3,
+    maxEdgeLength: options.maxEdgeLength ?? 12,
+    maxVerticesPerPoly: options.maxVerticesPerPoly ?? 6,
+    detailSampleDistance: options.detailSampleDistance ?? 6,
+    detailSampleMaxError: options.detailSampleMaxError ?? 1,
+  };
+  const res = generateSoloNavMesh({ positions, indices }, full);
+  return {
+    world: new NavcatWorld(res.navMesh, worldOptions),
+    navMesh: res.navMesh,
+    intermediates: res.intermediates,
+  };
+}
+
+export { annotateJumpLinks } from './offmesh';
+export { markTileRebuilt } from './tile-rebuild';
+export type { StaticAffordanceMetadata, JumpCandidate } from './types';

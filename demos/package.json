@@ -12,16 +12,18 @@
   },
   "dependencies": {
     "@kinocat/three": "workspace:*",
+    "kinocat": "workspace:*",
+    "navcat": "0.4.1",
     "next": "^15.1.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "three": "^0.171.0"
+    "three": "^0.180.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "@types/three": "^0.171.0",
+    "@types/three": "^0.180.0",
     "typescript": "^5.7.0"
   }
 }

@@ -1,0 +1,87 @@
+{
+  "name": "kinocat",
+  "version": "0.0.0",
+  "description": "Pure-TypeScript, tree-shakeable, web-native time-extended kinodynamic motion planner",
+  "type": "module",
+  "license": "BSD-3-Clause",
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./curves": {
+      "types": "./dist/curves/index.d.ts",
+      "default": "./dist/curves/index.js"
+    },
+    "./primitives": {
+      "types": "./dist/primitives/index.d.ts",
+      "default": "./dist/primitives/index.js"
+    },
+    "./agent": {
+      "types": "./dist/agent/index.d.ts",
+      "default": "./dist/agent/index.js"
+    },
+    "./planner": {
+      "types": "./dist/planner/index.d.ts",
+      "default": "./dist/planner/index.js"
+    },
+    "./environment": {
+      "types": "./dist/environment/index.d.ts",
+      "default": "./dist/environment/index.js"
+    },
+    "./predict": {
+      "types": "./dist/predict/index.d.ts",
+      "default": "./dist/predict/index.js"
+    },
+    "./execute": {
+      "types": "./dist/execute/index.d.ts",
+      "default": "./dist/execute/index.js"
+    },
+    "./adapters/navcat": {
+      "types": "./dist/adapters/navcat/index.d.ts",
+      "default": "./dist/adapters/navcat/index.js"
+    },
+    "./adapters/rapier": {
+      "types": "./dist/adapters/rapier/index.d.ts",
+      "default": "./dist/adapters/rapier/index.js"
+    },
+    "./adapters/three": {
+      "types": "./dist/adapters/three/index.d.ts",
+      "default": "./dist/adapters/three/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "size": "node scripts/size-check.mjs"
+  },
+  "peerDependencies": {
+    "@dimforge/rapier3d-compat": ">=0.14.0",
+    "navcat": ">=0.4.0",
+    "three": ">=0.160.0"
+  },
+  "peerDependenciesMeta": {
+    "@dimforge/rapier3d-compat": {
+      "optional": true
+    },
+    "navcat": {
+      "optional": true
+    },
+    "three": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@dimforge/rapier3d-compat": "^0.14.0",
+    "@types/three": "^0.180.0",
+    "navcat": "0.4.1",
+    "three": "^0.180.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0"
+  }
+}
