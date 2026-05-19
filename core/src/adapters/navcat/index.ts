@@ -22,6 +22,11 @@ import type {
   OffMeshLink,
   PolygonRef,
 } from '../../environment/nav-world';
+import {
+  ChfClearanceField,
+  type ClearanceFieldOptions,
+} from './compact-heightfield';
+import type { CompactHeightfield } from 'navcat';
 
 export interface NavcatWorldOptions {
   queryFilter?: QueryFilter;
@@ -31,6 +36,9 @@ export interface NavcatWorldOptions {
   verticalExtent?: number;
   /** Y used for planar queries (Y is derived from polygon containment). */
   queryHeight?: number;
+  /** Build the O(1) CompactHeightfield clearance field (Opt 1, spec §10.2)
+   *  so `clearanceAt` is available for VehicleEnvironment's broadphase. */
+  clearanceField?: boolean | ClearanceFieldOptions;
 }
 
 export class NavcatWorld implements NavWorld {
@@ -43,6 +51,7 @@ export class NavcatWorld implements NavWorld {
   private readonly hTol: number;
   private readonly vExt: number;
   private readonly qy: number;
+  private chf?: ChfClearanceField;
 
   constructor(
     private readonly navMesh: NavMesh,
@@ -65,6 +74,21 @@ export class NavcatWorld implements NavWorld {
 
   addOffLink(link: OffMeshLink): void {
     this.offLinks.push(link);
+  }
+
+  /** Attach a CompactHeightfield clearance field (from the generator's
+   *  intermediates) so `clearanceAt` becomes available. */
+  attachClearanceField(
+    chf: CompactHeightfield,
+    opts: ClearanceFieldOptions = {},
+  ): void {
+    this.chf = new ChfClearanceField(chf, opts);
+  }
+
+  /** O(1) lower-bound clearance, or null when no field is attached / the
+   *  point is off-field — callers then fall back to the exact check. */
+  clearanceAt(x: number, z: number, queryY?: number): number | null {
+    return this.chf ? this.chf.clearanceAt(x, z, queryY) : null;
   }
 
   polygonAt(x: number, z: number): PolygonRef | null {
@@ -136,6 +160,11 @@ export interface NavWorldFromMeshResult {
   world: NavcatWorld;
   navMesh: NavMesh;
   intermediates: ReturnType<typeof generateSoloNavMesh>['intermediates'];
+  /** The generated CompactHeightfield (distance field) — handy for the
+   *  `navcat/three` `createCompactHeightfieldDistancesHelper` overlay. */
+  compactHeightfield: ReturnType<
+    typeof generateSoloNavMesh
+  >['intermediates']['compactHeightfield'];
 }
 
 /** Build a NavcatWorld from a triangle soup via navcat's solo generator. */
@@ -169,10 +198,19 @@ export function navWorldFromTriangleMesh(
     detailSampleMaxError: options.detailSampleMaxError ?? 1,
   };
   const res = generateSoloNavMesh({ positions, indices }, full);
+  const world = new NavcatWorld(res.navMesh, worldOptions);
+  const cf = worldOptions.clearanceField;
+  if (cf) {
+    world.attachClearanceField(
+      res.intermediates.compactHeightfield,
+      typeof cf === 'object' ? cf : {},
+    );
+  }
   return {
-    world: new NavcatWorld(res.navMesh, worldOptions),
+    world,
     navMesh: res.navMesh,
     intermediates: res.intermediates,
+    compactHeightfield: res.intermediates.compactHeightfield,
   };
 }
 

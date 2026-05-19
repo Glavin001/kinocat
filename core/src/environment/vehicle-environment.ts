@@ -42,6 +42,16 @@ export interface VehicleEnvOptions {
    * to enable; `false` is the explicit disable.
    */
   heuristicTable?: false | { posCell?: number; headingBuckets?: number };
+  /**
+   * O(1) clearance broadphase (Opt 1, spec §10.2). When the `NavWorld`
+   * provides a `clearanceAt` oracle (e.g. a `NavcatWorld` built with
+   * `clearanceField`), skip the expensive exact footprint check at any sweep
+   * sample where a disk of the agent's circumscribed radius is provably
+   * clear. Early-ACCEPT only — never early-rejects — so it cannot introduce
+   * a false "clear"; the exact check still runs in the uncertain band.
+   * Disabled by default. No-op on worlds without `clearanceAt`.
+   */
+  clearanceBroadphase?: boolean;
 }
 
 interface DriveEdgeData {
@@ -77,6 +87,8 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   private hGoalX = NaN;
   private hGoalZ = NaN;
   private hGoalH = NaN;
+  private readonly cbEnabled: boolean;
+  private readonly rCirc: number;
 
   constructor(
     private readonly world: NavWorld,
@@ -104,6 +116,15 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     this.htSlack = this.htEnabled
       ? 0.5 * this.htPos * Math.SQRT2 + this.agent.minTurnRadius * (Math.PI / this.htHead)
       : 0;
+    let rc = 0;
+    for (const [vx, vz] of this.agent.footprint) {
+      const r = Math.hypot(vx, vz);
+      if (r > rc) rc = r;
+    }
+    this.rCirc = rc;
+    this.cbEnabled =
+      opts.clearanceBroadphase === true &&
+      typeof this.world.clearanceAt === 'function';
     this.levels = this.divisors.length;
   }
 
@@ -139,8 +160,18 @@ export class VehicleEnvironment implements Environment<VehicleState> {
       const wx = node.x + sp.x * c - sp.z * s;
       const wz = node.z + sp.x * s + sp.z * c;
       const wh = wrapAngle(node.heading + sp.heading);
-      const fp = placeFootprint(this.agent.footprint, wx, wz, wh);
-      if (!this.world.footprintClear(fp)) return false;
+      // Clearance broadphase: if a disk of the circumscribed footprint
+      // radius at (wx,wz) is provably clear, the footprint is too — skip the
+      // exact check (early-accept only; never rejects).
+      let cleared = false;
+      if (this.cbEnabled) {
+        const cl = this.world.clearanceAt!(wx, wz);
+        if (cl !== null && cl >= this.rCirc) cleared = true;
+      }
+      if (!cleared) {
+        const fp = placeFootprint(this.agent.footprint, wx, wz, wh);
+        if (!this.world.footprintClear(fp)) return false;
+      }
       if (this.sweepSegmentCheck && i > 0) {
         if (!this.world.segmentClear(px, pz, wx, wz)) return false;
       }

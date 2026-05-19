@@ -191,3 +191,144 @@ describe('VehicleEnvironment Reeds-Shepp analytic expansion', () => {
     expect(r.nodes.every((n) => n.edge?.kind !== 'reeds-shepp')).toBe(true);
   });
 });
+
+// --- Opt 1: clearance broadphase is a pure accelerator -------------------
+import type {
+  NavWorld,
+  PolygonRef,
+  OffMeshLink,
+} from '../../src/environment/nav-world';
+
+interface Rect {
+  x0: number;
+  z0: number;
+  x1: number;
+  z1: number;
+}
+
+/** Open world rect minus an optional obstacle rect. `clearanceAt` returns
+ *  the EXACT clearance (distance to the world border / obstacle) — a valid
+ *  lower bound, so the early-accept is provably sound and the plan must be
+ *  byte-identical with the broadphase on or off. */
+class StubWorld implements NavWorld {
+  readonly revision = 0;
+  constructor(
+    private readonly world: Rect,
+    private readonly obstacle?: Rect,
+  ) {}
+  private free(x: number, z: number): boolean {
+    const w = this.world;
+    if (x < w.x0 || x > w.x1 || z < w.z0 || z > w.z1) return false;
+    const o = this.obstacle;
+    return !(o && x >= o.x0 && x <= o.x1 && z >= o.z0 && z <= o.z1);
+  }
+  private static distOutside(x: number, z: number, r: Rect): number {
+    const dx = Math.max(r.x0 - x, 0, x - r.x1);
+    const dz = Math.max(r.z0 - z, 0, z - r.z1);
+    return Math.hypot(dx, dz);
+  }
+  polygonAt(x: number, z: number): PolygonRef | null {
+    return this.free(x, z) ? { id: 1, cx: x, cz: z, y: 0 } : null;
+  }
+  heightAt(): number {
+    return 0;
+  }
+  footprintClear(fp: ReadonlyArray<readonly [number, number]>): boolean {
+    for (const [x, z] of fp) if (!this.free(x, z)) return false;
+    return true;
+  }
+  segmentClear(x0: number, z0: number, x1: number, z1: number): boolean {
+    for (let i = 0; i <= 8; i++) {
+      const u = i / 8;
+      if (!this.free(x0 + (x1 - x0) * u, z0 + (z1 - z0) * u)) return false;
+    }
+    return true;
+  }
+  offMeshFrom(): ReadonlyArray<OffMeshLink> {
+    return [];
+  }
+  clearanceAt(x: number, z: number): number | null {
+    const w = this.world;
+    let c = Math.min(x - w.x0, w.x1 - x, z - w.z0, w.z1 - z);
+    if (this.obstacle) c = Math.min(c, StubWorld.distOutside(x, z, this.obstacle));
+    return c > 0 ? c : 0;
+  }
+}
+
+describe('VehicleEnvironment clearance broadphase', () => {
+  const start: VehicleState = { x: 3, z: 0, heading: 0, speed: 0, t: 0 };
+  const goal: VehicleState = { x: 37, z: 0, heading: 0, speed: 0, t: 0 };
+  const WORLD: Rect = { x0: 0, z0: -16, x1: 40, z1: 16 };
+  const envOpts = {
+    goalRadius: 1.5,
+    goalHeadingTol: Infinity,
+    sweepSegmentCheck: false,
+    analyticExpansion: false as const,
+  };
+  const runPlan = (world: NavWorld, clearanceBroadphase: boolean) =>
+    plan(
+      {
+        start,
+        goal,
+        environment: new VehicleEnvironment(world, agent, lib, {
+          ...envOpts,
+          clearanceBroadphase,
+        }),
+        options: { maxExpansions: 40000 },
+      },
+      Infinity,
+    );
+
+  it('open field: byte-identical plan + expansions on vs off', () => {
+    const world = new StubWorld(WORLD);
+    const off = runPlan(world, false);
+    const on = runPlan(world, true);
+    expect(on.found).toBe(true);
+    expect(on.found).toBe(off.found);
+    expect(on.cost).toBeCloseTo(off.cost, 9);
+    expect(on.stats.expansions).toBe(off.stats.expansions);
+    expect(on.path.length).toBe(off.path.length);
+    for (let i = 0; i < off.path.length; i++) {
+      expect(on.path[i]!.x).toBeCloseTo(off.path[i]!.x, 9);
+      expect(on.path[i]!.z).toBeCloseTo(off.path[i]!.z, 9);
+    }
+  });
+
+  it('with an obstacle (gap above): identical & exact check runs near it', () => {
+    // Blocks z ≤ 6 at x∈[18,22]; a real gap at z∈(6,16] so a plan exists.
+    const obstacle: Rect = { x0: 18, z0: -16, x1: 22, z1: 6 };
+    const world = new StubWorld(WORLD, obstacle);
+    const off = runPlan(world, false);
+    const on = runPlan(world, true);
+    expect(on.found).toBe(true);
+    expect(on.cost).toBeCloseTo(off.cost, 9);
+    expect(on.stats.expansions).toBe(off.stats.expansions);
+    expect(on.path.length).toBe(off.path.length);
+    // hard constraint preserved: no path state sits inside the obstacle
+    for (const s of on.path) {
+      const inside =
+        s.x >= obstacle.x0 &&
+        s.x <= obstacle.x1 &&
+        s.z >= obstacle.z0 &&
+        s.z <= obstacle.z1;
+      expect(inside).toBe(false);
+    }
+  });
+
+  it('no-ops on a world without clearanceAt (InMemoryNavWorld)', () => {
+    const world = new InMemoryNavWorld([rect(1, 0, -16, 40, 16)]);
+    const r = plan(
+      {
+        start,
+        goal,
+        environment: new VehicleEnvironment(world, agent, lib, {
+          ...envOpts,
+          clearanceBroadphase: true,
+        }),
+        options: { maxExpansions: 40000 },
+      },
+      Infinity,
+    );
+    expect(r.found).toBe(true);
+  });
+});
