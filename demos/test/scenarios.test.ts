@@ -25,9 +25,12 @@ import {
   buildCanyon,
   buildRestrictedAirspace,
   buildGauntlet,
+  buildKnifeEdge,
   planInteractive,
   densifyPath,
   aircraftAirspace,
+  aircraftPose,
+  AIRCRAFT_HALF,
   INTERACTIVE_BOXES,
   AIRCRAFT_AGENT,
   AIRCRAFT_MAX_EXPANSIONS,
@@ -310,21 +313,21 @@ describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
   it('restricted airspace: routes clear of the moving no-fly zone', () => {
     const s = buildRestrictedAirspace();
     expect(s.found).toBe(true);
-    const r = (s.zoneRadius ?? 0) + AIRCRAFT_AGENT.radius;
+    const zones =
+      s.zoneAt && s.zoneRadius != null
+        ? [{ radius: s.zoneRadius, predict: s.zoneAt }]
+        : [];
+    const air = aircraftAirspace(s.boxes, zones);
     for (const p of s.path) {
-      const c = s.zoneAt?.(p.t);
-      if (!c) continue;
-      expect(
-        Math.hypot(p.x - c.x, p.y - c.y, p.z - c.z),
-      ).toBeGreaterThan(r - 1e-6);
+      expect(air.clear(aircraftPose(p), AIRCRAFT_HALF, p.t)).toBe(true);
     }
   });
 
   it('interactive: replans within budget and weaves the full-height walls', () => {
     const r = planInteractive(
       INTERACTIVE_BOXES,
-      { x: 8, y: 30, z: 0, heading: 0, pitch: 0, speed: 18, t: 0 },
-      { x: 150, y: 30, z: 0, heading: 0, pitch: 0, speed: 18, t: 0 },
+      { x: 8, y: 30, z: 0, heading: 0, pitch: 0, roll: 0, speed: 18, t: 0 },
+      { x: 150, y: 30, z: 0, heading: 0, pitch: 0, roll: 0, speed: 18, t: 0 },
     );
     expect(r.found).toBe(true);
     expect(r.stats.expansions).toBeLessThan(AIRCRAFT_MAX_EXPANSIONS);
@@ -348,7 +351,7 @@ describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
     expect(dense.length).toBeGreaterThan(s.path.length * 5);
     const air = aircraftAirspace(s.boxes);
     for (const p of dense) {
-      expect(air.clear(p.x, p.y, p.z, p.t, AIRCRAFT_AGENT.radius)).toBe(true);
+      expect(air.clear(aircraftPose(p), AIRCRAFT_HALF, p.t)).toBe(true);
     }
   });
 
@@ -361,7 +364,28 @@ describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
         : [];
     const air = aircraftAirspace(s.boxes, zones);
     for (const p of dense) {
-      expect(air.clear(p.x, p.y, p.z, p.t, AIRCRAFT_AGENT.radius)).toBe(true);
+      expect(air.clear(aircraftPose(p), AIRCRAFT_HALF, p.t)).toBe(true);
+    }
+  });
+
+  it('knife-edge: banks ~90° to fit a slot narrower than the wingspan', () => {
+    const s = buildKnifeEdge();
+    expect(s.found).toBe(true);
+    // Sample the dense rendering path inside the slot (the coarse planner
+    // path stores only primitive endpoints, which may straddle the slot).
+    const dense = densifyPath(s.path, 12);
+    const inSlot = dense.filter((p) => p.x >= 78 && p.x <= 92);
+    expect(inSlot.length).toBeGreaterThan(0);
+    const maxBank = Math.max(...inSlot.map((p) => Math.abs(p.roll)));
+    expect(maxBank).toBeGreaterThan(Math.PI / 2 - 0.2); // ≥ ~78°
+    // Whole planned path stays collision-clear under OBB collision (incl.
+    // the slot crossing, where wings-level would intersect the walls).
+    const air = aircraftAirspace(s.boxes);
+    for (const p of dense) {
+      expect(air.clear(aircraftPose(p), AIRCRAFT_HALF, p.t)).toBe(true);
+    }
+    for (let i = 1; i < s.path.length; i++) {
+      expect(s.path[i]!.t).toBeGreaterThan(s.path[i - 1]!.t - 1e-9);
     }
   });
 
@@ -377,14 +401,14 @@ describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
     expect(Math.max(...atA.map((p) => p.z))).toBeGreaterThan(4); // weave +z
     expect(Math.min(...atB.map((p) => p.z))).toBeLessThan(-4); // weave -z
     expect(Math.max(...s.path.map((p) => p.y))).toBeGreaterThan(36); // ridge
-    // never inside the moving no-fly zone at the time the plane is there
-    const clear = (s.zoneRadius ?? 0) + AIRCRAFT_AGENT.radius;
+    // Every planned state clears all obstacles AND the moving zone at its t.
+    const zones =
+      s.zoneAt && s.zoneRadius != null
+        ? [{ radius: s.zoneRadius, predict: s.zoneAt }]
+        : [];
+    const air = aircraftAirspace(s.boxes, zones);
     for (const p of s.path) {
-      const c = s.zoneAt?.(p.t);
-      if (!c) continue;
-      expect(
-        Math.hypot(p.x - c.x, p.y - c.y, p.z - c.z),
-      ).toBeGreaterThan(clear - 1e-6);
+      expect(air.clear(aircraftPose(p), AIRCRAFT_HALF, p.t)).toBe(true);
     }
     for (let i = 1; i < s.path.length; i++) {
       expect(s.path[i]!.t).toBeGreaterThan(s.path[i - 1]!.t - 1e-9);

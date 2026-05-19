@@ -36,8 +36,24 @@ export const AIRCRAFT_AGENT: AircraftAgent = defaultAircraftAgent({
   minSpeed: 8,
   maxSpeed: 18,
   maxClimbAngle: Math.PI / 6,
-  radius: 1.6,
+  maxBank: Math.PI / 2,
+  halfLength: 2,
+  halfSpan: 1.5,
+  halfHeight: 0.3,
 });
+
+/** Convenience: body-frame half-extents matching AIRCRAFT_AGENT, in the
+ *  order AirspaceWorld.clear expects (length, span, height). */
+export const AIRCRAFT_HALF: [number, number, number] = [
+  AIRCRAFT_AGENT.halfLength,
+  AIRCRAFT_AGENT.halfSpan,
+  AIRCRAFT_AGENT.halfHeight,
+];
+
+/** Pose helper for AirspaceWorld.clear from an AircraftState. */
+export function aircraftPose(s: AircraftState) {
+  return { x: s.x, y: s.y, z: s.z, yaw: s.heading, pitch: s.pitch, roll: s.roll };
+}
 
 export const AIRCRAFT_BOUNDS = {
   x0: 0,
@@ -100,7 +116,16 @@ export function planAircraftLeg(
 }
 
 function gate(x: number, y: number, z: number): AircraftState {
-  return { x, y, z, heading: 0, pitch: 0, speed: AIRCRAFT_AGENT.maxSpeed, t: 0 };
+  return {
+    x,
+    y,
+    z,
+    heading: 0,
+    pitch: 0,
+    roll: 0,
+    speed: AIRCRAFT_AGENT.maxSpeed,
+    t: 0,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -110,7 +135,7 @@ function gate(x: number, y: number, z: number): AircraftState {
 // pattern the 2D demos use.
 
 export interface AircraftScene {
-  kind: 'waypoint' | 'canyon' | 'restricted' | 'gauntlet';
+  kind: 'waypoint' | 'canyon' | 'restricted' | 'gauntlet' | 'knife-edge';
   path: AircraftState[];
   found: boolean;
   duration: number;
@@ -277,6 +302,43 @@ export function buildGauntlet(): AircraftScene {
 }
 
 // ---------------------------------------------------------------------------
+// Knife edge — a narrow vertical slot too tight for the wingspan. The only
+// feasible plan banks to ±π/2 (wings vertical) so the OBB's thin axis lines
+// up with the slot. Requires roll to be a searched dimension, opted in via
+// rollFractions.
+
+export function buildKnifeEdge(): AircraftScene {
+  const f = AIRCRAFT_BOUNDS.floor;
+  const c = AIRCRAFT_BOUNDS.ceiling;
+  // Slot is 1.2 units wide in z, full height. Wingspan 3 (halfSpan 1.5) does
+  // NOT fit level; thickness 0.6 (halfHeight 0.3) fits when banked ±90°.
+  const boxes: AABB[] = [
+    { min: [78, f, -60], max: [92, c, -0.6] },
+    { min: [78, f, 0.6], max: [92, c, 60] },
+  ];
+  const airspace = aircraftAirspace(boxes);
+  const start = gate(8, 24, 0);
+  const goal = gate(152, 24, 0);
+  const r = planAircraftLeg(airspace, start, goal, {
+    maxExpansions: AIRCRAFT_DYNAMIC_MAX_EXPANSIONS,
+    env: { rollFractions: [-1, 0, 1], goalRadius: 10 },
+  });
+  return {
+    kind: 'knife-edge',
+    path: r.found ? r.path : [start],
+    found: r.found,
+    duration: r.found ? r.path[r.path.length - 1]!.t : 0,
+    start,
+    goal,
+    gates: [],
+    boxes,
+    info: r.found
+      ? `knife-edged through a 1.2 m slot (${r.path.length} states)`
+      : 'no plan — the slot is impassable level',
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Interactive — default obstacle field for the tap-to-retarget mode. Two
 // full-height walls (alternating side gaps) so the plane must weave *between*
 // them on the way to the tapped destination; kept to two walls (no ridge) so
@@ -327,10 +389,11 @@ export function densifyPath(
     if (dh < -Math.PI) dh += 2 * Math.PI;
     const k = dh / (speed * dt);
     const climb = b.pitch;
+    const roll = b.roll;
     const dtSub = dt / substepsPerSegment;
     let s = a;
     for (let j = 0; j < substepsPerSegment; j++) {
-      s = sim(s, [k, climb, speed], dtSub);
+      s = sim(s, [k, climb, roll, speed], dtSub);
       out.push(s);
     }
   }

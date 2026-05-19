@@ -11,22 +11,26 @@ export function defaultAircraftAgent(
     minSpeed: 6,
     maxSpeed: 18,
     maxClimbAngle: Math.PI / 6,
-    radius: 1.4,
+    maxBank: Math.PI / 2,
+    halfLength: 2,
+    halfSpan: 1.5,
+    halfHeight: 0.3,
     ...overrides,
   };
 }
 
 /**
  * Kinematic flight model for an agent without a host flight-dynamics engine.
- * `controls = [curvature, climbAngle, targetSpeed]`:
- *   - curvature is clamped to ±1/minTurnRadius (a coordinated bank-to-turn),
+ * `controls = [curvature, climbAngle, rollTarget, targetSpeed]`:
+ *   - curvature is clamped to ±1/minTurnRadius (horizontal turn rate),
  *   - climbAngle (the commanded flight-path angle) clamped to ±maxClimbAngle,
+ *   - rollTarget (the commanded bank angle) clamped to ±maxBank — purely a
+ *     footprint-orientation control in this kinematic model; the planner uses
+ *     it to slip the OBB through tight slots,
  *   - targetSpeed clamped to [minSpeed, maxSpeed].
- * Pitch tracks the commanded climb angle within the step (a quasi-static
- * airframe); airspeed is constant along the 3D path, so its ground projection
- * shrinks as the climb angle steepens. Used by the characterization/tests and
- * the planner's successor integration; a real game supplies a physics-backed
- * ForwardSim instead.
+ * Pitch and roll track their commanded targets within the step (a
+ * quasi-static airframe). Used by tests and the planner's successor
+ * integration; a real game supplies a physics-backed ForwardSim instead.
  */
 export function aircraftForwardSim(
   agent: AircraftAgent,
@@ -39,8 +43,9 @@ export function aircraftForwardSim(
       -agent.maxClimbAngle,
       agent.maxClimbAngle,
     );
+    const roll = clamp(controls[2] ?? 0, -agent.maxBank, agent.maxBank);
     const speed = clamp(
-      controls[2] ?? agent.maxSpeed,
+      controls[3] ?? agent.maxSpeed,
       agent.minSpeed,
       agent.maxSpeed,
     );
@@ -52,6 +57,7 @@ export function aircraftForwardSim(
       y: s.y + speed * Math.sin(pitch) * dt,
       heading,
       pitch,
+      roll,
       speed,
       t: s.t + dt,
     };

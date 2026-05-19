@@ -9,6 +9,7 @@ import {
   buildCanyon,
   buildRestrictedAirspace,
   buildGauntlet,
+  buildKnifeEdge,
   planInteractive,
   densifyPath,
   INTERACTIVE_BOXES,
@@ -18,7 +19,13 @@ import {
   type AircraftScene,
 } from '../lib/aircraft-scenarios';
 
-type Mode = 'waypoint' | 'canyon' | 'restricted' | 'gauntlet' | 'interactive';
+type Mode =
+  | 'waypoint'
+  | 'canyon'
+  | 'restricted'
+  | 'gauntlet'
+  | 'knife-edge'
+  | 'interactive';
 
 const CRUISE_Y = 32;
 
@@ -35,7 +42,7 @@ function lerpAngle(a: number, b: number, t: number) {
 function sampleAt(path: AircraftState[], tp: number) {
   if (path.length === 1) {
     const p = path[0]!;
-    return { x: p.x, y: p.y, z: p.z, heading: p.heading, pitch: p.pitch, yawRate: 0 };
+    return { x: p.x, y: p.y, z: p.z, heading: p.heading, pitch: p.pitch, roll: p.roll };
   }
   let i = 0;
   while (i < path.length - 2 && path[i + 1]!.t < tp) i++;
@@ -49,7 +56,7 @@ function sampleAt(path: AircraftState[], tp: number) {
     z: lerp(a.z, b.z, u),
     heading: lerpAngle(a.heading, b.heading, u),
     pitch: lerp(a.pitch, b.pitch, u),
-    yawRate: (((b.heading - a.heading + Math.PI) % (2 * Math.PI)) - Math.PI) / span,
+    roll: lerpAngle(a.roll, b.roll, u),
   };
 }
 
@@ -139,7 +146,7 @@ export default function Plane() {
     let scn: AircraftScene | null = null;
     let playPath: AircraftState[] = [];
     let goal: AircraftState = {
-      x: 150, y: CRUISE_Y, z: 0, heading: 0, pitch: 0, speed: AIRCRAFT_AGENT.maxSpeed, t: 0,
+      x: 150, y: CRUISE_Y, z: 0, heading: 0, pitch: 0, roll: 0, speed: AIRCRAFT_AGENT.maxSpeed, t: 0,
     };
     let playT = 0;
 
@@ -211,7 +218,7 @@ export default function Plane() {
 
     const replanInteractive = () => {
       const start: AircraftState = {
-        x: 8, y: CRUISE_Y, z: 0, heading: 0, pitch: 0,
+        x: 8, y: CRUISE_Y, z: 0, heading: 0, pitch: 0, roll: 0,
         speed: AIRCRAFT_AGENT.maxSpeed, t: 0,
       };
       const r = planInteractive(INTERACTIVE_BOXES, start, goal);
@@ -236,6 +243,7 @@ export default function Plane() {
       else if (m === 'canyon') scn = buildCanyon();
       else if (m === 'restricted') scn = buildRestrictedAirspace();
       else if (m === 'gauntlet') scn = buildGauntlet();
+      else if (m === 'knife-edge') scn = buildKnifeEdge();
       else {
         replanInteractive();
         return;
@@ -273,6 +281,7 @@ export default function Plane() {
         z: Math.max(B.z0 + 6, Math.min(B.z1 - 6, hit.point.z)),
         heading: 0,
         pitch: 0,
+        roll: 0,
         speed: AIRCRAFT_AGENT.maxSpeed,
         t: 0,
       };
@@ -302,7 +311,7 @@ export default function Plane() {
           p.z + cp * Math.sin(p.heading),
         );
         plane.lookAt(fwd);
-        plane.rotateZ(Math.max(-1.1, Math.min(1.1, -p.yawRate * 1.7)));
+        plane.rotateZ(p.roll);
         const zoneMesh = dyn.getObjectByName('zone');
         if (zoneMesh && scn.zoneAt) {
           const c = scn.zoneAt(playT);
@@ -372,9 +381,10 @@ export default function Plane() {
         A fixed-wing aircraft planned by the same IGHA* core as every other
         demo — but over a genuinely 3D state (x, y, z, heading, pitch, speed,
         t). Altitude is <em>searched</em>, not derived: the plane climbs over
-        ridges, weaves a canyon, threads gates, and routes around a moving
-        no-fly zone — or all of it at once in the grand tour. Drag to orbit;
-        in interactive mode, tap the ground to retarget and watch it replan.
+        ridges, weaves a canyon, threads gates, routes around a moving no-fly
+        zone, and knife-edges through a slot too narrow for its wingspan by
+        banking 90° (roll is a searched dimension). Drag to orbit; in
+        interactive mode, tap the ground to retarget and watch it replan.
       </p>
       <div style={{ display: 'flex', gap: 8, margin: '8px 0', flexWrap: 'wrap' }}>
         <button onClick={() => choose('waypoint')} style={btn(mode === 'waypoint')}>
@@ -394,6 +404,12 @@ export default function Plane() {
           style={btn(mode === 'gauntlet')}
         >
           grand tour
+        </button>
+        <button
+          onClick={() => choose('knife-edge')}
+          style={btn(mode === 'knife-edge')}
+        >
+          knife edge
         </button>
         <button
           onClick={() => choose('interactive')}

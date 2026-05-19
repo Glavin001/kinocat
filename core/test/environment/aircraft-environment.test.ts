@@ -10,43 +10,73 @@ import {
   aircraftForwardSim,
 } from '../../src/agent/aircraft';
 import type { AircraftState } from '../../src/agent/types';
+import {
+  poseToOBB,
+  obbHitsAABB,
+  obbHitsSphere,
+} from '../../src/internal/obb';
 
 const agent = defaultAircraftAgent({
   minTurnRadius: 12,
   minSpeed: 6,
   maxSpeed: 18,
   maxClimbAngle: Math.PI / 6,
-  radius: 1.4,
+  maxBank: Math.PI / 2,
+  halfLength: 2,
+  halfSpan: 1.5,
+  halfHeight: 0.3,
 });
 
+const HALF: [number, number, number] = [
+  agent.halfLength,
+  agent.halfSpan,
+  agent.halfHeight,
+];
+
 function start(over: Partial<AircraftState> = {}): AircraftState {
-  return { x: 0, y: 20, z: 0, heading: 0, pitch: 0, speed: 18, t: 0, ...over };
+  return {
+    x: 0,
+    y: 20,
+    z: 0,
+    heading: 0,
+    pitch: 0,
+    roll: 0,
+    speed: 18,
+    t: 0,
+    ...over,
+  };
 }
 
 describe('aircraftForwardSim', () => {
   it('climbs when commanded a positive flight-path angle', () => {
     const sim = aircraftForwardSim(agent);
-    const s = sim(start(), [0, agent.maxClimbAngle, agent.maxSpeed], 1);
+    const s = sim(start(), [0, agent.maxClimbAngle, 0, agent.maxSpeed], 1);
     expect(s.y).toBeGreaterThan(20);
     expect(s.pitch).toBeCloseTo(agent.maxClimbAngle, 6);
-    // airspeed is conserved: 3D step length ≈ speed * dt
     expect(Math.hypot(s.x, s.y - 20, s.z)).toBeCloseTo(18, 1);
   });
 
-  it('defaults to straight level flight at cruise when controls are absent', () => {
+  it('tracks the commanded bank angle in one step (quasi-static airframe)', () => {
     const sim = aircraftForwardSim(agent);
-    const s = sim(start({ heading: 0 }), [], 1);
-    expect(s.heading).toBeCloseTo(0, 9); // curvature → 0
-    expect(s.pitch).toBeCloseTo(0, 9); // climb → 0
-    expect(s.y).toBeCloseTo(20, 9); // level
-    expect(s.speed).toBeCloseTo(agent.maxSpeed, 9); // speed → maxSpeed
+    const s = sim(start(), [0, 0, agent.maxBank, agent.maxSpeed], 1);
+    expect(s.roll).toBeCloseTo(agent.maxBank, 6);
+  });
+
+  it('defaults to straight level wings-level flight when controls are absent', () => {
+    const sim = aircraftForwardSim(agent);
+    const s = sim(start(), [], 1);
+    expect(s.heading).toBeCloseTo(0, 9);
+    expect(s.pitch).toBeCloseTo(0, 9);
+    expect(s.roll).toBeCloseTo(0, 9);
+    expect(s.speed).toBeCloseTo(agent.maxSpeed, 9);
     expect(s.x).toBeCloseTo(agent.maxSpeed, 6);
   });
 
-  it('clamps climb angle and turn curvature to the agent limits', () => {
+  it('clamps climb, turn, bank, and speed to agent limits', () => {
     const sim = aircraftForwardSim(agent);
-    const s = sim(start(), [99, 99, 999], 1);
+    const s = sim(start(), [99, 99, 99, 999], 1);
     expect(s.pitch).toBeCloseTo(agent.maxClimbAngle, 6);
+    expect(s.roll).toBeCloseTo(agent.maxBank, 6);
     expect(Math.abs(s.heading)).toBeLessThanOrEqual(
       (agent.maxSpeed / agent.minTurnRadius) * 1 + 1e-6,
     );
@@ -54,26 +84,67 @@ describe('aircraftForwardSim', () => {
   });
 });
 
-describe('InMemoryAirspace', () => {
+describe('OBB primitives', () => {
+  it('hits an AABB it overlaps and misses one it does not', () => {
+    const pose = { x: 0, y: 0, z: 0, yaw: 0, pitch: 0, roll: 0 };
+    const obb = poseToOBB(pose, HALF);
+    expect(obbHitsAABB(obb, [-0.5, -0.5, -0.5], [0.5, 0.5, 0.5])).toBe(true);
+    expect(obbHitsAABB(obb, [10, 10, 10], [11, 11, 11])).toBe(false);
+  });
+
+  it('lets a banked plane fit a tall slot a level plane cannot', () => {
+    // Slot z ∈ [-0.7, 0.7] (1.4 wide), full ceiling tall. Wings level
+    // (halfSpan=1.5) cannot fit; banked 90° (wings vertical, halfHeight=0.3
+    // becomes the lateral extent) does fit.
+    const slot: AABB = { min: [-1, -50, -50], max: [1, 50, -0.7] };
+    const slot2: AABB = { min: [-1, -50, 0.7], max: [1, 50, 50] };
+    const level = poseToOBB({ x: 0, y: 0, z: 0, yaw: 0, pitch: 0, roll: 0 }, HALF);
+    expect(
+      obbHitsAABB(level, slot.min, slot.max) ||
+        obbHitsAABB(level, slot2.min, slot2.max),
+    ).toBe(true);
+    const banked = poseToOBB(
+      { x: 0, y: 0, z: 0, yaw: 0, pitch: 0, roll: Math.PI / 2 },
+      HALF,
+    );
+    expect(obbHitsAABB(banked, slot.min, slot.max)).toBe(false);
+    expect(obbHitsAABB(banked, slot2.min, slot2.max)).toBe(false);
+  });
+
+  it('detects a sphere hugging the OBB and misses one outside', () => {
+    const obb = poseToOBB(
+      { x: 0, y: 0, z: 0, yaw: 0, pitch: 0, roll: 0 },
+      HALF,
+    );
+    expect(obbHitsSphere(obb, [agent.halfLength + 0.4, 0, 0], 0.5)).toBe(true);
+    expect(obbHitsSphere(obb, [10, 10, 10], 0.5)).toBe(false);
+  });
+});
+
+describe('InMemoryAirspace (OBB collision)', () => {
   const box: AABB = { min: [40, 0, -10], max: [50, 30, 10] };
   const air = new InMemoryAirspace({
     floor: 0,
     ceiling: 60,
     boxes: [box],
-    // a no-fly zone drifting along +z: centre = (100, 20, t * 2)
     zones: [{ radius: 5, predict: (t) => ({ x: 100, y: 20, z: t * 2 }) }],
   });
 
-  it('rejects points inside a box, below the floor, above the ceiling', () => {
-    expect(air.clear(45, 15, 0, 0, 1.4)).toBe(false); // inside box
-    expect(air.clear(0, 0.5, 0, 0, 1.4)).toBe(false); // below floor
-    expect(air.clear(0, 59.5, 0, 0, 1.4)).toBe(false); // above ceiling
-    expect(air.clear(0, 20, 0, 0, 1.4)).toBe(true); // open air
+  const pose = (over: Partial<AircraftState>) => {
+    const s = start(over);
+    return { x: s.x, y: s.y, z: s.z, yaw: s.heading, pitch: s.pitch, roll: s.roll };
+  };
+
+  it('rejects an OBB inside a box, below floor, above ceiling', () => {
+    expect(air.clear(pose({ x: 45, y: 15 }), HALF, 0)).toBe(false);
+    expect(air.clear(pose({ x: 0, y: 0.1 }), HALF, 0)).toBe(false);
+    expect(air.clear(pose({ x: 0, y: 59.9 }), HALF, 0)).toBe(false);
+    expect(air.clear(pose({ x: 0, y: 20 }), HALF, 0)).toBe(true);
   });
 
-  it('rejects a point inside a moving zone only while the zone is there', () => {
-    expect(air.clear(100, 20, 0, 0, 1.4)).toBe(false); // zone at z=0 at t=0
-    expect(air.clear(100, 20, 0, 50, 1.4)).toBe(true); // zone moved to z=100
+  it('rejects only while a moving zone is at the queried time', () => {
+    expect(air.clear(pose({ x: 100, y: 20, z: 0 }), HALF, 0)).toBe(false);
+    expect(air.clear(pose({ x: 100, y: 20, z: 0 }), HALF, 50)).toBe(true);
   });
 });
 
@@ -86,9 +157,9 @@ describe('AircraftEnvironment + IGHA*', () => {
       goalRadius: 8,
     });
     const s = start();
-    const g = start({ x: 120, z: 0, speed: 0 });
+    const g = start({ x: 120 });
     const r = plan(
-      { start: s, goal: g, environment: env, options: { maxExpansions: 20000 } },
+      { start: s, goal: g, environment: env, options: { maxExpansions: 40000 } },
       Infinity,
     );
     expect(r.found).toBe(true);
@@ -100,8 +171,6 @@ describe('AircraftEnvironment + IGHA*', () => {
   });
 
   it('searches altitude: climbs over a wall that blocks level flight', () => {
-    // A wall from the floor up to y=30 across the direct route. The only
-    // feasible plan gains altitude — altitude is genuinely searched.
     const wall: AABB = { min: [50, 0, -40], max: [58, 30, 40] };
     const air = new InMemoryAirspace({ floor: 0, ceiling: 90, boxes: [wall] });
     const env = new AircraftEnvironment(air, agent, {
@@ -111,19 +180,20 @@ describe('AircraftEnvironment + IGHA*', () => {
       levelDivisors: [4, 2, 1],
     });
     const s = start({ y: 8 });
-    const g = start({ x: 110, y: 8, z: 0, speed: 0 });
+    const g = start({ x: 110, y: 8 });
     const r = plan(
-      { start: s, goal: g, environment: env, options: { maxExpansions: 80000 } },
+      { start: s, goal: g, environment: env, options: { maxExpansions: 200000 } },
       Infinity,
     );
     expect(r.found).toBe(true);
     expect(Math.max(...r.path.map((p) => p.y))).toBeGreaterThan(30);
     for (const p of r.path) {
-      expect(air.clear(p.x, p.y, p.z, p.t, agent.radius)).toBe(true);
+      const pose = { x: p.x, y: p.y, z: p.z, yaw: p.heading, pitch: p.pitch, roll: p.roll };
+      expect(air.clear(pose, HALF, p.t)).toBe(true);
     }
   });
 
-  it('heuristic is an admissible lower bound on the plan cost', () => {
+  it('heuristic is an admissible lower bound on plan cost', () => {
     const air = new InMemoryAirspace({ floor: 0, ceiling: 80 });
     const env = new AircraftEnvironment(air, agent, {
       posCell: 4,
@@ -131,7 +201,7 @@ describe('AircraftEnvironment + IGHA*', () => {
       goalRadius: 8,
     });
     const s = start();
-    const g = start({ x: 120, z: 0, speed: 0 });
+    const g = start({ x: 120 });
     const r = plan(
       { start: s, goal: g, environment: env, options: { maxExpansions: 20000 } },
       Infinity,
@@ -140,7 +210,7 @@ describe('AircraftEnvironment + IGHA*', () => {
     expect(env.heuristic(s, g)).toBeLessThanOrEqual(r.cost + 1e-6);
   });
 
-  it('reports an invalid start when it begins inside an obstacle', () => {
+  it('reports an invalid start when its OBB intersects an obstacle', () => {
     const box: AABB = { min: [-5, 0, -5], max: [5, 40, 5] };
     const air = new InMemoryAirspace({ floor: 0, ceiling: 80, boxes: [box] });
     const env = new AircraftEnvironment(air, agent);

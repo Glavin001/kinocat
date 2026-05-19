@@ -1,9 +1,9 @@
 // AircraftEnvironment — a true 3D Environment<AircraftState> for the IGHA*
-// core. Altitude is a searched dimension: it participates in the exact `hash`
-// (finest-pass dedup) AND the per-level dominance key, so coarse passes
-// genuinely separate over/under routes. The planner itself is unchanged —
-// this is just a new Environment implementation, exactly the extension point
-// the 6-method interface is designed for.
+// core. Altitude is a searched dimension (in the hash and the per-level
+// dominance key); roll is a tactical searched dimension (in the hash only,
+// so coarse passes don't fragment over equivalent-altitude routes at
+// different banks). Collision uses an OBB oriented by yaw + pitch + roll so
+// the planner can knife-edge through slots too narrow for level wings.
 
 import type { Environment, EdgeRef, Node } from './types';
 import type { AirspaceWorld } from './airspace-world';
@@ -20,6 +20,7 @@ export interface AircraftEnvOptions {
   altCell?: number;
   headingBuckets?: number;
   pitchBuckets?: number;
+  rollBuckets?: number;
   speedQuant?: number;
   /** Position-index divisors, coarse → fine; last MUST be 1. */
   levelDivisors?: number[];
@@ -34,19 +35,23 @@ export interface AircraftEnvOptions {
   turnFractions?: number[];
   /** Climb-angle fractions of maxClimbAngle. */
   climbFractions?: number[];
+  /** Bank-angle fractions of maxBank. */
+  rollFractions?: number[];
   /** Target speeds; default `[maxSpeed]`. */
   speeds?: number[];
 }
 
-interface ControlTriple {
+interface ControlQuad {
   k: number;
   climb: number;
+  roll: number;
   v: number;
 }
 
 interface FlyEdgeData {
   k: number;
   climb: number;
+  roll: number;
 }
 
 export class AircraftEnvironment implements Environment<AircraftState> {
@@ -55,15 +60,17 @@ export class AircraftEnvironment implements Environment<AircraftState> {
   private readonly altCell: number;
   private readonly headingBuckets: number;
   private readonly pitchBuckets: number;
+  private readonly rollBuckets: number;
   private readonly speedQuant: number;
   private readonly divisors: number[];
   private readonly goalRadius: number;
   private readonly goalHeadingTol: number;
   private readonly primDuration: number;
   private readonly substeps: number;
-  private readonly controls: ControlTriple[];
+  private readonly controls: ControlQuad[];
   private readonly sim: ForwardSim<AircraftState>;
   private readonly invMaxSpeed: number;
+  private readonly half: [number, number, number];
 
   constructor(
     private readonly world: AirspaceWorld,
@@ -74,32 +81,41 @@ export class AircraftEnvironment implements Environment<AircraftState> {
     this.altCell = opts.altCell ?? 3;
     this.headingBuckets = opts.headingBuckets ?? 16;
     this.pitchBuckets = opts.pitchBuckets ?? 4;
+    this.rollBuckets = opts.rollBuckets ?? 4;
     this.speedQuant = opts.speedQuant ?? 4;
     this.divisors = opts.levelDivisors ?? [4, 2, 1];
     this.goalRadius = opts.goalRadius ?? 6;
     this.goalHeadingTol = opts.goalHeadingTol ?? Infinity;
     this.primDuration = opts.primDuration ?? 1;
-    this.substeps = opts.substeps ?? 4;
+    this.substeps = opts.substeps ?? 6;
     this.sim = aircraftForwardSim(agent);
     this.invMaxSpeed = 1 / agent.maxSpeed;
+    this.half = [agent.halfLength, agent.halfSpan, agent.halfHeight];
 
     const kMax = 1 / agent.minTurnRadius;
     const turns = opts.turnFractions ?? [-1, -0.5, 0, 0.5, 1];
     const climbs = opts.climbFractions ?? [-1, 0, 1];
+    // Roll search is opt-in: it lets the planner knife-edge through tight
+    // slots but triples the branching factor. Scenarios that need it (e.g.,
+    // narrow vertical slots) pass `rollFractions: [-1, 0, 1]` explicitly.
+    const rolls = opts.rollFractions ?? [0];
     const speeds = opts.speeds ?? [agent.maxSpeed];
-    const triples: ControlTriple[] = [];
+    const quads: ControlQuad[] = [];
     for (const tf of turns) {
       for (const cf of climbs) {
-        for (const v of speeds) {
-          triples.push({
-            k: tf * kMax,
-            climb: cf * agent.maxClimbAngle,
-            v,
-          });
+        for (const rf of rolls) {
+          for (const v of speeds) {
+            quads.push({
+              k: tf * kMax,
+              climb: cf * agent.maxClimbAngle,
+              roll: rf * agent.maxBank,
+              v,
+            });
+          }
         }
       }
     }
-    this.controls = triples;
+    this.controls = quads;
     this.levels = this.divisors.length;
   }
 
@@ -125,6 +141,9 @@ export class AircraftEnvironment implements Environment<AircraftState> {
       (state.pitch / Math.max(this.agent.maxClimbAngle, 1e-6)) *
         this.pitchBuckets,
     );
+    const ir = Math.round(
+      (state.roll / Math.max(this.agent.maxBank, 1e-6)) * this.rollBuckets,
+    );
     const isp = Math.round(state.speed / this.speedQuant);
     const it = Math.round(state.t / 0.25);
     const index: string[] = [];
@@ -138,8 +157,19 @@ export class AircraftEnvironment implements Environment<AircraftState> {
       parent,
       edge,
       index,
-      `${ix},${iy},${iz},${ih},${ip},${isp},${it}`,
+      `${ix},${iy},${iz},${ih},${ip},${ir},${isp},${it}`,
     );
+  }
+
+  private poseOf(s: AircraftState) {
+    return {
+      x: s.x,
+      y: s.y,
+      z: s.z,
+      yaw: s.heading,
+      pitch: s.pitch,
+      roll: s.roll,
+    };
   }
 
   succ(
@@ -149,12 +179,12 @@ export class AircraftEnvironment implements Environment<AircraftState> {
     const dtSub = this.primDuration / this.substeps;
     const out: Node<AircraftState>[] = [];
     for (const c of this.controls) {
-      const ctl = [c.k, c.climb, c.v];
+      const ctl = [c.k, c.climb, c.roll, c.v];
       let s = node.state;
       let clear = true;
       for (let i = 0; i < this.substeps; i++) {
         s = this.sim(s, ctl, dtSub);
-        if (!this.world.clear(s.x, s.y, s.z, s.t, this.agent.radius)) {
+        if (!this.world.clear(this.poseOf(s), this.half, s.t)) {
           clear = false;
           break;
         }
@@ -164,7 +194,7 @@ export class AircraftEnvironment implements Environment<AircraftState> {
       const edge: EdgeRef = {
         cost,
         kind: 'fly',
-        data: { k: c.k, climb: c.climb } satisfies FlyEdgeData,
+        data: { k: c.k, climb: c.climb, roll: c.roll } satisfies FlyEdgeData,
       };
       const n = this.createNode(s, node, edge);
       n.g = node.g + cost;
@@ -175,10 +205,8 @@ export class AircraftEnvironment implements Environment<AircraftState> {
     return out;
   }
 
-  /** 3D straight-line time. Admissible & consistent: airspeed is constant
-   *  along the path so the 3D arc length per edge is `speed·duration` with
-   *  `speed ≤ maxSpeed`, hence the per-edge h-drop never exceeds the edge
-   *  cost. With enough budget the finest pass returns the optimal plan. */
+  /** 3D straight-line time. Admissible & consistent (airspeed is constant
+   *  along the path, so the per-edge h-drop never exceeds the edge cost). */
   heuristic(from: AircraftState, to: AircraftState): number {
     const dx = from.x - to.x;
     const dy = from.y - to.y;
@@ -186,15 +214,14 @@ export class AircraftEnvironment implements Environment<AircraftState> {
     return Math.sqrt(dx * dx + dy * dy + dz * dz) * this.invMaxSpeed;
   }
 
-  private clearAt(s: AircraftState): boolean {
-    return this.world.clear(s.x, s.y, s.z, s.t, this.agent.radius);
-  }
-
   checkValidity(
     start: AircraftState,
     goal: AircraftState,
   ): [boolean, boolean] {
-    return [this.clearAt(start), this.clearAt(goal)];
+    return [
+      this.world.clear(this.poseOf(start), this.half, start.t),
+      this.world.clear(this.poseOf(goal), this.half, goal.t),
+    ];
   }
 
   reachedGoalRegion(

@@ -1,11 +1,17 @@
-// The aircraft planner's only collision coupling. Unlike NavWorld (a 2D
-// polygon nav graph with derived height), airspace is genuinely volumetric:
-// a flyable altitude band, static box volumes (terrain / canyon walls /
-// buildings), and moving spherical no-fly zones (storms, traffic) queried at
-// the successor's absolute time — the same Predict<T> seam the rest of kinocat
-// uses for everything dynamic.
+// The aircraft planner's only collision coupling. Volumetric and oriented:
+// the agent is an OBB (length × span × height), oriented by yaw + pitch +
+// roll from the searched state, so the planner can knife-edge through slots
+// too narrow for a level-wing footprint. Static box volumes use SAT; moving
+// spherical no-fly zones use closest-point-on-OBB.
 
 import type { Predict } from '../predict/types';
+import {
+  poseToOBB,
+  obbHitsAABB,
+  obbHitsSphere,
+  obbWorldExtent,
+  type Pose,
+} from '../internal/obb';
 
 /** Axis-aligned box volume in world coordinates. */
 export interface AABB {
@@ -19,10 +25,10 @@ export interface MovingZone {
   radius: number;
 }
 
-/** Is a sphere of `radius` centred at (x,y,z) at absolute time `t` free of
- *  obstacles? The aircraft Environment depends on nothing else. */
+/** Is the agent's OBB at (pose) at absolute time `t` free of obstacles? The
+ *  aircraft Environment depends on nothing else. */
 export interface AirspaceWorld {
-  clear(x: number, y: number, z: number, t: number, radius: number): boolean;
+  clear(pose: Pose, half: [number, number, number], t: number): boolean;
 }
 
 export interface AirspaceOptions {
@@ -31,22 +37,6 @@ export interface AirspaceOptions {
   ceiling?: number;
   boxes?: AABB[];
   zones?: MovingZone[];
-}
-
-function sphereHitsAABB(
-  x: number,
-  y: number,
-  z: number,
-  r: number,
-  b: AABB,
-): boolean {
-  const cx = Math.max(b.min[0], Math.min(x, b.max[0]));
-  const cy = Math.max(b.min[1], Math.min(y, b.max[1]));
-  const cz = Math.max(b.min[2], Math.min(z, b.max[2]));
-  const dx = x - cx;
-  const dy = y - cy;
-  const dz = z - cz;
-  return dx * dx + dy * dy + dz * dz < r * r;
 }
 
 export class InMemoryAirspace implements AirspaceWorld {
@@ -62,19 +52,17 @@ export class InMemoryAirspace implements AirspaceWorld {
     this.zones = opts.zones ?? [];
   }
 
-  clear(x: number, y: number, z: number, t: number, radius: number): boolean {
-    if (y - radius < this.floor || y + radius > this.ceiling) return false;
+  clear(pose: Pose, half: [number, number, number], t: number): boolean {
+    const obb = poseToOBB(pose, half);
+    const ext = obbWorldExtent(obb);
+    if (ext.min[1] < this.floor || ext.max[1] > this.ceiling) return false;
     for (const b of this.boxes) {
-      if (sphereHitsAABB(x, y, z, radius, b)) return false;
+      if (obbHitsAABB(obb, b.min, b.max)) return false;
     }
     for (const zone of this.zones) {
       const c = zone.predict(t);
       if (!c) continue;
-      const dx = x - c.x;
-      const dy = y - c.y;
-      const dz = z - c.z;
-      const rr = radius + zone.radius;
-      if (dx * dx + dy * dy + dz * dz < rr * rr) return false;
+      if (obbHitsSphere(obb, [c.x, c.y, c.z], zone.radius)) return false;
     }
     return true;
   }
