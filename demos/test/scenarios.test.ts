@@ -281,12 +281,22 @@ describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
     }
   });
 
-  it('canyon: weaves the walls and the path genuinely changes altitude', () => {
+  it('canyon: flies BETWEEN the full-height walls, then climbs the ridge', () => {
     const s = buildCanyon();
     expect(s.found).toBe(true);
-    const ys = s.path.map((p) => p.y);
-    // the ridge forces a real climb — altitude is a searched dimension
-    expect(Math.max(...ys) - Math.min(...ys)).toBeGreaterThan(8);
+    // The walls are full-height: the only way past is laterally through the
+    // alternating side gaps. At the first wall the plane must be on the +z
+    // side; at the second, on the -z side — it weaves, it does not fly over.
+    const near = (lo: number, hi: number) =>
+      s.path.filter((p) => p.x >= lo && p.x <= hi);
+    const atWallA = near(38, 62);
+    const atWallB = near(86, 110);
+    expect(atWallA.length).toBeGreaterThan(0);
+    expect(atWallB.length).toBeGreaterThan(0);
+    expect(Math.max(...atWallA.map((p) => p.z))).toBeGreaterThan(4);
+    expect(Math.min(...atWallB.map((p) => p.z))).toBeLessThan(-4);
+    // The final ridge (top y=34) spans the full width — altitude is searched.
+    expect(Math.max(...s.path.map((p) => p.y))).toBeGreaterThan(36);
     for (let i = 1; i < s.path.length; i++) {
       expect(s.path[i]!.t).toBeGreaterThan(s.path[i - 1]!.t - 1e-9);
     }

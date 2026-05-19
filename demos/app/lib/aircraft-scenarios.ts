@@ -161,18 +161,25 @@ export function buildWaypointCourse(): AircraftScene {
 }
 
 // ---------------------------------------------------------------------------
-// Canyon / terrain slalom — staggered walls force lateral weaving, then a low
-// ridge forces a climb. Altitude must be searched to solve it.
+// Canyon / terrain slalom — full-height walls leave only an alternating side
+// gap, so the plane must weave *between* them (it cannot fly over); a final
+// full-width ridge is low enough to climb. Both lateral routing and altitude
+// must be searched to solve it.
 
 export function buildCanyon(): AircraftScene {
+  const f = AIRCRAFT_BOUNDS.floor;
+  const c = AIRCRAFT_BOUNDS.ceiling;
   const boxes: AABB[] = [
-    { min: [42, 0, -60], max: [50, 14, 12] }, // weave right
-    { min: [82, 0, -12], max: [90, 14, 60] }, // weave left
-    { min: [116, 0, -60], max: [124, 30, 60] }, // climb over the ridge
+    // full-height wall; the only gap is on the +z side → weave right
+    { min: [44, f, -60], max: [52, c, 4] },
+    // full-height wall; the only gap is on the -z side → weave left
+    { min: [92, f, -4], max: [100, c, 60] },
+    // full-width ridge, low enough to fly over → altitude is searched
+    { min: [130, f, -60], max: [138, 34, 60] },
   ];
   const airspace = aircraftAirspace(boxes);
-  const start = gate(8, 24, 0);
-  const goal = gate(152, 24, 0);
+  const start = gate(8, 22, 0);
+  const goal = gate(152, 22, 0);
   const r = planAircraftLeg(airspace, start, goal, {
     maxExpansions: AIRCRAFT_DYNAMIC_MAX_EXPANSIONS,
   });
@@ -186,7 +193,7 @@ export function buildCanyon(): AircraftScene {
     gates: [],
     boxes,
     info: r.found
-      ? `weaved the walls and climbed the ridge (${r.path.length} states)`
+      ? `weaved between the walls and climbed the ridge (${r.path.length} states)`
       : 'no plan',
   };
 }
