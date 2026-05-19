@@ -9,6 +9,17 @@ interface Demo {
 
 const groups: { heading: string; demos: Demo[] }[] = [
   {
+    heading: 'Flagship',
+    demos: [
+      {
+        href: '/flagship',
+        title: 'Interactive multi-agent flagship',
+        desc: 'Opposing cross-traffic on a large procedural navcat terrain. Click a vehicle to select it, retarget its goal or drop hazards and watch every NPC replan live. A genuine boost & canyon jump the planner adopts, a misdirect it rejects on its own. Toggleable clearance & moving-obstacle broadphase.',
+        tag: '3D · interactive · multi-agent',
+      },
+    ],
+  },
+  {
     heading: 'Algorithms & curves',
     demos: [
       {
