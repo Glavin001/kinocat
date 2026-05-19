@@ -3,6 +3,7 @@ export type {
   PurePursuitConfig,
   TrackingCommand,
   ReplanTrigger,
+  ReplanReason,
   PlanPath,
 } from './types';
 export { purePursuit } from './pure-pursuit';

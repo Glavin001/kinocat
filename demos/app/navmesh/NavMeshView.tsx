@@ -105,16 +105,22 @@ export default function NavMeshView() {
     };
 
     let state: VehicleState = { x: 4, z: 12, heading: 0, speed: 0, t: 0 };
-    const replan = new ReplanState({ divergenceThresholdMeters: 2.5, refreshIntervalMs: 1800 });
+    const replan = new ReplanState({
+      divergenceThresholdMeters: 2.5,
+      refreshIntervalMs: 1800,
+      switchCostImprovement: 0.15,
+      switchCostMargin: 0.5,
+    });
 
-    const doReplan = (nowMs: number) => {
+    const doReplan = (nowMs: number, force = false) => {
+      if (force) replan.markDirty('edit');
       const t0 = performance.now();
       const r = planNavmesh(world, state, goalRef.current);
       if (r.found) {
-        replan.setPlan(r.path, nowMs);
-        drawPath(r.path);
+        const adopted = replan.consider(r.path, r.cost, nowMs);
+        if (adopted) drawPath(r.path);
         setInfo(
-          `navmesh: ${(performance.now() - t0).toFixed(0)} ms plan · cost ${r.cost.toFixed(1)} · ${r.path.length} states · drag to orbit, click the mesh to move the goal`,
+          `navmesh: ${(performance.now() - t0).toFixed(0)} ms · ${adopted ? 'replanned' : 'kept plan'} · cost ${r.cost.toFixed(1)} · drag to orbit, click the mesh to move the goal`,
         );
       } else {
         setInfo('no plan to that point — try elsewhere on the mesh');
@@ -125,7 +131,7 @@ export default function NavMeshView() {
       m.position.set(s.x, surfaceY(s.x, s.z) + 0.6, s.z);
     place(startMarker, state);
     place(goalMarker, goalRef.current);
-    doReplan(performance.now());
+    doReplan(performance.now(), true);
 
     const ray = new THREE.Raycaster();
     const ndc = new THREE.Vector2();
@@ -145,7 +151,7 @@ export default function NavMeshView() {
       };
       goalRef.current = g;
       place(goalMarker, g);
-      doReplan(performance.now());
+      doReplan(performance.now(), true);
     };
     renderer.domElement.addEventListener('click', onClick);
 

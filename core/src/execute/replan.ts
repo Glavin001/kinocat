@@ -3,7 +3,7 @@
 // dirty mark (tile rebuild, new affordance, prediction change).
 
 import type { VehicleState } from '../agent/types';
-import type { PlanPath, ReplanTrigger } from './types';
+import type { PlanPath, ReplanReason, ReplanTrigger } from './types';
 import { dist, lerp, lerpAngle } from '../internal/math';
 
 /** Interpolate the planned pose at absolute time `t` (clamped to the ends). */
@@ -33,13 +33,17 @@ export function planPoseAt(path: PlanPath, t: number): VehicleState | null {
 
 export class ReplanState {
   private plan: PlanPath | null = null;
+  private committedCost = Infinity;
   private dirtyReason: string | null = null;
+  private lastReason: ReplanReason = 'none';
   lastReplanMs = -Infinity;
 
   constructor(private readonly trigger: ReplanTrigger) {}
 
-  setPlan(path: PlanPath, nowMs: number): void {
+  /** Commit a plan unconditionally (initial plan / forced). */
+  setPlan(path: PlanPath, nowMs: number, cost = 0): void {
     this.plan = path;
+    this.committedCost = cost;
     this.lastReplanMs = nowMs;
     this.dirtyReason = null;
   }
@@ -62,9 +66,47 @@ export class ReplanState {
   }
 
   shouldReplan(current: VehicleState, nowMs: number): boolean {
-    if (!this.plan) return true;
-    if (this.dirtyReason !== null) return true;
-    if (nowMs - this.lastReplanMs >= this.trigger.refreshIntervalMs) return true;
-    return this.divergence(current) > this.trigger.divergenceThresholdMeters;
+    if (!this.plan) {
+      this.lastReason = 'no-plan';
+      return true;
+    }
+    if (this.dirtyReason !== null) {
+      this.lastReason = 'dirty';
+      return true;
+    }
+    if (this.divergence(current) > this.trigger.divergenceThresholdMeters) {
+      this.lastReason = 'divergence';
+      return true;
+    }
+    if (nowMs - this.lastReplanMs >= this.trigger.refreshIntervalMs) {
+      this.lastReason = 'periodic';
+      return true;
+    }
+    this.lastReason = 'none';
+    return false;
+  }
+
+  /**
+   * Decide whether to adopt a freshly-planned route. Always adopts when the
+   * current plan is invalid (no-plan / dirty / divergence); on a routine
+   * periodic replan it keeps the committed plan unless the candidate is
+   * meaningfully cheaper — this is the plan-switch hysteresis that stops the
+   * agent oscillating between two equal-cost routes. Returns true if adopted.
+   */
+  consider(path: PlanPath, cost: number, nowMs: number): boolean {
+    const frac = this.trigger.switchCostImprovement ?? 0.15;
+    const margin = this.trigger.switchCostMargin ?? 0.5;
+    const forced =
+      this.plan === null ||
+      this.lastReason === 'no-plan' ||
+      this.lastReason === 'dirty' ||
+      this.lastReason === 'divergence';
+    if (forced || cost < this.committedCost * (1 - frac) - margin) {
+      this.setPlan(path, nowMs, cost);
+      return true;
+    }
+    // keep the committed plan, but don't re-trigger a periodic replan at once
+    this.lastReplanMs = nowMs;
+    return false;
   }
 }

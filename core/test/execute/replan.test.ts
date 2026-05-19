@@ -64,3 +64,62 @@ describe('ReplanState', () => {
     expect(rs.shouldReplan(onTrack, 1150)).toBe(false);
   });
 });
+
+describe('ReplanState plan-switch hysteresis (anti-oscillation)', () => {
+  const trigger = {
+    divergenceThresholdMeters: 1.5,
+    refreshIntervalMs: 500,
+    switchCostImprovement: 0.15,
+    switchCostMargin: 0.5,
+  };
+  const altPath: PlanPath = [
+    { x: 0, z: 0, heading: 0, speed: 4, t: 0 },
+    { x: 8, z: -1, heading: 0, speed: 4, t: 2 },
+  ];
+  const onTrack: VehicleState = { x: 4, z: 0, heading: 0, speed: 4, t: 1 };
+
+  it('adopts the first plan unconditionally', () => {
+    const rs = new ReplanState(trigger);
+    rs.shouldReplan(onTrack, 0); // reason = no-plan
+    expect(rs.consider(path, 10, 0)).toBe(true);
+    expect(rs.currentPlan).toBe(path);
+  });
+
+  it('keeps the committed plan against an equal-cost alternative (periodic)', () => {
+    const rs = new ReplanState(trigger);
+    rs.setPlan(path, 1000, 10);
+    rs.shouldReplan(onTrack, 1600); // reason = periodic
+    expect(rs.consider(altPath, 10, 1600)).toBe(false); // equal cost ⇒ keep
+    expect(rs.currentPlan).toBe(path);
+    rs.shouldReplan(onTrack, 2200);
+    expect(rs.consider(altPath, 9.5, 2200)).toBe(false); // <15% better ⇒ keep
+  });
+
+  it('adopts a meaningfully cheaper plan on a periodic replan', () => {
+    const rs = new ReplanState(trigger);
+    rs.setPlan(path, 1000, 10);
+    rs.shouldReplan(onTrack, 1600);
+    expect(rs.consider(altPath, 7, 1600)).toBe(true); // 30% cheaper ⇒ switch
+    expect(rs.currentPlan).toBe(altPath);
+  });
+
+  it('always adopts when diverged or dirty (current plan invalid)', () => {
+    const rs = new ReplanState(trigger);
+    rs.setPlan(path, 1000, 10);
+    const off: VehicleState = { x: 4, z: 9, heading: 0, speed: 4, t: 1 };
+    rs.shouldReplan(off, 1100); // reason = divergence
+    expect(rs.consider(altPath, 10, 1100)).toBe(true); // equal cost but adopt
+    rs.setPlan(path, 1200, 10);
+    rs.markDirty('tile-rebuild');
+    rs.shouldReplan(onTrack, 1250); // reason = dirty
+    expect(rs.consider(altPath, 99, 1250)).toBe(true); // worse but adopt
+  });
+
+  it('does not immediately re-trigger after keeping a plan', () => {
+    const rs = new ReplanState(trigger);
+    rs.setPlan(path, 1000, 10);
+    rs.shouldReplan(onTrack, 1600);
+    rs.consider(altPath, 10, 1600); // kept
+    expect(rs.shouldReplan(onTrack, 1650)).toBe(false); // timer reset
+  });
+});

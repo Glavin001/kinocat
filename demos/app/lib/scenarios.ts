@@ -334,19 +334,29 @@ export function buildDynamic(scn: Scenario): DynamicScene {
 // World3D (in-memory box obstacle)
 
 export const WORLD3D_OBSTACLE: [number, number, number, number] = [17, -3, 23, 3];
+export const WORLD3D_BOUNDS = { x0: 0, z0: -12, x1: 40, z1: 12 };
 
-export function world3dWorld(): InMemoryNavWorld {
+export interface BoxObstacle {
+  x: number;
+  z: number;
+  hx: number;
+  hz: number;
+}
+
+export const WORLD3D_DEFAULT_OBSTACLES: BoxObstacle[] = [
+  { x: 20, z: 0, hx: 3, hz: 3 },
+];
+
+/** World3D world from an arbitrary list of axis-aligned box obstacles. */
+export function world3dWorldFrom(obstacles: BoxObstacle[]): InMemoryNavWorld {
   return new InMemoryNavWorld(
     [{ id: 1, y: 0, ring: [[0, -12], [40, -12], [40, 12], [0, 12]] }],
-    [
-      box(
-        (WORLD3D_OBSTACLE[0] + WORLD3D_OBSTACLE[2]) / 2,
-        (WORLD3D_OBSTACLE[1] + WORLD3D_OBSTACLE[3]) / 2,
-        (WORLD3D_OBSTACLE[2] - WORLD3D_OBSTACLE[0]) / 2,
-        (WORLD3D_OBSTACLE[3] - WORLD3D_OBSTACLE[1]) / 2,
-      ),
-    ],
+    obstacles.map((o) => box(o.x, o.z, o.hx, o.hz)),
   );
+}
+
+export function world3dWorld(): InMemoryNavWorld {
+  return world3dWorldFrom(WORLD3D_DEFAULT_OBSTACLES);
 }
 
 export function planWorld3d(

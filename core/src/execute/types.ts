@@ -36,6 +36,18 @@ export interface TrackingCommand {
 export interface ReplanTrigger {
   divergenceThresholdMeters: number;
   refreshIntervalMs: number;
+  /**
+   * Plan-switch hysteresis. On a routine *periodic* replan (agent on-track,
+   * current plan still valid) a freshly-planned route is adopted only if it
+   * is cheaper than the committed plan by at least this fraction (default
+   * 0.15) plus `switchCostMargin`. Prevents flip-flopping between two
+   * equal-cost routes around a symmetric obstacle. Divergence / dirty
+   * replans always adopt (the current plan is no longer valid).
+   */
+  switchCostImprovement?: number;
+  switchCostMargin?: number;
 }
+
+export type ReplanReason = 'no-plan' | 'dirty' | 'divergence' | 'periodic' | 'none';
 
 export type PlanPath = VehicleState[];
