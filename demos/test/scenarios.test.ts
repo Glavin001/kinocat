@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
+import { readdirSync, existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   planPlayground,
   buildDynamic,
@@ -22,6 +24,21 @@ import {
   type JumpLinksResult,
   type FlagshipResult,
 } from '../app/lib/scenarios';
+import {
+  buildWaypointCourse,
+  buildCanyon,
+  buildRestrictedAirspace,
+  buildGauntlet,
+  buildKnifeEdge,
+  planInteractive,
+  densifyPath,
+  aircraftAirspace,
+  aircraftPose,
+  AIRCRAFT_HALF,
+  INTERACTIVE_BOXES,
+  AIRCRAFT_AGENT,
+  AIRCRAFT_MAX_EXPANSIONS,
+} from '../app/lib/aircraft-scenarios';
 import type { VehicleState } from 'kinocat/agent';
 
 // These assert the *exact* configuration the demos ship with always finds a
@@ -261,24 +278,159 @@ describe('humanoid demo: omnidirectional vs. turn-radius-constrained', () => {
   });
 });
 
-// Built lazily in beforeAll (not at collect time) so test collection stays
-// fast; navcat mesh generation can be environment-sensitive, so a runner
-// without it skips the assertion rather than failing the suite.
-describe('jumplinks demo: Mononen-style off-mesh annotation', () => {
-  let jumpLinks: JumpLinksResult | null = null;
-  beforeAll(() => {
-    try {
-      jumpLinks = buildJumpLinks();
-    } catch {
-      jumpLinks = null;
+describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
+  it('waypoint course: flies every gate, monotone time', () => {
+    const s = buildWaypointCourse();
+    expect(s.found).toBe(true);
+    expect(s.path.length).toBeGreaterThanOrEqual(s.gates.length + 1);
+    const end = s.path[s.path.length - 1]!;
+    const g = s.goal;
+    expect(
+      Math.hypot(end.x - g.x, end.y - g.y, end.z - g.z),
+    ).toBeLessThanOrEqual(10);
+    for (let i = 1; i < s.path.length; i++) {
+      expect(s.path[i]!.t).toBeGreaterThan(s.path[i - 1]!.t - 1e-9);
     }
+  });
+
+  it('canyon: flies BETWEEN the full-height walls, then climbs the ridge', () => {
+    const s = buildCanyon();
+    expect(s.found).toBe(true);
+    // The walls are full-height: the only way past is laterally through the
+    // alternating side gaps. At the first wall the plane must be on the +z
+    // side; at the second, on the -z side — it weaves, it does not fly over.
+    const near = (lo: number, hi: number) =>
+      s.path.filter((p) => p.x >= lo && p.x <= hi);
+    const atWallA = near(38, 62);
+    const atWallB = near(86, 110);
+    expect(atWallA.length).toBeGreaterThan(0);
+    expect(atWallB.length).toBeGreaterThan(0);
+    expect(Math.max(...atWallA.map((p) => p.z))).toBeGreaterThan(4);
+    expect(Math.min(...atWallB.map((p) => p.z))).toBeLessThan(-4);
+    // The final ridge (top y=34) spans the full width — altitude is searched.
+    expect(Math.max(...s.path.map((p) => p.y))).toBeGreaterThan(36);
+    for (let i = 1; i < s.path.length; i++) {
+      expect(s.path[i]!.t).toBeGreaterThan(s.path[i - 1]!.t - 1e-9);
+    }
+  });
+
+  it('restricted airspace: routes clear of the moving no-fly zone', () => {
+    const s = buildRestrictedAirspace();
+    expect(s.found).toBe(true);
+    const zones =
+      s.zoneAt && s.zoneRadius != null
+        ? [{ radius: s.zoneRadius, predict: s.zoneAt }]
+        : [];
+    const air = aircraftAirspace(s.boxes, zones);
+    for (const p of s.path) {
+      expect(air.clear(aircraftPose(p), AIRCRAFT_HALF, p.t)).toBe(true);
+    }
+  });
+
+  it('interactive: replans within budget and weaves the full-height walls', () => {
+    const r = planInteractive(
+      INTERACTIVE_BOXES,
+      { x: 8, y: 30, z: 0, heading: 0, pitch: 0, roll: 0, speed: 18, t: 0 },
+      { x: 150, y: 30, z: 0, heading: 0, pitch: 0, roll: 0, speed: 18, t: 0 },
+    );
+    expect(r.found).toBe(true);
+    expect(r.stats.expansions).toBeLessThan(AIRCRAFT_MAX_EXPANSIONS);
+    // INTERACTIVE_BOXES are full-height: the plane cannot fly over them, so
+    // it must pass the first wall on the +z side and the second on the -z
+    // side (regression guard for the "walls too short, flies over" bug).
+    const atA = r.path.filter((p) => p.x >= 50 && p.x <= 66);
+    const atB = r.path.filter((p) => p.x >= 98 && p.x <= 114);
+    expect(atA.length).toBeGreaterThan(0);
+    expect(atB.length).toBeGreaterThan(0);
+    expect(Math.max(...atA.map((p) => p.z))).toBeGreaterThan(6);
+    expect(Math.min(...atB.map((p) => p.z))).toBeLessThan(-6);
+  });
+
+  it('densified rendering path stays collision-clear (canyon)', () => {
+    // Renders interpolate over densifyPath, not the coarse planner output —
+    // assert the dense arc itself is collision-free, so the visual plane
+    // can't appear to clip walls between primitive endpoints.
+    const s = buildCanyon();
+    const dense = densifyPath(s.path, 12);
+    expect(dense.length).toBeGreaterThan(s.path.length * 5);
+    const air = aircraftAirspace(s.boxes);
+    for (const p of dense) {
+      expect(air.clear(aircraftPose(p), AIRCRAFT_HALF, p.t)).toBe(true);
+    }
+  });
+
+  it('densified rendering path clears walls AND the moving zone (gauntlet)', () => {
+    const s = buildGauntlet();
+    const dense = densifyPath(s.path, 12);
+    const zones =
+      s.zoneAt && s.zoneRadius != null
+        ? [{ radius: s.zoneRadius, predict: s.zoneAt }]
+        : [];
+    const air = aircraftAirspace(s.boxes, zones);
+    for (const p of dense) {
+      expect(air.clear(aircraftPose(p), AIRCRAFT_HALF, p.t)).toBe(true);
+    }
+  });
+
+  it('knife-edge: banks ~90° to fit a slot narrower than the wingspan', () => {
+    const s = buildKnifeEdge();
+    expect(s.found).toBe(true);
+    // Sample the dense rendering path inside the slot (the coarse planner
+    // path stores only primitive endpoints, which may straddle the slot).
+    const dense = densifyPath(s.path, 12);
+    const inSlot = dense.filter((p) => p.x >= 78 && p.x <= 92);
+    expect(inSlot.length).toBeGreaterThan(0);
+    const maxBank = Math.max(...inSlot.map((p) => Math.abs(p.roll)));
+    expect(maxBank).toBeGreaterThan(Math.PI / 2 - 0.2); // ≥ ~78°
+    // Whole planned path stays collision-clear under OBB collision (incl.
+    // the slot crossing, where wings-level would intersect the walls).
+    const air = aircraftAirspace(s.boxes);
+    for (const p of dense) {
+      expect(air.clear(aircraftPose(p), AIRCRAFT_HALF, p.t)).toBe(true);
+    }
+    for (let i = 1; i < s.path.length; i++) {
+      expect(s.path[i]!.t).toBeGreaterThan(s.path[i - 1]!.t - 1e-9);
+    }
+  });
+
+  it('gauntlet: weaves both walls, beats the moving zone, climbs the ridge', () => {
+    const s = buildGauntlet();
+    expect(s.found).toBe(true);
+    const near = (lo: number, hi: number) =>
+      s.path.filter((p) => p.x >= lo && p.x <= hi);
+    const atA = near(34, 53);
+    const atB = near(89, 108);
+    expect(atA.length).toBeGreaterThan(0);
+    expect(atB.length).toBeGreaterThan(0);
+    expect(Math.max(...atA.map((p) => p.z))).toBeGreaterThan(4); // weave +z
+    expect(Math.min(...atB.map((p) => p.z))).toBeLessThan(-4); // weave -z
+    expect(Math.max(...s.path.map((p) => p.y))).toBeGreaterThan(36); // ridge
+    // Every planned state clears all obstacles AND the moving zone at its t.
+    const zones =
+      s.zoneAt && s.zoneRadius != null
+        ? [{ radius: s.zoneRadius, predict: s.zoneAt }]
+        : [];
+    const air = aircraftAirspace(s.boxes, zones);
+    for (const p of s.path) {
+      expect(air.clear(aircraftPose(p), AIRCRAFT_HALF, p.t)).toBe(true);
+    }
+    for (let i = 1; i < s.path.length; i++) {
+      expect(s.path[i]!.t).toBeGreaterThan(s.path[i - 1]!.t - 1e-9);
+    }
+  });
+});
+
+// Built lazily in beforeAll (not at collect time) so test collection stays
+// fast. navcat mesh generation runs in CI (ubuntu/node 22) exactly as it does
+// locally, so a failure here is a real regression — it fails loudly rather
+// than skipping, otherwise CI could be green with this demo unverified.
+describe('jumplinks demo: Mononen-style off-mesh annotation', () => {
+  let jumpLinks: JumpLinksResult;
+  beforeAll(() => {
+    jumpLinks = buildJumpLinks();
   }, 60000);
 
-  it('the humanoid crosses the gap only once the link is registered', (ctx) => {
-    if (jumpLinks === null) {
-      ctx.skip();
-      return;
-    }
+  it('the humanoid crosses the gap only once the link is registered', () => {
     const j = jumpLinks;
     expect(j.linkMeta.length).toBe(1);
     expect(typeof j.linkMeta[0]!.connectionId).toBe('number');
@@ -439,5 +591,48 @@ describe('catmouse demo: predict + intercept', () => {
     const tailMin = Math.min(...distanceTrace.slice(-5));
     // The chase should make meaningful progress in 14 ticks.
     expect(tailMin).toBeLessThan(initialMax);
+  });
+});
+
+// Coverage manifest: every demo route under demos/app/<slug>/page.tsx MUST
+// have a headless scenario asserted above. This fails CI if a new demo ships
+// without a test (or if a tested demo is deleted), so "all demos are covered"
+// is enforced, not just claimed.
+const TESTED_DEMOS = new Set([
+  'anytime', // 'anytime demo' — buildAnytime
+  'catmouse', // 'catmouse demo' — buildCatAndMouseScenario (predict + intercept)
+  'curves', // 'curves demo' — compareCurves
+  'dynamic', // 'dynamic demo scenarios' — buildDynamic (moving/coop/jump)
+  'flagship', // 'flagship demo' — buildFlagship (large multi-agent navcat)
+  'humanoid', // 'humanoid demo' — buildHumanoid
+  'jumplinks', // 'jumplinks demo' — buildJumpLinks
+  'navmesh', // 'navmesh demo' — buildNavmesh / planNavmesh
+  'plane', // 'aircraft demo' — waypoint/canyon/restricted/gauntlet/knife-edge
+  'playground', // 'playground demo' — planPlayground
+  'primitives', // 'primitives demo' — buildPrimitiveFan
+  'reverse', // 'reverse demo' — planReverse
+  'swarm', // 'swarm demo' — buildSwarm
+  'world3d', // 'world3d demo' — planWorld3d
+]);
+
+describe('demo coverage manifest', () => {
+  const appDir = fileURLToPath(new URL('../app', import.meta.url));
+  const routes = readdirSync(appDir, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && existsSync(`${appDir}/${e.name}/page.tsx`))
+    .map((e) => e.name)
+    .sort();
+
+  it('discovers at least every demo we know about', () => {
+    expect(routes.length).toBeGreaterThanOrEqual(TESTED_DEMOS.size);
+  });
+
+  it('every demo route has a headless test (no untested demo ships)', () => {
+    const untested = routes.filter((r) => !TESTED_DEMOS.has(r));
+    expect(untested, `demo route(s) without a headless test: ${untested.join(', ')}`).toEqual([]);
+  });
+
+  it('no stale entries: every tested demo still exists as a route', () => {
+    const missing = [...TESTED_DEMOS].filter((d) => !routes.includes(d));
+    expect(missing, `tested demo(s) with no route: ${missing.join(', ')}`).toEqual([]);
   });
 });
