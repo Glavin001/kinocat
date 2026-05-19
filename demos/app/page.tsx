@@ -13,9 +13,9 @@ const groups: { heading: string; demos: Demo[] }[] = [
     demos: [
       {
         href: '/flagship',
-        title: 'Real-time multi-agent flagship',
-        desc: 'Large procedural navcat terrain, NPC vehicles on a staggered round-robin, a genuine boost shortcut and a misdirect the planner rejects on its own. Toggle the CompactHeightfield clearance & moving-obstacle broadphase and watch the solve time.',
-        tag: '3D · multi-agent',
+        title: 'Interactive multi-agent flagship',
+        desc: 'Opposing cross-traffic on a large procedural navcat terrain. Click a vehicle to select it, retarget its goal or drop hazards and watch every NPC replan live. A genuine boost & canyon jump the planner adopts, a misdirect it rejects on its own. Toggleable clearance & moving-obstacle broadphase.',
+        tag: '3D · interactive · multi-agent',
       },
     ],
   },

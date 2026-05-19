@@ -1072,6 +1072,12 @@ export function flagshipTerrain(): {
   return { positions, indices, bounds: { x0: 0, z0: 0, x1: FLAGSHIP_W, z1: FLAGSHIP_D } };
 }
 
+export interface FlagshipHazard {
+  x: number;
+  z: number;
+  r: number;
+}
+
 export interface FlagshipInput {
   agents?: number;
   rounds?: number;
@@ -1086,6 +1092,17 @@ export interface FlagshipInput {
    */
   gridHeuristic?: boolean;
   timeBroadphase?: boolean;
+  /**
+   * Richer interactive scenario: opposing cross-traffic start/goal pairs plus
+   * two extra affordances (a second boost + a canyon jump). Off by default so
+   * the headless scenario test exercises the exact stable lane config.
+   */
+  crossTraffic?: boolean;
+  /** Per-agent goal replacement (click-to-retarget in the UI). */
+  goalOverrides?: Record<string, { x: number; z: number }>;
+  /** Stationary circular danger zones the planner must route around (a
+   *  click-placed obstacle in the UI). */
+  hazards?: FlagshipHazard[];
 }
 
 export interface FlagshipAgent {
@@ -1096,14 +1113,37 @@ export interface FlagshipAgent {
   found: boolean;
   usedShortcut: boolean;
   usedMisdirect: boolean;
+  usedJump: boolean;
+}
+
+export interface FlagshipAffordanceView {
+  id: string;
+  launch: { x: number; z: number };
+  land: { x: number; z: number };
+}
+
+export interface FlagshipWorld {
+  bounds: { x0: number; z0: number; x1: number; z1: number };
+  positions: number[];
+  indices: number[];
+  world: ReturnType<typeof navWorldFromTriangleMesh>['world'];
+  affordances: AffordanceRegistry;
+  shortcuts: FlagshipAffordanceView[];
+  misdirects: FlagshipAffordanceView[];
+  jumps: FlagshipAffordanceView[];
+  boostIds: Set<string>;
+  decoyIds: Set<string>;
+  jumpIds: Set<string>;
 }
 
 export interface FlagshipResult {
   bounds: { x0: number; z0: number; x1: number; z1: number };
   positions: number[];
   indices: number[];
-  shortcuts: { id: string; launch: { x: number; z: number }; land: { x: number; z: number } }[];
-  misdirects: { id: string; launch: { x: number; z: number }; land: { x: number; z: number } }[];
+  shortcuts: FlagshipAffordanceView[];
+  misdirects: FlagshipAffordanceView[];
+  jumps: FlagshipAffordanceView[];
+  hazards: FlagshipHazard[];
   agents: FlagshipAgent[];
   registry: PlanRegistry;
   affordances: AffordanceRegistry;
@@ -1114,12 +1154,17 @@ export interface FlagshipResult {
 
 const FLAGSHIP_ROUND_DT = 2.5;
 
-export function buildFlagship(inp: FlagshipInput = {}): FlagshipResult {
-  const n = Math.max(8, Math.min(12, inp.agents ?? 8));
-  const rounds = inp.rounds ?? 6;
-  const cb = inp.clearanceBroadphase ?? true;
-  const gh = inp.gridHeuristic ?? false; // see FlagshipInput.gridHeuristic
-  const tb = inp.timeBroadphase ?? true;
+/**
+ * Build the (expensive) flagship navmesh + affordance registry ONCE. The
+ * terrain/affordances never change across interactive re-solves — only the
+ * agents' goals and the dynamic hazards do — so the UI builds this a single
+ * time and calls solveFlagship() per interaction (no navmesh regen).
+ *
+ * `rich` adds the cross-traffic-only extra affordances; the default
+ * (rich=false) is byte-identical to the original stable lane scenario so the
+ * headless scenario test is unaffected.
+ */
+export function buildFlagshipWorld(rich = false): FlagshipWorld {
   const { positions, indices, bounds } = flagshipTerrain();
   const { world } = navWorldFromTriangleMesh(
     positions,
@@ -1128,9 +1173,15 @@ export function buildFlagship(inp: FlagshipInput = {}): FlagshipResult {
     { clearanceField: true, horizontalTolerance: 0.6 },
   );
 
-  const reg = new PlanRegistry();
   const aff = new AffordanceRegistry();
-  const shortcut = createBoostAffordance({
+  const shortcuts: FlagshipAffordanceView[] = [];
+  const misdirects: FlagshipAffordanceView[] = [];
+  const jumps: FlagshipAffordanceView[] = [];
+  const boostIds = new Set<string>();
+  const decoyIds = new Set<string>();
+  const jumpIds = new Set<string>();
+
+  const boost = createBoostAffordance({
     id: 'boost-canyon',
     pad: { x: 28, z: 24 },
     entryRadius: 5,
@@ -1138,6 +1189,10 @@ export function buildFlagship(inp: FlagshipInput = {}): FlagshipResult {
     duration: 1,
     cost: 1.2, // genuine: far cheaper than the long bottom detour
   });
+  aff.add(boost);
+  boostIds.add(boost.id);
+  shortcuts.push({ id: boost.id, launch: { x: 28, z: 24 }, land: { x: 40, z: 24 } });
+
   const decoy = createMisdirectAffordance({
     id: 'decoy-pocket',
     launch: { x: 28, z: 16 }, // also near the wall — tempting
@@ -1146,24 +1201,127 @@ export function buildFlagship(inp: FlagshipInput = {}): FlagshipResult {
     duration: 1,
     cost: 60, // honest & high ⇒ planner rejects it on its own
   });
-  aff.add(shortcut);
   aff.add(decoy);
+  decoyIds.add(decoy.id);
+  misdirects.push({ id: decoy.id, launch: { x: 28, z: 16 }, land: { x: 20, z: 30 } });
 
-  const agents: FlagshipAgent[] = [];
+  if (rich) {
+    const boost2 = createBoostAffordance({
+      id: 'boost-return',
+      pad: { x: 36, z: 6 },
+      entryRadius: 5,
+      exit: { x: 20, z: 6, heading: Math.PI, speed: 0, t: 0 },
+      duration: 1,
+      cost: 1.2, // genuine shortcut for the right→left cross-traffic
+    });
+    aff.add(boost2);
+    boostIds.add(boost2.id);
+    shortcuts.push({ id: boost2.id, launch: { x: 36, z: 6 }, land: { x: 20, z: 6 } });
+
+    const jump = createJumpAffordance({
+      id: 'jump-wall',
+      launch: { x: 33, z: 8 },
+      entryRadius: 4,
+      land: { x: 33, z: 22, heading: Math.PI / 2, speed: 0, t: 0 },
+      apexY: 3,
+      duration: 1.1,
+      cost: 4, // genuine: hops the canyon wall instead of the long way
+    });
+    aff.add(jump);
+    jumpIds.add(jump.id);
+    jumps.push({ id: jump.id, launch: { x: 33, z: 8 }, land: { x: 33, z: 22 } });
+  }
+
+  return {
+    bounds,
+    positions,
+    indices,
+    world,
+    affordances: aff,
+    shortcuts,
+    misdirects,
+    jumps,
+    boostIds,
+    decoyIds,
+    jumpIds,
+  };
+}
+
+/** Default start/goal pairs. `crossTraffic` spreads opposing diagonal
+ *  traffic (rich interactive scene); otherwise the stable left→right lanes
+ *  the headless test pins. Deterministic — no RNG, no clock. */
+function flagshipAgentPairs(
+  n: number,
+  crossTraffic: boolean,
+): { id: string; start: VehicleState; goal: VehicleState }[] {
+  const span = FLAGSHIP_D - 12;
+  const pairs: { id: string; start: VehicleState; goal: VehicleState }[] = [];
   for (let i = 0; i < n; i++) {
-    const z = 6 + (i / (n - 1)) * (FLAGSHIP_D - 12);
-    const start: VehicleState = { x: 4, z, heading: 0, speed: 0, t: 0 };
-    const goal: VehicleState = { x: FLAGSHIP_W - 4, z, heading: 0, speed: 0, t: 0 };
-    agents.push({
+    const z = 6 + (i / (n - 1)) * span;
+    if (!crossTraffic) {
+      pairs.push({
+        id: `V${i}`,
+        start: { x: 4, z, heading: 0, speed: 0, t: 0 },
+        goal: { x: FLAGSHIP_W - 4, z, heading: 0, speed: 0, t: 0 },
+      });
+      continue;
+    }
+    const zMirror = 6 + ((n - 1 - i) / (n - 1)) * span;
+    const eastbound = i % 2 === 0;
+    pairs.push({
       id: `V${i}`,
-      start,
-      goal,
-      path: [start],
-      found: false,
-      usedShortcut: false,
-      usedMisdirect: false,
+      start: eastbound
+        ? { x: 4, z, heading: 0, speed: 0, t: 0 }
+        : { x: FLAGSHIP_W - 4, z, heading: Math.PI, speed: 0, t: 0 },
+      goal: eastbound
+        ? { x: FLAGSHIP_W - 4, z: zMirror, heading: 0, speed: 0, t: 0 }
+        : { x: 4, z: zMirror, heading: Math.PI, speed: 0, t: 0 },
     });
   }
+  return pairs;
+}
+
+/**
+ * Run the staggered round-robin multi-agent solve over a prebuilt world.
+ * Fast (no navmesh regen) so the UI can call it on every interaction.
+ */
+export function solveFlagship(
+  fw: FlagshipWorld,
+  inp: FlagshipInput = {},
+): FlagshipResult {
+  const n = Math.max(8, Math.min(12, inp.agents ?? 8));
+  const rounds = inp.rounds ?? 6;
+  const cb = inp.clearanceBroadphase ?? true;
+  const gh = inp.gridHeuristic ?? false; // see FlagshipInput.gridHeuristic
+  const tb = inp.timeBroadphase ?? true;
+  const crossTraffic = inp.crossTraffic ?? false;
+  const overrides = inp.goalOverrides ?? {};
+  const hazards = inp.hazards ?? [];
+  const { world } = fw;
+
+  const reg = new PlanRegistry();
+  const hazardObstacles = hazards.map((h) =>
+    linearObstacle(h.x, h.z, 0, 0, h.r, 0, 1e6),
+  );
+
+  const agents: FlagshipAgent[] = flagshipAgentPairs(n, crossTraffic).map(
+    (p) => {
+      const ov = overrides[p.id];
+      const goal: VehicleState = ov
+        ? { x: ov.x, z: ov.z, heading: 0, speed: 0, t: 0 }
+        : p.goal;
+      return {
+        id: p.id,
+        start: p.start,
+        goal,
+        path: [p.start],
+        found: false,
+        usedShortcut: false,
+        usedMisdirect: false,
+        usedJump: false,
+      };
+    },
+  );
 
   const mkEnv = (selfId: string) =>
     new TimeAwareEnvironment(
@@ -1184,11 +1342,14 @@ export function buildFlagship(inp: FlagshipInput = {}): FlagshipResult {
         gridHeuristic: gh ? {} : false,
       }),
       {
-        obstacles: agents
-          .filter((o) => o.id !== selfId)
-          .map((o) => asObstacle(reg.predictNPC(o.id), 1.8)),
+        obstacles: [
+          ...agents
+            .filter((o) => o.id !== selfId)
+            .map((o) => asObstacle(reg.predictNPC(o.id), 1.8)),
+          ...hazardObstacles,
+        ],
         agentRadius: 1.4,
-        affordances: aff,
+        affordances: fw.affordances,
         affordanceRadius: 14,
         broadphase: tb ? {} : false,
       },
@@ -1216,8 +1377,9 @@ export function buildFlagship(inp: FlagshipInput = {}): FlagshipResult {
       for (const node of res.nodes) {
         if (node.edge?.kind !== 'affordance') continue;
         const id = (node.edge.data as { affordanceId?: string }).affordanceId;
-        if (id === shortcut.id) ag.usedShortcut = true;
-        if (id === decoy.id) ag.usedMisdirect = true;
+        if (id && fw.boostIds.has(id)) ag.usedShortcut = true;
+        if (id && fw.decoyIds.has(id)) ag.usedMisdirect = true;
+        if (id && fw.jumpIds.has(id)) ag.usedJump = true;
       }
       const next = planPoseAt(res.path, (cur[i]!.t ?? 0) + FLAGSHIP_ROUND_DT);
       if (next) cur[i] = next;
@@ -1239,16 +1401,24 @@ export function buildFlagship(inp: FlagshipInput = {}): FlagshipResult {
   );
 
   return {
-    bounds,
-    positions,
-    indices,
-    shortcuts: [{ id: shortcut.id, launch: { x: 28, z: 24 }, land: { x: 40, z: 24 } }],
-    misdirects: [{ id: decoy.id, launch: { x: 28, z: 16 }, land: { x: 20, z: 30 } }],
+    bounds: fw.bounds,
+    positions: fw.positions,
+    indices: fw.indices,
+    shortcuts: fw.shortcuts,
+    misdirects: fw.misdirects,
+    jumps: fw.jumps,
+    hazards,
     agents,
     registry: reg,
-    affordances: aff,
+    affordances: fw.affordances,
     rounds,
     reached,
     duration,
   };
+}
+
+/** Headless one-shot: build the world (rich iff crossTraffic) then solve.
+ *  The scenario test calls this with the default (stable) config. */
+export function buildFlagship(inp: FlagshipInput = {}): FlagshipResult {
+  return solveFlagship(buildFlagshipWorld(inp.crossTraffic ?? false), inp);
 }
