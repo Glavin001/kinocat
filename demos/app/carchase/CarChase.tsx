@@ -71,7 +71,7 @@ interface Banner {
 const NUM_COPS = 3;
 const CAPTURE_DISTANCE = 4.5;
 const PHYSICS_DT = 1 / 60;
-const REPLAN_INTERVAL_MS = 140;
+const REPLAN_INTERVAL_MS = 80;
 const CAPTURE_COOLDOWN_MS = 2000;
 
 const COP_COLORS = [0xff5566, 0xffaa44, 0xff66dd];
@@ -632,21 +632,24 @@ export default function CarChase() {
       }
       const now = performance.now();
 
-      // Step physics @ 60Hz with fixed dt for stability.
-      world.timestep = PHYSICS_DT;
-      world.step();
-      // Per-vehicle update (suspension + drive forces).
+      // Read pre-step states so AI plan-tracking and player input both see
+      // the post-previous-step poses (the chassis state we'll render).
       const robberState = robber.car.readState(now);
       const copStates = cops.map((co) => co.car.readState(now));
 
-      // ---- drive each car ----
+      // ---- drive each car (set wheel forces BEFORE world.step) ----
       if (playerDrivingRef.current) {
-        // Player drives robber with WASD.
-        const accel = (keys.has('w') ? 1 : 0) - (keys.has('s') ? 1 : 0);
-        const steer = (keys.has('a') ? 1 : 0) - (keys.has('d') ? 1 : 0);
+        // Player drives robber with WASD. ArrowKeys mirror WASD so the demo
+        // works regardless of layout. Space = handbrake.
+        const accel =
+          (keys.has('w') || keys.has('arrowup') ? 1 : 0) -
+          (keys.has('s') || keys.has('arrowdown') ? 1 : 0);
+        const steerIn =
+          (keys.has('a') || keys.has('arrowleft') ? 1 : 0) -
+          (keys.has('d') || keys.has('arrowright') ? 1 : 0);
         const brake = keys.has(' ') ? 1 : 0;
         robber.car.applyControls({
-          steer: steer * 0.4,
+          steer: steerIn * 0.55,
           throttle: accel,
           brake,
         });
@@ -659,11 +662,11 @@ export default function CarChase() {
           const cmd = planToControls(robberState, live);
           robber.car.applyControls(cmd);
         } else {
-          robber.car.applyControls({ steer: 0, throttle: 0.1, brake: 0 });
+          robber.car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
         }
       } else {
-        // No plan yet → idle gently.
-        robber.car.applyControls({ steer: 0, throttle: 0.05, brake: 0 });
+        // No plan yet → idle gently forward.
+        robber.car.applyControls({ steer: 0, throttle: 0.15, brake: 0 });
       }
       for (let i = 0; i < cops.length; i++) {
         const co = cops[i]!;
@@ -680,18 +683,29 @@ export default function CarChase() {
             continue;
           }
         }
-        co.car.applyControls({ steer: 0, throttle: 0.08, brake: 0 });
+        co.car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
       }
-      // Run Rapier's vehicle solver for every controller this frame.
+
+      // Canonical Rapier raycast-vehicle order: updateVehicle BEFORE
+      // world.step so the wheel forces are integrated this tick (not the
+      // next one). Calling it after results in a 1-frame lag at best, and
+      // with the chassis at rest, the engine force is overwritten by the
+      // step's gravity before it ever produces motion.
+      world.timestep = PHYSICS_DT;
       robber.car.vehicle.updateVehicle(PHYSICS_DT);
       for (const co of cops) co.car.vehicle.updateVehicle(PHYSICS_DT);
+      world.step();
+
+      // Re-read post-step states for rendering + capture detection.
+      const robberStateAfter = robber.car.readState(now);
+      const copStatesAfter = cops.map((co) => co.car.readState(now));
 
       // ---- capture detection ----
       for (let i = 0; i < cops.length; i++) {
         const co = cops[i]!;
         if (co.capturedAtWall + CAPTURE_COOLDOWN_MS > now) continue;
-        const dx = robberState.x - copStates[i]!.x;
-        const dz = robberState.z - copStates[i]!.z;
+        const dx = robberStateAfter.x - copStatesAfter[i]!.x;
+        const dz = robberStateAfter.z - copStatesAfter[i]!.z;
         const d = Math.hypot(dx, dz);
         if (d < CAPTURE_DISTANCE) {
           co.capturedAtWall = now;
@@ -712,9 +726,9 @@ export default function CarChase() {
       }
 
       // ---- visual sync ----
-      syncCarMesh(robberMesh.group, robberState);
+      syncCarMesh(robberMesh.group, robberStateAfter);
       for (let i = 0; i < cops.length; i++) {
-        syncCarMesh(copMeshes[i]!.group, copStates[i]!);
+        syncCarMesh(copMeshes[i]!.group, copStatesAfter[i]!);
         // Blink the lightbar in pursuit.
         const bar = copMeshes[i]!.lightbar;
         if (bar) {
@@ -739,23 +753,23 @@ export default function CarChase() {
 
       // Chase camera tracks the robber from behind.
       if (chaseRef.current) {
-        const c = Math.cos(robberState.heading);
-        const s = Math.sin(robberState.heading);
+        const c = Math.cos(robberStateAfter.heading);
+        const s = Math.sin(robberStateAfter.heading);
         const cam = new THREE.Vector3(
-          robberState.x - 14 * c,
+          robberStateAfter.x - 14 * c,
           7,
-          robberState.z - 14 * s,
+          robberStateAfter.z - 14 * s,
         );
         camera.position.lerp(cam, 0.12);
-        orbit.target.set(robberState.x, 1.5, robberState.z);
+        orbit.target.set(robberStateAfter.x, 1.5, robberStateAfter.z);
         orbit.update();
       }
 
       // HUD throttle (~10 Hz to avoid React thrash).
       if (now - lastHudWall > 100) {
         lastHudWall = now;
-        const v = Math.abs(robberState.speed).toFixed(1);
-        const hdg = ((robberState.heading * 180) / Math.PI).toFixed(0);
+        const v = Math.abs(robberStateAfter.speed).toFixed(1);
+        const hdg = ((robberStateAfter.heading * 180) / Math.PI).toFixed(0);
         setHud(
           `${playerDrivingRef.current ? 'YOU (T to release)' : 'AI ROBBER'} · v=${v} m/s · hdg=${hdg}°`,
         );

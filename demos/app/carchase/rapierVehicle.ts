@@ -113,6 +113,10 @@ const WHEEL_RADIUS = 0.4;
 const WHEEL_SUSPENSION_REST = 0.6;
 const WHEEL_BASE = 1.6; // distance from chassis centre forward/back
 const WHEEL_TRACK = 0.85; // distance from chassis centre left/right
+// Engine + brake force tuned for the ~10 kg Rapier chassis so it actually
+// accelerates from rest under AI throttle ≈ 0.2 (low) up to 1.0 (full).
+const ENGINE_FORCE = 600;
+const BRAKE_FORCE = 80;
 
 export interface SpawnCarOptions {
   position: { x: number; y?: number; z: number };
@@ -197,18 +201,18 @@ export function spawnCar(
   }
 
   function applyControls(c: { steer: number; throttle: number; brake: number }) {
-    const steer = clamp(c.steer, -0.5, 0.5);
+    const steer = clamp(c.steer, -0.6, 0.6);
     const throttle = clamp(c.throttle, -1, 1);
     const brake = clamp(c.brake, 0, 1);
     // Front-wheel steering.
     vehicle.setWheelSteering(0, steer);
     vehicle.setWheelSteering(1, steer);
-    // RWD: engine force on the rear wheels.
-    const engineForce = throttle * 1800;
-    vehicle.setWheelEngineForce(2, engineForce);
-    vehicle.setWheelEngineForce(3, engineForce);
+    // AWD: engine force on every wheel so the chassis (~10 kg in Rapier
+    // units) actually accelerates from rest. Reverse uses the same wheels.
+    const engineForce = throttle * ENGINE_FORCE;
+    for (let i = 0; i < 4; i++) vehicle.setWheelEngineForce(i, engineForce);
     // Brake on all wheels.
-    const brakeForce = brake * 60;
+    const brakeForce = brake * BRAKE_FORCE;
     for (let i = 0; i < 4; i++) vehicle.setWheelBrake(i, brakeForce);
   }
 
