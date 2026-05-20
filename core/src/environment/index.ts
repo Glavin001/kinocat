@@ -17,5 +17,10 @@ export type {
   AABB,
   MovingZone,
 } from './airspace-world';
+export { HeightfieldAirspace } from './heightfield-airspace';
+export type {
+  HeightfieldAirspaceOptions,
+  HeightfieldSampler,
+} from './heightfield-airspace';
 export { TimeAwareEnvironment } from './time-aware';
 export type { TimeAwareOptions } from './time-aware';

@@ -39,6 +39,12 @@ import {
   AIRCRAFT_AGENT,
   AIRCRAFT_MAX_EXPANSIONS,
 } from '../app/lib/aircraft-scenarios';
+import {
+  buildDogfightSnapshot,
+  DOGFIGHT_HALF,
+  DOGFIGHT_TEST_MAX_EXPANSIONS,
+  dogfightAirspace,
+} from '../app/lib/dogfight-scenarios';
 import type { VehicleState } from 'kinocat/agent';
 
 // These assert the *exact* configuration the demos ship with always finds a
@@ -594,6 +600,47 @@ describe('catmouse demo: predict + intercept', () => {
   });
 });
 
+// Dogfight: HeightfieldAirspace + AircraftEnvironment + TimeAwareEnvironment
+// + PlanRegistry, all wired up. The snapshot asserts that the AIs deterministic-
+// ally produce a plan against the spawn matchup the demo loads with — a
+// "no plan" regression here will fail CI before it reaches the demo route.
+describe('dogfight demo: interactive 3D pursuit', () => {
+  it('both AIs find a plan against the spawn matchup', () => {
+    const s = buildDogfightSnapshot();
+    expect(s.ais.length).toBe(2);
+    for (const a of s.ais) {
+      expect(a.result.found).toBe(true);
+      expect(a.result.path.length).toBeGreaterThanOrEqual(2);
+      expect(a.result.stats.expansions).toBeLessThan(
+        DOGFIGHT_TEST_MAX_EXPANSIONS,
+      );
+      for (let i = 1; i < a.result.path.length; i++) {
+        expect(a.result.path[i]!.t).toBeGreaterThan(
+          a.result.path[i - 1]!.t - 1e-9,
+        );
+      }
+    }
+  });
+
+  it('every planned aircraft state clears the heightfield + obstacles', () => {
+    const s = buildDogfightSnapshot();
+    const air = dogfightAirspace();
+    for (const a of s.ais) {
+      for (const p of a.result.path) {
+        const pose = {
+          x: p.x,
+          y: p.y,
+          z: p.z,
+          yaw: p.heading,
+          pitch: p.pitch,
+          roll: p.roll,
+        };
+        expect(air.clear(pose, DOGFIGHT_HALF, p.t)).toBe(true);
+      }
+    }
+  });
+});
+
 // Coverage manifest: every demo route under demos/app/<slug>/page.tsx MUST
 // have a headless scenario asserted above. This fails CI if a new demo ships
 // without a test (or if a tested demo is deleted), so "all demos are covered"
@@ -602,6 +649,7 @@ const TESTED_DEMOS = new Set([
   'anytime', // 'anytime demo' — buildAnytime
   'catmouse', // 'catmouse demo' — buildCatAndMouseScenario (predict + intercept)
   'curves', // 'curves demo' — compareCurves
+  'dogfight', // 'dogfight demo' — buildDogfightSnapshot (heightfield + multi-AI)
   'dynamic', // 'dynamic demo scenarios' — buildDynamic (moving/coop/jump)
   'flagship', // 'flagship demo' — buildFlagship (large multi-agent navcat)
   'humanoid', // 'humanoid demo' — buildHumanoid
