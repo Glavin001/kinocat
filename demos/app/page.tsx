@@ -12,6 +12,12 @@ const groups: { heading: string; demos: Demo[] }[] = [
     heading: 'Flagship',
     demos: [
       {
+        href: '/carchase',
+        title: 'Car-chase — Rapier raycast vehicles + multi-AI pursuit',
+        desc: 'A cops-and-robbers stunt arena driven by Rapier.js DynamicRayCastVehicleControllers: three police cars pursue an AI evader through a downtown grid, an alley shortcut, a ramped jump gap, drift slalom, and boost pads. Each cop replans against the robber\'s published plan (PlanRegistry) and reads its siblings to fan out instead of stacking; the robber takes affordances (BoostPad / BallisticJump) opportunistically. Press T to take over the robber yourself — the cops re-target the human-driven chassis with no code change. Real Rapier raycast suspension + kinocat IGHA* on Reeds-Shepp curves.',
+        tag: '3D · interactive · rapier · multi-agent',
+      },
+      {
         href: '/dogfight',
         title: 'Dogfight — interactive 3D pursuit',
         desc: 'Pilot a fixed-wing aircraft with the keyboard while three kinocat-driven opponents pursue, intercept, and flank you through a continuous heightfield terrain, tall pylons, a sweeping barrier between twin peaks, and a drifting blimp. Each AI replans against the live predicted player trajectory; sibling AIs read each other from a shared plan registry. Demonstrates the new HeightfieldAirspace (real ground-elevation collision), time-aware multi-agent planning, anytime replanning, and a GOAP-style tactical layer above kinocat.',
