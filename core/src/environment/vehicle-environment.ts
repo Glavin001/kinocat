@@ -8,6 +8,7 @@ import { placeFootprint } from '../internal/geom';
 import { angleDiff, dist, wrapAngle } from '../internal/math';
 import { reedsSheppShortestPath } from '../curves/reeds-shepp';
 import { sampleCurve } from '../curves/sample';
+import { NULL_RECORDER, type PerfRecorder } from '../planner/perf';
 
 export interface VehicleEnvOptions {
   posCell?: number;
@@ -105,6 +106,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   private ghGoalX = NaN;
   private ghGoalZ = NaN;
   private ghLB: ((x: number, z: number, y?: number) => number | null) | null = null;
+  private rec: PerfRecorder = NULL_RECORDER;
 
   constructor(
     private readonly world: NavWorld,
@@ -150,6 +152,10 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     this.levels = this.divisors.length;
   }
 
+  attachRecorder(rec: PerfRecorder): void {
+    this.rec = rec;
+  }
+
   private headingBucket(h: number): number {
     const step = (2 * Math.PI) / this.headingBuckets;
     return Math.round(wrapAngle(h) / step) % this.headingBuckets;
@@ -192,10 +198,18 @@ export class VehicleEnvironment implements Environment<VehicleState> {
       }
       if (!cleared) {
         const fp = placeFootprint(this.agent.footprint, wx, wz, wh);
-        if (!this.world.footprintClear(fp)) return false;
+        this.rec.counters.collisionChecks++;
+        if (!this.world.footprintClear(fp)) {
+          this.rec.counters.collisionRejects++;
+          return false;
+        }
       }
       if (this.sweepSegmentCheck && i > 0) {
-        if (!this.world.segmentClear(px, pz, wx, wz)) return false;
+        this.rec.counters.collisionChecks++;
+        if (!this.world.segmentClear(px, pz, wx, wz)) {
+          this.rec.counters.collisionRejects++;
+          return false;
+        }
       }
       px = wx;
       pz = wz;
@@ -277,9 +291,17 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     let pz = a.z;
     for (const p of poses) {
       const fp = placeFootprint(this.agent.footprint, p.x, p.y, p.theta);
-      if (!this.world.footprintClear(fp)) return null;
+      this.rec.counters.collisionChecks++;
+      if (!this.world.footprintClear(fp)) {
+        this.rec.counters.collisionRejects++;
+        return null;
+      }
       if (this.sweepSegmentCheck && (p.x !== px || p.y !== pz)) {
-        if (!this.world.segmentClear(px, pz, p.x, p.y)) return null;
+        this.rec.counters.collisionChecks++;
+        if (!this.world.segmentClear(px, pz, p.x, p.y)) {
+          this.rec.counters.collisionRejects++;
+          return null;
+        }
       }
       samples.push([p.x, p.y]);
       px = p.x;
@@ -319,6 +341,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   }
 
   heuristic(from: VehicleState, to: VehicleState): number {
+    this.rec.counters.heuristicCalls++;
     const euclid = dist(from.x, from.z, to.x, to.z);
     let tRS: number;
     if (this.htEnabled) {
@@ -371,9 +394,12 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   }
 
   private poseClear(s: VehicleState): boolean {
-    return this.world.footprintClear(
+    this.rec.counters.collisionChecks++;
+    const ok = this.world.footprintClear(
       placeFootprint(this.agent.footprint, s.x, s.z, s.heading),
     );
+    if (!ok) this.rec.counters.collisionRejects++;
+    return ok;
   }
 
   checkValidity(start: VehicleState, goal: VehicleState): [boolean, boolean] {

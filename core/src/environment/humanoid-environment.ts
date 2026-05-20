@@ -5,6 +5,7 @@ import { makeNode } from '../planner/node';
 import { pack3 } from '../planner/resolution';
 import { dist, wrapAngle } from '../internal/math';
 import type { Pt } from '../internal/geom';
+import { NULL_RECORDER, type PerfRecorder } from '../planner/perf';
 
 export interface HumanoidEnvOptions {
   posCell?: number;
@@ -44,6 +45,7 @@ export class HumanoidEnvironment implements Environment<HumanoidState> {
   private readonly goalRadius: number;
   private readonly footprintSegments: number;
   private readonly stepDist: number;
+  private rec: PerfRecorder = NULL_RECORDER;
 
   constructor(
     private readonly world: NavWorld,
@@ -61,15 +63,22 @@ export class HumanoidEnvironment implements Environment<HumanoidState> {
     this.levels = this.divisors.length;
   }
 
+  attachRecorder(rec: PerfRecorder): void {
+    this.rec = rec;
+  }
+
   private headingBucket(h: number): number {
     const step = (2 * Math.PI) / this.headingBuckets;
     return Math.round(wrapAngle(h) / step) % this.headingBuckets;
   }
 
   private clear(x: number, z: number): boolean {
-    return this.world.footprintClear(
+    this.rec.counters.collisionChecks++;
+    const ok = this.world.footprintClear(
       circlePoly(x, z, this.agent.radius, this.footprintSegments),
     );
+    if (!ok) this.rec.counters.collisionRejects++;
+    return ok;
   }
 
   createNode(
@@ -97,7 +106,11 @@ export class HumanoidEnvironment implements Environment<HumanoidState> {
       const nx = st.x + this.stepDist * Math.cos(dir);
       const nz = st.z + this.stepDist * Math.sin(dir);
       if (!this.clear(nx, nz)) continue;
-      if (!this.world.segmentClear(st.x, st.z, nx, nz)) continue;
+      this.rec.counters.collisionChecks++;
+      if (!this.world.segmentClear(st.x, st.z, nx, nz)) {
+        this.rec.counters.collisionRejects++;
+        continue;
+      }
       const next: HumanoidState = {
         x: nx,
         z: nz,
@@ -140,6 +153,7 @@ export class HumanoidEnvironment implements Environment<HumanoidState> {
   }
 
   heuristic(from: HumanoidState, to: HumanoidState): number {
+    this.rec.counters.heuristicCalls++;
     return dist(from.x, from.z, to.x, to.z) / this.agent.maxSpeed;
   }
 

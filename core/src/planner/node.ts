@@ -20,6 +20,7 @@ export function makeNode<State>(
     hash,
     level: 0,
     active: false,
+    seq: 0,
   };
 }
 

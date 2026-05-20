@@ -1,5 +1,7 @@
 // The planner's only coupling to a domain. IGHA* operates purely on these.
 
+import type { PerfRecorder } from '../planner/perf';
+
 /** An edge taken to reach a node (motion primitive, curve, affordance, …).
  *  `cost` is the additive g-cost of traversing it. JSON-serializable. */
 export interface EdgeRef {
@@ -10,7 +12,8 @@ export interface EdgeRef {
 
 /** A search vertex. `index` holds one packed cell key per resolution level,
  *  ordered coarse (0) → fine (levels-1). `hash` uniquely keys the exact state
- *  class (used for optimal dedup). `level`/`active` are planner-managed. */
+ *  class (used for optimal dedup). `level`/`active`/`seq` are planner-managed
+ *  — environments should treat them as opaque. */
 export interface Node<State> {
   state: State;
   g: number;
@@ -22,6 +25,9 @@ export interface Node<State> {
   hash: string;
   level: number;
   active: boolean;
+  /** Insertion sequence, set by the planner when the node enters the open
+   *  list; used as the priority-queue tiebreaker (FIFO within equal-f). */
+  seq: number;
 }
 
 /** The five-method domain interface, plus a `levels` count for the
@@ -38,8 +44,13 @@ export interface Environment<State> {
     edge: EdgeRef | null,
   ): Node<State>;
 
-  /** Valid successors of `node` toward `goal`, each with g/h/f set. */
-  succ(node: Node<State>, goal: Node<State>): Node<State>[];
+  /** Valid successors of `node` toward `goal`, each with g/h/f set.
+   *  Optional `level` argument: 0 = coarsest pass, `levels - 1` = finest.
+   *  Envs may use it to widen the primitive set on finer passes (coarse
+   *  passes plan a low-branching skeleton; finest pass refines). Envs
+   *  that ignore the parameter behave identically across passes — the
+   *  trailing `?` keeps existing implementations type-compatible. */
+  succ(node: Node<State>, goal: Node<State>, level?: number): Node<State>[];
 
   /** Admissible (ideally consistent) cost-to-go estimate. */
   heuristic(from: State, to: State): number;
@@ -49,4 +60,11 @@ export interface Environment<State> {
 
   /** Goal predicate. */
   reachedGoalRegion(node: Node<State>, goal: Node<State>): boolean;
+
+  /** Optional: install a performance recorder so the env can increment
+   *  per-search counters (collisions, predicts, …) at zero cost when the
+   *  recorder is the shared `NULL_RECORDER`. Implementations that do not
+   *  contribute counters can omit this method. Composing wrappers (e.g.
+   *  TimeAwareEnvironment) must forward to their base environment. */
+  attachRecorder?(rec: PerfRecorder): void;
 }
