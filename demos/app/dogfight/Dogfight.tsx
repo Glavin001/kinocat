@@ -9,6 +9,7 @@ import { PlanRegistry } from 'kinocat/predict';
 import {
   DOGFIGHT_AGENT,
   DOGFIGHT_BOUNDS,
+  DOGFIGHT_HALF,
   DOGFIGHT_PALETTE as C,
   dogfightAirspace,
   dogfightTerrain,
@@ -34,15 +35,42 @@ interface AI {
   lastReplanWall: number;
   lastExpansions: number;
   lastBudgetMs: number;
+  /** Wall time at which a crashed AI may rejoin combat (-Infinity = active). */
+  respawnAtWall: number;
 }
 
-interface BoostState {
-  endT: number;
-  ringId: string | null;
+interface Score {
+  aiWins: number;
+  crashes: number;
+  round: number;
+}
+
+interface Banner {
+  text: string;
+  color: string;
+  untilWall: number;
 }
 
 const NUM_AIS = 3;
-const PLAYER_INPUT_RATE = 1 / 60;
+const CAPTURE_RADIUS = 7;
+const RESPAWN_INVINCIBLE_MS = 1500;
+const AI_RESPAWN_DELAY_MS = 2200;
+
+/** Player spawn points used after a crash / capture — picked far from AIs. */
+const PLAYER_SPAWNS: Array<Omit<AircraftState, 'speed' | 't'>> = [
+  { x: 20, y: 38, z: 0, heading: 0, pitch: 0, roll: 0 },
+  { x: 20, y: 55, z: -50, heading: 0.2, pitch: 0, roll: 0 },
+  { x: 30, y: 60, z: 50, heading: -0.2, pitch: 0, roll: 0 },
+  { x: 10, y: 42, z: -25, heading: 0, pitch: 0, roll: 0 },
+];
+
+/** AI spawn points used after an AI crash. */
+const AI_SPAWNS: Array<Omit<AircraftState, 'speed' | 't'>> = [
+  { x: 225, y: 50, z: -45, heading: Math.PI, pitch: 0, roll: 0 },
+  { x: 225, y: 55, z: 45, heading: Math.PI, pitch: 0, roll: 0 },
+  { x: 220, y: 65, z: 0, heading: Math.PI, pitch: 0, roll: 0 },
+  { x: 215, y: 45, z: -25, heading: Math.PI + 0.15, pitch: 0, roll: 0 },
+];
 
 export default function Dogfight() {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -56,6 +84,8 @@ export default function Dogfight() {
   const [showZones, setShowZones] = useState(true);
   const [hud, setHud] = useState('');
   const [aiStatus, setAiStatus] = useState<string[]>([]);
+  const [score, setScore] = useState<Score>({ aiWins: 0, crashes: 0, round: 1 });
+  const [banner, setBanner] = useState<Banner | null>(null);
 
   const pausedRef = useRef(paused);
   const chaseRef = useRef(chase);
@@ -72,17 +102,17 @@ export default function Dogfight() {
     const mount = mountRef.current;
     if (!mount) return;
 
-    const W = mount.clientWidth;
-    const viewH = () =>
-      Math.round(Math.min(620, Math.max(360, window.innerHeight * 0.7)));
-    let Hpx = viewH();
+    const vpW = () => window.innerWidth;
+    const vpH = () => window.innerHeight;
+    let W = vpW();
+    let H = vpH();
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(C.bg);
-    scene.fog = new THREE.Fog(C.fog, 220, 480);
-    const camera = new THREE.PerspectiveCamera(62, W / Hpx, 0.1, 1000);
+    scene.fog = new THREE.Fog(C.fog, 220, 540);
+    const camera = new THREE.PerspectiveCamera(64, W / H, 0.1, 1200);
     const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setSize(W, Hpx);
+    renderer.setSize(W, H);
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     mount.appendChild(renderer.domElement);
 
@@ -101,11 +131,9 @@ export default function Dogfight() {
     const td = DOGFIGHT_BOUNDS.z1 - DOGFIGHT_BOUNDS.z0 + 40;
     const tgeo = new THREE.PlaneGeometry(tw, td, 192, 128);
     tgeo.rotateX(-Math.PI / 2);
-    // World-space offset so plane spans the playable bounds.
     const tcx = (DOGFIGHT_BOUNDS.x0 + DOGFIGHT_BOUNDS.x1) / 2;
     const tcz = (DOGFIGHT_BOUNDS.z0 + DOGFIGHT_BOUNDS.z1) / 2;
     tgeo.translate(tcx, 0, tcz);
-    // Displace + colour each vertex by its terrain sample.
     {
       const pos = tgeo.attributes['position'] as THREE.BufferAttribute;
       const cols = new Float32Array(pos.count * 3);
@@ -191,7 +219,6 @@ export default function Dogfight() {
         }),
       );
       m.position.set(r.x, r.y, r.z);
-      // Torus's hole axis is local +Z; orient it so the hole points along r.axis.
       const dir = new THREE.Vector3(r.axis.x, r.axis.y, r.axis.z).normalize();
       const q = new THREE.Quaternion().setFromUnitVectors(
         new THREE.Vector3(0, 0, 1),
@@ -202,7 +229,7 @@ export default function Dogfight() {
       ringMeshes.push(m);
     }
 
-    // ---- player aircraft mesh ----------------------------------------------
+    // ---- aircraft prefabs --------------------------------------------------
     const buildPlane = (color: number) => {
       const group = new THREE.Group();
       const mat = new THREE.MeshStandardMaterial({ color });
@@ -214,10 +241,7 @@ export default function Dogfight() {
       const nose = new THREE.Mesh(new THREE.ConeGeometry(0.28, 1.0, 12), mat);
       nose.rotation.x = Math.PI / 2;
       nose.position.z = 1.8;
-      const wing = new THREE.Mesh(
-        new THREE.BoxGeometry(3.6, 0.12, 0.9),
-        mat,
-      );
+      const wing = new THREE.Mesh(new THREE.BoxGeometry(3.6, 0.12, 0.9), mat);
       const tail = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.1, 0.5), mat);
       tail.position.z = -1.15;
       const fin = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.65, 0.5), mat);
@@ -227,6 +251,27 @@ export default function Dogfight() {
     };
     const playerMesh = buildPlane(parseInt(C.player.slice(1), 16));
     scene.add(playerMesh);
+    const playerMaterials = (playerMesh.children as THREE.Mesh[]).map(
+      (m) => m.material as THREE.MeshStandardMaterial,
+    );
+
+    // Explosion marker reused for both player and AI crashes.
+    const burst = new THREE.Mesh(
+      new THREE.SphereGeometry(2.5, 16, 12),
+      new THREE.MeshStandardMaterial({
+        color: 0xff8844,
+        emissive: 0xff5522,
+        emissiveIntensity: 1.2,
+        transparent: true,
+        opacity: 0,
+      }),
+    );
+    scene.add(burst);
+    let burstUntilWall = -Infinity;
+    const triggerBurst = (x: number, y: number, z: number) => {
+      burst.position.set(x, y, z);
+      burstUntilWall = performance.now() + 700;
+    };
 
     // ---- AIs ---------------------------------------------------------------
     const aiMeshes: THREE.Group[] = [];
@@ -267,16 +312,12 @@ export default function Dogfight() {
       scene.add(cone);
       aiCones.push(cone);
       aiPathLines.push(null);
+      const spawn = AI_SPAWNS[i % AI_SPAWNS.length]!;
       ais.push({
         id: `AI${i}`,
         color,
         state: {
-          x: 200 + (i - 1) * 10,
-          y: 40 + i * 6,
-          z: -30 + i * 30,
-          heading: Math.PI,
-          pitch: 0,
-          roll: 0,
+          ...spawn,
           speed: DOGFIGHT_AGENT.maxSpeed,
           t: 0,
         },
@@ -288,26 +329,111 @@ export default function Dogfight() {
         lastReplanWall: -Infinity,
         lastExpansions: 0,
         lastBudgetMs: 0,
+        respawnAtWall: -Infinity,
       });
     }
 
-    // ---- shared registry so AIs predict each other ------------------------
     const registry = new PlanRegistry();
     const airspace = dogfightAirspace();
     const sim = aircraftForwardSim(DOGFIGHT_AGENT);
 
     // ---- player state ------------------------------------------------------
-    let player: AircraftState = {
-      x: 30,
-      y: 35,
-      z: 0,
-      heading: 0,
-      pitch: 0,
-      roll: 0,
-      speed: DOGFIGHT_AGENT.maxSpeed * 0.9,
-      t: 0,
-    };
-    let playerBoost: BoostState = { endT: -1, ringId: null };
+    let player: AircraftState = makePlayerSpawn(0, []);
+    let playerInvincibleUntilWall = performance.now() + RESPAWN_INVINCIBLE_MS;
+    let playerCrashedUntilWall = -Infinity;
+    let playerBoostUntilT = -1;
+    let lastBoostRing: string | null = null;
+    const scoreRef = { aiWins: 0, crashes: 0, round: 1 };
+
+    /** Pick the player spawn farthest from any active AI. */
+    function makePlayerSpawn(
+      round: number,
+      activeAis: AI[],
+    ): AircraftState {
+      let best = PLAYER_SPAWNS[0]!;
+      let bestD = -Infinity;
+      for (const s of PLAYER_SPAWNS) {
+        let minDtoAi = Infinity;
+        for (const a of activeAis) {
+          const d = Math.hypot(s.x - a.state.x, s.z - a.state.z);
+          if (d < minDtoAi) minDtoAi = d;
+        }
+        if (minDtoAi > bestD) {
+          bestD = minDtoAi;
+          best = s;
+        }
+      }
+      // Round bumps the start altitude slightly so successive respawns stagger.
+      const yOff = (round % 3) * 4;
+      return {
+        x: best.x,
+        y: best.y + yOff,
+        z: best.z,
+        heading: best.heading,
+        pitch: 0,
+        roll: 0,
+        speed: DOGFIGHT_AGENT.maxSpeed * 0.9,
+        t: 0,
+      };
+    }
+
+    function respawnPlayer(reason: 'crash' | 'caught', byAi: string | null) {
+      triggerBurst(player.x, player.y, player.z);
+      const wall = performance.now();
+      if (reason === 'crash') {
+        scoreRef.crashes += 1;
+        flashBanner('CRASHED — you flew into the terrain', '#ff7777', 1800);
+      } else {
+        scoreRef.aiWins += 1;
+        scoreRef.round += 1;
+        flashBanner(
+          `${byAi ?? 'An AI'} got you! Round ${scoreRef.round}`,
+          '#ffaa44',
+          1800,
+        );
+      }
+      setScore({ ...scoreRef });
+      player = makePlayerSpawn(scoreRef.round, ais);
+      playerInvincibleUntilWall = wall + RESPAWN_INVINCIBLE_MS;
+      playerCrashedUntilWall = -Infinity;
+      playerBoostUntilT = -1;
+      lastBoostRing = null;
+      // Kick the AIs into immediate replanning toward the new spawn — clearing
+      // their plans triggers a no-plan replan on the next loop tick.
+      for (const a of ais) {
+        a.plan = null;
+        registry.remove(a.id);
+      }
+    }
+
+    let bannerToken = 0;
+    function flashBanner(text: string, color: string, ms: number) {
+      const wall = performance.now();
+      const token = ++bannerToken;
+      setBanner({ text, color, untilWall: wall + ms });
+      window.setTimeout(() => {
+        // Only clear if no newer banner has appeared in the meantime.
+        if (token === bannerToken) setBanner(null);
+      }, ms);
+    }
+
+    function crashAi(ai: AI) {
+      triggerBurst(ai.state.x, ai.state.y, ai.state.z);
+      ai.plan = null;
+      registry.remove(ai.id);
+      ai.respawnAtWall = performance.now() + AI_RESPAWN_DELAY_MS;
+    }
+
+    function respawnAi(ai: AI, idx: number) {
+      const spawn = AI_SPAWNS[idx % AI_SPAWNS.length]!;
+      ai.state = {
+        ...spawn,
+        speed: DOGFIGHT_AGENT.maxSpeed,
+        t: ai.state.t, // continue absolute game time so registry stays valid
+      };
+      ai.respawnAtWall = -Infinity;
+      ai.plan = null;
+    }
 
     // ---- input -------------------------------------------------------------
     const keys = new Set<string>();
@@ -324,9 +450,16 @@ export default function Dogfight() {
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
 
-    // ---- planning loop: round-robin one AI per tick (~150ms) --------------
+    // ---- planning loop -----------------------------------------------------
     let aiCursor = 0;
     const replanOne = () => {
+      // Skip crashed AIs in the rotation.
+      let tries = 0;
+      while (tries < ais.length && ais[aiCursor]!.respawnAtWall !== -Infinity) {
+        aiCursor = (aiCursor + 1) % ais.length;
+        tries += 1;
+      }
+      if (tries >= ais.length) return; // all AIs respawning
       const ai = ais[aiCursor]!;
       aiCursor = (aiCursor + 1) % ais.length;
       const mode = selectTacticalMode(player, ai.state, aiCursor);
@@ -339,7 +472,9 @@ export default function Dogfight() {
         goal,
         player,
         registry,
-        otherNpcs: ais.filter((o) => o.id !== ai.id).map((o) => o.id),
+        otherNpcs: ais
+          .filter((o) => o.id !== ai.id && o.respawnAtWall === -Infinity)
+          .map((o) => o.id),
         deadlineMs: 100,
         maxExpansions: 50000,
       });
@@ -350,14 +485,13 @@ export default function Dogfight() {
       ai.lastExpansions = res.stats.expansions;
       ai.lastReplanWall = performance.now();
       if (res.found && res.path.length > 1) {
-        // Re-base plan times so playback starts at 0.
         const t0p = res.path[0]!.t;
         ai.plan = res.path.map((p) => ({ ...p, t: p.t - t0p }));
         ai.planStartT = 0;
         ai.planStartWall = performance.now();
         registry.publish(
           ai.id,
-          ai.plan.map((p) => ({ ...p, t: p.t + (performance.now() / 1000) })),
+          ai.plan.map((p) => ({ ...p, t: p.t + performance.now() / 1000 })),
         );
       }
     };
@@ -365,26 +499,27 @@ export default function Dogfight() {
       if (!pausedRef.current) replanOne();
     }, 160);
 
-    // ---- HUD status reporter (lower-frequency setState) -------------------
+    // ---- HUD reporter ------------------------------------------------------
     const hudTimer = window.setInterval(() => {
-      const speed = player.speed;
-      const alt = player.y;
-      const boost = playerBoost.endT > player.t ? ' · BOOST' : '';
+      const boost = playerBoostUntilT > player.t ? ' · BOOST' : '';
+      const invinc =
+        performance.now() < playerInvincibleUntilWall ? ' · INVINCIBLE' : '';
       setHud(
-        `airspeed ${speed.toFixed(1)}  alt ${alt.toFixed(0)}  heading ${(
-          (player.heading * 180) / Math.PI
-        ).toFixed(0)}°  bank ${((player.roll * 180) / Math.PI).toFixed(0)}°${boost}`,
+        `airspeed ${player.speed.toFixed(1)}  alt ${player.y.toFixed(0)}  ` +
+          `heading ${((player.heading * 180) / Math.PI).toFixed(0)}°  ` +
+          `bank ${((player.roll * 180) / Math.PI).toFixed(0)}°${boost}${invinc}`,
       );
       setAiStatus(
         ais.map(
           (a) =>
-            `${a.id}: ${a.mode} · ${a.plan ? `path ${a.plan.length}` : 'no-plan'} · ` +
+            `${a.id}: ${
+              a.respawnAtWall !== -Infinity ? 'RESPAWNING' : a.mode
+            } · ${a.plan ? `path ${a.plan.length}` : 'no-plan'} · ` +
             `${a.lastExpansions} exp · ${a.lastBudgetMs.toFixed(0)} ms`,
         ),
       );
     }, 250);
 
-    // ---- per-AI path-line refresh (when plan changes) ---------------------
     const refreshLine = (i: number) => {
       const ai = ais[i]!;
       if (aiPathLines[i]) {
@@ -411,6 +546,18 @@ export default function Dogfight() {
     const chaseOffset = new THREE.Vector3(-26, 8, 0);
     let last = performance.now();
     let frame = 0;
+
+    function poseOf(s: AircraftState) {
+      return {
+        x: s.x,
+        y: s.y,
+        z: s.z,
+        yaw: s.heading,
+        pitch: s.pitch,
+        roll: s.roll,
+      };
+    }
+
     const animate = () => {
       frame = requestAnimationFrame(animate);
       const now = performance.now();
@@ -418,8 +565,9 @@ export default function Dogfight() {
       last = now;
       if (pausedRef.current) dt = 0;
 
-      // -- update player from input --
-      if (dt > 0) {
+      // -- player input + integration --
+      const playerAlive = now >= playerCrashedUntilWall;
+      if (dt > 0 && playerAlive) {
         const pitch = keys.has('w') ? -0.6 : keys.has('s') ? 0.6 : 0;
         const roll = keys.has('a') ? -0.9 : keys.has('d') ? 0.9 : 0;
         const yawInput = keys.has('q') ? 1 : keys.has('e') ? -1 : 0;
@@ -428,8 +576,6 @@ export default function Dogfight() {
           : keys.has('control')
             ? -1
             : 0;
-        // Roll commands a curvature scaled by sin(roll) — banked turns feel
-        // natural without needing live yaw input.
         const targetRoll = roll * DOGFIGHT_AGENT.maxBank;
         const targetPitch = pitch * DOGFIGHT_AGENT.maxClimbAngle;
         const curvature =
@@ -440,16 +586,15 @@ export default function Dogfight() {
           DOGFIGHT_AGENT.minSpeed,
           Math.min(DOGFIGHT_AGENT.maxSpeed, targetSpeed),
         );
-        const boost = playerBoost.endT > player.t ? 1.3 : 1;
+        const boost = playerBoostUntilT > player.t ? 1.3 : 1;
         const stepSpeed = targetSpeed * boost;
-        // Use the kinematic forward sim — same model the planner uses, so
-        // the AIs' predictions of the player stay calibrated.
         player = sim(
           player,
           [curvature, targetPitch, targetRoll, stepSpeed],
           dt,
         );
-        // Soft horizontal bounds (snap inside the playable region).
+        // Soft horizontal bounds — keep the playable area finite without
+        // crashing (going to the edge is a navigation choice, not a fail).
         player.x = Math.max(
           DOGFIGHT_BOUNDS.x0 + 4,
           Math.min(DOGFIGHT_BOUNDS.x1 - 4, player.x),
@@ -458,70 +603,113 @@ export default function Dogfight() {
           DOGFIGHT_BOUNDS.z0 + 4,
           Math.min(DOGFIGHT_BOUNDS.z1 - 4, player.z),
         );
-        // Ground / ceiling clamp; bounce up off terrain.
-        const groundY = dogfightTerrain(player.x, player.z);
-        if (player.y < groundY + 4) {
-          player.y = groundY + 4;
-          if (player.pitch < 0) player.pitch = 0;
-        }
         player.y = Math.min(player.y, DOGFIGHT_BOUNDS.ceiling - 4);
 
-        // Ring detection
+        // -- crash detection: solid airspace check (terrain + obstacles + zones).
+        // No auto ground-clamp — fly too low and you crash.
+        if (now > playerInvincibleUntilWall) {
+          if (!airspace.clear(poseOf(player), DOGFIGHT_HALF, player.t)) {
+            playerCrashedUntilWall = now + 1100;
+            // Defer the actual respawn so the burst is visible at the impact.
+            window.setTimeout(() => respawnPlayer('crash', null), 1100);
+          }
+        }
+
+        // -- ring detection (visual / sim-only speed boost) --
         for (const r of rings) {
           const dx = player.x - r.x;
           const dy = player.y - r.y;
           const dz = player.z - r.z;
           if (dx * dx + dy * dy + dz * dz < (r.radius + 1) * (r.radius + 1)) {
-            if (playerBoost.ringId !== r.id) {
-              playerBoost = { endT: player.t + 2.5, ringId: r.id };
+            if (lastBoostRing !== r.id) {
+              playerBoostUntilT = player.t + 2.5;
+              lastBoostRing = r.id;
             }
           }
         }
-        if (playerBoost.endT < player.t) playerBoost.ringId = null;
+        if (playerBoostUntilT < player.t) lastBoostRing = null;
       }
 
-      // -- advance AIs along their plans --
+      // -- advance AIs along their plans + crash check + capture check --
       const wall = performance.now();
       for (let i = 0; i < ais.length; i++) {
         const ai = ais[i]!;
-        const plan = ai.plan;
-        if (!plan || plan.length < 2) {
-          // Drift forward at level cruise until a plan arrives.
-          if (dt > 0) {
-            ai.state = sim(
-              ai.state,
-              [0, 0, 0, DOGFIGHT_AGENT.maxSpeed * 0.9],
-              dt,
-            );
-          }
-          continue;
+        // Respawn an AI whose cooldown elapsed.
+        if (ai.respawnAtWall !== -Infinity && wall >= ai.respawnAtWall) {
+          respawnAi(ai, i);
         }
-        // Playback time = wall-clock since plan committed.
-        const tp = (wall - ai.planStartWall) / 1000;
-        const sampled = samplePathAt(plan, tp);
-        ai.state = {
-          x: sampled.x,
-          y: sampled.y,
-          z: sampled.z,
-          heading: sampled.heading,
-          pitch: sampled.pitch,
-          roll: sampled.roll,
-          speed: sampled.speed,
-          t: ai.state.t + dt,
-        };
+        const respawning = ai.respawnAtWall !== -Infinity;
+
+        if (!respawning) {
+          const plan = ai.plan;
+          if (!plan || plan.length < 2) {
+            if (dt > 0) {
+              ai.state = sim(
+                ai.state,
+                [0, 0, 0, DOGFIGHT_AGENT.maxSpeed * 0.9],
+                dt,
+              );
+            }
+          } else {
+            const tp = (wall - ai.planStartWall) / 1000;
+            const sampled = samplePathAt(plan, tp);
+            ai.state = {
+              x: sampled.x,
+              y: sampled.y,
+              z: sampled.z,
+              heading: sampled.heading,
+              pitch: sampled.pitch,
+              roll: sampled.roll,
+              speed: sampled.speed,
+              t: ai.state.t + dt,
+            };
+          }
+
+          // AI crash check — same airspace contract as the player.
+          if (
+            !airspace.clear(poseOf(ai.state), DOGFIGHT_HALF, ai.state.t)
+          ) {
+            crashAi(ai);
+            continue;
+          }
+
+          // Capture check (skipped while player is invincible/crashed).
+          if (playerAlive && wall > playerInvincibleUntilWall) {
+            const dx = player.x - ai.state.x;
+            const dy = player.y - ai.state.y;
+            const dz = player.z - ai.state.z;
+            if (
+              dx * dx + dy * dy + dz * dz <
+              CAPTURE_RADIUS * CAPTURE_RADIUS
+            ) {
+              playerCrashedUntilWall = wall + 1100;
+              window.setTimeout(() => respawnPlayer('caught', ai.id), 1100);
+              break;
+            }
+          }
+        }
       }
 
       // -- update visuals --
-      orientPlane(playerMesh, player, fwd);
+      const alive = now < playerCrashedUntilWall ? false : true;
+      playerMesh.visible = alive;
+      if (alive) orientPlane(playerMesh, player, fwd);
+      // Subtle invincibility shimmer — pulse emissive.
+      const invinc = now < playerInvincibleUntilWall && alive;
+      const pulse = invinc ? 0.4 + 0.4 * Math.sin(now / 80) : 0;
+      for (const m of playerMaterials)
+        m.emissiveIntensity = pulse;
+
       for (let i = 0; i < ais.length; i++) {
         const ai = ais[i]!;
-        orientPlane(aiMeshes[i]!, ai.state, fwd);
+        const respawning = ai.respawnAtWall !== -Infinity;
+        aiMeshes[i]!.visible = !respawning;
+        if (!respawning) orientPlane(aiMeshes[i]!, ai.state, fwd);
         const gm = aiGoalMarks[i]!;
-        gm.visible = !!ai.goal;
+        gm.visible = !!ai.goal && !respawning;
         if (ai.goal) gm.position.set(ai.goal.x, ai.goal.y, ai.goal.z);
-        // Vision cone — origin at AI nose, pointing along its heading.
         const cone = aiCones[i]!;
-        cone.visible = showConesRef.current;
+        cone.visible = showConesRef.current && !respawning;
         if (cone.visible) {
           const cp = Math.cos(ai.state.pitch);
           cone.position.set(
@@ -532,19 +720,26 @@ export default function Dogfight() {
           cone.lookAt(ai.state.x, ai.state.y, ai.state.z);
           cone.rotateX(Math.PI / 2);
         }
-        // Refresh path line if its target reference changed.
         const line = aiPathLines[i];
         const hasPlan = ai.plan && ai.plan.length > 1;
         if (showPathsRef.current && hasPlan && line === null) refreshLine(i);
-        if (line) line.visible = showPathsRef.current && !!hasPlan;
+        if (line) line.visible = showPathsRef.current && !!hasPlan && !respawning;
         if (line && hasPlan) {
-          // Cheap check: refresh if the line vertex count is stale.
           const need = ai.plan!.length;
           const have =
             (line.geometry.attributes['position'] as THREE.BufferAttribute)
               .count;
           if (have !== need) refreshLine(i);
         }
+      }
+
+      // -- burst animation --
+      if (now < burstUntilWall) {
+        const u = 1 - (burstUntilWall - now) / 700;
+        burst.scale.setScalar(1 + u * 4);
+        (burst.material as THREE.MeshStandardMaterial).opacity = 1 - u;
+      } else {
+        (burst.material as THREE.MeshStandardMaterial).opacity = 0;
       }
 
       // -- moving zones --
@@ -560,18 +755,25 @@ export default function Dogfight() {
         }
       }
 
-      // -- camera (chase / orbit) --
-      if (chaseRef.current) {
+      // -- camera --
+      if (chaseRef.current && alive) {
         controls.enabled = false;
         const ch = Math.cos(player.heading);
         const sh = Math.sin(player.heading);
         const offX = chaseOffset.x * ch - chaseOffset.z * sh;
         const offZ = chaseOffset.x * sh + chaseOffset.z * ch;
         camera.position.lerp(
-          new THREE.Vector3(player.x + offX, player.y + chaseOffset.y, player.z + offZ),
+          new THREE.Vector3(
+            player.x + offX,
+            player.y + chaseOffset.y,
+            player.z + offZ,
+          ),
           0.18,
         );
         camera.lookAt(player.x, player.y, player.z);
+      } else if (chaseRef.current) {
+        // Player dead — hold last camera and look at burst point.
+        camera.lookAt(burst.position);
       } else {
         controls.enabled = true;
         controls.update();
@@ -581,13 +783,12 @@ export default function Dogfight() {
     };
     animate();
 
-    // ---- resize -----------------------------------------------------------
     const onResize = () => {
-      const w = mount.clientWidth;
-      Hpx = viewH();
-      camera.aspect = w / Hpx;
+      W = vpW();
+      H = vpH();
+      camera.aspect = W / H;
       camera.updateProjectionMatrix();
-      renderer.setSize(w, Hpx);
+      renderer.setSize(W, H);
     };
     window.addEventListener('resize', onResize);
 
@@ -603,97 +804,180 @@ export default function Dogfight() {
       if (renderer.domElement.parentNode === mount)
         mount.removeChild(renderer.domElement);
     };
-    // The scene mounts once; control toggles flow through refs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const btn = (active: boolean) => ({
-    background: active ? '#2a3550' : '#161a22',
+  const overlayBg = 'rgba(10, 14, 22, 0.72)';
+  const overlayBorder = '1px solid #2a2f3a';
+  const overlayCommon: React.CSSProperties = {
+    background: overlayBg,
+    border: overlayBorder,
+    borderRadius: 8,
+    padding: '10px 12px',
+    color: '#cdd3de',
+    fontFamily: 'ui-monospace, monospace',
+    fontSize: 12.5,
+    backdropFilter: 'blur(4px)',
+  };
+  const btn = (active: boolean): React.CSSProperties => ({
+    background: active ? '#2a3550' : '#161a22cc',
     color: '#cdd3de',
     border: '1px solid #2a2f3a',
     borderRadius: 6,
-    padding: '6px 12px',
+    padding: '5px 9px',
+    fontFamily: 'ui-monospace, monospace',
+    fontSize: 12,
     cursor: 'pointer',
   });
 
   return (
-    <main
+    <div
       style={{
-        color: '#cdd3de',
-        fontFamily: 'ui-monospace, monospace',
-        padding: 'clamp(12px, 4vw, 24px)',
-        maxWidth: 1080,
-        margin: '0 auto',
+        position: 'fixed',
+        inset: 0,
+        background: '#0a0e16',
+        overflow: 'hidden',
       }}
     >
-      <a href="/" style={{ color: '#7fd6ff' }}>
-        ← demos
-      </a>
-      <h1 style={{ fontSize: 18 }}>Dogfight — interactive 3D</h1>
-      <p style={{ opacity: 0.75, marginTop: 0 }}>
-        Pilot the cyan aircraft with the keyboard while {NUM_AIS} kinocat-driven
-        opponents pursue, intercept, and flank you through a heightfield
-        terrain, sky-high pylons, moving no-fly zones, and a sweeping barrier
-        between the twin peaks. Each AI rebuilds its plan every ~160 ms against
-        the live <em>predicted</em> player trajectory; sibling AIs read each
-        other from a shared plan registry so they don&apos;t pile up. A new{' '}
-        <code>HeightfieldAirspace</code> in core gives the planner real
-        ground-elevation collision — fly low through valleys to break line of
-        sight.
-      </p>
+      <div ref={mountRef} style={{ position: 'absolute', inset: 0 }} />
 
+      {/* Top-left: brand + back */}
+      <div style={{ position: 'absolute', top: 12, left: 12, ...overlayCommon }}>
+        <a href="/" style={{ color: '#7fd6ff', textDecoration: 'none' }}>
+          ← demos
+        </a>
+        <div style={{ marginTop: 4, fontWeight: 600 }}>
+          Dogfight — interactive 3D
+        </div>
+        <div style={{ opacity: 0.7, marginTop: 2 }}>
+          {NUM_AIS} kinocat AIs · live replanning · heightfield collision
+        </div>
+      </div>
+
+      {/* Top-right: scoreboard */}
       <div
-        style={{ display: 'flex', gap: 8, margin: '8px 0', flexWrap: 'wrap' }}
+        style={{
+          position: 'absolute',
+          top: 12,
+          right: 12,
+          ...overlayCommon,
+          minWidth: 170,
+        }}
+      >
+        <div style={{ fontSize: 11, opacity: 0.7, marginBottom: 2 }}>SCORE</div>
+        <div style={{ fontSize: 18, fontWeight: 600 }}>
+          <span style={{ color: '#ff7799' }}>AI {score.aiWins}</span>
+          {'  '}
+          <span style={{ opacity: 0.4 }}>·</span>{'  '}
+          <span style={{ color: '#7fd6ff' }}>YOU 0</span>
+        </div>
+        <div style={{ marginTop: 4, fontSize: 12, opacity: 0.75 }}>
+          round {score.round} · {score.crashes} crashes
+        </div>
+      </div>
+
+      {/* Top-centre: control bar */}
+      <div
+        style={{
+          position: 'absolute',
+          top: 12,
+          left: '50%',
+          transform: 'translateX(-50%)',
+          display: 'flex',
+          gap: 6,
+          flexWrap: 'wrap',
+          justifyContent: 'center',
+          ...overlayCommon,
+          padding: '6px 8px',
+        }}
       >
         <button onClick={() => setPaused((v) => !v)} style={btn(paused)}>
-          {paused ? 'play' : 'pause'} (p)
+          {paused ? '▶ play' : '⏸ pause'} (P)
         </button>
         <button onClick={() => setChase((v) => !v)} style={btn(chase)}>
-          camera: {chase ? 'chase' : 'orbit'} (c)
+          camera: {chase ? 'chase' : 'orbit'} (C)
         </button>
         <button onClick={() => setShowPaths((v) => !v)} style={btn(showPaths)}>
           AI plans (1)
         </button>
         <button onClick={() => setShowCones((v) => !v)} style={btn(showCones)}>
-          AI vision cones (2)
+          vision (2)
         </button>
         <button onClick={() => setShowZones((v) => !v)} style={btn(showZones)}>
-          moving zones (3)
+          zones (3)
         </button>
       </div>
 
+      {/* Bottom-left: HUD + AI status */}
       <div
-        ref={mountRef}
         style={{
-          width: '100%',
-          borderRadius: 8,
-          overflow: 'hidden',
-          outline: 'none',
-        }}
-        tabIndex={0}
-      />
-
-      <p style={{ opacity: 0.9, margin: '8px 0 2px' }}>{hud}</p>
-      <ul
-        style={{
-          listStyle: 'none',
-          padding: 0,
-          margin: '4px 0 0',
-          opacity: 0.85,
-          fontSize: 13,
+          position: 'absolute',
+          bottom: 12,
+          left: 12,
+          ...overlayCommon,
+          maxWidth: 380,
         }}
       >
-        {aiStatus.map((s, i) => (
-          <li key={i}>{s}</li>
-        ))}
-      </ul>
-      <p style={{ opacity: 0.7, marginTop: 12, fontSize: 13 }}>
-        <strong>Controls:</strong> <code>W/S</code> pitch · <code>A/D</code>{' '}
-        roll · <code>Q/E</code> yaw · <code>Shift / Ctrl</code> throttle ± ·
-        green rings give a temporary speed boost · <code>P</code> pause ·{' '}
-        <code>C</code> camera · <code>1 2 3</code> overlays.
-      </p>
-    </main>
+        <div style={{ marginBottom: 4 }}>{hud}</div>
+        <ul
+          style={{
+            listStyle: 'none',
+            padding: 0,
+            margin: '4px 0 0',
+            opacity: 0.85,
+          }}
+        >
+          {aiStatus.map((s, i) => (
+            <li key={i}>{s}</li>
+          ))}
+        </ul>
+      </div>
+
+      {/* Bottom-right: control hint */}
+      <div
+        style={{
+          position: 'absolute',
+          bottom: 12,
+          right: 12,
+          ...overlayCommon,
+          maxWidth: 320,
+          opacity: 0.85,
+        }}
+      >
+        <div style={{ fontSize: 11, opacity: 0.7, marginBottom: 4 }}>
+          CONTROLS
+        </div>
+        <code>W/S</code> pitch · <code>A/D</code> roll · <code>Q/E</code> yaw
+        <br />
+        <code>Shift / Ctrl</code> throttle ± · green rings boost
+      </div>
+
+      {/* Centre banner: flashes on crash / capture */}
+      {banner && (
+        <div
+          style={{
+            position: 'absolute',
+            top: '38%',
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
+            background: 'rgba(10, 14, 22, 0.88)',
+            border: `1px solid ${banner.color}`,
+            color: banner.color,
+            padding: '14px 22px',
+            borderRadius: 10,
+            fontFamily: 'ui-monospace, monospace',
+            fontSize: 20,
+            fontWeight: 700,
+            letterSpacing: 1,
+            textAlign: 'center',
+            pointerEvents: 'none',
+            textShadow: `0 0 12px ${banner.color}`,
+          }}
+        >
+          {banner.text}
+        </div>
+      )}
+    </div>
   );
 }
 
