@@ -48,6 +48,13 @@ export interface PlanCounters {
   predictCalls: number;
   /** Moving-obstacle broadphase cheap-rejects. */
   broadphaseSkips: number;
+  /** Per-primitive swept-AABB pre-check skipped the substep narrowphase
+   *  (entire primitive provably clear). Aircraft-env only. */
+  primitiveSweptSkips: number;
+  /** Analytic shot-to-goal attempted (aircraft-env / vehicle-env). */
+  analyticShots: number;
+  /** Analytic shot succeeded (emitted a goal-reaching successor). */
+  analyticShotsClear: number;
   /** Wall-clock ms since plan() start at each improving incumbent. */
   improvementWallMs: number[];
 }
@@ -99,6 +106,9 @@ export function makeCounters(): PlanCounters {
     collisionRejects: 0,
     predictCalls: 0,
     broadphaseSkips: 0,
+    primitiveSweptSkips: 0,
+    analyticShots: 0,
+    analyticShotsClear: 0,
     improvementWallMs: [],
   };
 }
@@ -150,8 +160,15 @@ export function formatPerf(
   );
   lines.push(
     `collision.checks=${c.collisionChecks}  collision.rejects=${c.collisionRejects}  ` +
-      `predict.calls=${c.predictCalls}  broadphase.skips=${c.broadphaseSkips}`,
+      `predict.calls=${c.predictCalls}  broadphase.skips=${c.broadphaseSkips}  ` +
+      `prim.swept.skips=${c.primitiveSweptSkips}`,
   );
+  if (c.analyticShots > 0) {
+    lines.push(
+      `analytic.shots=${c.analyticShots}  analytic.shots.clear=${c.analyticShotsClear}  ` +
+        `hit.rate=${((100 * c.analyticShotsClear) / c.analyticShots).toFixed(1)}%`,
+    );
+  }
   if (stats.expansions > 0) {
     const perExp = (x: number) => (x / stats.expansions).toFixed(2);
     lines.push(

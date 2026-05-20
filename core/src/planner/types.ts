@@ -19,6 +19,19 @@ export interface PlannerOptions {
    * (use only when every cycle matters and you've already optimized).
    */
   profile?: PerfMode;
+  /**
+   * Weighted-A* multiplier on the heuristic (Pohl 1970): `f = g + weight·h`.
+   * `weight = 1` (default) is pure admissible A* — returned plan is optimal.
+   * `weight > 1` is ε-suboptimal: returned plan cost is bounded by
+   * `weight × cost*` but expansion count drops dramatically (typically
+   * 2-10× fewer expansions for `weight = 1.5`, more for larger). Useful in
+   * anytime mode — the planner's anytime loop still improves the incumbent
+   * over time, so a heavy initial `weight` plus a generous deadline gives
+   * both a fast first plan and continued tightening. The environment's
+   * `h` is unchanged (kept admissible); only the planner's f-ordering is
+   * inflated.
+   */
+  weight?: number;
 }
 
 export interface PlanRequest<State> {

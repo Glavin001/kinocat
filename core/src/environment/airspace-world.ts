@@ -37,6 +37,28 @@ export interface MovingZone {
  *  aircraft Environment depends on nothing else. */
 export interface AirspaceWorld {
   clear(pose: Pose, half: [number, number, number], t: number): boolean;
+  /**
+   * Optional fast broadphase: is the world-axis-aligned box (min..max)
+   * provably free of all *static* obstacles AND inside the altitude band?
+   * If true, no per-substep narrowphase is needed for any OBB that fits
+   * inside this AABB. If the world has moving obstacles (whose position
+   * depends on time), implementations MUST return false (conservatively
+   * forces the per-substep narrowphase). Implementations may omit this
+   * method; callers must then fall back to repeated `clear()`.
+   *
+   * Used by `AircraftEnvironment.succ()` for the per-primitive swept-AABB
+   * pre-check: a primitive's local-frame swept envelope is rotated to
+   * world space, queried here, and if clear all substep collision checks
+   * for that primitive can be skipped.
+   */
+  clearAABB?(
+    minX: number,
+    minY: number,
+    minZ: number,
+    maxX: number,
+    maxY: number,
+    maxZ: number,
+  ): boolean;
   /** Optional: wire per-search counters (collisions, broadphase skips). */
   attachRecorder?(rec: PerfRecorder): void;
 }
@@ -167,6 +189,77 @@ export class InMemoryAirspace implements AirspaceWorld {
 
   attachRecorder(rec: PerfRecorder): void {
     this.rec = rec;
+  }
+
+  /**
+   * Fast static-only AABB clearance broadphase. Returns true iff the query
+   * box is provably inside the altitude band AND no static box overlaps it.
+   *
+   * Used by `AircraftEnvironment.succ()` to skip per-substep narrowphase
+   * when a primitive's swept envelope is entirely clear. Sound: AABB-vs-AABB
+   * overlap is a *necessary* condition for OBB-vs-AABB overlap (the OBB is
+   * contained in the query AABB by construction), so a "no overlap" answer
+   * here also rules out narrowphase collision.
+   *
+   * Conservatively returns false if any moving zones exist (zones move with
+   * time, and `clearAABB` has no time argument). Callers with moving zones
+   * fall back to the per-substep `clear()` loop.
+   */
+  clearAABB(
+    minX: number,
+    minY: number,
+    minZ: number,
+    maxX: number,
+    maxY: number,
+    maxZ: number,
+  ): boolean {
+    // Moving zones move; can't certify clearance over an unknown time span.
+    if (this.zones.length > 0) return false;
+    if (minY < this.floor || maxY > this.ceiling) return false;
+    if (this.bpEnabled) {
+      const cell = this.bpCell;
+      const c0 = Math.max(0, Math.floor((minX - this.bpMinX) / cell));
+      const c1 = Math.min(this.bpCols - 1, Math.floor((maxX - this.bpMinX) / cell));
+      const r0 = Math.max(0, Math.floor((minZ - this.bpMinZ) / cell));
+      const r1 = Math.min(this.bpRows - 1, Math.floor((maxZ - this.bpMinZ) / cell));
+      const token = ++this.bpToken;
+      if (token === 0) this.bpVisited.fill(0);
+      const visited = this.bpVisited;
+      for (let r = r0; r <= r1; r++) {
+        const rowBase = r * this.bpCols;
+        for (let c = c0; c <= c1; c++) {
+          const cellBoxes = this.bpCells[rowBase + c];
+          if (!cellBoxes) continue;
+          for (let k = 0; k < cellBoxes.length; k++) {
+            const idx = cellBoxes[k]!;
+            if (visited[idx] === token) continue;
+            visited[idx] = token;
+            const b = this.bpEntries[idx]!.box;
+            if (
+              maxX < b.min[0] || minX > b.max[0] ||
+              maxY < b.min[1] || minY > b.max[1] ||
+              maxZ < b.min[2] || minZ > b.max[2]
+            ) {
+              continue;
+            }
+            return false; // some box overlaps the query AABB
+          }
+        }
+      }
+      return true;
+    }
+    for (let i = 0; i < this.boxes.length; i++) {
+      const b = this.boxes[i]!;
+      if (
+        maxX < b.min[0] || minX > b.max[0] ||
+        maxY < b.min[1] || minY > b.max[1] ||
+        maxZ < b.min[2] || minZ > b.max[2]
+      ) {
+        continue;
+      }
+      return false;
+    }
+    return true;
   }
 
   clear(pose: Pose, half: [number, number, number], t: number): boolean {

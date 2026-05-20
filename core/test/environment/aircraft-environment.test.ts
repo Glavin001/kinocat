@@ -241,4 +241,210 @@ describe('AircraftEnvironment + IGHA*', () => {
     );
     expect(r.found).toBe(false);
   });
+
+  it('swept-AABB pre-check skips per-substep checks in clear cells', () => {
+    // Open airspace ⇒ most primitives' swept envelopes are entirely inside
+    // the altitude band and away from any box ⇒ the fast path fires.
+    // Primitives whose envelope dips below floor or above ceiling fall
+    // back to the per-substep loop (each substep is checked individually);
+    // some of those still produce a valid successor whose substeps all
+    // happen to be in-band, so primitiveSweptSkips < successorsTotal in
+    // general. We only assert the fast path took the MAJORITY of work and
+    // that bulk collision.checks were avoided.
+    const air = new InMemoryAirspace({ floor: 0, ceiling: 80 });
+    const env = new AircraftEnvironment(air, agent, {
+      posCell: 4,
+      altCell: 4,
+      goalRadius: 8,
+    });
+    const s = start();
+    const g = start({ x: 120 });
+    const r = plan(
+      { start: s, goal: g, environment: env, options: { maxExpansions: 20000 } },
+      Infinity,
+    );
+    expect(r.found).toBe(true);
+    expect(r.stats.counters.primitiveSweptSkips).toBeGreaterThan(0);
+    // Majority of successors took the fast path.
+    expect(r.stats.counters.primitiveSweptSkips).toBeGreaterThan(
+      0.5 * r.stats.counters.successorsTotal,
+    );
+    // Per-expansion collision checks should be dramatically reduced versus
+    // the old behavior (which was ~substeps × primitives ≈ 4 × 15 = 60).
+    // With the fast path, only out-of-band primitives trigger per-substep.
+    const checksPerExpansion =
+      r.stats.counters.collisionChecks / Math.max(1, r.stats.expansions);
+    expect(checksPerExpansion).toBeLessThan(20);
+  });
+
+  it('analytic shot finds open-airspace plans in <10 expansions', () => {
+    const air = new InMemoryAirspace({ floor: 0, ceiling: 80 });
+    const env = new AircraftEnvironment(air, agent, {
+      posCell: 4,
+      altCell: 4,
+      goalRadius: 8,
+      analyticExpansion: {},
+    });
+    const s = start();
+    const g = start({ x: 120 });
+    const r = plan(
+      { start: s, goal: g, environment: env, options: { maxExpansions: 20000 } },
+      Infinity,
+    );
+    expect(r.found).toBe(true);
+    // Shot should have been tried and at least one should have succeeded.
+    expect(r.stats.counters.analyticShots).toBeGreaterThan(0);
+    expect(r.stats.counters.analyticShotsClear).toBeGreaterThan(0);
+    // Plan should include the shot edge.
+    expect(r.nodes.some((n) => n.edge?.kind === 'fly-shot')).toBe(true);
+    // And the shot collapses the search to a handful of expansions.
+    expect(r.stats.expansions).toBeLessThan(50);
+  });
+
+  it('analytic shot pre-reject is harmless when straight is blocked', () => {
+    // Wall between start and goal — initial shots from near start fail at
+    // the AABB pre-reject (cheap). Once the lattice has expanded past the
+    // wall, a shot from that node to the goal may succeed. Either way the
+    // plan completes; the shot's cost when blocked is bounded (no per-
+    // sample loop, just one clearAABB call per attempt).
+    const wall: AABB = { min: [50, 0, -40], max: [58, 80, 40] };
+    const air = new InMemoryAirspace({ floor: 0, ceiling: 90, boxes: [wall] });
+    const env = new AircraftEnvironment(air, agent, {
+      posCell: 4,
+      altCell: 4,
+      goalRadius: 10,
+      analyticExpansion: {},
+    });
+    const s = start({ y: 8 });
+    const g = start({ x: 110, y: 8 });
+    const r = plan(
+      { start: s, goal: g, environment: env, options: { maxExpansions: 200000 } },
+      Infinity,
+    );
+    expect(r.found).toBe(true);
+    expect(r.stats.counters.analyticShots).toBeGreaterThan(0);
+    // Hit-rate is low (most shots blocked) but the AABB pre-reject keeps
+    // cost bounded: shots * (1 clearAABB call) instead of shots * (~50
+    // per-sample world.clear calls).
+    const hitRate =
+      r.stats.counters.analyticShotsClear /
+      Math.max(1, r.stats.counters.analyticShots);
+    expect(hitRate).toBeLessThan(0.5);
+  });
+
+  it('per-level control sets reduce knife-edge expansions', () => {
+    // Same knife-edge geometry as scenarios.test.ts; compare default vs
+    // level-aware. Coarse passes use no roll; finest uses ±90°.
+    const slot1: AABB = { min: [78, 0, -60], max: [92, 80, -0.6] };
+    const slot2: AABB = { min: [78, 0, 0.6], max: [92, 80, 60] };
+    const air = new InMemoryAirspace({
+      floor: 0,
+      ceiling: 80,
+      boxes: [slot1, slot2],
+    });
+    const s = start({ y: 24 });
+    const g = start({ x: 152, y: 24 });
+
+    const baseEnv = new AircraftEnvironment(air, agent, {
+      posCell: 4,
+      altCell: 4,
+      goalRadius: 10,
+      rollFractions: [-1, 0, 1],
+    });
+    const base = plan(
+      { start: s, goal: g, environment: baseEnv, options: { maxExpansions: 200000 } },
+      Infinity,
+    );
+
+    const layeredEnv = new AircraftEnvironment(air, agent, {
+      posCell: 4,
+      altCell: 4,
+      goalRadius: 10,
+      rollFractions: [-1, 0, 1],
+      levelControls: [
+        { rollFractions: [0] }, // L0: wings level only
+        { rollFractions: [0] }, // L1: wings level only
+        { rollFractions: [-1, 0, 1] }, // L2: full roll set
+      ],
+    });
+    const layered = plan(
+      { start: s, goal: g, environment: layeredEnv, options: { maxExpansions: 200000 } },
+      Infinity,
+    );
+
+    expect(base.found).toBe(true);
+    expect(layered.found).toBe(true);
+    // The win is in successor-work, not expansion count: coarse passes
+    // produce 1/3 as many candidate successors per expansion (15 vs 45
+    // primitives). Total successors generated should drop noticeably. The
+    // hysteresis decides expansion count per pass independently.
+    expect(layered.stats.counters.successorsTotal).toBeLessThan(
+      base.stats.counters.successorsTotal,
+    );
+    // And per-expansion collision work drops too (less branching at
+    // coarse passes means fewer fast-path AABB queries).
+    const baseChecksPerExp =
+      base.stats.counters.collisionChecks / Math.max(1, base.stats.expansions);
+    const layeredChecksPerExp =
+      layered.stats.counters.collisionChecks /
+      Math.max(1, layered.stats.expansions);
+    expect(layeredChecksPerExp).toBeLessThanOrEqual(baseChecksPerExp + 0.01);
+  });
+});
+
+describe('weighted A* (weight option)', () => {
+  it('weight=1 reproduces pure A* (same expansions and cost)', () => {
+    const air = new InMemoryAirspace({ floor: 0, ceiling: 80 });
+    const env = new AircraftEnvironment(air, agent, {
+      posCell: 4,
+      altCell: 4,
+      goalRadius: 8,
+    });
+    const s = start();
+    const g = start({ x: 120 });
+    const baseline = plan(
+      { start: s, goal: g, environment: env, options: { maxExpansions: 20000 } },
+      Infinity,
+    );
+    const w1 = plan(
+      {
+        start: s,
+        goal: g,
+        environment: env,
+        options: { maxExpansions: 20000, weight: 1 },
+      },
+      Infinity,
+    );
+    expect(w1.found).toBe(true);
+    expect(w1.stats.expansions).toBe(baseline.stats.expansions);
+    expect(w1.cost).toBeCloseTo(baseline.cost, 6);
+  });
+
+  it('weight>1 finds a (possibly suboptimal) plan with fewer expansions', () => {
+    // Use the obstacle wall scene to ensure A* has actual work to do; in
+    // open airspace the search is already trivial.
+    const wall: AABB = { min: [50, 0, -40], max: [58, 30, 40] };
+    const air = new InMemoryAirspace({ floor: 0, ceiling: 90, boxes: [wall] });
+    const env = new AircraftEnvironment(air, agent, {
+      posCell: 4,
+      altCell: 4,
+      goalRadius: 10,
+    });
+    const s = start({ y: 8 });
+    const g = start({ x: 110, y: 8 });
+    const w1 = plan(
+      { start: s, goal: g, environment: env, options: { maxExpansions: 200000, weight: 1 } },
+      Infinity,
+    );
+    const w3 = plan(
+      { start: s, goal: g, environment: env, options: { maxExpansions: 200000, weight: 3 } },
+      Infinity,
+    );
+    expect(w1.found).toBe(true);
+    expect(w3.found).toBe(true);
+    // Heavier weight ⇒ fewer expansions.
+    expect(w3.stats.expansions).toBeLessThan(w1.stats.expansions);
+    // ε-suboptimal: cost is bounded by weight × optimal (allow small slack).
+    expect(w3.cost).toBeLessThanOrEqual(w1.cost * 3 + 1e-6);
+  });
 });

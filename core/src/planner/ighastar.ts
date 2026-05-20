@@ -68,6 +68,7 @@ export function plan<State>(
   const maxExpansions = opts.maxExpansions ?? Infinity;
   const checkEvery = opts.deadlineCheckEvery ?? 64;
   const hyst = opts.hysteresis ?? DEFAULT_HYSTERESIS;
+  const weight = opts.weight ?? 1;
   const useClock = Number.isFinite(deadlineMs);
   const t0 = useClock ? performance.now() : 0;
   const deadAt = t0 + deadlineMs;
@@ -107,7 +108,7 @@ export function plan<State>(
     startNode.h = env.heuristic(start, goal);
     if (timingsOn) timings.heuristic += performance.now() - th;
     counters.heuristicCalls++;
-    startNode.f = startNode.h;
+    startNode.f = weight * startNode.h;
     startNode.seq = seq++;
     gExact.set(startNode.hash, 0);
     open.push(startNode);
@@ -156,12 +157,16 @@ export function plan<State>(
 
       counters.succCalls++;
       const ts = timingsOn ? performance.now() : 0;
-      const succs = env.succ(v, goalNode);
+      const succs = env.succ(v, goalNode, level);
       if (timingsOn) timings.succ += performance.now() - ts;
       counters.successorsTotal += succs.length;
 
       for (let i = 0; i < succs.length; i++) {
         const n = succs[i]!;
+        // Apply weighted-A* f-inflation. Env returns n.h admissible; the
+        // planner controls the f-ordering so weight is honored uniformly
+        // regardless of env implementation.
+        if (weight !== 1) n.f = n.g + weight * n.h;
         if (n.f > omega + EPS) {
           counters.rejectedByOmega++;
           continue;

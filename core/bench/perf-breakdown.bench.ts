@@ -11,7 +11,10 @@
 import { bench, describe } from 'vitest';
 import { plan } from '../src/planner/ighastar';
 import { formatPerf } from '../src/planner/perf';
-import { AircraftEnvironment } from '../src/environment/aircraft-environment';
+import {
+  AircraftEnvironment,
+  type AircraftEnvOptions,
+} from '../src/environment/aircraft-environment';
 import {
   InMemoryAirspace,
   type AABB,
@@ -50,7 +53,7 @@ function gate(x: number, y: number, z: number): AircraftState {
   };
 }
 
-function makeCanyon() {
+function makeCanyon(analyticExpansion: AircraftEnvOptions['analyticExpansion'] = false) {
   const f = AIR_BOUNDS.floor;
   const c = AIR_BOUNDS.ceiling;
   const boxes: AABB[] = [
@@ -72,6 +75,30 @@ function makeCanyon() {
     goalHeadingTol: Infinity,
     primDuration: 1,
     substeps: 4,
+    analyticExpansion,
+  });
+  return { env, start, goal };
+}
+
+function makeOpen(analyticExpansion: AircraftEnvOptions['analyticExpansion'] = false) {
+  const airspace = new InMemoryAirspace({
+    floor: AIR_BOUNDS.floor,
+    ceiling: AIR_BOUNDS.ceiling,
+  });
+  const start = gate(8, 22, 0);
+  const goal = gate(152, 22, 0);
+  const env = new AircraftEnvironment(airspace, AIR_AGENT, {
+    posCell: 4,
+    altCell: 4,
+    headingBuckets: 16,
+    pitchBuckets: 4,
+    speedQuant: 4,
+    levelDivisors: [4, 2, 1],
+    goalRadius: 9,
+    goalHeadingTol: Infinity,
+    primDuration: 1,
+    substeps: 4,
+    analyticExpansion,
   });
   return { env, start, goal };
 }
@@ -168,14 +195,24 @@ function logBreakdown<S>(
 }
 
 // Module-level breakdown — runs once at file load, before any benches.
-logBreakdown<AircraftState>('aircraft / canyon', makeCanyon, 80_000);
+logBreakdown<AircraftState>('aircraft / open (no shot)', () => makeOpen(false), 80_000);
+logBreakdown<AircraftState>('aircraft / open (analytic shot)', () => makeOpen({}), 80_000);
+logBreakdown<AircraftState>('aircraft / canyon (no shot)', () => makeCanyon(false), 80_000);
+logBreakdown<AircraftState>('aircraft / canyon (analytic shot)', () => makeCanyon({}), 80_000);
 logBreakdown<AircraftState>('aircraft / restricted-airspace', makeRestricted, 80_000);
 logBreakdown<AircraftState>('aircraft / knife-edge', makeKnifeEdge, 80_000);
 logBreakdown('r2 / wall-with-gap', makeR2, 10_000);
 
 describe('IGHA* perf breakdown', () => {
-  bench('aircraft canyon (80k budget)', () => {
-    const { env, start, goal } = makeCanyon();
+  bench('aircraft canyon (no shot, 80k budget)', () => {
+    const { env, start, goal } = makeCanyon(false);
+    plan<AircraftState>(
+      { start, goal, environment: env, options: { maxExpansions: 80_000 } },
+      Infinity,
+    );
+  });
+  bench('aircraft canyon (analytic shot, 80k budget)', () => {
+    const { env, start, goal } = makeCanyon({});
     plan<AircraftState>(
       { start, goal, environment: env, options: { maxExpansions: 80_000 } },
       Infinity,

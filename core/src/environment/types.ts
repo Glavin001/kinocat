@@ -44,8 +44,13 @@ export interface Environment<State> {
     edge: EdgeRef | null,
   ): Node<State>;
 
-  /** Valid successors of `node` toward `goal`, each with g/h/f set. */
-  succ(node: Node<State>, goal: Node<State>): Node<State>[];
+  /** Valid successors of `node` toward `goal`, each with g/h/f set.
+   *  Optional `level` argument: 0 = coarsest pass, `levels - 1` = finest.
+   *  Envs may use it to widen the primitive set on finer passes (coarse
+   *  passes plan a low-branching skeleton; finest pass refines). Envs
+   *  that ignore the parameter behave identically across passes — the
+   *  trailing `?` keeps existing implementations type-compatible. */
+  succ(node: Node<State>, goal: Node<State>, level?: number): Node<State>[];
 
   /** Admissible (ideally consistent) cost-to-go estimate. */
   heuristic(from: State, to: State): number;
