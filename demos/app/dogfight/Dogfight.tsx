@@ -55,9 +55,12 @@ interface Banner {
 }
 
 const NUM_AIS = 3;
-const CAPTURE_RADIUS = 7;
 const RESPAWN_INVINCIBLE_MS = 1500;
 const AI_RESPAWN_DELAY_MS = 2200;
+/** Small inflation on the OBB sides during the AI-touches-player test so a
+ *  near-miss at high speed reads as a tag (the strict cuboids are 4 × 3.6 ×
+ *  0.7 m — at 44 m/s, wingtip alignment is rare without a buffer). */
+const CAPTURE_INFLATE = 0.6;
 
 // Spawn points line the east-west avenue (z=0) which the city generator
 // always leaves empty. Y picked to clear the tallest skyscrapers (~60 m) so
@@ -364,20 +367,8 @@ export default function Dogfight() {
       .slice(0, 5) // exclude the OBB wireframe
       .map((m) => m.material as THREE.MeshStandardMaterial);
 
-    // Capture-radius wireframe around the player — the actual radius at which
-    // an AI "tags" the player.
-    const captureWire = new THREE.LineSegments(
-      new THREE.WireframeGeometry(
-        new THREE.SphereGeometry(CAPTURE_RADIUS, 16, 10),
-      ),
-      new THREE.LineBasicMaterial({
-        color: 0xff5566,
-        transparent: true,
-        opacity: 0.55,
-      }),
-    );
-    captureWire.visible = false;
-    scene.add(captureWire);
+    // (The player's actual capture-collision cuboid is the OBB wireframe
+    // child of the plane mesh — `playerObb`. It's already toggled by debug.)
 
     // Explosion marker reused for both player and AI crashes.
     const burst = new THREE.Mesh(
@@ -800,15 +791,11 @@ export default function Dogfight() {
             continue;
           }
 
-          // Capture check (skipped while player is invincible/crashed).
+          // Capture check — strict OBB-vs-OBB SAT (the actual planes' cuboid
+          // collision shape), inflated by CAPTURE_INFLATE so the tag fires on
+          // a near-miss rather than requiring a perfect wingtip overlap.
           if (playerAlive && wall > playerInvincibleUntilWall) {
-            const dx = player.x - ai.state.x;
-            const dy = player.y - ai.state.y;
-            const dz = player.z - ai.state.z;
-            if (
-              dx * dx + dy * dy + dz * dz <
-              CAPTURE_RADIUS * CAPTURE_RADIUS
-            ) {
+            if (obbObbTouch(player, ai.state)) {
               playerCrashedUntilWall = wall + 1100;
               window.setTimeout(() => respawnPlayer('caught', ai.id), 1100);
               break;
@@ -823,8 +810,6 @@ export default function Dogfight() {
       playerMesh.visible = alive;
       if (alive) orientPlane(playerMesh, player, fwd);
       playerObb.visible = dbg && alive;
-      captureWire.visible = dbg && alive;
-      if (alive) captureWire.position.set(player.x, player.y, player.z);
       // Subtle invincibility shimmer — pulse emissive.
       const invinc = now < playerInvincibleUntilWall && alive;
       const pulse = invinc ? 0.4 + 0.4 * Math.sin(now / 80) : 0;
@@ -1194,4 +1179,107 @@ function orientPlane(
   );
   group.lookAt(fwdScratch);
   group.rotateZ(-s.roll);
+}
+
+// ---------------------------------------------------------------------------
+// OBB-vs-OBB collision (SAT). Used for the "AI tags player" capture test —
+// strictly checks whether the two planes' cuboid collision shapes overlap.
+// Mirrors the basis the core planner's `poseToOBBInto` builds, so the
+// runtime test is consistent with what kinocat used while planning.
+
+type Vec3 = [number, number, number];
+interface Basis {
+  fwd: Vec3;
+  right: Vec3;
+  up: Vec3;
+  cx: number;
+  cy: number;
+  cz: number;
+}
+
+function aircraftBasis(s: AircraftState): Basis {
+  const ch = Math.cos(s.heading);
+  const sh = Math.sin(s.heading);
+  const cp = Math.cos(s.pitch);
+  const sp = Math.sin(s.pitch);
+  const cr = Math.cos(s.roll);
+  const sr = Math.sin(s.roll);
+  const fwdX = cp * ch;
+  const fwdY = sp;
+  const fwdZ = cp * sh;
+  const rhX = sh;
+  const rhY = 0;
+  const rhZ = -ch;
+  const upPreX = fwdY * rhZ - fwdZ * rhY;
+  const upPreY = fwdZ * rhX - fwdX * rhZ;
+  const upPreZ = fwdX * rhY - fwdY * rhX;
+  return {
+    fwd: [fwdX, fwdY, fwdZ],
+    right: [cr * rhX + sr * upPreX, cr * rhY + sr * upPreY, cr * rhZ + sr * upPreZ],
+    up: [-sr * rhX + cr * upPreX, -sr * rhY + cr * upPreY, -sr * rhZ + cr * upPreZ],
+    cx: s.x,
+    cy: s.y,
+    cz: s.z,
+  };
+}
+
+function dot(a: Vec3, b: Vec3): number {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+/** SAT for two oriented boxes. `halfA/halfB` are along (fwd, right, up).
+ *  Both boxes have full half-extents inflated by `inflate` on every side. */
+function obbVsObb(a: Basis, halfA: Vec3, b: Basis, halfB: Vec3): boolean {
+  const hA: Vec3 = [halfA[0] + CAPTURE_INFLATE, halfA[1] + CAPTURE_INFLATE, halfA[2] + CAPTURE_INFLATE];
+  const hB: Vec3 = [halfB[0] + CAPTURE_INFLATE, halfB[1] + CAPTURE_INFLATE, halfB[2] + CAPTURE_INFLATE];
+  const d: Vec3 = [b.cx - a.cx, b.cy - a.cy, b.cz - a.cz];
+  const aAxes: Vec3[] = [a.fwd, a.right, a.up];
+  const bAxes: Vec3[] = [b.fwd, b.right, b.up];
+  const testAxis = (L: Vec3): boolean => {
+    const projA =
+      Math.abs(dot(L, a.fwd)) * hA[0] +
+      Math.abs(dot(L, a.right)) * hA[1] +
+      Math.abs(dot(L, a.up)) * hA[2];
+    const projB =
+      Math.abs(dot(L, b.fwd)) * hB[0] +
+      Math.abs(dot(L, b.right)) * hB[1] +
+      Math.abs(dot(L, b.up)) * hB[2];
+    return Math.abs(dot(L, d)) > projA + projB;
+  };
+  for (const ax of aAxes) if (testAxis(ax)) return false;
+  for (const ax of bAxes) if (testAxis(ax)) return false;
+  for (const aAx of aAxes) {
+    for (const bAx of bAxes) {
+      const cx: Vec3 = [
+        aAx[1] * bAx[2] - aAx[2] * bAx[1],
+        aAx[2] * bAx[0] - aAx[0] * bAx[2],
+        aAx[0] * bAx[1] - aAx[1] * bAx[0],
+      ];
+      const m = Math.hypot(cx[0], cx[1], cx[2]);
+      if (m < 1e-6) continue; // axes parallel — skip
+      cx[0] /= m;
+      cx[1] /= m;
+      cx[2] /= m;
+      if (testAxis(cx)) return false;
+    }
+  }
+  return true;
+}
+
+/** Strict cuboid touch between two aircraft, using their planner OBBs (with
+ *  a small `CAPTURE_INFLATE` buffer). Cheap bounding-sphere broadphase first. */
+function obbObbTouch(a: AircraftState, b: AircraftState): boolean {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  const dz = a.z - b.z;
+  // Circumscribed sphere radius (with inflation) for each plane.
+  const Hx = DOGFIGHT_HALF[0] + CAPTURE_INFLATE;
+  const Hy = DOGFIGHT_HALF[1] + CAPTURE_INFLATE;
+  const Hz = DOGFIGHT_HALF[2] + CAPTURE_INFLATE;
+  const R = Math.sqrt(Hx * Hx + Hy * Hy + Hz * Hz);
+  if (dx * dx + dy * dy + dz * dz > (2 * R) * (2 * R)) return false;
+  const ba = aircraftBasis(a);
+  const bb = aircraftBasis(b);
+  const half: Vec3 = [DOGFIGHT_HALF[0], DOGFIGHT_HALF[1], DOGFIGHT_HALF[2]];
+  return obbVsObb(ba, half, bb, half);
 }
