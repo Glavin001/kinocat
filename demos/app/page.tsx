@@ -12,6 +12,12 @@ const groups: { heading: string; demos: Demo[] }[] = [
     heading: 'Flagship',
     demos: [
       {
+        href: '/dogfight',
+        title: 'Dogfight — interactive 3D pursuit',
+        desc: 'Pilot a fixed-wing aircraft with the keyboard while three kinocat-driven opponents pursue, intercept, and flank you through a continuous heightfield terrain, tall pylons, a sweeping barrier between twin peaks, and a drifting blimp. Each AI replans against the live predicted player trajectory; sibling AIs read each other from a shared plan registry. Demonstrates the new HeightfieldAirspace (real ground-elevation collision), time-aware multi-agent planning, anytime replanning, and a GOAP-style tactical layer above kinocat.',
+        tag: '3D · interactive · flight · multi-agent',
+      },
+      {
         href: '/flagship',
         title: 'Interactive multi-agent flagship',
         desc: 'Opposing cross-traffic on a large procedural navcat terrain. Click a vehicle to select it, retarget its goal or drop hazards and watch every NPC replan live. A genuine boost & canyon jump the planner adopts, a misdirect it rejects on its own. Toggleable clearance & moving-obstacle broadphase.',
