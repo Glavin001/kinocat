@@ -45,17 +45,24 @@ export const DOGFIGHT_MAX_EXPANSIONS = 60000;
 export const DOGFIGHT_TEST_MAX_EXPANSIONS = 220000;
 
 /** Same envelope as the /plane demo so existing primitive characterizations
- *  remain in scope; tweaked slightly so the AI feels nimble in the dogfight. */
+ *  remain in scope; tuned for the dogfight at the demo's elevated cruise. */
 export const DOGFIGHT_AGENT: AircraftAgent = defaultAircraftAgent({
-  minTurnRadius: 14,
-  minSpeed: 8,
-  maxSpeed: 22,
+  minTurnRadius: 22,
+  minSpeed: 18,
+  maxSpeed: 44,
   maxClimbAngle: Math.PI / 5,
   maxBank: Math.PI / 3,
   halfLength: 2,
   halfSpan: 1.8,
   halfHeight: 0.35,
 });
+
+/** Multiplier the demo applies on top of agent.maxSpeed when the player
+ *  flies through a green boost ring. ~2× makes the boost feel meaningful at
+ *  the elevated default cruise. */
+export const DOGFIGHT_BOOST_MULT = 2.0;
+/** Boost duration when a ring fires, in seconds. */
+export const DOGFIGHT_BOOST_DURATION = 2.5;
 
 export const DOGFIGHT_HALF: [number, number, number] = [
   DOGFIGHT_AGENT.halfLength,
@@ -64,87 +71,219 @@ export const DOGFIGHT_HALF: [number, number, number] = [
 ];
 
 export const DOGFIGHT_BOUNDS = {
-  x0: -10,
-  x1: 240,
-  z0: -100,
-  z1: 100,
+  x0: -20,
+  x1: 280,
+  z0: -130,
+  z1: 130,
   floor: 0,
-  ceiling: 90,
+  ceiling: 130,
 };
+
+const MAP_CX = (DOGFIGHT_BOUNDS.x0 + DOGFIGHT_BOUNDS.x1) / 2;
+const MAP_CZ = (DOGFIGHT_BOUNDS.z0 + DOGFIGHT_BOUNDS.z1) / 2;
+const MAP_HX = (DOGFIGHT_BOUNDS.x1 - DOGFIGHT_BOUNDS.x0) / 2;
+const MAP_HZ = (DOGFIGHT_BOUNDS.z1 - DOGFIGHT_BOUNDS.z0) / 2;
 
 // ---------------------------------------------------------------------------
-// Terrain — analytic, deterministic, smooth. The same function feeds both
-// the planner's HeightfieldAirspace and the renderer's displaced PlaneGeometry,
-// so what the player sees IS what the planner respects.
+// Terrain — perimeter mountains hugging a smoothly-curving low-altitude ring,
+// with two canyon passes cutting between the mountains, and a flat-ish city
+// floor at the centre. The same analytic function feeds both the planner's
+// HeightfieldAirspace and the renderer's displaced PlaneGeometry, so what the
+// pilot sees IS what the planner respects.
 
-/** Returns ground elevation Y at world (x, z). Bounded ~[0, 28]. */
+/** Closed parametric spline radius (normalized 0..1) at polar angle `a`.
+ *  Sum-of-sines so it's smooth, closed (period 2π), and visibly non-circular. */
+export function dogfightSplineRadius(a: number): number {
+  return (
+    0.78 +
+    0.08 * Math.sin(3 * a + 0.7) +
+    0.05 * Math.sin(5 * a - 0.4) +
+    0.03 * Math.sin(7 * a + 1.2)
+  );
+}
+
+/** Mountain depression at canyon passes — 1 = full mountain, 0 = open pass. */
+function canyonGate(a: number): number {
+  // Two canyon openings: one east (a≈0), one south-west (a≈π+0.6).
+  const g1 = Math.exp(-((a - 0) * (a - 0)) / 0.04);
+  const g2 = Math.exp(-((a - Math.PI - 0.6) * (a - Math.PI - 0.6)) / 0.06);
+  const g3 = Math.exp(-((a + Math.PI + 0.6) * (a + Math.PI + 0.6)) / 0.06);
+  return Math.max(0, 1 - 0.85 * Math.max(g1, g2, g3));
+}
+
 export const dogfightTerrain: HeightfieldSampler = (x, z) => {
-  // Long rolling base ridge along x = 60.
-  const ridgeA = 12 * Math.exp(-((x - 60) * (x - 60)) / 700) *
-    (0.7 + 0.3 * Math.cos(z * 0.04));
-  // Twin peaks straddling the centre corridor at x = 130.
-  const peakN = 22 * Math.exp(-(((x - 130) * (x - 130)) / 250 + ((z - 35) * (z - 35)) / 220));
-  const peakS = 22 * Math.exp(-(((x - 130) * (x - 130)) / 250 + ((z + 35) * (z + 35)) / 220));
-  // Far wall: a high mesa near the east edge to keep play bounded.
-  const mesa = 18 * smoothStep(x, 200, 230) * (0.6 + 0.4 * Math.cos(z * 0.03));
-  // Subtle dunes for texture (low amplitude — kept small so the planner's
-  // 9-sample OBB clearance check stays well above terrain at normal cruise).
-  const dunes = 1.2 * (Math.sin(x * 0.08) + Math.cos(z * 0.11));
-  return Math.max(0, ridgeA + peakN + peakS + mesa + dunes);
+  const u = (x - MAP_CX) / MAP_HX;
+  const v = (z - MAP_CZ) / MAP_HZ;
+  const r = Math.hypot(u, v);
+  const a = Math.atan2(v, u);
+  const R = dogfightSplineRadius(a);
+
+  // Distance outward from the spline path (negative = inside city, positive
+  // = entering perimeter mountains).
+  const dOut = r - R;
+
+  // Mountains rise on the outside of the spline; canyon gates suppress them.
+  let mountain = 0;
+  if (dOut > -0.02) {
+    const t = Math.min(1, Math.max(0, (dOut + 0.02) / 0.38));
+    const peakHeight = 78; // metres
+    const rough = 0.92 + 0.08 * Math.cos(a * 11);
+    mountain = peakHeight * smoothStep01(t) * rough * canyonGate(a);
+    // Beyond r ≈ R + 0.4 we're on the high plateau — clamp.
+    if (dOut > 0.4) mountain *= 1 - smoothStep01((dOut - 0.4) / 0.2) * 0.15;
+  }
+
+  // City floor: low rolling ground inside the spline, with gentle hills.
+  const cityBase =
+    1.2 * Math.sin(x * 0.07) + 0.9 * Math.cos(z * 0.09) +
+    0.6 * Math.sin((x + z) * 0.13);
+
+  // Soft transition band so the city blends into the mountains.
+  let band = 0;
+  if (r > 0.45 && r < R + 0.02) {
+    const t = (r - 0.45) / (R + 0.02 - 0.45);
+    band = 6 * smoothStep01(t);
+  }
+
+  return Math.max(0, cityBase + band + mountain);
 };
 
-function smoothStep(t: number, a: number, b: number): number {
-  const u = Math.max(0, Math.min(1, (t - a) / (b - a)));
+function smoothStep01(t: number): number {
+  const u = Math.max(0, Math.min(1, t));
   return u * u * (3 - 2 * u);
 }
 
 // ---------------------------------------------------------------------------
-// Static obstacles + moving zones in addition to the terrain.
+// City buildings + moving zones. Buildings are procedurally placed inside the
+// spline ring (the "city zone"), with two clear roadway avenues left empty so
+// the pilot can fly straight along the cardinal axes between buildings.
 
-/** Tall thin pylons + a horizontal "wall of pillars" the AI must thread. */
-export function dogfightStaticObstacles(): AABB[] {
-  const f = DOGFIGHT_BOUNDS.floor;
-  const c = DOGFIGHT_BOUNDS.ceiling;
-  const out: AABB[] = [];
-  // Four pylons in a diamond around (95, 0).
-  for (const [px, pz] of [
-    [85, -14],
-    [105, -14],
-    [85, 14],
-    [105, 14],
-  ] as [number, number][]) {
-    out.push({ min: [px - 1.2, f, pz - 1.2], max: [px + 1.2, c, pz + 1.2] });
-  }
-  // Vertical "wall of pillars" — five tall thin boxes the AI must weave
-  // around, leaving alternating gaps at different x positions.
-  for (let i = 0; i < 5; i++) {
-    const px = 160 + i * 2;
-    const pz = -40 + i * 20; // staggered
-    out.push({ min: [px - 1.5, f, pz - 6], max: [px + 1.5, c, pz + 6] });
+interface BuildingSpec {
+  x: number;
+  z: number;
+  hx: number; // half-width along X
+  hz: number; // half-depth along Z
+  height: number;
+}
+
+const CITY_SEED = 0x9e3779b1;
+
+/** Tiny seeded PRNG (mulberry32) so building placement is deterministic. */
+function rng(seed: number): () => number {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function inCityZone(x: number, z: number): boolean {
+  const u = (x - MAP_CX) / MAP_HX;
+  const v = (z - MAP_CZ) / MAP_HZ;
+  const r = Math.hypot(u, v);
+  return r < 0.55;
+}
+
+function inAvenue(x: number, z: number): boolean {
+  // Two roadway avenues — one east-west (z ≈ MAP_CZ), one north-south (x ≈ MAP_CX).
+  const ROAD_HALF = 9;
+  return (
+    Math.abs(z - MAP_CZ) < ROAD_HALF ||
+    Math.abs(x - MAP_CX) < ROAD_HALF
+  );
+}
+
+function buildCitySpecs(): BuildingSpec[] {
+  const r = rng(CITY_SEED);
+  const out: BuildingSpec[] = [];
+  const TRIES = 600;
+  const TARGET = 38;
+  for (let i = 0; i < TRIES && out.length < TARGET; i++) {
+    // Random footprint somewhere inside the city zone.
+    const x = MAP_CX + (r() - 0.5) * MAP_HX * 1.15;
+    const z = MAP_CZ + (r() - 0.5) * MAP_HZ * 1.15;
+    if (!inCityZone(x, z)) continue;
+    if (inAvenue(x, z)) continue;
+    // Mix of short / mid / tall — biased toward shorter so the skyline reads.
+    const tier = r();
+    let height: number;
+    let hxz: number;
+    if (tier < 0.45) {
+      // Short buildings: 6–14 m.
+      height = 6 + r() * 8;
+      hxz = 3 + r() * 2.5;
+    } else if (tier < 0.85) {
+      // Mid: 16–30 m.
+      height = 16 + r() * 14;
+      hxz = 3.5 + r() * 3;
+    } else {
+      // Tall: 36–60 m (skyscrapers, hard to fly over).
+      height = 36 + r() * 24;
+      hxz = 4 + r() * 4;
+    }
+    const hx = hxz * (0.7 + r() * 0.6);
+    const hz = hxz * (0.7 + r() * 0.6);
+    // Reject overlap with already-placed buildings (with a 3 m flight gap).
+    const gap = 3;
+    let ok = true;
+    for (const b of out) {
+      if (
+        Math.abs(x - b.x) < hx + b.hx + gap &&
+        Math.abs(z - b.z) < hz + b.hz + gap
+      ) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
+    // Reject if straddling an avenue after expansion.
+    if (Math.abs(z - MAP_CZ) - hz < 9) continue;
+    if (Math.abs(x - MAP_CX) - hx < 9) continue;
+    out.push({ x, z, hx, hz, height });
   }
   return out;
 }
 
-/** A blimp drifting in a sine along the corridor, and an oscillating barrier
- *  that sweeps the canyon entrance — both as spherical moving zones. */
+const _CITY = buildCitySpecs();
+
+/** Mixed-height city buildings inside the spline ring (no grid; avenues left
+ *  empty for east-west and north-south flight). */
+export function dogfightStaticObstacles(): AABB[] {
+  const f = DOGFIGHT_BOUNDS.floor;
+  return _CITY.map((b) => ({
+    min: [b.x - b.hx, f, b.z - b.hz] as [number, number, number],
+    max: [b.x + b.hx, b.height, b.z + b.hz] as [number, number, number],
+  }));
+}
+
+/** Building specs for visual reference (extends the AABB list with metadata
+ *  the renderer uses to colour the skyline). */
+export function dogfightBuildings(): BuildingSpec[] {
+  return _CITY;
+}
+
+/** A drifting blimp + a sweeping barrier along the central road. Kept after
+ *  the redesign so the time-aware planning still has live moving obstacles. */
 export function dogfightMovingZones(): MovingZone[] {
   return [
     {
-      // Blimp: cruises along x, gently bobbing in z and y.
-      radius: 8,
+      // Blimp drifting east-west over the central avenue.
+      radius: 9,
       predict: (t) => ({
-        x: 40 + 7 * Math.sin(t * 0.25),
-        y: 50 + 3 * Math.sin(t * 0.6),
-        z: 18 * Math.sin(t * 0.35),
+        x: MAP_CX + 70 * Math.sin(t * 0.18),
+        y: 65 + 4 * Math.sin(t * 0.6),
+        z: MAP_CZ + 8 * Math.sin(t * 0.35),
       }),
     },
     {
-      // Sweeping barrier between the twin peaks.
-      radius: 9,
+      // Sweeping barrier across the east canyon entrance.
+      radius: 10,
       predict: (t) => ({
-        x: 130,
-        y: 36,
-        z: 30 * Math.sin(t * 0.55),
+        x: DOGFIGHT_BOUNDS.x1 - 35,
+        y: 35,
+        z: 40 * Math.sin(t * 0.55),
       }),
     },
   ];
@@ -165,28 +304,86 @@ export function dogfightAirspace(): HeightfieldAirspace {
 }
 
 // ---------------------------------------------------------------------------
-// Boost rings — visual / simulator features (no planner affordance edge):
-// when the player or an AI flies through a ring, a +25% airspeed bonus
-// applies for 2s. Used purely by the demo's runtime; the planner doesn't
-// route through them deliberately, but the AI naturally passes them en-route.
+// Boost rings — placed along the perimeter flightway (one per canyon mouth
+// plus a string along the curved low ring) so the pilot has a natural reason
+// to fly the spline at speed.
 
 export interface BoostRing {
   id: string;
   x: number;
   y: number;
   z: number;
-  /** Ring normal — passage is detected along this axis. */
+  /** Ring normal — passage is detected by sphere overlap, but the normal is
+   *  used to orient the visual torus along the expected flight direction. */
   axis: { x: number; y: number; z: number };
   radius: number;
 }
 
+/** Sample the spline ring at angle `a` and return the world-space position. */
+export function dogfightSplinePoint(a: number, yAt = 26): {
+  x: number;
+  y: number;
+  z: number;
+} {
+  const R = dogfightSplineRadius(a);
+  return {
+    x: MAP_CX + Math.cos(a) * R * MAP_HX,
+    y: yAt,
+    z: MAP_CZ + Math.sin(a) * R * MAP_HZ,
+  };
+}
+
+/** Tangent direction along the spline at angle `a` (XZ plane). */
+export function dogfightSplineTangent(a: number): {
+  x: number;
+  y: number;
+  z: number;
+} {
+  // Numerical derivative — analytic is messy with R(a), and this is cheap.
+  const eps = 1e-3;
+  const p0 = dogfightSplinePoint(a - eps);
+  const p1 = dogfightSplinePoint(a + eps);
+  const dx = p1.x - p0.x;
+  const dz = p1.z - p0.z;
+  const m = Math.hypot(dx, dz) || 1;
+  return { x: dx / m, y: 0, z: dz / m };
+}
+
 export function dogfightBoostRings(): BoostRing[] {
-  return [
-    { id: 'R0', x: 20, y: 22, z: -10, axis: { x: 1, y: 0, z: 0 }, radius: 6 },
-    { id: 'R1', x: 95, y: 38, z: 0, axis: { x: 1, y: 0, z: 0 }, radius: 6 },
-    { id: 'R2', x: 130, y: 30, z: 0, axis: { x: 1, y: 0, z: 0 }, radius: 6 },
-    { id: 'R3', x: 180, y: 28, z: 20, axis: { x: 1, y: 0, z: 0.4 }, radius: 6 },
-  ];
+  const out: BoostRing[] = [];
+  const COUNT = 8;
+  for (let i = 0; i < COUNT; i++) {
+    const a = (i / COUNT) * Math.PI * 2;
+    const p = dogfightSplinePoint(a, 28 + 4 * Math.sin(a * 2));
+    const tan = dogfightSplineTangent(a);
+    out.push({
+      id: `R${i}`,
+      x: p.x,
+      y: p.y,
+      z: p.z,
+      axis: tan,
+      radius: 7,
+    });
+  }
+  // Plus one boost ring in each city avenue so the player has a reason to
+  // dive through the buildings.
+  out.push({
+    id: 'CITY_EW',
+    x: MAP_CX,
+    y: 18,
+    z: MAP_CZ,
+    axis: { x: 1, y: 0, z: 0 },
+    radius: 6,
+  });
+  out.push({
+    id: 'CITY_NS',
+    x: MAP_CX + 35,
+    y: 22,
+    z: MAP_CZ + 20,
+    axis: { x: 0, y: 0, z: 1 },
+    radius: 6,
+  });
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -410,17 +607,19 @@ export function planAI(
   req: AIPlanRequest,
 ): PlanResult<AircraftState> {
   const baseEnv = new AircraftEnvironment(airspace, DOGFIGHT_AGENT, {
-    posCell: 4,
-    altCell: 4,
+    posCell: 6,
+    altCell: 5,
     headingBuckets: 16,
     pitchBuckets: 4,
-    speedQuant: 4,
+    speedQuant: 6,
     levelDivisors: [4, 2, 1],
-    goalRadius: 10,
+    goalRadius: 14,
     goalHeadingTol: Infinity,
-    primDuration: 1,
-    substeps: 4,
-    analyticExpansion: { everyN: 6, step: 3 },
+    // Faster aircraft + ~5 m city footprints: shorter primitives + finer
+    // substeps so OBB-vs-building swept tests don't tunnel.
+    primDuration: 0.7,
+    substeps: 8,
+    analyticExpansion: { everyN: 6, step: 4 },
     ...req.envOpts,
   });
   const playerPredict = playerForecast(req.player, 6);
@@ -472,9 +671,12 @@ export interface DogfightSnapshot {
 
 export function buildDogfightSnapshot(): DogfightSnapshot {
   const airspace = dogfightAirspace();
+  // Spawn on the east-west avenue (z=0) — the city building generator leaves
+  // a clear runway along it, so these poses always clear the airspace
+  // regardless of the procedural skyline.
   const player: AircraftState = {
-    x: 30,
-    y: 35,
+    x: 40,
+    y: 50,
     z: 0,
     heading: 0,
     pitch: 0,
@@ -486,9 +688,9 @@ export function buildDogfightSnapshot(): DogfightSnapshot {
   const registry = new PlanRegistry();
   const starts: AircraftState[] = [
     {
-      x: 180,
-      y: 40,
-      z: -25,
+      x: 240,
+      y: 45,
+      z: 0,
       heading: Math.PI,
       pitch: 0,
       roll: 0,
@@ -496,9 +698,9 @@ export function buildDogfightSnapshot(): DogfightSnapshot {
       t: 0,
     },
     {
-      x: 200,
-      y: 50,
-      z: 30,
+      x: 220,
+      y: 60,
+      z: 0,
       heading: Math.PI,
       pitch: 0,
       roll: 0,

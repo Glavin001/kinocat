@@ -8,6 +8,8 @@ import type { AircraftState } from 'kinocat/agent';
 import { PlanRegistry } from 'kinocat/predict';
 import {
   DOGFIGHT_AGENT,
+  DOGFIGHT_BOOST_DURATION,
+  DOGFIGHT_BOOST_MULT,
   DOGFIGHT_BOUNDS,
   DOGFIGHT_HALF,
   DOGFIGHT_PALETTE as C,
@@ -16,6 +18,7 @@ import {
   dogfightStaticObstacles,
   dogfightMovingZones,
   dogfightBoostRings,
+  dogfightSplinePoint,
   playerForecast,
   selectTacticalMode,
   tacticalGoal,
@@ -56,20 +59,21 @@ const CAPTURE_RADIUS = 7;
 const RESPAWN_INVINCIBLE_MS = 1500;
 const AI_RESPAWN_DELAY_MS = 2200;
 
-/** Player spawn points used after a crash / capture — picked far from AIs. */
+// Spawn points line the east-west avenue (z=0) which the city generator
+// always leaves empty. Y picked to clear the tallest skyscrapers (~60 m) so
+// the player has airspace to manoeuvre on respawn.
 const PLAYER_SPAWNS: Array<Omit<AircraftState, 'speed' | 't'>> = [
-  { x: 20, y: 38, z: 0, heading: 0, pitch: 0, roll: 0 },
-  { x: 20, y: 55, z: -50, heading: 0.2, pitch: 0, roll: 0 },
-  { x: 30, y: 60, z: 50, heading: -0.2, pitch: 0, roll: 0 },
-  { x: 10, y: 42, z: -25, heading: 0, pitch: 0, roll: 0 },
+  { x: 30, y: 80, z: 0, heading: 0, pitch: 0, roll: 0 },
+  { x: 45, y: 70, z: 0, heading: 0, pitch: 0, roll: 0 },
+  { x: 30, y: 90, z: 0, heading: 0, pitch: 0, roll: 0 },
+  { x: 50, y: 75, z: 0, heading: 0, pitch: 0, roll: 0 },
 ];
 
-/** AI spawn points used after an AI crash. */
 const AI_SPAWNS: Array<Omit<AircraftState, 'speed' | 't'>> = [
-  { x: 225, y: 50, z: -45, heading: Math.PI, pitch: 0, roll: 0 },
-  { x: 225, y: 55, z: 45, heading: Math.PI, pitch: 0, roll: 0 },
-  { x: 220, y: 65, z: 0, heading: Math.PI, pitch: 0, roll: 0 },
-  { x: 215, y: 45, z: -25, heading: Math.PI + 0.15, pitch: 0, roll: 0 },
+  { x: 240, y: 75, z: 0, heading: Math.PI, pitch: 0, roll: 0 },
+  { x: 235, y: 85, z: 0, heading: Math.PI, pitch: 0, roll: 0 },
+  { x: 245, y: 90, z: 0, heading: Math.PI, pitch: 0, roll: 0 },
+  { x: 240, y: 70, z: 0, heading: Math.PI, pitch: 0, roll: 0 },
 ];
 
 export default function Dogfight() {
@@ -82,6 +86,7 @@ export default function Dogfight() {
   const [showPaths, setShowPaths] = useState(true);
   const [showCones, setShowCones] = useState(false);
   const [showZones, setShowZones] = useState(true);
+  const [debug, setDebug] = useState(false);
   const [hud, setHud] = useState('');
   const [aiStatus, setAiStatus] = useState<string[]>([]);
   const [score, setScore] = useState<Score>({ aiWins: 0, crashes: 0, round: 1 });
@@ -92,11 +97,13 @@ export default function Dogfight() {
   const showPathsRef = useRef(showPaths);
   const showConesRef = useRef(showCones);
   const showZonesRef = useRef(showZones);
+  const debugRef = useRef(debug);
   pausedRef.current = paused;
   chaseRef.current = chase;
   showPathsRef.current = showPaths;
   showConesRef.current = showCones;
   showZonesRef.current = showZones;
+  debugRef.current = debug;
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -116,9 +123,11 @@ export default function Dogfight() {
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     mount.appendChild(renderer.domElement);
 
+    const mapCx = (DOGFIGHT_BOUNDS.x0 + DOGFIGHT_BOUNDS.x1) / 2;
+    const mapCz = (DOGFIGHT_BOUNDS.z0 + DOGFIGHT_BOUNDS.z1) / 2;
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(120, 40, 0);
-    camera.position.set(40, 100, 120);
+    controls.target.set(mapCx, 30, mapCz);
+    camera.position.set(mapCx - 80, 140, mapCz + 200);
     controls.update();
 
     scene.add(new THREE.AmbientLight(0xffffff, 0.55));
@@ -129,11 +138,9 @@ export default function Dogfight() {
     // ---- terrain mesh (displaced PlaneGeometry using dogfightTerrain) ------
     const tw = DOGFIGHT_BOUNDS.x1 - DOGFIGHT_BOUNDS.x0 + 40;
     const td = DOGFIGHT_BOUNDS.z1 - DOGFIGHT_BOUNDS.z0 + 40;
-    const tgeo = new THREE.PlaneGeometry(tw, td, 192, 128);
+    const tgeo = new THREE.PlaneGeometry(tw, td, 240, 200);
     tgeo.rotateX(-Math.PI / 2);
-    const tcx = (DOGFIGHT_BOUNDS.x0 + DOGFIGHT_BOUNDS.x1) / 2;
-    const tcz = (DOGFIGHT_BOUNDS.z0 + DOGFIGHT_BOUNDS.z1) / 2;
-    tgeo.translate(tcx, 0, tcz);
+    tgeo.translate(mapCx, 0, mapCz);
     {
       const pos = tgeo.attributes['position'] as THREE.BufferAttribute;
       const cols = new Float32Array(pos.count * 3);
@@ -145,10 +152,10 @@ export default function Dogfight() {
         const z = pos.getZ(i);
         const y = dogfightTerrain(x, z);
         pos.setY(i, y);
-        const t = Math.min(1, y / 28);
+        const t = Math.min(1, y / 70);
         const tmp = new THREE.Color();
-        if (t < 0.5) tmp.copy(lo).lerp(mid, t * 2);
-        else tmp.copy(mid).lerp(hi, (t - 0.5) * 2);
+        if (t < 0.4) tmp.copy(lo).lerp(mid, t / 0.4);
+        else tmp.copy(mid).lerp(hi, (t - 0.4) / 0.6);
         cols[3 * i] = tmp.r;
         cols[3 * i + 1] = tmp.g;
         cols[3 * i + 2] = tmp.b;
@@ -156,33 +163,90 @@ export default function Dogfight() {
       tgeo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
       tgeo.computeVertexNormals();
     }
-    const terrainMesh = new THREE.Mesh(
-      tgeo,
-      new THREE.MeshStandardMaterial({
-        vertexColors: true,
-        flatShading: false,
-        side: THREE.FrontSide,
-      }),
-    );
+    const terrainMat = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      flatShading: false,
+      side: THREE.FrontSide,
+    });
+    const terrainMesh = new THREE.Mesh(tgeo, terrainMat);
     scene.add(terrainMesh);
 
-    // ---- static obstacles ---------------------------------------------------
+    // Debug-only terrain wireframe overlay (lazily built when first toggled
+    // on — building it for a 240×200 plane up-front is expensive).
+    let terrainWire: THREE.LineSegments | null = null;
+    function ensureTerrainWire() {
+      if (terrainWire) return terrainWire;
+      terrainWire = new THREE.LineSegments(
+        new THREE.WireframeGeometry(tgeo),
+        new THREE.LineBasicMaterial({
+          color: 0x00ffaa,
+          transparent: true,
+          opacity: 0.18,
+        }),
+      );
+      terrainWire.visible = false;
+      scene.add(terrainWire);
+      return terrainWire;
+    }
+
+    // Perimeter-spline visualisation — a faint curved line tracing the
+    // low-altitude flightway through the mountains.
+    {
+      const splinePts: THREE.Vector3[] = [];
+      const N = 200;
+      for (let i = 0; i <= N; i++) {
+        const a = (i / N) * Math.PI * 2;
+        const p = dogfightSplinePoint(a, 0);
+        splinePts.push(
+          new THREE.Vector3(p.x, dogfightTerrain(p.x, p.z) + 1.0, p.z),
+        );
+      }
+      const splineLine = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(splinePts),
+        new THREE.LineBasicMaterial({
+          color: 0x8fa6ff,
+          transparent: true,
+          opacity: 0.35,
+        }),
+      );
+      scene.add(splineLine);
+    }
+
+    // ---- city buildings ----------------------------------------------------
     const obsGroup = new THREE.Group();
     scene.add(obsGroup);
-    const wallMat = new THREE.MeshStandardMaterial({ color: C.wall });
-    for (const b of dogfightStaticObstacles()) {
-      const g = new THREE.BoxGeometry(
-        b.max[0] - b.min[0],
-        b.max[1] - b.min[1],
-        b.max[2] - b.min[2],
+    const buildingDebugWires: THREE.LineSegments[] = [];
+    const buildingSpecs = dogfightStaticObstacles();
+    // Building palette — windows-on-glass blues to read like a skyline.
+    const buildingPalette = [
+      0x4a5468, 0x3d4756, 0x52617a, 0x2c3645, 0x6779a0, 0x4f5b75, 0x394554,
+    ];
+    for (let i = 0; i < buildingSpecs.length; i++) {
+      const b = buildingSpecs[i]!;
+      const w = b.max[0] - b.min[0];
+      const h = b.max[1] - b.min[1];
+      const d = b.max[2] - b.min[2];
+      const g = new THREE.BoxGeometry(w, h, d);
+      const m = new THREE.Mesh(
+        g,
+        new THREE.MeshStandardMaterial({
+          color: buildingPalette[i % buildingPalette.length]!,
+        }),
       );
-      const m = new THREE.Mesh(g, wallMat);
       m.position.set(
         (b.min[0] + b.max[0]) / 2,
         (b.min[1] + b.max[1]) / 2,
         (b.min[2] + b.max[2]) / 2,
       );
       obsGroup.add(m);
+      const wf = new THREE.LineSegments(
+        new THREE.EdgesGeometry(g),
+        new THREE.LineBasicMaterial({ color: 0xff00ff }),
+      );
+      wf.position.copy(m.position);
+      wf.visible = false;
+      buildingDebugWires.push(wf);
+      obsGroup.add(wf);
     }
 
     // ---- moving zones (blimp + sweeping barrier) ---------------------------
@@ -204,9 +268,25 @@ export default function Dogfight() {
       zoneMeshes.push(mesh);
     }
 
+    // Debug wireframes for moving zones.
+    const zoneWires: THREE.LineSegments[] = [];
+    for (let i = 0; i < zones.length; i++) {
+      const z = zones[i]!;
+      const w = new THREE.LineSegments(
+        new THREE.WireframeGeometry(
+          new THREE.SphereGeometry(z.radius, 12, 8),
+        ),
+        new THREE.LineBasicMaterial({ color: 0xff00ff }),
+      );
+      w.visible = false;
+      scene.add(w);
+      zoneWires.push(w);
+    }
+
     // ---- boost rings -------------------------------------------------------
     const rings = dogfightBoostRings();
     const ringMeshes: THREE.Mesh[] = [];
+    const ringWires: THREE.LineSegments[] = [];
     for (const r of rings) {
       const m = new THREE.Mesh(
         new THREE.TorusGeometry(r.radius, 0.45, 12, 36),
@@ -227,10 +307,30 @@ export default function Dogfight() {
       m.quaternion.copy(q);
       scene.add(m);
       ringMeshes.push(m);
+      // Debug trigger sphere (this is the actual hit volume — `radius + 1`
+      // matches the simulator's overlap test).
+      const wf = new THREE.LineSegments(
+        new THREE.WireframeGeometry(
+          new THREE.SphereGeometry(r.radius + 1, 12, 8),
+        ),
+        new THREE.LineBasicMaterial({ color: 0x00ff66 }),
+      );
+      wf.position.copy(m.position);
+      wf.visible = false;
+      scene.add(wf);
+      ringWires.push(wf);
     }
 
     // ---- aircraft prefabs --------------------------------------------------
-    const buildPlane = (color: number) => {
+    // The OBB the planner uses is body-local: forward = +Z (after lookAt),
+    // right-wing = +X, up = +Y. Half-extents map (halfLength, halfSpan,
+    // halfHeight) → (Z, X, Y) in three.js BoxGeometry's (X, Y, Z) order.
+    const obbGeo = new THREE.BoxGeometry(
+      DOGFIGHT_HALF[1] * 2, // X (span)
+      DOGFIGHT_HALF[2] * 2, // Y (height)
+      DOGFIGHT_HALF[0] * 2, // Z (length)
+    );
+    const buildPlane = (color: number, wireColor: number) => {
       const group = new THREE.Group();
       const mat = new THREE.MeshStandardMaterial({ color });
       const fuse = new THREE.Mesh(
@@ -246,14 +346,38 @@ export default function Dogfight() {
       tail.position.z = -1.15;
       const fin = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.65, 0.5), mat);
       fin.position.set(0, 0.35, -1.15);
-      group.add(fuse, nose, wing, tail, fin);
-      return group;
+      // OBB wireframe — child of the group so it rotates with the plane,
+      // shown only when debug overlays are on.
+      const obb = new THREE.LineSegments(
+        new THREE.EdgesGeometry(obbGeo),
+        new THREE.LineBasicMaterial({ color: wireColor }),
+      );
+      obb.visible = false;
+      group.add(fuse, nose, wing, tail, fin, obb);
+      return { group, obb };
     };
-    const playerMesh = buildPlane(parseInt(C.player.slice(1), 16));
+    const player_ = buildPlane(parseInt(C.player.slice(1), 16), 0x00ffff);
+    const playerMesh = player_.group;
+    const playerObb = player_.obb;
     scene.add(playerMesh);
-    const playerMaterials = (playerMesh.children as THREE.Mesh[]).map(
-      (m) => m.material as THREE.MeshStandardMaterial,
+    const playerMaterials = (playerMesh.children as THREE.Mesh[])
+      .slice(0, 5) // exclude the OBB wireframe
+      .map((m) => m.material as THREE.MeshStandardMaterial);
+
+    // Capture-radius wireframe around the player — the actual radius at which
+    // an AI "tags" the player.
+    const captureWire = new THREE.LineSegments(
+      new THREE.WireframeGeometry(
+        new THREE.SphereGeometry(CAPTURE_RADIUS, 16, 10),
+      ),
+      new THREE.LineBasicMaterial({
+        color: 0xff5566,
+        transparent: true,
+        opacity: 0.55,
+      }),
     );
+    captureWire.visible = false;
+    scene.add(captureWire);
 
     // Explosion marker reused for both player and AI crashes.
     const burst = new THREE.Mesh(
@@ -275,6 +399,7 @@ export default function Dogfight() {
 
     // ---- AIs ---------------------------------------------------------------
     const aiMeshes: THREE.Group[] = [];
+    const aiObbs: THREE.LineSegments[] = [];
     const aiPathLines: (THREE.Line | null)[] = [];
     const aiGoalMarks: THREE.Mesh[] = [];
     const aiCones: THREE.Mesh[] = [];
@@ -282,9 +407,10 @@ export default function Dogfight() {
     const ais: AI[] = [];
     for (let i = 0; i < NUM_AIS; i++) {
       const color = C.enemy[i % C.enemy.length]!;
-      const m = buildPlane(color);
-      scene.add(m);
-      aiMeshes.push(m);
+      const built = buildPlane(color, 0xff8844);
+      scene.add(built.group);
+      aiMeshes.push(built.group);
+      aiObbs.push(built.obb);
       const goalMark = new THREE.Mesh(
         new THREE.OctahedronGeometry(1.6),
         new THREE.MeshStandardMaterial({
@@ -445,6 +571,7 @@ export default function Dogfight() {
       if (k === '1') setShowPaths((v) => !v);
       if (k === '2') setShowCones((v) => !v);
       if (k === '3') setShowZones((v) => !v);
+      if (k === '4' || k === 'b') setDebug((v) => !v);
     };
     const onKeyUp = (e: KeyboardEvent) => keys.delete(e.key.toLowerCase());
     window.addEventListener('keydown', onKeyDown);
@@ -586,7 +713,7 @@ export default function Dogfight() {
           DOGFIGHT_AGENT.minSpeed,
           Math.min(DOGFIGHT_AGENT.maxSpeed, targetSpeed),
         );
-        const boost = playerBoostUntilT > player.t ? 1.3 : 1;
+        const boost = playerBoostUntilT > player.t ? DOGFIGHT_BOOST_MULT : 1;
         const stepSpeed = targetSpeed * boost;
         player = sim(
           player,
@@ -622,7 +749,7 @@ export default function Dogfight() {
           const dz = player.z - r.z;
           if (dx * dx + dy * dy + dz * dz < (r.radius + 1) * (r.radius + 1)) {
             if (lastBoostRing !== r.id) {
-              playerBoostUntilT = player.t + 2.5;
+              playerBoostUntilT = player.t + DOGFIGHT_BOOST_DURATION;
               lastBoostRing = r.id;
             }
           }
@@ -692,18 +819,38 @@ export default function Dogfight() {
 
       // -- update visuals --
       const alive = now < playerCrashedUntilWall ? false : true;
+      const dbg = debugRef.current;
       playerMesh.visible = alive;
       if (alive) orientPlane(playerMesh, player, fwd);
+      playerObb.visible = dbg && alive;
+      captureWire.visible = dbg && alive;
+      if (alive) captureWire.position.set(player.x, player.y, player.z);
       // Subtle invincibility shimmer — pulse emissive.
       const invinc = now < playerInvincibleUntilWall && alive;
       const pulse = invinc ? 0.4 + 0.4 * Math.sin(now / 80) : 0;
       for (const m of playerMaterials)
         m.emissiveIntensity = pulse;
 
+      // Debug overlay toggles — terrain wireframe, building edges, ring
+      // trigger spheres, moving-zone wireframes.
+      if (dbg) {
+        const wire = ensureTerrainWire();
+        wire.visible = true;
+        terrainMat.wireframe = true;
+      } else if (terrainWire) {
+        terrainWire.visible = false;
+        terrainMat.wireframe = false;
+      } else {
+        terrainMat.wireframe = false;
+      }
+      for (const w of buildingDebugWires) w.visible = dbg;
+      for (const w of ringWires) w.visible = dbg;
+
       for (let i = 0; i < ais.length; i++) {
         const ai = ais[i]!;
         const respawning = ai.respawnAtWall !== -Infinity;
         aiMeshes[i]!.visible = !respawning;
+        aiObbs[i]!.visible = dbg && !respawning;
         if (!respawning) orientPlane(aiMeshes[i]!, ai.state, fwd);
         const gm = aiGoalMarks[i]!;
         gm.visible = !!ai.goal && !respawning;
@@ -747,11 +894,15 @@ export default function Dogfight() {
         const z = zones[i]!;
         const p = z.predict(player.t);
         const mesh = zoneMeshes[i]!;
+        const wire = zoneWires[i]!;
         if (p) {
           mesh.position.set(p.x, p.y, p.z);
+          wire.position.set(p.x, p.y, p.z);
           mesh.visible = showZonesRef.current;
+          wire.visible = dbg;
         } else {
           mesh.visible = false;
+          wire.visible = false;
         }
       }
 
@@ -906,6 +1057,9 @@ export default function Dogfight() {
         <button onClick={() => setShowZones((v) => !v)} style={btn(showZones)}>
           zones (3)
         </button>
+        <button onClick={() => setDebug((v) => !v)} style={btn(debug)}>
+          debug bounds (4)
+        </button>
       </div>
 
       {/* Bottom-left: HUD + AI status */}
@@ -949,7 +1103,12 @@ export default function Dogfight() {
         </div>
         <code>W/S</code> pitch · <code>A/D</code> roll · <code>Q/E</code> yaw
         <br />
-        <code>Shift / Ctrl</code> throttle ± · green rings boost
+        <code>Shift / Ctrl</code> throttle ± · green rings boost 2×
+        <br />
+        <span style={{ opacity: 0.65 }}>
+          <code>P</code> pause · <code>C</code> camera ·{' '}
+          <code>1 2 3</code> overlays · <code>4 / B</code> debug bounds
+        </span>
       </div>
 
       {/* Centre banner: flashes on crash / capture */}
