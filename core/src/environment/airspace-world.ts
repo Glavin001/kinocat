@@ -7,11 +7,17 @@
 
 import type { Predict } from '../predict/types';
 import {
-  poseToOBB,
-  obbHitsAABB,
-  obbHitsSphere,
-  obbWorldExtent,
+  computeOBBSepAxes,
+  makeOBB,
+  makeOBBSepAxes,
+  obbHitsAABBCached,
+  obbHitsSphereXYZ,
+  obbWorldExtentInto,
+  poseToOBBInto,
+  type OBB,
+  type OBBSepAxes,
   type Pose,
+  type Vec3,
 } from '../internal/obb';
 import { NULL_RECORDER, type PerfRecorder } from '../planner/perf';
 
@@ -75,6 +81,13 @@ export class InMemoryAirspace implements AirspaceWorld {
   private readonly bpVisited: Uint32Array;
   private bpToken: number = 0;
   private rec: PerfRecorder = NULL_RECORDER;
+  // Scratch OBB + separating-axes table + extent vectors reused across
+  // clear() calls. clear() is called >10⁶ times per long aircraft search;
+  // these saves ~9 allocations per call.
+  private readonly _obb: OBB = makeOBB();
+  private readonly _sep: OBBSepAxes = makeOBBSepAxes();
+  private readonly _extMin: Vec3 = [0, 0, 0];
+  private readonly _extMax: Vec3 = [0, 0, 0];
 
   constructor(opts: AirspaceOptions = {}) {
     this.floor = opts.floor ?? -Infinity;
@@ -158,18 +171,25 @@ export class InMemoryAirspace implements AirspaceWorld {
 
   clear(pose: Pose, half: [number, number, number], t: number): boolean {
     this.rec.counters.collisionChecks++;
-    const obb = poseToOBB(pose, half);
-    const ext = obbWorldExtent(obb);
-    if (ext.min[1] < this.floor || ext.max[1] > this.ceiling) {
+    const obb = this._obb;
+    const extMin = this._extMin;
+    const extMax = this._extMax;
+    poseToOBBInto(obb, pose, half);
+    obbWorldExtentInto(obb, extMin, extMax);
+    if (extMin[1] < this.floor || extMax[1] > this.ceiling) {
       this.rec.counters.collisionRejects++;
       return false;
     }
+    // Compute SAT cross-axes lazily — only when we will actually run SAT.
+    // Many calls bail out on AABB pre-reject without needing them.
+    let sepReady = false;
+    const sep = this._sep;
     if (this.bpEnabled) {
       const cell = this.bpCell;
-      const c0 = Math.max(0, Math.floor((ext.min[0] - this.bpMinX) / cell));
-      const c1 = Math.min(this.bpCols - 1, Math.floor((ext.max[0] - this.bpMinX) / cell));
-      const r0 = Math.max(0, Math.floor((ext.min[2] - this.bpMinZ) / cell));
-      const r1 = Math.min(this.bpRows - 1, Math.floor((ext.max[2] - this.bpMinZ) / cell));
+      const c0 = Math.max(0, Math.floor((extMin[0] - this.bpMinX) / cell));
+      const c1 = Math.min(this.bpCols - 1, Math.floor((extMax[0] - this.bpMinX) / cell));
+      const r0 = Math.max(0, Math.floor((extMin[2] - this.bpMinZ) / cell));
+      const r1 = Math.min(this.bpRows - 1, Math.floor((extMax[2] - this.bpMinZ) / cell));
       const token = ++this.bpToken;
       // Wrap-around protection (unlikely in practice; reset on overflow).
       if (token === 0) {
@@ -188,14 +208,18 @@ export class InMemoryAirspace implements AirspaceWorld {
             const b = this.bpEntries[idx]!.box;
             // Cheap AABB-vs-AABB pre-reject on world-extent.
             if (
-              ext.max[0] < b.min[0] || ext.min[0] > b.max[0] ||
-              ext.max[1] < b.min[1] || ext.min[1] > b.max[1] ||
-              ext.max[2] < b.min[2] || ext.min[2] > b.max[2]
+              extMax[0] < b.min[0] || extMin[0] > b.max[0] ||
+              extMax[1] < b.min[1] || extMin[1] > b.max[1] ||
+              extMax[2] < b.min[2] || extMin[2] > b.max[2]
             ) {
               this.rec.counters.broadphaseSkips++;
               continue;
             }
-            if (obbHitsAABB(obb, b.min, b.max)) {
+            if (!sepReady) {
+              computeOBBSepAxes(obb, sep);
+              sepReady = true;
+            }
+            if (obbHitsAABBCached(obb, sep, b.min, b.max)) {
               this.rec.counters.collisionRejects++;
               return false;
             }
@@ -205,7 +229,11 @@ export class InMemoryAirspace implements AirspaceWorld {
     } else {
       for (let i = 0; i < this.boxes.length; i++) {
         const b = this.boxes[i]!;
-        if (obbHitsAABB(obb, b.min, b.max)) {
+        if (!sepReady) {
+          computeOBBSepAxes(obb, sep);
+          sepReady = true;
+        }
+        if (obbHitsAABBCached(obb, sep, b.min, b.max)) {
           this.rec.counters.collisionRejects++;
           return false;
         }
@@ -216,7 +244,7 @@ export class InMemoryAirspace implements AirspaceWorld {
       this.rec.counters.predictCalls++;
       const c = zone.predict(t);
       if (!c) continue;
-      if (obbHitsSphere(obb, [c.x, c.y, c.z], zone.radius)) {
+      if (obbHitsSphereXYZ(obb, c.x, c.y, c.z, zone.radius)) {
         this.rec.counters.collisionRejects++;
         return false;
       }

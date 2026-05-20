@@ -12,7 +12,8 @@ export interface EdgeRef {
 
 /** A search vertex. `index` holds one packed cell key per resolution level,
  *  ordered coarse (0) → fine (levels-1). `hash` uniquely keys the exact state
- *  class (used for optimal dedup). `level`/`active` are planner-managed. */
+ *  class (used for optimal dedup). `level`/`active`/`seq` are planner-managed
+ *  — environments should treat them as opaque. */
 export interface Node<State> {
   state: State;
   g: number;
@@ -24,6 +25,9 @@ export interface Node<State> {
   hash: string;
   level: number;
   active: boolean;
+  /** Insertion sequence, set by the planner when the node enters the open
+   *  list; used as the priority-queue tiebreaker (FIFO within equal-f). */
+  seq: number;
 }
 
 /** The five-method domain interface, plus a `levels` count for the

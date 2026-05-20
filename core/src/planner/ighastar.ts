@@ -20,11 +20,6 @@ import type { PlanRequest, PlanResult, PlanStats } from './types';
 
 const EPS = 1e-9;
 
-interface QItem<State> {
-  node: Node<State>;
-  seq: number;
-}
-
 function emptyResult<State>(rec: PerfRecorder): PlanResult<State> {
   const stats: PlanStats = {
     expansions: 0,
@@ -84,9 +79,12 @@ export function plan<State>(
   let seq = 0;
   let expansionsSinceImprovement = 0;
 
-  const cmp = (a: QItem<State>, b: QItem<State>): number => {
-    if (a.node.f !== b.node.f) return a.node.f - b.node.f;
-    if (a.node.h !== b.node.h) return a.node.h - b.node.h;
+  // Heap pushes Node refs directly — node.seq breaks f/h ties (FIFO within
+  // equal cost). Avoids per-push QItem object allocation (~200k saved on
+  // canyon).
+  const cmp = (a: Node<State>, b: Node<State>): number => {
+    if (a.f !== b.f) return a.f - b.f;
+    if (a.h !== b.h) return a.h - b.h;
     return a.seq - b.seq;
   };
 
@@ -99,7 +97,7 @@ export function plan<State>(
     const passImprovementsBefore = stats.improvements;
     stats.passesRun++;
     const finest = level === levels - 1;
-    const open = new BinaryHeap<QItem<State>>(cmp);
+    const open = new BinaryHeap<Node<State>>(cmp);
     const gExact = new Map<string, number>();
     const dom = new DominanceTable(env.levels);
 
@@ -110,8 +108,9 @@ export function plan<State>(
     if (timingsOn) timings.heuristic += performance.now() - th;
     counters.heuristicCalls++;
     startNode.f = startNode.h;
+    startNode.seq = seq++;
     gExact.set(startNode.hash, 0);
-    open.push({ node: startNode, seq: seq++ });
+    open.push(startNode);
 
     while (!open.isEmpty()) {
       if (stats.expansions >= maxExpansions) {
@@ -129,7 +128,7 @@ export function plan<State>(
         break;
       }
 
-      const v = open.pop()!.node;
+      const v = open.pop()!;
 
       if (v.f > omega + EPS) continue; // branch-and-bound
       const gv = gExact.get(v.hash);
@@ -184,8 +183,8 @@ export function plan<State>(
           }
         }
         gExact.set(n.hash, n.g);
-        n.active = true;
-        open.push({ node: n, seq: seq++ });
+        n.seq = seq++;
+        open.push(n);
         stats.generated++;
       }
 
