@@ -10,6 +10,7 @@ import type { Environment, EdgeRef, Node } from './types';
 import type { MovingObstacle } from '../predict/types';
 import type { AffordanceRegistry } from '../predict/affordance-registry';
 import type { VehicleState } from '../agent/types';
+import { NULL_RECORDER, type PerfRecorder } from '../planner/perf';
 
 export interface TimeAwareOptions {
   obstacles?: MovingObstacle[];
@@ -65,6 +66,7 @@ export class TimeAwareEnvironment<State extends HasXZT>
   private readonly affordances?: AffordanceRegistry;
   private readonly affordanceRadius: number;
   private readonly bp: ObstacleBound[] | null;
+  private rec: PerfRecorder = NULL_RECORDER;
 
   constructor(
     private readonly base: Environment<State>,
@@ -154,12 +156,19 @@ export class TimeAwareEnvironment<State extends HasXZT>
     return out;
   }
 
+  attachRecorder(rec: PerfRecorder): void {
+    this.rec = rec;
+    this.base.attachRecorder?.(rec);
+  }
+
   private augment(node: Node<State>): Node<State> {
     const tb = Math.round(node.state.t / this.timeQuantum);
-    node.index = node.index.map((k, L) => {
+    // In-place mutation: createNode just allocated `node.index`, we own it.
+    const idx = node.index;
+    for (let L = 0; L < idx.length; L++) {
       const d = this.divisors[L] ?? 1;
-      return `${k}@${Math.floor(tb / d)}`;
-    });
+      idx[L] = `${idx[L]}@${Math.floor(tb / d)}`;
+    }
     node.hash = `${node.hash}@t${tb}`;
     return node;
   }
@@ -167,8 +176,10 @@ export class TimeAwareEnvironment<State extends HasXZT>
   /** True if `state` overlaps any predicted obstacle at its own time. */
   private collides(state: State): boolean {
     const bp = this.bp;
+    const counters = this.rec.counters;
     if (!bp) {
       for (const obs of this.obstacles) {
+        counters.predictCalls++;
         const p = obs.predict(state.t);
         if (!p) continue;
         const rr = obs.radius + this.agentRadius;
@@ -183,18 +194,26 @@ export class TimeAwareEnvironment<State extends HasXZT>
       const b = bp[i]!;
       if (state.t <= b.tMaxSampled) {
         // Full knowledge inside the sampled window.
-        if (!b.active) continue; // predictor null across the window
-        if (state.t < b.tLo || state.t > b.tHi) continue; // outside active span
+        if (!b.active) {
+          counters.broadphaseSkips++;
+          continue; // predictor null across the window
+        }
+        if (state.t < b.tLo || state.t > b.tHi) {
+          counters.broadphaseSkips++;
+          continue; // outside active span
+        }
         if (
           state.x < b.minX - b.pad ||
           state.x > b.maxX + b.pad ||
           state.z < b.minZ - b.pad ||
           state.z > b.maxZ + b.pad
         ) {
+          counters.broadphaseSkips++;
           continue; // provably farther than rr from the obstacle
         }
       }
       // Inside the uncertain band, or beyond the sampled window: exact test.
+      counters.predictCalls++;
       const p = obs.predict(state.t);
       if (!p) continue;
       const dx = state.x - p.x;

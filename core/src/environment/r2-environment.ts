@@ -7,6 +7,7 @@
 import type { Environment, EdgeRef, Node } from './types';
 import { makeNode } from '../planner/node';
 import { pack2 } from '../planner/resolution';
+import { NULL_RECORDER, type PerfRecorder } from '../planner/perf';
 
 export interface R2State {
   x: number;
@@ -50,6 +51,7 @@ export class R2Environment implements Environment<R2State> {
   private readonly blockedFn: (cx: number, cy: number) => boolean;
   private readonly bounds: R2Bounds;
   private readonly goalCellRadius: number;
+  private rec: PerfRecorder = NULL_RECORDER;
 
   constructor(opts: R2Options) {
     this.step = opts.step;
@@ -58,6 +60,10 @@ export class R2Environment implements Environment<R2State> {
     this.divisors = opts.levelDivisors ?? [4, 2, 1];
     this.goalCellRadius = opts.goalCellRadius ?? 0;
     this.levels = this.divisors.length;
+  }
+
+  attachRecorder(rec: PerfRecorder): void {
+    this.rec = rec;
   }
 
   cellOf(s: R2State): [number, number] {
@@ -70,7 +76,10 @@ export class R2Environment implements Environment<R2State> {
   }
 
   private free(cx: number, cy: number): boolean {
-    return this.inBounds(cx, cy) && !this.blockedFn(cx, cy);
+    this.rec.counters.collisionChecks++;
+    const ok = this.inBounds(cx, cy) && !this.blockedFn(cx, cy);
+    if (!ok) this.rec.counters.collisionRejects++;
+    return ok;
   }
 
   createNode(
@@ -107,6 +116,7 @@ export class R2Environment implements Environment<R2State> {
   }
 
   heuristic(from: R2State, to: R2State): number {
+    this.rec.counters.heuristicCalls++;
     return Math.hypot(from.x - to.x, from.y - to.y);
   }
 

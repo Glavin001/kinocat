@@ -1,5 +1,7 @@
 // The planner's only coupling to a domain. IGHA* operates purely on these.
 
+import type { PerfRecorder } from '../planner/perf';
+
 /** An edge taken to reach a node (motion primitive, curve, affordance, …).
  *  `cost` is the additive g-cost of traversing it. JSON-serializable. */
 export interface EdgeRef {
@@ -49,4 +51,11 @@ export interface Environment<State> {
 
   /** Goal predicate. */
   reachedGoalRegion(node: Node<State>, goal: Node<State>): boolean;
+
+  /** Optional: install a performance recorder so the env can increment
+   *  per-search counters (collisions, predicts, …) at zero cost when the
+   *  recorder is the shared `NULL_RECORDER`. Implementations that do not
+   *  contribute counters can omit this method. Composing wrappers (e.g.
+   *  TimeAwareEnvironment) must forward to their base environment. */
+  attachRecorder?(rec: PerfRecorder): void;
 }

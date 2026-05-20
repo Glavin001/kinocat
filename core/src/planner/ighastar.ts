@@ -10,6 +10,12 @@ import { reconstructNodes, reconstructStates } from './node';
 import { DominanceTable } from './resolution';
 import { BinaryHeap } from '../internal/heap';
 import { DEFAULT_HYSTERESIS, decideLevel } from './hysteresis';
+import {
+  NULL_RECORDER,
+  makeRecorder,
+  type PassStats,
+  type PerfRecorder,
+} from './perf';
 import type { PlanRequest, PlanResult, PlanStats } from './types';
 
 const EPS = 1e-9;
@@ -19,7 +25,7 @@ interface QItem<State> {
   seq: number;
 }
 
-function emptyResult<State>(): PlanResult<State> {
+function emptyResult<State>(rec: PerfRecorder): PlanResult<State> {
   const stats: PlanStats = {
     expansions: 0,
     generated: 0,
@@ -27,7 +33,10 @@ function emptyResult<State>(): PlanResult<State> {
     budgetHit: false,
     passesRun: 0,
     improvements: 0,
+    counters: rec.counters,
+    perPass: [],
   };
+  if (rec.timingsOn) stats.timings = rec.timings;
   return { found: false, cost: Infinity, path: [], nodes: [], stats, solutionHistory: [] };
 }
 
@@ -42,11 +51,23 @@ export function plan<State>(
 ): PlanResult<State> {
   const { start, goal, environment: env } = req;
   const opts = req.options ?? {};
-  const result = emptyResult<State>();
+  const profile = opts.profile ?? 'counts';
+  const rec = makeRecorder(profile);
+  env.attachRecorder?.(rec);
+
+  const tStart = rec.timingsOn ? performance.now() : 0;
+  const result = emptyResult<State>(rec);
   const stats = result.stats;
+  const counters = rec.counters;
+  const timings = rec.timings;
+  const timingsOn = rec.timingsOn;
 
   const [startValid, goalValid] = env.checkValidity(start, goal);
-  if (!startValid || !goalValid) return result;
+  if (!startValid || !goalValid) {
+    if (timingsOn) timings.total = performance.now() - tStart;
+    env.attachRecorder?.(NULL_RECORDER);
+    return result;
+  }
 
   const levels = Math.max(1, opts.levels ?? env.levels);
   const maxExpansions = opts.maxExpansions ?? Infinity;
@@ -72,6 +93,10 @@ export function plan<State>(
   let stop = false;
 
   for (let level = 0; level < levels && !stop; level++) {
+    const passStart = timingsOn ? performance.now() : 0;
+    const passExpansionsBefore = stats.expansions;
+    const passGeneratedBefore = stats.generated;
+    const passImprovementsBefore = stats.improvements;
     stats.passesRun++;
     const finest = level === levels - 1;
     const open = new BinaryHeap<QItem<State>>(cmp);
@@ -80,7 +105,10 @@ export function plan<State>(
 
     const startNode = env.createNode(start, null, null);
     startNode.g = 0;
+    const th = timingsOn ? performance.now() : 0;
     startNode.h = env.heuristic(start, goal);
+    if (timingsOn) timings.heuristic += performance.now() - th;
+    counters.heuristicCalls++;
     startNode.f = startNode.h;
     gExact.set(startNode.hash, 0);
     open.push({ node: startNode, seq: seq++ });
@@ -107,12 +135,18 @@ export function plan<State>(
       const gv = gExact.get(v.hash);
       if (gv !== undefined && v.g > gv + EPS) continue; // stale duplicate
 
+      counters.goalChecks++;
       if (env.reachedGoalRegion(v, goalNode)) {
         if (v.g < omega - EPS) {
           omega = v.g;
+          const tr = timingsOn ? performance.now() : 0;
           incumbentNodes = reconstructNodes(v);
           result.solutionHistory.push(reconstructStates(v));
+          if (timingsOn) timings.pathReconstruct += performance.now() - tr;
           stats.improvements++;
+          counters.improvementWallMs.push(
+            useClock ? performance.now() - t0 : 0,
+          );
           expansionsSinceImprovement = 0;
         }
         continue; // keep searching for a better solution (anytime)
@@ -121,14 +155,33 @@ export function plan<State>(
       stats.expansions++;
       expansionsSinceImprovement++;
 
-      for (const n of env.succ(v, goalNode)) {
-        if (n.f > omega + EPS) continue;
+      counters.succCalls++;
+      const ts = timingsOn ? performance.now() : 0;
+      const succs = env.succ(v, goalNode);
+      if (timingsOn) timings.succ += performance.now() - ts;
+      counters.successorsTotal += succs.length;
+
+      for (let i = 0; i < succs.length; i++) {
+        const n = succs[i]!;
+        if (n.f > omega + EPS) {
+          counters.rejectedByOmega++;
+          continue;
+        }
         const known = gExact.get(n.hash);
-        if (known !== undefined && n.g >= known - EPS) continue; // exact dedup
+        if (known !== undefined && n.g >= known - EPS) {
+          counters.rejectedByExact++;
+          continue;
+        }
         if (!finest) {
           const key = n.index[level];
-          if (key !== undefined && n.g >= dom.best(level, key) - EPS) continue;
-          if (key !== undefined) dom.relax(level, key, n.g);
+          if (key !== undefined) {
+            counters.domLookups++;
+            if (n.g >= dom.best(level, key) - EPS) {
+              counters.rejectedByDominance++;
+              continue;
+            }
+            if (dom.relax(level, key, n.g)) counters.domRelaxes++;
+          }
         }
         gExact.set(n.hash, n.g);
         n.active = true;
@@ -144,6 +197,15 @@ export function plan<State>(
         break;
       }
     }
+
+    const pass: PassStats = {
+      level,
+      expansions: stats.expansions - passExpansionsBefore,
+      generated: stats.generated - passGeneratedBefore,
+      improvements: stats.improvements - passImprovementsBefore,
+    };
+    if (timingsOn) pass.ms = performance.now() - passStart;
+    stats.perPass.push(pass);
   }
 
   if (incumbentNodes && incumbentNodes.length > 0) {
@@ -152,5 +214,7 @@ export function plan<State>(
     result.nodes = incumbentNodes;
     result.path = incumbentNodes.map((n) => n.state);
   }
+  if (timingsOn) timings.total = performance.now() - tStart;
+  env.attachRecorder?.(NULL_RECORDER);
   return result;
 }

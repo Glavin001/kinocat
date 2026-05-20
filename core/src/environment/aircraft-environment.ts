@@ -1,9 +1,13 @@
 // AircraftEnvironment — a true 3D Environment<AircraftState> for the IGHA*
-// core. Altitude is a searched dimension (in the hash and the per-level
-// dominance key); roll is a tactical searched dimension (in the hash only,
-// so coarse passes don't fragment over equivalent-altitude routes at
-// different banks). Collision uses an OBB oriented by yaw + pitch + roll so
-// the planner can knife-edge through slots too narrow for level wings.
+// core. Altitude is a searched dimension. Pitch and roll participate in the
+// coarse-level dominance index at a coarser bucket (so equivalent-position
+// routes that differ only in attitude collapse on coarse passes) but the
+// finest-level exact hash keeps all 8 dimensions — preserving optimality.
+// Collision uses an OBB oriented by yaw + pitch + roll so the planner can
+// knife-edge through slots too narrow for level wings. Motion primitives are
+// pre-characterized as local-frame sweeps (mirror of the vehicle pattern),
+// so `succ()` is rigid-transform + collision-check per substep, not
+// forward-sim per substep.
 
 import type { Environment, EdgeRef, Node } from './types';
 import type { AirspaceWorld } from './airspace-world';
@@ -11,7 +15,8 @@ import type { AircraftAgent, AircraftState } from '../agent/types';
 import { aircraftForwardSim } from '../agent/aircraft';
 import type { ForwardSim } from '../primitives/types';
 import { makeNode } from '../planner/node';
-import { angleDiff, wrapAngle } from '../internal/math';
+import { wrapAngle, angleDiff } from '../internal/math';
+import { NULL_RECORDER, type PerfRecorder } from '../planner/perf';
 
 export interface AircraftEnvOptions {
   /** Horizontal position cell (x, z) for quantization. */
@@ -39,13 +44,7 @@ export interface AircraftEnvOptions {
   rollFractions?: number[];
   /** Target speeds; default `[maxSpeed]`. */
   speeds?: number[];
-  /** Per-edge penalty added to cost as `rollCost · |roll| · primDuration` (in
-   *  cost units per radian per second). Biases the planner toward wings-level
-   *  flight; banking is still chosen when geometry demands it (the alternative
-   *  is collision rejection). Default 0.5: a full ±π/2 bank for 1 s costs
-   *  ~0.79, roughly doubling the edge cost of wings-level cruise. Kept
-   *  admissible w.r.t. the 3D-Euclidean / maxSpeed heuristic because edge
-   *  cost stays ≥ primDuration ≥ h-decrease. */
+  /** Per-edge penalty added to cost as `rollCost · |roll| · primDuration`. */
   rollCost?: number;
 }
 
@@ -60,6 +59,30 @@ interface FlyEdgeData {
   k: number;
   climb: number;
   roll: number;
+}
+
+/** A local-frame swept pose along one primitive (start-relative). */
+interface LocalSweep {
+  dx: number; // forward (body +x at heading 0)
+  dz: number; // lateral (body +z at heading 0; world +z when heading 0)
+  dy: number; // altitude delta
+  dHeading: number;
+  pitch: number; // absolute (controls clamp; constant within primitive)
+  roll: number; // absolute
+  dt: number;
+}
+
+interface CachedPrimitive {
+  control: ControlQuad;
+  /** Per-substep local-frame poses; length = substeps. */
+  samples: LocalSweep[];
+  /** End-of-primitive deltas in local frame (== samples[last] for convenience). */
+  end: LocalSweep;
+  /** Pre-built `controls` array for legacy/sim use; reused, not reallocated. */
+  ctlArray: readonly [number, number, number, number];
+  /** Edge data preset (the `data` is mutated per use? No — it's read-only). */
+  cost: number;
+  edgeData: FlyEdgeData;
 }
 
 export class AircraftEnvironment implements Environment<AircraftState> {
@@ -77,9 +100,20 @@ export class AircraftEnvironment implements Environment<AircraftState> {
   private readonly substeps: number;
   private readonly rollCost: number;
   private readonly controls: ControlQuad[];
+  private readonly primitives: CachedPrimitive[];
   private readonly sim: ForwardSim<AircraftState>;
   private readonly invMaxSpeed: number;
   private readonly half: [number, number, number];
+  // Scratch pose object reused by collision checks (poseOf).
+  private readonly _scratchPose = {
+    x: 0,
+    y: 0,
+    z: 0,
+    yaw: 0,
+    pitch: 0,
+    roll: 0,
+  };
+  private rec: PerfRecorder = NULL_RECORDER;
 
   constructor(
     private readonly world: AirspaceWorld,
@@ -106,8 +140,7 @@ export class AircraftEnvironment implements Environment<AircraftState> {
     const turns = opts.turnFractions ?? [-1, -0.5, 0, 0.5, 1];
     const climbs = opts.climbFractions ?? [-1, 0, 1];
     // Roll search is opt-in: it lets the planner knife-edge through tight
-    // slots but triples the branching factor. Scenarios that need it (e.g.,
-    // narrow vertical slots) pass `rollFractions: [-1, 0, 1]` explicitly.
+    // slots but multiplies the branching factor.
     const rolls = opts.rollFractions ?? [0];
     const speeds = opts.speeds ?? [agent.maxSpeed];
     const quads: ControlQuad[] = [];
@@ -126,7 +159,79 @@ export class AircraftEnvironment implements Environment<AircraftState> {
       }
     }
     this.controls = quads;
+    this.primitives = this.buildPrimitiveCache();
     this.levels = this.divisors.length;
+  }
+
+  attachRecorder(rec: PerfRecorder): void {
+    this.rec = rec;
+    this.world.attachRecorder?.(rec);
+  }
+
+  /**
+   * Pre-characterize each control quad against the kinematic forward sim,
+   * recording substep-by-substep local-frame deltas. At runtime `succ()`
+   * rigid-transforms these by the parent node's heading + position rather
+   * than re-simulating, mirroring `characterizeVehicle()` for vehicles.
+   *
+   * Soundness: `aircraftForwardSim` (in `core/src/agent/aircraft.ts`) is a
+   * pure function of input state, control, and dt. The XZ-plane translation
+   * depends only on heading + speed + pitch; rotating the world-frame
+   * outputs by the parent's heading reproduces the simulated trajectory
+   * exactly because the body-axes' yaw appears linearly in (cos h, sin h)
+   * factors. Altitude is heading-independent. If the agent's forward sim is
+   * later swapped for one that depends on global wind or absolute position,
+   * gate this cache on that property.
+   */
+  private buildPrimitiveCache(): CachedPrimitive[] {
+    const out: CachedPrimitive[] = [];
+    const dt = this.primDuration / this.substeps;
+    for (const c of this.controls) {
+      const ctl: readonly [number, number, number, number] = [
+        c.k,
+        c.climb,
+        c.roll,
+        c.v,
+      ];
+      // Simulate from a canonical start (heading 0, origin, level wings),
+      // then store world-frame deltas — they're the local-frame deltas.
+      let s: AircraftState = {
+        x: 0,
+        y: 0,
+        z: 0,
+        heading: 0,
+        pitch: 0,
+        roll: 0,
+        speed: c.v,
+        t: 0,
+      };
+      const samples: LocalSweep[] = [];
+      for (let i = 0; i < this.substeps; i++) {
+        s = this.sim(s, ctl as unknown as number[], dt);
+        samples.push({
+          dx: s.x,
+          dz: s.z,
+          dy: s.y,
+          dHeading: s.heading,
+          pitch: s.pitch,
+          roll: s.roll,
+          dt: s.t,
+        });
+      }
+      const end = samples[samples.length - 1]!;
+      const cost =
+        this.primDuration +
+        this.rollCost * Math.abs(c.roll) * this.primDuration;
+      out.push({
+        control: c,
+        samples,
+        end,
+        ctlArray: ctl,
+        cost,
+        edgeData: { k: c.k, climb: c.climb, roll: c.roll },
+      });
+    }
+    return out;
   }
 
   private headingBucket(h: number): number {
@@ -156,11 +261,20 @@ export class AircraftEnvironment implements Environment<AircraftState> {
     );
     const isp = Math.round(state.speed / this.speedQuant);
     const it = Math.round(state.t / 0.25);
-    const index: string[] = [];
-    for (const d of this.divisors) {
-      index.push(
-        `${Math.floor(ix / d)}:${Math.floor(iy / d)}:${Math.floor(iz / d)}:${ih}`,
-      );
+    const index: string[] = new Array(this.divisors.length);
+    for (let L = 0; L < this.divisors.length; L++) {
+      const d = this.divisors[L]!;
+      // Coarse passes (d > 1) include pitch/roll buckets at coarser bins so
+      // equivalent-(x,y,z,heading) routes that differ only in attitude
+      // collapse to one dominance cell. The finest level (d === 1) keeps
+      // (ix,iy,iz,ih) only — its exact-hash dedup carries the (pitch,roll)
+      // distinction, so finest-pass optimality is unaffected.
+      if (d > 1) {
+        index[L] =
+          `${Math.floor(ix / d)}:${Math.floor(iy / d)}:${Math.floor(iz / d)}:${ih}:${Math.floor(ip / d)}:${Math.floor(ir / d)}`;
+      } else {
+        index[L] = `${ix}:${iy}:${iz}:${ih}`;
+      }
     }
     return makeNode(
       state,
@@ -171,68 +285,98 @@ export class AircraftEnvironment implements Environment<AircraftState> {
     );
   }
 
-  private poseOf(s: AircraftState) {
-    return {
-      x: s.x,
-      y: s.y,
-      z: s.z,
-      yaw: s.heading,
-      pitch: s.pitch,
-      roll: s.roll,
-    };
-  }
-
   succ(
     node: Node<AircraftState>,
     goal: Node<AircraftState>,
   ): Node<AircraftState>[] {
-    const dtSub = this.primDuration / this.substeps;
     const out: Node<AircraftState>[] = [];
-    for (const c of this.controls) {
-      const ctl = [c.k, c.climb, c.roll, c.v];
-      let s = node.state;
+    const st = node.state;
+    const ch = Math.cos(st.heading);
+    const sh = Math.sin(st.heading);
+    const pose = this._scratchPose;
+    const half = this.half;
+
+    for (let pi = 0; pi < this.primitives.length; pi++) {
+      const prim = this.primitives[pi]!;
       let clear = true;
-      for (let i = 0; i < this.substeps; i++) {
-        s = this.sim(s, ctl, dtSub);
-        if (!this.world.clear(this.poseOf(s), this.half, s.t)) {
+      // Rigid-transform each local-frame substep pose into world space and
+      // collision-check. The primitive cache stored (dx, dz, dy, dHeading,
+      // pitch, roll) at heading 0; rotate (dx, dz) by parent heading.
+      for (let i = 0; i < prim.samples.length; i++) {
+        const sp = prim.samples[i]!;
+        pose.x = st.x + sp.dx * ch - sp.dz * sh;
+        pose.z = st.z + sp.dx * sh + sp.dz * ch;
+        pose.y = st.y + sp.dy;
+        pose.yaw = wrapAngle(st.heading + sp.dHeading);
+        pose.pitch = sp.pitch;
+        pose.roll = sp.roll;
+        const tNow = st.t + sp.dt;
+        if (!this.world.clear(pose, half, tNow)) {
           clear = false;
           break;
         }
       }
       if (!clear) continue;
-      const cost =
-        this.primDuration + this.rollCost * Math.abs(c.roll) * this.primDuration;
-      const edge: EdgeRef = {
-        cost,
-        kind: 'fly',
-        data: { k: c.k, climb: c.climb, roll: c.roll } satisfies FlyEdgeData,
+
+      const end = prim.end;
+      const nextState: AircraftState = {
+        x: st.x + end.dx * ch - end.dz * sh,
+        y: st.y + end.dy,
+        z: st.z + end.dx * sh + end.dz * ch,
+        heading: wrapAngle(st.heading + end.dHeading),
+        pitch: end.pitch,
+        roll: end.roll,
+        speed: prim.control.v,
+        t: st.t + end.dt,
       };
-      const n = this.createNode(s, node, edge);
-      n.g = node.g + cost;
-      n.h = this.heuristic(s, goal.state);
+      const edge: EdgeRef = {
+        cost: prim.cost,
+        kind: 'fly',
+        data: prim.edgeData,
+      };
+      const n = this.createNode(nextState, node, edge);
+      n.g = node.g + prim.cost;
+      this.rec.counters.heuristicCalls++;
+      n.h = this.heuristicState(nextState, goal.state);
       n.f = n.g + n.h;
       out.push(n);
     }
     return out;
   }
 
-  /** 3D straight-line time. Admissible & consistent (airspeed is constant
-   *  along the path, so the per-edge h-drop never exceeds the edge cost). */
-  heuristic(from: AircraftState, to: AircraftState): number {
+  /** Internal heuristic that bypasses the public counter (caller already
+   *  incremented for the per-successor case). */
+  private heuristicState(from: AircraftState, to: AircraftState): number {
     const dx = from.x - to.x;
     const dy = from.y - to.y;
     const dz = from.z - to.z;
     return Math.sqrt(dx * dx + dy * dy + dz * dz) * this.invMaxSpeed;
   }
 
+  /** 3D straight-line time. Admissible & consistent. */
+  heuristic(from: AircraftState, to: AircraftState): number {
+    this.rec.counters.heuristicCalls++;
+    return this.heuristicState(from, to);
+  }
+
+  private poseOf(s: AircraftState) {
+    const p = this._scratchPose;
+    p.x = s.x;
+    p.y = s.y;
+    p.z = s.z;
+    p.yaw = s.heading;
+    p.pitch = s.pitch;
+    p.roll = s.roll;
+    return p;
+  }
+
   checkValidity(
     start: AircraftState,
     goal: AircraftState,
   ): [boolean, boolean] {
-    return [
-      this.world.clear(this.poseOf(start), this.half, start.t),
-      this.world.clear(this.poseOf(goal), this.half, goal.t),
-    ];
+    const a = this.world.clear(this.poseOf(start), this.half, start.t);
+    const b = this.world.clear(this.poseOf(goal), this.half, goal.t);
+    return [a, b];
   }
 
   reachedGoalRegion(
