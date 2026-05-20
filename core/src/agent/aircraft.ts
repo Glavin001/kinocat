@@ -35,9 +35,8 @@ export function defaultAircraftAgent(
 export function aircraftForwardSim(
   agent: AircraftAgent,
 ): ForwardSim<AircraftState> {
-  const kMax = 1 / agent.minTurnRadius;
+  const baseKMax = 1 / agent.minTurnRadius;
   return (s: AircraftState, controls: number[], dt: number): AircraftState => {
-    const curvature = clamp(controls[0] ?? 0, -kMax, kMax);
     const pitch = clamp(
       controls[1] ?? 0,
       -agent.maxClimbAngle,
@@ -49,6 +48,12 @@ export function aircraftForwardSim(
       agent.minSpeed,
       agent.maxSpeed,
     );
+    // Speed-dependent turn cap: agility shrinks as speed grows when the
+    // agent provides a `turnRadiusAt` profile (real airframes obey ≈v²/g).
+    const kMax = agent.turnRadiusAt
+      ? 1 / agent.turnRadiusAt(speed)
+      : baseKMax;
+    const curvature = clamp(controls[0] ?? 0, -kMax, kMax);
     const heading = wrapAngle(s.heading + speed * curvature * dt);
     const hs = speed * Math.cos(pitch);
     return {

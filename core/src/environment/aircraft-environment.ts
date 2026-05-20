@@ -258,12 +258,18 @@ export class AircraftEnvironment implements Environment<AircraftState> {
     speeds: number[],
   ): ControlQuad[] {
     const quads: ControlQuad[] = [];
-    for (const tf of turns) {
-      for (const cf of climbs) {
-        for (const rf of rolls) {
-          for (const v of speeds) {
+    // Each speed band may have its own min-turn-radius (via the agent's
+    // optional `turnRadiusAt` hook). Without the hook, every band shares
+    // `kMax` and behavior is identical to before.
+    for (const v of speeds) {
+      const kMaxV = this.agent.turnRadiusAt
+        ? 1 / this.agent.turnRadiusAt(v)
+        : kMax;
+      for (const tf of turns) {
+        for (const cf of climbs) {
+          for (const rf of rolls) {
             quads.push({
-              k: tf * kMax,
+              k: tf * kMaxV,
               climb: cf * this.agent.maxClimbAngle,
               roll: rf * this.agent.maxBank,
               v,

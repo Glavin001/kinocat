@@ -24,3 +24,5 @@ export type {
 } from './heightfield-airspace';
 export { TimeAwareEnvironment } from './time-aware';
 export type { TimeAwareOptions } from './time-aware';
+export { ResourceAwareEnvironment } from './resource-aware';
+export type { ResourceAwareOptions } from './resource-aware';

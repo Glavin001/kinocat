@@ -77,6 +77,12 @@ export interface AircraftAgent {
   halfLength: number;
   halfSpan: number;
   halfHeight: number;
+  /** Optional speed → min-turn-radius. Real aircraft turn under bounded
+   *  lateral g, so the minimum turn radius scales as v²/g (faster = wider
+   *  circle). When supplied, both `aircraftForwardSim` and the planner's
+   *  primitive generation consult this hook so the planner natively weighs
+   *  the agility cost of speed. Defaults to a constant `minTurnRadius`. */
+  turnRadiusAt?(speed: number): number;
 }
 
 export type AgentModel = VehicleAgent | HumanoidAgent | AircraftAgent;

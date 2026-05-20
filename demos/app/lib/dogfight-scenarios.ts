@@ -9,6 +9,7 @@ import type { PlanResult } from 'kinocat/planner';
 import {
   AircraftEnvironment,
   HeightfieldAirspace,
+  ResourceAwareEnvironment,
   TimeAwareEnvironment,
 } from 'kinocat/environment';
 import type {
@@ -44,25 +45,55 @@ export const DOGFIGHT_MAX_EXPANSIONS = 60000;
 /** Headless scenario test budget (one-shot, generous). */
 export const DOGFIGHT_TEST_MAX_EXPANSIONS = 220000;
 
+// --- Speed modes (shared action space for player + NPCs) -------------------
+// Three discrete primitives. SLOW conserves fuel + tightens turn radius;
+// NORMAL is the baseline cruise; BOOST is twice NORMAL but consumes fuel
+// and (via `turnRadiusAt`) sweeps a much wider turn circle, so the planner
+// naturally avoids it near terrain.
+export const DOGFIGHT_SPEED_SLOW = 24;
+export const DOGFIGHT_SPEED_NORMAL = 32;
+export const DOGFIGHT_SPEED_BOOST = 64;
+export type SpeedMode = 'SLOW' | 'NORMAL' | 'BOOST';
+export const DOGFIGHT_SPEED: Record<SpeedMode, number> = {
+  SLOW: DOGFIGHT_SPEED_SLOW,
+  NORMAL: DOGFIGHT_SPEED_NORMAL,
+  BOOST: DOGFIGHT_SPEED_BOOST,
+};
+/** A primitive is "boost-class" when its target speed exceeds this. Used by
+ *  the fuel-aware planner gate and the runtime fuel accountant. */
+export const DOGFIGHT_BOOST_SPEED_THRESHOLD = DOGFIGHT_SPEED_NORMAL * 1.3;
+
+// --- Boost-fuel mechanics ---------------------------------------------------
+export const DOGFIGHT_FUEL_MAX = 100;
+/** Fuel regen (units/sec) while not boosting. */
+export const DOGFIGHT_FUEL_REGEN = 8;
+/** Fuel consume (units/sec) while boosting. */
+export const DOGFIGHT_FUEL_CONSUME = 30;
+/** Fuel restored when a pilot flies through a ring. */
+export const DOGFIGHT_FUEL_RING_GIFT = 45;
+/** Below this, boost is unavailable (engine must "spool up"). */
+export const DOGFIGHT_FUEL_BOOST_MIN = 5;
+/** Quantization for the planner's fuel dimension (5 buckets over [0,100]). */
+export const DOGFIGHT_FUEL_QUANTUM = 25;
+
 /** Same envelope as the /plane demo so existing primitive characterizations
- *  remain in scope; tuned for the dogfight at the demo's elevated cruise. */
+ *  remain in scope; tuned for the dogfight at the demo's elevated cruise.
+ *  `turnRadiusAt` scales the min turn radius with (v/NORMAL)² so the planner
+ *  natively weighs boost's reduced agility against its forward speed. */
 export const DOGFIGHT_AGENT: AircraftAgent = defaultAircraftAgent({
   minTurnRadius: 22,
   minSpeed: 18,
-  maxSpeed: 44,
+  // BOOST sits at the cap so the simulator's clamp never silently
+  // throttles a boosting NPC's planned speed.
+  maxSpeed: DOGFIGHT_SPEED_BOOST,
   maxClimbAngle: Math.PI / 5,
   maxBank: Math.PI / 3,
   halfLength: 2,
   halfSpan: 1.8,
   halfHeight: 0.35,
+  turnRadiusAt: (speed) =>
+    22 * Math.pow(speed / DOGFIGHT_SPEED_NORMAL, 2),
 });
-
-/** Multiplier the demo applies on top of agent.maxSpeed when the player
- *  flies through a green boost ring. ~2× makes the boost feel meaningful at
- *  the elevated default cruise. */
-export const DOGFIGHT_BOOST_MULT = 2.0;
-/** Boost duration when a ring fires, in seconds. */
-export const DOGFIGHT_BOOST_DURATION = 2.5;
 
 export const DOGFIGHT_HALF: [number, number, number] = [
   DOGFIGHT_AGENT.halfLength,
@@ -427,13 +458,37 @@ export function selectTacticalMode(
   return npcIndex % 2 === 0 ? 'FLANK_LEFT' : 'FLANK_RIGHT';
 }
 
-/** Translate a tactical mode into an AircraftState goal pose. The planner
- *  uses goalRadius ~ 10, so these need only be in the right neighbourhood. */
+/** Pick the *goal* speed for the NPC's plan based on tactic + fuel. The
+ *  planner chooses which speeds to use *along* the trajectory from its
+ *  fuel-gated allowed set; this picks where the NPC wants to *end up*. */
+export function chooseNpcSpeedMode(
+  mode: TacticalMode,
+  fuel: number,
+): SpeedMode {
+  const canBoost = fuel > DOGFIGHT_FUEL_BOOST_MIN;
+  switch (mode) {
+    case 'EVADE':
+      return canBoost ? 'BOOST' : 'NORMAL';
+    case 'PURSUE':
+      return canBoost && fuel > 30 ? 'BOOST' : 'NORMAL';
+    case 'INTERCEPT':
+    case 'FLANK_LEFT':
+    case 'FLANK_RIGHT':
+      return 'NORMAL';
+    case 'REGROUP':
+      return 'SLOW';
+  }
+}
+
+/** Translate a tactical mode + chosen speed into an AircraftState goal
+ *  pose. The planner uses goalRadius ~ 14, so these need only be in the
+ *  right neighbourhood. */
 export function tacticalGoal(
   player: AircraftState,
   playerPredict: Predict<AircraftState>,
   npc: AircraftState,
   mode: TacticalMode,
+  speedMode: SpeedMode = 'NORMAL',
 ): AircraftState {
   const ahead = (t: number) => playerPredict(t) ?? player;
   const dx = player.x - npc.x;
@@ -442,7 +497,7 @@ export function tacticalGoal(
   const eta = Math.min(8, Math.max(1, dist / DOGFIGHT_AGENT.maxSpeed));
   const future = ahead(npc.t + eta);
 
-  const speed = DOGFIGHT_AGENT.maxSpeed;
+  const speed = DOGFIGHT_SPEED[speedMode];
   const base = {
     heading: 0,
     pitch: 0,
@@ -598,8 +653,49 @@ export interface AIPlanRequest {
   deadlineMs?: number;
   /** Hard expansion cap. */
   maxExpansions?: number;
+  /** NPC's current boost-fuel reserve (0..DOGFIGHT_FUEL_MAX). The planner
+   *  treats this as the start-node resource and gates BOOST primitives
+   *  accordingly; without it, the wrapper defaults to a full tank. */
+  startFuel?: number;
+  /** World features the planner should see as fuel-refill affordances.
+   *  Defaults to `dogfightBoostRings()`. */
+  rings?: BoostRing[];
   /** Optional override for the AircraftEnvironment options. */
   envOpts?: AircraftEnvOptions;
+}
+
+/** Sphere-vs-segment overlap. The runtime ring trigger uses a sphere test
+ *  too (`Dogfight.tsx` line ~750), so the planner sees the same affordance
+ *  geometry the runtime enforces. Conservative: any point on the segment
+ *  within `radius` of the sphere centre counts as a hit. */
+function segmentHitsSphere(
+  a: { x: number; y: number; z: number },
+  b: { x: number; y: number; z: number },
+  c: { x: number; y: number; z: number; radius: number },
+): boolean {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const dz = b.z - a.z;
+  const len2 = dx * dx + dy * dy + dz * dz;
+  let t = 0;
+  if (len2 > 1e-9) {
+    t = ((c.x - a.x) * dx + (c.y - a.y) * dy + (c.z - a.z) * dz) / len2;
+    if (t < 0) t = 0;
+    else if (t > 1) t = 1;
+  }
+  const px = a.x + dx * t;
+  const py = a.y + dy * t;
+  const pz = a.z + dz * t;
+  const ex = px - c.x;
+  const ey = py - c.y;
+  const ez = pz - c.z;
+  return ex * ex + ey * ey + ez * ez <= c.radius * c.radius;
+}
+
+type FuelR = { fuel: number };
+
+function clampFuel(f: number): number {
+  return f < 0 ? 0 : f > DOGFIGHT_FUEL_MAX ? DOGFIGHT_FUEL_MAX : f;
 }
 
 export function planAI(
@@ -620,6 +716,10 @@ export function planAI(
     primDuration: 0.7,
     substeps: 8,
     analyticExpansion: { everyN: 6, step: 4 },
+    // Three discrete speed primitives. The fuel-aware wrapper gates BOOST
+    // by the per-state fuel resource so the planner never expands a boost
+    // edge from an empty tank.
+    speeds: [DOGFIGHT_SPEED_SLOW, DOGFIGHT_SPEED_NORMAL, DOGFIGHT_SPEED_BOOST],
     ...req.envOpts,
   });
   const playerPredict = playerForecast(req.player, 6);
@@ -634,10 +734,47 @@ export function planAI(
       asObstacle(req.registry.predictNPC(id) as Predict<{ x: number; z: number }>, 4),
     ),
   ];
-  const env = new TimeAwareEnvironment(baseEnv, {
+  const timeEnv = new TimeAwareEnvironment(baseEnv, {
     obstacles,
     agentRadius: agentR,
     broadphase: { sampleStep: 0.5, maxSamples: 32 },
+  });
+  // Fuel-aware layer. Hooks are pure dogfight policy: BOOST edges gated by
+  // current fuel; fuel drains at boost speed and regenerates at slow/normal;
+  // segment crossing a ring refills. The planner sees rings as affordances,
+  // so a multi-step "detour through ring → boost to target" is found by A*
+  // when the path-cost arithmetic works out — no scripting.
+  const rings = req.rings ?? dogfightBoostRings();
+  // Inflate ring radius by 1m to match the runtime overlap test
+  // (`Dogfight.tsx` uses `radius + 1` for the trigger sphere).
+  const planRings = rings.map((r) => ({
+    x: r.x,
+    y: r.y,
+    z: r.z,
+    radius: r.radius + 1,
+  }));
+  const env = new ResourceAwareEnvironment<AircraftState, FuelR>(timeEnv, {
+    initial: { fuel: req.startFuel ?? DOGFIGHT_FUEL_MAX },
+    bucket: ({ fuel }) =>
+      String(Math.round(fuel / DOGFIGHT_FUEL_QUANTUM)),
+    allow: ({ fuel }, _from, _edge, to) =>
+      to.speed < DOGFIGHT_BOOST_SPEED_THRESHOLD ||
+      fuel >= DOGFIGHT_FUEL_BOOST_MIN,
+    step: ({ fuel }, _from, _edge, to, dt) => {
+      const isBoost = to.speed >= DOGFIGHT_BOOST_SPEED_THRESHOLD;
+      const delta = isBoost
+        ? -DOGFIGHT_FUEL_CONSUME * dt
+        : DOGFIGHT_FUEL_REGEN * dt;
+      return { fuel: clampFuel(fuel + delta) };
+    },
+    affordance: ({ fuel }, from, to) => {
+      for (const r of planRings) {
+        if (segmentHitsSphere(from, to, r)) {
+          return { fuel: clampFuel(fuel + DOGFIGHT_FUEL_RING_GIFT) };
+        }
+      }
+      return null;
+    },
   });
   return plan(
     {

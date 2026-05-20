@@ -7,12 +7,19 @@ import { aircraftForwardSim } from 'kinocat/agent';
 import type { AircraftState } from 'kinocat/agent';
 import { PlanRegistry } from 'kinocat/predict';
 import {
+  chooseNpcSpeedMode,
   DOGFIGHT_AGENT,
-  DOGFIGHT_BOOST_DURATION,
-  DOGFIGHT_BOOST_MULT,
   DOGFIGHT_BOUNDS,
+  DOGFIGHT_FUEL_BOOST_MIN,
+  DOGFIGHT_FUEL_CONSUME,
+  DOGFIGHT_FUEL_MAX,
+  DOGFIGHT_FUEL_REGEN,
+  DOGFIGHT_FUEL_RING_GIFT,
   DOGFIGHT_HALF,
   DOGFIGHT_PALETTE as C,
+  DOGFIGHT_SPEED,
+  DOGFIGHT_SPEED_NORMAL,
+  DOGFIGHT_BOOST_SPEED_THRESHOLD,
   dogfightAirspace,
   dogfightTerrain,
   dogfightStaticObstacles,
@@ -23,6 +30,7 @@ import {
   selectTacticalMode,
   tacticalGoal,
   planAI,
+  type SpeedMode,
   type TacticalMode,
 } from '../lib/dogfight-scenarios';
 
@@ -40,6 +48,10 @@ interface AI {
   lastBudgetMs: number;
   /** Wall time at which a crashed AI may rejoin combat (-Infinity = active). */
   respawnAtWall: number;
+  /** Boost-fuel reserve, 0..DOGFIGHT_FUEL_MAX. Mirrors the player. */
+  boostFuel: number;
+  /** Speed mode of the currently-executing plan (set at replan time). */
+  speedMode: SpeedMode;
 }
 
 interface Score {
@@ -285,6 +297,40 @@ export default function Dogfight() {
 
     // ---- boost rings -------------------------------------------------------
     const rings = dogfightBoostRings();
+    /** Check if `pos` is inside any ring's trigger sphere. Returns the ring
+     *  id on first hit, or null. Honours a per-collector cooldown so the
+     *  same collector can't refire on the same ring until they leave its
+     *  sphere — but two collectors can both score the same ring. */
+    function checkRingHit(
+      collectorId: string,
+      pos: { x: number; y: number; z: number },
+    ): string | null {
+      const last = lastRingByCollector.get(collectorId) ?? null;
+      let still = false;
+      let hit: string | null = null;
+      for (const r of rings) {
+        const dx = pos.x - r.x;
+        const dy = pos.y - r.y;
+        const dz = pos.z - r.z;
+        const inside =
+          dx * dx + dy * dy + dz * dz < (r.radius + 1) * (r.radius + 1);
+        if (!inside) continue;
+        if (last === r.id) {
+          still = true; // still in the last ring → no refire yet
+        } else if (!hit) {
+          hit = r.id;
+        }
+      }
+      if (hit) {
+        lastRingByCollector.set(collectorId, hit);
+        return hit;
+      }
+      if (!still) {
+        // Left the cooldown ring; clear so a future re-entry refires.
+        lastRingByCollector.delete(collectorId);
+      }
+      return null;
+    }
     const ringMeshes: THREE.Mesh[] = [];
     const ringWires: THREE.LineSegments[] = [];
     for (const r of rings) {
@@ -444,7 +490,7 @@ export default function Dogfight() {
         color,
         state: {
           ...spawn,
-          speed: DOGFIGHT_AGENT.maxSpeed,
+          speed: DOGFIGHT_SPEED_NORMAL,
           t: 0,
         },
         plan: null,
@@ -456,6 +502,8 @@ export default function Dogfight() {
         lastExpansions: 0,
         lastBudgetMs: 0,
         respawnAtWall: -Infinity,
+        boostFuel: DOGFIGHT_FUEL_MAX,
+        speedMode: 'NORMAL',
       });
     }
 
@@ -467,8 +515,11 @@ export default function Dogfight() {
     let player: AircraftState = makePlayerSpawn(0, []);
     let playerInvincibleUntilWall = performance.now() + RESPAWN_INVINCIBLE_MS;
     let playerCrashedUntilWall = -Infinity;
-    let playerBoostUntilT = -1;
-    let lastBoostRing: string | null = null;
+    let playerBoostFuel = DOGFIGHT_FUEL_MAX;
+    let playerSpeedMode: SpeedMode = 'NORMAL';
+    /** Per-collector cooldown so the same ring doesn't refire on the same
+     *  pilot across consecutive frames. Keyed by 'player' or `ai.id`. */
+    const lastRingByCollector = new Map<string, string>();
     const scoreRef = { aiWins: 0, crashes: 0, round: 1 };
 
     /** Pick the player spawn farthest from any active AI. */
@@ -498,7 +549,7 @@ export default function Dogfight() {
         heading: best.heading,
         pitch: 0,
         roll: 0,
-        speed: DOGFIGHT_AGENT.maxSpeed * 0.9,
+        speed: DOGFIGHT_SPEED_NORMAL,
         t: 0,
       };
     }
@@ -522,8 +573,9 @@ export default function Dogfight() {
       player = makePlayerSpawn(scoreRef.round, ais);
       playerInvincibleUntilWall = wall + RESPAWN_INVINCIBLE_MS;
       playerCrashedUntilWall = -Infinity;
-      playerBoostUntilT = -1;
-      lastBoostRing = null;
+      playerBoostFuel = DOGFIGHT_FUEL_MAX;
+      playerSpeedMode = 'NORMAL';
+      lastRingByCollector.delete('player');
       // Kick the AIs into immediate replanning toward the new spawn — clearing
       // their plans triggers a no-plan replan on the next loop tick.
       for (const a of ais) {
@@ -554,17 +606,22 @@ export default function Dogfight() {
       const spawn = AI_SPAWNS[idx % AI_SPAWNS.length]!;
       ai.state = {
         ...spawn,
-        speed: DOGFIGHT_AGENT.maxSpeed,
+        speed: DOGFIGHT_SPEED_NORMAL,
         t: ai.state.t, // continue absolute game time so registry stays valid
       };
       ai.respawnAtWall = -Infinity;
       ai.plan = null;
+      ai.boostFuel = DOGFIGHT_FUEL_MAX;
+      ai.speedMode = 'NORMAL';
+      lastRingByCollector.delete(ai.id);
     }
 
     // ---- input -------------------------------------------------------------
     const keys = new Set<string>();
     const onKeyDown = (e: KeyboardEvent) => {
       const k = e.key.toLowerCase();
+      // Stop space from scrolling the page; we use it for SLOW.
+      if (k === ' ') e.preventDefault();
       keys.add(k);
       if (k === 'p') setPaused((v) => !v);
       if (k === 'c') setChase((v) => !v);
@@ -573,7 +630,11 @@ export default function Dogfight() {
       if (k === '3') setShowZones((v) => !v);
       if (k === '4' || k === 'b') setDebug((v) => !v);
     };
-    const onKeyUp = (e: KeyboardEvent) => keys.delete(e.key.toLowerCase());
+    const onKeyUp = (e: KeyboardEvent) => {
+      const k = e.key.toLowerCase();
+      if (k === ' ') e.preventDefault();
+      keys.delete(k);
+    };
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
 
@@ -590,8 +651,9 @@ export default function Dogfight() {
       const ai = ais[aiCursor]!;
       aiCursor = (aiCursor + 1) % ais.length;
       const mode = selectTacticalMode(player, ai.state, aiCursor);
+      const speedMode = chooseNpcSpeedMode(mode, ai.boostFuel);
       const playerPredict = playerForecast(player, 5);
-      const goal = tacticalGoal(player, playerPredict, ai.state, mode);
+      const goal = tacticalGoal(player, playerPredict, ai.state, mode, speedMode);
       const t0 = performance.now();
       const res = planAI(airspace, {
         npcId: ai.id,
@@ -604,9 +666,11 @@ export default function Dogfight() {
           .map((o) => o.id),
         deadlineMs: 100,
         maxExpansions: 50000,
+        startFuel: ai.boostFuel,
       });
       const dt = performance.now() - t0;
       ai.mode = mode;
+      ai.speedMode = speedMode;
       ai.goal = goal;
       ai.lastBudgetMs = dt;
       ai.lastExpansions = res.stats.expansions;
@@ -628,20 +692,27 @@ export default function Dogfight() {
 
     // ---- HUD reporter ------------------------------------------------------
     const hudTimer = window.setInterval(() => {
-      const boost = playerBoostUntilT > player.t ? ' · BOOST' : '';
       const invinc =
         performance.now() < playerInvincibleUntilWall ? ' · INVINCIBLE' : '';
+      const boostMark =
+        playerSpeedMode === 'BOOST' &&
+        player.speed >= DOGFIGHT_BOOST_SPEED_THRESHOLD
+          ? ' · BOOST'
+          : '';
       setHud(
         `airspeed ${player.speed.toFixed(1)}  alt ${player.y.toFixed(0)}  ` +
           `heading ${((player.heading * 180) / Math.PI).toFixed(0)}°  ` +
-          `bank ${((player.roll * 180) / Math.PI).toFixed(0)}°${boost}${invinc}`,
+          `bank ${((player.roll * 180) / Math.PI).toFixed(0)}°  ` +
+          `fuel ${playerBoostFuel.toFixed(0)}%  mode ${playerSpeedMode}` +
+          `${boostMark}${invinc}`,
       );
       setAiStatus(
         ais.map(
           (a) =>
             `${a.id}: ${
               a.respawnAtWall !== -Infinity ? 'RESPAWNING' : a.mode
-            } · ${a.plan ? `path ${a.plan.length}` : 'no-plan'} · ` +
+            } · ${a.speedMode} · fuel ${a.boostFuel.toFixed(0)} · ` +
+            `${a.plan ? `path ${a.plan.length}` : 'no-plan'} · ` +
             `${a.lastExpansions} exp · ${a.lastBudgetMs.toFixed(0)} ms`,
         ),
       );
@@ -698,26 +769,53 @@ export default function Dogfight() {
         const pitch = keys.has('w') ? -0.6 : keys.has('s') ? 0.6 : 0;
         const roll = keys.has('a') ? -0.9 : keys.has('d') ? 0.9 : 0;
         const yawInput = keys.has('q') ? 1 : keys.has('e') ? -1 : 0;
-        const throttle = keys.has('shift')
-          ? 1
-          : keys.has('control')
-            ? -1
-            : 0;
+
+        // Discrete speed mode: Space → SLOW always (cancels boost even if
+        // Shift is also down — the safe fallback). Shift → BOOST only when
+        // we have fuel above the spool-up threshold. Otherwise NORMAL.
+        let mode: SpeedMode = 'NORMAL';
+        if (keys.has(' ')) mode = 'SLOW';
+        else if (keys.has('shift') && playerBoostFuel > DOGFIGHT_FUEL_BOOST_MIN)
+          mode = 'BOOST';
+        playerSpeedMode = mode;
+
         const targetRoll = roll * DOGFIGHT_AGENT.maxBank;
         const targetPitch = pitch * DOGFIGHT_AGENT.maxClimbAngle;
+        // Curvature input is unscaled by speed here; aircraftForwardSim
+        // applies the speed-dependent turn cap (via `turnRadiusAt`) so
+        // the player sweeps a wider arc at BOOST than at NORMAL — same
+        // physics the planner sees.
         const curvature =
           (Math.sin(targetRoll) / DOGFIGHT_AGENT.minTurnRadius) * 1.0 +
           yawInput * (0.4 / DOGFIGHT_AGENT.minTurnRadius);
-        let targetSpeed = player.speed + throttle * 8 * dt;
-        targetSpeed = Math.max(
-          DOGFIGHT_AGENT.minSpeed,
-          Math.min(DOGFIGHT_AGENT.maxSpeed, targetSpeed),
+
+        // Ease toward the mode's target speed (24 / 32 / 64). ACCEL chosen
+        // so SLOW↔BOOST takes ~1.7s, which feels responsive without being
+        // teleporty.
+        const ACCEL = 24;
+        const target = DOGFIGHT_SPEED[mode];
+        let targetSpeed = player.speed;
+        if (target > targetSpeed)
+          targetSpeed = Math.min(target, targetSpeed + ACCEL * dt);
+        else if (target < targetSpeed)
+          targetSpeed = Math.max(target, targetSpeed - ACCEL * dt);
+
+        // Fuel accountant — same rates the planner uses, so plan and
+        // runtime stay in lockstep.
+        const isBoosting =
+          mode === 'BOOST' && targetSpeed >= DOGFIGHT_BOOST_SPEED_THRESHOLD;
+        playerBoostFuel = Math.max(
+          0,
+          Math.min(
+            DOGFIGHT_FUEL_MAX,
+            playerBoostFuel +
+              (isBoosting ? -DOGFIGHT_FUEL_CONSUME : DOGFIGHT_FUEL_REGEN) * dt,
+          ),
         );
-        const boost = playerBoostUntilT > player.t ? DOGFIGHT_BOOST_MULT : 1;
-        const stepSpeed = targetSpeed * boost;
+
         player = sim(
           player,
-          [curvature, targetPitch, targetRoll, stepSpeed],
+          [curvature, targetPitch, targetRoll, targetSpeed],
           dt,
         );
         // Soft horizontal bounds — keep the playable area finite without
@@ -742,19 +840,14 @@ export default function Dogfight() {
           }
         }
 
-        // -- ring detection (visual / sim-only speed boost) --
-        for (const r of rings) {
-          const dx = player.x - r.x;
-          const dy = player.y - r.y;
-          const dz = player.z - r.z;
-          if (dx * dx + dy * dy + dz * dz < (r.radius + 1) * (r.radius + 1)) {
-            if (lastBoostRing !== r.id) {
-              playerBoostUntilT = player.t + DOGFIGHT_BOOST_DURATION;
-              lastBoostRing = r.id;
-            }
-          }
+        // -- ring detection (fuel refill, shared affordance) --
+        const ringHit = checkRingHit('player', player);
+        if (ringHit) {
+          playerBoostFuel = Math.min(
+            DOGFIGHT_FUEL_MAX,
+            playerBoostFuel + DOGFIGHT_FUEL_RING_GIFT,
+          );
         }
-        if (playerBoostUntilT < player.t) lastBoostRing = null;
       }
 
       // -- advance AIs along their plans + crash check + capture check --
@@ -773,7 +866,7 @@ export default function Dogfight() {
             if (dt > 0) {
               ai.state = sim(
                 ai.state,
-                [0, 0, 0, DOGFIGHT_AGENT.maxSpeed * 0.9],
+                [0, 0, 0, DOGFIGHT_SPEED_NORMAL],
                 dt,
               );
             }
@@ -790,6 +883,36 @@ export default function Dogfight() {
               speed: sampled.speed,
               t: ai.state.t + dt,
             };
+          }
+
+          // Fuel accountant — same rates the planner used at replan time.
+          // Keys off the *actual* current speed (not just `speedMode`) so a
+          // plan that ramps speed mid-trajectory bills fuel correctly.
+          const aiBoosting = ai.state.speed >= DOGFIGHT_BOOST_SPEED_THRESHOLD;
+          ai.boostFuel = Math.max(
+            0,
+            Math.min(
+              DOGFIGHT_FUEL_MAX,
+              ai.boostFuel +
+                (aiBoosting ? -DOGFIGHT_FUEL_CONSUME : DOGFIGHT_FUEL_REGEN) *
+                  dt,
+            ),
+          );
+          // If we ran out of fuel mid-boost, force a replan so the next
+          // tactical goal is computed against the empty tank. The planner's
+          // `allow` will then prune BOOST primitives from the search.
+          if (aiBoosting && ai.boostFuel <= 0) {
+            ai.plan = null;
+            registry.remove(ai.id);
+          }
+
+          // Ring detection — NPCs use the same affordance as the player.
+          const aiRingHit = checkRingHit(ai.id, ai.state);
+          if (aiRingHit) {
+            ai.boostFuel = Math.min(
+              DOGFIGHT_FUEL_MAX,
+              ai.boostFuel + DOGFIGHT_FUEL_RING_GIFT,
+            );
           }
 
           // AI crash check — same airspace contract as the player.
@@ -1103,7 +1226,8 @@ export default function Dogfight() {
         </div>
         <code>W/S</code> pitch · <code>A/D</code> roll · <code>Q/E</code> yaw
         <br />
-        <code>Shift / Ctrl</code> throttle ± · green rings boost 2×
+        <code>Shift</code> boost (burns fuel) · <code>Space</code> slow
+        (cancels boost) · green rings refill fuel
         <br />
         <span style={{ opacity: 0.65 }}>
           <code>P</code> pause · <code>C</code> camera ·{' '}
