@@ -704,6 +704,7 @@ const TESTED_DEMOS = new Set([
   'plane', // 'aircraft demo' — waypoint/canyon/restricted/gauntlet/knife-edge
   'playground', // 'playground demo' — planPlayground
   'raceprimitives', // 'raceprimitives demo' — side-by-side kinematic vs learned library race
+  'ramp', // 'ramp + affordance demo' — drivable heightfield ramp + planner-only BallisticJump
   'primitives', // 'primitives demo' — buildPrimitiveFan
   'reverse', // 'reverse demo' — planReverse
   'swarm', // 'swarm demo' — buildSwarm
