@@ -571,6 +571,68 @@ export function buildLearnedLibrary(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Online fit: refit the 5 coefficients from arbitrary one-step (state,
+// controls, dt, next-state) transitions. Unlike `fitParams` (which integrates
+// each trial's controls across multiple substeps) the online loss compares
+// `learnedSim(s, controls, dt)` directly against the observed next state.
+// Used by `/raceprimitives` to refit between laps as the car races on the
+// real course — no dedicated trial phase needed.
+
+/** One physics tick of recorded driving data. `controls` is the
+ *  (curvature, targetSpeed) pair the pure-pursuit tracker produced for this
+ *  tick — the same form the parametric model accepts. */
+export interface TransitionSample {
+  state: VehicleState;
+  controls: [number, number];
+  dt: number;
+  next: VehicleState;
+}
+
+function transitionLoss(
+  samples: ReadonlyArray<TransitionSample>,
+  params: LearnedVehicleParams,
+  agent: VehicleAgent,
+): { loss: number; errors: number[] } {
+  const sim = learnedForwardSim(params, agent);
+  let loss = 0;
+  const errors: number[] = [];
+  for (const t of samples) {
+    const pred = sim(t.state, t.controls, t.dt);
+    const dx = pred.x - t.next.x;
+    const dz = pred.z - t.next.z;
+    const dh = angleDelta(pred.heading, t.next.heading);
+    const ds = pred.speed - t.next.speed;
+    loss += POS_W * (dx * dx + dz * dz) + HEADING_W * dh * dh + SPEED_W * ds * ds;
+    errors.push(Math.sqrt(dx * dx + dz * dz));
+  }
+  return { loss, errors };
+}
+
+export interface OnlineFitOptions {
+  init?: LearnedVehicleParams;
+  maxIter?: number;
+}
+
+/** Fit the 5-coefficient model directly to a buffer of one-step transitions
+ *  recorded during real driving. Deterministic for a fixed `init`. */
+export function fitParamsOnline(
+  samples: ReadonlyArray<TransitionSample>,
+  agent: VehicleAgent,
+  opts: OnlineFitOptions = {},
+): FitResult {
+  const init = opts.init ?? DEFAULT_LEARNED_PARAMS;
+  const x0 = toVec(init);
+  const lossFn = (v: number[]) => transitionLoss(samples, fromVec(v), agent).loss;
+  const xStar = nelderMead(x0, lossFn, { maxIter: opts.maxIter ?? 300 });
+  const params = fromVec(xStar);
+  const finalRoll = transitionLoss(samples, params, agent);
+  const errs = finalRoll.errors;
+  const mean = errs.length ? errs.reduce((a, b) => a + b, 0) / errs.length : 0;
+  const max = errs.length ? Math.max(...errs) : 0;
+  return { params, loss: finalRoll.loss, meanPosError: mean, maxPosError: max };
+}
+
 /** Comparison summary: per-primitive max/mean error between the kinematic
  *  ghost and the recorded Rapier trial. Surfaced in the demo HUD. */
 export interface DiscrepancySummary {
