@@ -30,6 +30,12 @@ const groups: { heading: string; demos: Demo[] }[] = [
         tag: '3D · interactive · multi-agent',
       },
       {
+        href: '/ramp',
+        title: 'Ramp + Affordance — drivable ramp vs ballistic shortcut',
+        desc: 'A real drivable heightfield ramp the car physically climbs and launches off, paired with a BallisticJump Affordance the planner can take as a shortcut across a planner-only gap. Toggle the affordance to watch the planned path swap from the long detour to the jump. Execution is always real Rapier physics — the car always drives, never poses along the arc.',
+        tag: '3D · interactive · affordances',
+      },
+      {
         href: '/obstaclecourse',
         title: 'Obstacle course — kinocat building blocks',
         desc: 'A single car on a small course with every kinocat building block toggleable from the HUD: heightfield terrain, cuboid buildings, jump ramp + affordance, boost pad, drift slalom, and a waypoint loop. Built entirely on the new core APIs (`kinocat/adapters/rapier`, `kinocat/adapters/three`, `planVehicleOnce`, `nudgeGoalClear`). Use it to sanity-check each piece in isolation before graduating to /carchase.',
