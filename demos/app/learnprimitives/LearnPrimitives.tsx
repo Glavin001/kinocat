@@ -41,7 +41,9 @@ type Phase = 'idle' | 'collecting' | 'fitting' | 'done' | 'error';
 interface CachedRun {
   params: LearnedVehicleParams;
   fit: { meanPosError: number; maxPosError: number; loss: number };
-  kinematic: DiscrepancySummary;
+  /** Optional — older caches (or the race demo's inline learn) may omit
+   *  this. Render gracefully when missing. */
+  kinematic?: DiscrepancySummary;
   libraryJSON: string;
   createdAt: number;
 }
@@ -335,9 +337,24 @@ export default function LearnPrimitives() {
             <h2 style={{ fontSize: 12, opacity: 0.65, marginTop: 16, marginBottom: 4, textTransform: 'uppercase', letterSpacing: 1 }}>
               Kinematic-model gap (baseline)
             </h2>
-            <KV k="mean pos error" v={`${run.kinematic.meanPosError.toFixed(3)} m`} />
-            <KV k="max pos error" v={`${run.kinematic.maxPosError.toFixed(3)} m`} />
-            <KV k="mean speed error" v={`${run.kinematic.meanSpeedError.toFixed(3)} m/s`} />
+            <KV
+              k="mean pos error"
+              v={run.kinematic ? `${run.kinematic.meanPosError.toFixed(3)} m` : '—'}
+            />
+            <KV
+              k="max pos error"
+              v={run.kinematic ? `${run.kinematic.maxPosError.toFixed(3)} m` : '—'}
+            />
+            <KV
+              k="mean speed error"
+              v={run.kinematic ? `${run.kinematic.meanSpeedError.toFixed(3)} m/s` : '—'}
+            />
+            {!run.kinematic && (
+              <p style={{ opacity: 0.55, marginTop: 4, fontSize: 11 }}>
+                Cache was written by another flow without the kinematic
+                baseline. Click <em>re-learn</em> below to recompute.
+              </p>
+            )}
             <div style={{ display: 'flex', gap: 6, marginTop: 14, flexWrap: 'wrap' }}>
               <Button onClick={onDownloadParams}>download params</Button>
               <Button onClick={onDownloadLibrary}>download library</Button>

@@ -87,19 +87,25 @@ export function buildRaceCourse(): {
   // No physical obstacles — the course is pure dynamics + waypoint chase.
   const obstacles: Array<[number, number][]> = [];
 
-  // Loop: accelerate → tight slalom (alternating ±z gates 12-15m apart) →
-  // long straight → hard 90° turn → return leg → start.
+  // Loop: accelerate → TIGHT slalom (alternating ±z gates only 8m apart,
+  // demanding tight curvature at speed) → short straight → hard 90° turn →
+  // return leg → start. The slalom gates are deliberately spaced just inside
+  // the agent's minimum turn radius at cruise — kinematic plans will say
+  // "take it at 12 m/s", real chassis can't, the kinematic car overshoots
+  // and has to recover. The learned planner predicts the understeer and
+  // plans entry-speed accordingly.
   const waypoints: VehicleState[] = [
-    pose(-30, 0, 0),     // 0: accel into slalom
-    pose(-15, 10, 0),    // 1: slalom L
-    pose(0, -10, 0),     // 2: slalom R
-    pose(15, 10, 0),     // 3: slalom L
-    pose(30, -10, 0),    // 4: slalom R
-    pose(45, 0, 0),      // 5: recover to centerline
-    pose(55, 20, Math.PI / 2),  // 6: hard 90° turn (north)
-    pose(-50, 25, Math.PI),     // 7: long straight to far corner
-    pose(-55, -10, -Math.PI / 2), // 8: south leg
-    pose(-50, -25, 0),   // 9: back to start
+    pose(-35, 0, 0),    // 0: accel into slalom
+    pose(-22, 8, 0),    // 1: slalom L
+    pose(-12, -8, 0),   // 2: slalom R  (8m gates, ±8m throw)
+    pose(-2, 8, 0),     // 3: slalom L
+    pose(8, -8, 0),     // 4: slalom R
+    pose(18, 8, 0),     // 5: slalom L
+    pose(35, 0, 0),     // 6: recover to centerline
+    pose(55, 22, Math.PI / 2),    // 7: hard 90° turn (north)
+    pose(-50, 25, Math.PI),       // 8: long straight to far corner
+    pose(-55, -10, -Math.PI / 2), // 9: south leg
+    pose(-50, -25, 0),  // 10: back to start
   ];
 
   return {
@@ -189,12 +195,15 @@ export interface WaypointPick {
   advanced: boolean;
 }
 
-/** Advance to the next waypoint once within `arriveRadius`. Loops forever. */
+/** Advance to the next waypoint once within `arriveRadius`. Loops forever.
+ *  Default radius is tight (3m) so cars must actually hit each gate, not
+ *  just brush past — exposes the kinematic planner's tendency to overshoot
+ *  tight gates at speed. */
 export function pickNextWaypoint(
   state: VehicleState,
   waypoints: VehicleState[],
   loopIndex: number,
-  arriveRadius = 5,
+  arriveRadius = 3,
 ): WaypointPick {
   const cur = waypoints[loopIndex]!;
   const d = Math.hypot(state.x - cur.x, state.z - cur.z);

@@ -47,14 +47,24 @@ import {
   fitParams,
   LEARN_VEHICLE_TUNING,
   runSweep,
+  summariseKinematicGap,
 } from '../lib/learn-primitives';
 
 const PHYSICS_DT = 1 / 60;
 const VEHICLE_SUBSTEPS = 4;
-const REPLAN_INTERVAL_MS = 200;
+// Replan slowly enough that the planner's prediction error has time to
+// manifest as tracking error (each primitive is 0.55s; replanning every
+// 200ms means we only ever compare actual-vs-predicted over a 200ms window
+// where both libraries look the same).
+const REPLAN_INTERVAL_MS = 500;
 const WHEEL_BASE = 1.6;
 const TOTAL_LAPS = 2;
 const RACE_TIMEOUT_S = 90;
+// Raise the tracker's curvature speed cap so the planner's CHOICE of speed
+// in tight curves dominates execution. At the default 8 the cap kicks in
+// at any reasonable κ and forces both cars to take corners at ~6 m/s
+// regardless of plan — hiding the kinematic library's overconfidence.
+const TRACKER_MAX_LATERAL_ACCEL = 25;
 const PARAMS_KEY = 'kinocat:learned-params';
 const LIBRARY_KEY = 'kinocat:learned-library';
 
@@ -176,7 +186,10 @@ export default function RacePrimitives() {
           yieldFn: () => new Promise((r) => setTimeout(r, 0)),
         });
         const fit = fitParams(data);
+        const kinematic = summariseKinematicGap(data);
         const lib = buildLearnedLibrary(fit.params, { agent: RACE_AGENT });
+        // Cache matches /learnprimitives' CachedRun shape so both demos can
+        // share the same localStorage entry.
         const cached = {
           params: fit.params,
           fit: {
@@ -184,6 +197,7 @@ export default function RacePrimitives() {
             maxPosError: fit.maxPosError,
             loss: fit.loss,
           },
+          kinematic,
           createdAt: Date.now(),
         };
         window.localStorage.setItem(PARAMS_KEY, JSON.stringify(cached));
@@ -376,27 +390,18 @@ async function setupScene(
   const kinematic = makeCar('kinematic', kinematicLib, C.kinematic, C.kinematicPath);
   const learned = makeCar('learned', learnedLib, C.learned, C.learnedPath);
 
-  // ---- Cameras (one per side) ----
-  const mapCx = (RACE_BOUNDS.x0 + RACE_BOUNDS.x1) / 2;
-  const mapCz = (RACE_BOUNDS.z0 + RACE_BOUNDS.z1) / 2;
-  const range = 40;
-  function makeOrthoCamera(): THREE.OrthographicCamera {
+  // ---- Cameras: one perspective chase-cam per car. Stays slightly above and
+  // behind the chassis so the user can see the wheels, suspension, and the
+  // car's relationship to upcoming waypoints — i.e. a real 3D Rapier vehicle.
+  function makeChaseCamera(): THREE.PerspectiveCamera {
     const aspect = (W / 2) / H;
-    const cam = new THREE.OrthographicCamera(
-      -range * aspect,
-      range * aspect,
-      range,
-      -range,
-      0.1,
-      400,
-    );
-    cam.position.set(mapCx, 120, mapCz);
-    cam.up.set(0, 0, 1);
-    cam.lookAt(mapCx, 0, mapCz);
+    const cam = new THREE.PerspectiveCamera(55, aspect, 0.3, 600);
+    cam.position.set(course.spawn.x - 16, 10, course.spawn.z - 4);
+    cam.lookAt(course.spawn.x, 1, course.spawn.z);
     return cam;
   }
-  let camK = makeOrthoCamera();
-  let camL = makeOrthoCamera();
+  const camK = makeChaseCamera();
+  const camL = makeChaseCamera();
 
   // ---- Settle both vehicles ----
   for (const car of [kinematic, learned]) {
@@ -521,7 +526,7 @@ async function setupScene(
             lookaheadMin: 3,
             lookaheadGain: 0.45,
             lookaheadMax: 14,
-            maxLateralAccel: 8,
+            maxLateralAccel: TRACKER_MAX_LATERAL_ACCEL,
             maxAccel: 6,
             maxDecel: 8,
             cruiseSpeed: RACE_AGENT.maxSpeed,
@@ -637,6 +642,11 @@ async function setupScene(
         cb.onFinish(w);
       }
     }
+    // Update chase cameras (smooth follow). Reads chassis pose directly from
+    // Rapier — same DynamicRayCastVehicleController used in /carchase, just
+    // viewed through a chase-cam per side.
+    updateChaseCamera(camK, kinematic.car.readState(now));
+    updateChaseCamera(camL, learned.car.readState(now));
     // Render split viewport.
     const w = mount.clientWidth;
     const h = mount.clientHeight;
@@ -657,10 +667,7 @@ async function setupScene(
     renderer.setSize(w, h);
     const aspect = (w / 2) / h;
     for (const cam of [camK, camL]) {
-      cam.left = -range * aspect;
-      cam.right = range * aspect;
-      cam.top = range;
-      cam.bottom = -range;
+      cam.aspect = aspect;
       cam.updateProjectionMatrix();
     }
   };
@@ -706,6 +713,19 @@ function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
   let i = 0;
   while (i < plan.length - 1 && plan[i + 1]!.t <= elapsed) i++;
   return plan.slice(i);
+}
+
+/** Smoothly move a perspective camera into a chase position behind a
+ *  VehicleState. The chassis y is unknown to the planner (Y is derived in
+ *  kinocat); for the cam we place it ~10m above so the wheels and the
+ *  upcoming course are both visible. */
+function updateChaseCamera(cam: THREE.PerspectiveCamera, s: VehicleState): void {
+  const c = Math.cos(s.heading);
+  const sn = Math.sin(s.heading);
+  // 14m behind + 7m above the chassis, looking ~6m ahead.
+  const target = new THREE.Vector3(s.x - 14 * c, 7, s.z - 14 * sn);
+  cam.position.lerp(target, 0.12);
+  cam.lookAt(s.x + 6 * c, 1.2, s.z + 6 * sn);
 }
 
 function planAtTime(plan: VehicleState[], t: number): VehicleState | null {
@@ -783,6 +803,7 @@ function TopBar({
         <>
           <Status>library ready</Status>
           <Btn onClick={onStart}>start race</Btn>
+          <Btn onClick={onLearn} secondary>re-learn</Btn>
           <Btn onClick={onReset} secondary>reset</Btn>
         </>
       )}
