@@ -33,8 +33,17 @@ import {
 } from '../lib/learn-primitives';
 import { CARCHASE_AGENT } from '../lib/carchase-scenarios';
 
-const PARAMS_KEY = 'kinocat:learned-params';
-const LIBRARY_KEY = 'kinocat:learned-library';
+// Schema-versioned cache key. Bump the version suffix any time the model
+// formulation (e.g. learnedForwardSim) or the parameter bounds change in
+// a way that would silently re-interpret old cached coefficients. The old
+// keys become unreachable; the user transparently re-fits.
+//
+// :v2 — switched learnedForwardSim from clamp(speedErr/tau) to
+//       sat*tanh(speedErr/(sat*tau)); also tightened PARAM_LO/HI which
+//       would otherwise clamp old fits onto the new bounds and produce
+//       a permanently-pinned prior.
+const PARAMS_KEY = 'kinocat:learned-params:v2';
+const LIBRARY_KEY = 'kinocat:learned-library:v2';
 
 type Phase = 'idle' | 'collecting' | 'fitting' | 'done' | 'error';
 

@@ -92,7 +92,20 @@ export function learnedForwardSim(
     const target = clamp(controls[1] ?? 0, -agent.maxReverseSpeed, agent.maxSpeed);
     const tau = Math.max(params.accelTau, 1e-3);
     const speedErr = target - s.speed;
-    const accel = clamp(speedErr / tau, -params.maxDecel, params.maxAccel);
+    // Smooth saturating accel: `dir * tanh(speedErr / (dir * tau))`
+    //   - At small |speedErr|: accel ≈ speedErr / tau (linear / proportional,
+    //     so `tau` actually matters for cruise samples)
+    //   - At large |speedErr|: accel saturates at ±dir (= ±maxAccel for
+    //     accelerating, ±maxDecel for braking)
+    //   - C¹ smooth across the transition
+    // The OLD `clamp(speedErr/tau, ...)` form let the fit park `tau` at the
+    // lower bound for free because — at small tau — the clamp was active
+    // for nearly every sample, making `tau` a degenerate parameter (only
+    // affected the few cruise samples). With tanh, `tau` controls the
+    // proportional gain everywhere and has gradient signal in every sample.
+    const dir = speedErr >= 0 ? params.maxAccel : params.maxDecel;
+    const denom = Math.max(dir * tau, 1e-6);
+    const accel = dir * Math.tanh(speedErr / denom);
     const v = s.speed;
     const latDrag = params.lateralDrag * curvature * curvature * v * Math.abs(v) * dt;
     const speed = v + accel * dt - latDrag;

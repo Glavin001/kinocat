@@ -454,18 +454,18 @@ const PARAM_ORDER = [
 // data. Tight bounds + the L2 regularization in `transitionLoss` keep
 // poorly-constrained coefficients near their priors.
 const PARAM_LO: Record<(typeof PARAM_ORDER)[number], number> = {
-  maxAccel: 4,
-  maxDecel: 5,
-  accelTau: 0.15,
+  maxAccel: 3,
+  maxDecel: 3,
+  accelTau: 0.08,
   understeerGain: 0,
   lateralDrag: 0,
 };
 const PARAM_HI: Record<(typeof PARAM_ORDER)[number], number> = {
-  maxAccel: 9,
-  maxDecel: 12,
-  accelTau: 0.5,
-  understeerGain: 0.04,
-  lateralDrag: 0.08,
+  maxAccel: 14,
+  maxDecel: 18,
+  accelTau: 0.8,
+  understeerGain: 0.08,
+  lateralDrag: 0.15,
 };
 /** Characteristic scale per coefficient — used to make the L2
  *  regularization scale-invariant. */

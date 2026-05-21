@@ -75,8 +75,13 @@ const ONLINE_SAMPLE_CAP = 4000;
 // Refit takes a few hundred ms on 4000 samples — long enough that doing it
 // inline in the animation loop would visibly hitch. Defer to a microtask.
 const REFIT_DEFER_MS = 0;
-const PARAMS_KEY = 'kinocat:learned-params';
-const LIBRARY_KEY = 'kinocat:learned-library';
+// Schema-versioned cache key — must match the value in
+// /learnprimitives so the two demos share a single cache. Bump the
+// version suffix whenever the model formulation or parameter bounds
+// change in a way that would silently re-interpret old cached
+// coefficients. See LearnPrimitives.tsx for the change history.
+const PARAMS_KEY = 'kinocat:learned-params:v2';
+const LIBRARY_KEY = 'kinocat:learned-library:v2';
 
 type Phase = 'loading' | 'learning' | 'ready' | 'racing' | 'finished';
 
@@ -327,6 +332,22 @@ export default function RacePrimitives() {
     setPhase('ready');
   }
 
+  /** Wipe localStorage cache and rebuild the scene with default priors.
+   *  Use this when the live coefs are pinned to bounds matching the cached
+   *  prior (a sign the prior is stale / poisoned, e.g. after a bounds or
+   *  model change), or just to start fresh. */
+  function clearCache() {
+    if (typeof window !== 'undefined') {
+      window.localStorage.removeItem(PARAMS_KEY);
+      window.localStorage.removeItem(LIBRARY_KEY);
+    }
+    setParams(DEFAULT_LEARNED_PARAMS);
+    setWinner(null);
+    setMetrics({ kinematic: emptyMetrics(), learned: emptyMetrics() });
+    setLearner(null);
+    setPhase('ready');
+  }
+
   return (
     <div
       style={{
@@ -349,6 +370,7 @@ export default function RacePrimitives() {
         onStart={startRace}
         onStop={stopRace}
         onReset={resetRace}
+        onClearCache={clearCache}
       />
       <div style={{ flex: 1, position: 'relative' }}>
         <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
@@ -1257,6 +1279,7 @@ function TopBar({
   onStart,
   onStop,
   onReset,
+  onClearCache,
 }: {
   phase: Phase;
   learnProgress: {
@@ -1273,6 +1296,7 @@ function TopBar({
   onStart: () => void;
   onStop: () => void;
   onReset: () => void;
+  onClearCache: () => void;
 }) {
   return (
     <div
@@ -1303,6 +1327,7 @@ function TopBar({
           <Btn onClick={onStart}>start race</Btn>
           <Btn onClick={onLearn} secondary>pre-train</Btn>
           <Btn onClick={onReset} secondary>reset</Btn>
+          <Btn onClick={onClearCache} secondary>clear cache</Btn>
         </>
       )}
       {phase === 'racing' && (
