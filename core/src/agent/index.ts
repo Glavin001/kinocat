@@ -9,6 +9,12 @@ export type {
   AircraftAgent,
   AgentModel,
 } from './types';
-export { defaultVehicleAgent, kinematicForwardSim } from './vehicle';
+export {
+  defaultVehicleAgent,
+  kinematicForwardSim,
+  learnedForwardSim,
+  DEFAULT_LEARNED_PARAMS,
+} from './vehicle';
+export type { LearnedVehicleParams } from './vehicle';
 export { defaultHumanoidAgent } from './humanoid';
 export { defaultAircraftAgent, aircraftForwardSim } from './aircraft';

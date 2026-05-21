@@ -125,6 +125,17 @@ const groups: { heading: string; demos: Demo[] }[] = [
     ],
   },
   {
+    heading: 'Tools',
+    demos: [
+      {
+        href: '/learnprimitives',
+        title: 'Autonomous motion-primitive learner',
+        desc: 'Spawn a Rapier vehicle on flat ground, drive it autonomously through 48 deterministic open-loop trials, fit a 5-coefficient parametric dynamics model to the recorded trajectories, and emit a drop-in MotionPrimitiveLibrary the planner can use directly. Closes the kinematic-vs-physics sim-to-real gap (inertia, suspension, tire slip, engine force) with ~5 numbers persisted to localStorage. Downloadable JSON.',
+        tag: '3D · autonomous · learning',
+      },
+    ],
+  },
+  {
     heading: 'Humanoid',
     demos: [
       {

@@ -698,6 +698,7 @@ const TESTED_DEMOS = new Set([
   'flagship', // 'flagship demo' — buildFlagship (large multi-agent navcat)
   'humanoid', // 'humanoid demo' — buildHumanoid
   'jumplinks', // 'jumplinks demo' — buildJumpLinks
+  'learnprimitives', // 'learnprimitives demo' — autonomous motion-primitive learner (Rapier)
   'navmesh', // 'navmesh demo' — buildNavmesh / planNavmesh
   'obstaclecourse', // 'obstaclecourse demo' — buildObstacleCourseSnapshot (single-car building-blocks)
   'plane', // 'aircraft demo' — waypoint/canyon/restricted/gauntlet/knife-edge
