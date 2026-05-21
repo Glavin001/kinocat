@@ -33,7 +33,7 @@ import {
   buildRaceCourse,
   emptyMetrics,
   pickNextWaypoint,
-  planRace,
+  planThroughWaypoints,
   RACE_AGENT,
   RACE_BOUNDS,
   RACE_PALETTE as C,
@@ -56,7 +56,14 @@ const PHYSICS_DT = 1 / 60;
 const VEHICLE_SUBSTEPS = 4;
 const REPLAN_INTERVAL_MS = 500;
 const WHEEL_BASE = 1.6;
-const TRACKER_MAX_LATERAL_ACCEL = 25;
+// Real tire grip on dry asphalt is ~9-10 m/s² (~1g). 12 keeps the cars
+// physically plausible — pure-pursuit won't follow a plan that demands more
+// than this, so a kinematic plan saying "take this turn at 16 m/s" gets
+// clipped to ~7 m/s by the tracker. The LEARNED planner knows about this
+// and plans entry speeds the tracker WON'T need to clip, so its trajectory
+// executes cleanly. With the previous TRACKER_MAX_LATERAL_ACCEL=25 the
+// tracker would let the car attempt impossible turns and slide off-map.
+const TRACKER_MAX_LATERAL_ACCEL = 12;
 // Online-learning buffer cap. ~60Hz × ~30s/lap = 1800 samples/lap; 4000
 // covers ~2 laps of real driving, refit converges in well under a second.
 const ONLINE_SAMPLE_CAP = 4000;
@@ -76,6 +83,10 @@ interface CarRuntime {
   car: CarHandle;
   carMesh: ReturnType<typeof createCarMeshHelper>;
   pathLine: THREE.Line | null;
+  /** Dashed straight reference line from chassis to the next-uncleared
+   *  waypoint — lets the viewer compare the planner's actual curve to the
+   *  naïve "drive in a straight line to the cone" trajectory. */
+  idealLine: THREE.Line;
   trailLine: THREE.Line;
   trailPts: THREE.Vector3[];
   ai: {
@@ -414,6 +425,22 @@ async function setupScene(
       new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.55 }),
     );
     scene.add(trail);
+    // Ideal/reference line — dashed straight line from car to next waypoint.
+    // Pure visual reference; never followed.
+    const idealMat = new THREE.LineDashedMaterial({
+      color: 0xffffff,
+      dashSize: 1.0,
+      gapSize: 0.8,
+      transparent: true,
+      opacity: 0.45,
+    });
+    const idealGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(course.spawn.x, 0.25, course.spawn.z),
+      new THREE.Vector3(course.spawn.x, 0.25, course.spawn.z),
+    ]);
+    const ideal = new THREE.Line(idealGeo, idealMat);
+    ideal.computeLineDistances();
+    scene.add(ideal);
     return {
       id,
       color,
@@ -422,6 +449,7 @@ async function setupScene(
       car,
       carMesh,
       pathLine: null,
+      idealLine: ideal,
       trailLine: trail,
       trailPts: [new THREE.Vector3(course.spawn.x, 0.15, course.spawn.z)],
       ai: {
@@ -549,15 +577,24 @@ async function setupScene(
       }
     }
     car.ai.goal = pick.goal;
-    const res = planRace({
+    // Plan THROUGH the next 3 waypoints (or fewer if the loop is short),
+    // producing one continuous path. Each segment is short (~15-25m) so
+    // each planVehicleOnce call finishes well under the per-segment budget.
+    // pure-pursuit then follows a path that genuinely passes through every
+    // gate — no diagonal skips, no braking at any intermediate waypoint
+    // because pure-pursuit's `atGoal` only fires for the very last point.
+    const PLAN_LOOKAHEAD_COUNT = 3;
+    const res = planThroughWaypoints({
       state: { ...state, t: 0 },
-      goal: { ...pick.goal, t: 0 },
+      waypoints: course.waypoints,
+      fromIdx: car.ai.loopIndex,
+      count: PLAN_LOOKAHEAD_COUNT,
       lib: car.lib,
       polygons: course.polygons,
       obstacles: course.obstacles,
       world: navWorld,
     });
-    if (res.found && res.path.length > 1) {
+    if (res.segments > 0 && res.path.length > 1) {
       car.ai.plan = res.path;
       car.ai.planStartWall = now;
       // Replace path line.
@@ -566,7 +603,7 @@ async function setupScene(
         car.pathLine.geometry.dispose();
         (car.pathLine.material as THREE.Material).dispose();
       }
-      const pts = res.path.map((p) => new THREE.Vector3(p.x, 0.4, p.z));
+      const pts = res.path.map((p: VehicleState) => new THREE.Vector3(p.x, 0.4, p.z));
       car.pathLine = new THREE.Line(
         new THREE.BufferGeometry().setFromPoints(pts),
         new THREE.LineBasicMaterial({
@@ -643,6 +680,19 @@ async function setupScene(
 
     // Metrics + visuals.
     syncCarMesh(car.carMesh.group, after);
+    // Update ideal reference line: straight from chassis to the next-uncleared
+    // waypoint. Lets the viewer see how much the planner's curve deviates
+    // from the naive direct path.
+    {
+      const wp = course.waypoints[car.ai.loopIndex]!;
+      const pts = [
+        new THREE.Vector3(after.x, 0.25, after.z),
+        new THREE.Vector3(wp.x, 0.25, wp.z),
+      ];
+      car.idealLine.geometry.dispose();
+      car.idealLine.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+      car.idealLine.computeLineDistances();
+    }
     car.metrics.peakSpeed = Math.max(car.metrics.peakSpeed, Math.abs(after.speed));
     if (running) car.metrics.raceTime += dt;
     if (car.ai.plan && car.ai.plan.length > 1) {

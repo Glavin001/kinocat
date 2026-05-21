@@ -52,12 +52,13 @@ export const RACE_PALETTE = {
   startMarker: 0x55ff88,
 } as const;
 
-/** Race waypoint pose. `speed` is set to the agent's cruise speed so the
- *  planner produces FLOW-THROUGH plans (target end-speed > 0) rather than
- *  plans that decelerate to a stop at every gate. Without this the cars
- *  brake into every cone and lose all momentum. */
-function pose(x: number, z: number, heading: number, speed = 14): VehicleState {
-  return { x, z, heading, speed, t: 0 };
+/** Race waypoint pose. Speed is left at 0 — the planner's goal-region check
+ *  only considers position + heading (see vehicle-environment.ts'
+ *  `reachedGoalRegion`), so the planner is free to choose whatever speed
+ *  is most efficient for the trajectory. Flow-through behaviour is
+ *  achieved by the lookahead in `pickNextWaypoint`, not by goal speed. */
+function pose(x: number, z: number, heading: number): VehicleState {
+  return { x, z, heading, speed: 0, t: 0 };
 }
 
 /** A challenging waypoint loop. Coordinates picked so the kinematic library
@@ -123,14 +124,13 @@ export function buildRaceCourse(): {
 
 export const RACE_AGENT: VehicleAgent = defaultVehicleAgent({
   minTurnRadius: 4.5,
-  // Raised from 14 → 20 so the planner has real headroom. The Rapier chassis
-  // has no air drag and ~4kN of engine on ~580kg → it CAN reach 20 m/s on
-  // a flat surface, the only question is whether the planner gets there
-  // without inducing a crash through a tight gate. Kinematic library: "yes,
-  // take it at 20". Real chassis at 4.5m radius and 20 m/s needs 89 m/s²
-  // centripetal — way above tire grip — so it understeers. Learned library
-  // discovers that and plans entry-speeds accordingly.
-  maxSpeed: 20,
+  // 16 m/s gives the planner real headroom on straights (kinematic library
+  // will plan a 14-16 m/s cruise) without making the slalom physically
+  // impossible (corner centripetal at 4.5m radius + 16 m/s = ~57 m/s²,
+  // well above tire grip — both libraries' plans will get clipped by the
+  // tracker's lateral-accel cap, but the LEARNED library plans more
+  // honest entry speeds so it gets clipped less).
+  maxSpeed: 16,
   maxReverseSpeed: 6,
   footprint: [
     [2.4, 1.0],
@@ -151,19 +151,18 @@ export function raceControlSets(agent: VehicleAgent = RACE_AGENT): number[][] {
   const kHalf = k / 2;
   return [
     // Cruise at successive speeds — kinematic plan happily takes the
-    // 20 m/s straight bucket; learned plan picks up that it can sustain it.
-    [0, 20],
+    // 16 m/s straight bucket; learned plan picks up that it can sustain it.
     [0, 16],
     [0, 12],
     [0, 8],
     [0, 4],
-    // Gentle turn at high speed — this is the most informative test:
-    // kinematic library says "take it at 18", real car loses speed and
-    // understeers, learned library plans 12-14.
-    [kHalf, 18],
-    [-kHalf, 18],
-    [kHalf, 12],
-    [-kHalf, 12],
+    // Gentle turn at high speed — the most informative test:
+    // kinematic library says "take it at 14", real car loses speed and
+    // understeers, learned library plans 10-12.
+    [kHalf, 14],
+    [-kHalf, 14],
+    [kHalf, 10],
+    [-kHalf, 10],
     // Full-lock turn at moderate speed — kinematic believes 10 m/s is fine
     // at min turn radius (centripetal 22 m/s²); real chassis tops out at
     // ~6.5 m/s; learned library plans accordingly.
@@ -180,8 +179,8 @@ export function raceControlSets(agent: VehicleAgent = RACE_AGENT): number[][] {
   ];
 }
 
-/** Higher start-speed buckets to match the bigger max speed. */
-export const RACE_START_SPEEDS = [0, 6, 12, 18];
+/** Start-speed buckets covering the full envelope from rest to cruise. */
+export const RACE_START_SPEEDS = [0, 6, 12];
 
 export function buildKinematicLibrary(): MotionPrimitiveLibrary {
   return characterizeVehicle({
@@ -206,8 +205,8 @@ export function buildLearnedRaceLibrary(
 // ---------------------------------------------------------------------------
 // Per-tick planning helper.
 
-export const RACE_REPLAN_BUDGET_MS = 100;
-export const RACE_MAX_EXPANSIONS = 20000;
+export const RACE_REPLAN_BUDGET_MS = 200;
+export const RACE_MAX_EXPANSIONS = 30000;
 export const RACE_TEST_MAX_EXPANSIONS = 60000;
 
 export interface RacePlanRequest {
@@ -234,6 +233,75 @@ export function planRace(req: RacePlanRequest): PlanResult<VehicleState> {
   });
 }
 
+/** Plan a single continuous trajectory that PASSES THROUGH `count`
+ *  consecutive waypoints starting at `fromIdx`. Internally runs N
+ *  planVehicleOnce calls in series (current → wp[k], wp[k] → wp[k+1], …)
+ *  and concatenates the resulting paths with monotonically increasing
+ *  time stamps so pure-pursuit sees one smooth path.
+ *
+ *  This is how the planner "knows" about the sequence of gates — a single
+ *  planVehicleOnce only supports one goal pose and would happily diagonal
+ *  THROUGH the gates if asked for a far-away one. Chaining short segments
+ *  forces each intermediate waypoint to be reached, with heading
+ *  continuity provided by the planner's `reachedGoalRegion` heading
+ *  tolerance.
+ *
+ *  Returns the merged path plus a count of segments that successfully
+ *  planned (so the caller can fall back gracefully if a later segment
+ *  fails). */
+export function planThroughWaypoints(args: {
+  state: VehicleState;
+  waypoints: VehicleState[];
+  fromIdx: number;
+  count: number;
+  lib: MotionPrimitiveLibrary;
+  polygons: NavPolygon[];
+  obstacles: Array<[number, number][]>;
+  world?: NavWorld;
+  totalBudgetMs?: number;
+}): { path: VehicleState[]; segments: number } {
+  const {
+    state,
+    waypoints,
+    fromIdx,
+    count,
+    lib,
+    polygons,
+    obstacles,
+    world,
+  } = args;
+  const navWorld = world ?? new InMemoryNavWorld(polygons, obstacles);
+  const totalBudget = args.totalBudgetMs ?? RACE_REPLAN_BUDGET_MS;
+  const perSegment = Math.max(40, totalBudget / Math.max(1, count));
+  const path: VehicleState[] = [];
+  let from: VehicleState = { ...state, t: 0 };
+  let tOffset = 0;
+  let segments = 0;
+  for (let i = 0; i < count; i++) {
+    const goalIdx = (fromIdx + i) % waypoints.length;
+    const res = planRace({
+      state: from,
+      goal: { ...waypoints[goalIdx]!, t: 0 },
+      lib,
+      polygons,
+      obstacles,
+      world: navWorld,
+      deadlineMs: perSegment,
+    });
+    if (!res.found || res.path.length < 2) break;
+    // Skip the first state of subsequent segments to avoid duplicating
+    // the previous segment's end point.
+    const segment = i === 0 ? res.path : res.path.slice(1);
+    for (const s of segment) {
+      path.push({ ...s, t: s.t + tOffset });
+    }
+    tOffset = path[path.length - 1]!.t;
+    from = { ...res.path[res.path.length - 1]!, t: 0 };
+    segments++;
+  }
+  return { path, segments };
+}
+
 // ---------------------------------------------------------------------------
 // Waypoint AI — pick the next waypoint, advance when reached.
 
@@ -244,26 +312,25 @@ export interface WaypointPick {
   advanced: boolean;
 }
 
-/** Advance the loop index once within `arriveRadius` of the NEXT
- *  not-yet-cleared waypoint, and return the goal pose the planner should
- *  aim for. The goal is `lookahead` waypoints AHEAD of the next-uncleared
- *  one — letting the planner stitch a smooth curve through the
- *  intermediate gates instead of point-to-point hopping with a brake
- *  zone at each one.
+/** Advance the loop index once within `arriveRadius` of the next-uncleared
+ *  waypoint, and return THAT waypoint as the planner's goal.
  *
- *  `arriveRadius` is sized so the handoff happens before pure-pursuit's
- *  `goalTolerance = 2m` brake zone fires (worst-case at 20 m/s with 500ms
- *  replans, the car covers ~10m between ticks → 12m is the margin).
+ *  Subtle: we deliberately do NOT lookahead-bypass to a later waypoint as
+ *  the goal — for an alternating slalom course, the planner's shortest
+ *  path to a far gate would diagonal STRAIGHT THROUGH the intermediate
+ *  gates (bypassing them entirely), since the planner only knows about
+ *  the goal pose, not the sequence of waypoints in between. We hit each
+ *  gate by aiming for it directly; flow-through (no braking at the gate)
+ *  is achieved by EXTENDING the plan past the goal in the caller
+ *  (`RacePrimitives.tsx`) when the waypoint is cleared.
  *
- *  Both cars MUST consume the same output of this function so the comparison
- *  stays fair — the only variable between the two cars is the
- *  motion-primitive library, never the goal stream. */
+ *  Both cars MUST consume the same output of this function so the
+ *  comparison stays fair — only the motion-primitive library varies. */
 export function pickNextWaypoint(
   state: VehicleState,
   waypoints: VehicleState[],
   loopIndex: number,
   arriveRadius = 12,
-  lookahead = 3,
 ): WaypointPick {
   const cur = waypoints[loopIndex]!;
   const d = Math.hypot(state.x - cur.x, state.z - cur.z);
@@ -273,14 +340,7 @@ export function pickNextWaypoint(
     nextIndex = (loopIndex + 1) % waypoints.length;
     advanced = true;
   }
-  // Plan all the way through `lookahead` waypoints so the trajectory is
-  // smooth across multiple gates. lookahead=3 means we plan to the gate
-  // two-after the next not-yet-cleared one — the planner finds a path that
-  // naturally curves through the intermediate gates because that's the
-  // shortest feasible route, but it never has to brake-to-stop at any of
-  // them.
-  const goalIdx = (nextIndex + Math.max(1, lookahead) - 1) % waypoints.length;
-  return { goal: waypoints[goalIdx]!, nextIndex, advanced };
+  return { goal: waypoints[nextIndex]!, nextIndex, advanced };
 }
 
 // ---------------------------------------------------------------------------
