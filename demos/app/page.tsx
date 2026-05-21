@@ -130,8 +130,14 @@ const groups: { heading: string; demos: Demo[] }[] = [
       {
         href: '/learnprimitives',
         title: 'Autonomous motion-primitive learner',
-        desc: 'Spawn a Rapier vehicle on flat ground, drive it autonomously through 48 deterministic open-loop trials, fit a 5-coefficient parametric dynamics model to the recorded trajectories, and emit a drop-in MotionPrimitiveLibrary the planner can use directly. Closes the kinematic-vs-physics sim-to-real gap (inertia, suspension, tire slip, engine force) with ~5 numbers persisted to localStorage. Downloadable JSON.',
+        desc: 'Spawn a Rapier vehicle on flat ground and DRIVE it like a human — only steer/throttle/brake, no teleports between trials. For each (start speed, controls) pair the car brakes itself to a stop, accelerates physically to the target speed, then applies the test controls for 0.55s while sample poses are recorded. A 5-coefficient parametric dynamics model is least-squares fit to the recorded trajectories and emitted as a drop-in MotionPrimitiveLibrary the planner uses directly. Closes the kinematic-vs-physics sim-to-real gap (inertia, suspension, tire slip, finite accel) with ~5 numbers persisted to localStorage. Downloadable JSON.',
         tag: '3D · autonomous · learning',
+      },
+      {
+        href: '/raceprimitives',
+        title: 'Race the primitives — kinematic vs learned, side by side',
+        desc: 'A time trial. Two identical Rapier vehicles start on the same line and race the same waypoint loop (tight high-speed slalom + hard 90° turn into a stop). The ONLY difference: one planner uses the kinematic-derived primitive library, the other uses the library learned in /learnprimitives. The kinematic car overshoots the slalom (no understeer in its model) and brakes too late into the corner; the learned car threads the gates and stops on the mark. Split-viewport render with per-car lap times, tracking error, and lap counter — the gap closure is visible and measurable. If no learned library is cached, click "learn now" to fit one in ~10s.',
+        tag: '3D · interactive · before-after',
       },
     ],
   },

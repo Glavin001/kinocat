@@ -703,6 +703,7 @@ const TESTED_DEMOS = new Set([
   'obstaclecourse', // 'obstaclecourse demo' — buildObstacleCourseSnapshot (single-car building-blocks)
   'plane', // 'aircraft demo' — waypoint/canyon/restricted/gauntlet/knife-edge
   'playground', // 'playground demo' — planPlayground
+  'raceprimitives', // 'raceprimitives demo' — side-by-side kinematic vs learned library race
   'primitives', // 'primitives demo' — buildPrimitiveFan
   'reverse', // 'reverse demo' — planReverse
   'swarm', // 'swarm demo' — buildSwarm

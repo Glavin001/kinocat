@@ -1,11 +1,16 @@
 // Autonomous motion-primitive learner. Headless orchestration (no React,
-// no three.js). The vehicle is run open-loop through a deterministic grid of
-// `(startSpeed, controls)` trials inside Rapier, the resulting trajectories
-// are recorded as ground-truth, and a 5-coefficient parametric dynamics
-// model (`LearnedVehicleParams`) is fit to them via Nelder-Mead. The fitted
-// model is a drop-in `ForwardSim<VehicleState>` so the standard
-// `characterizeVehicle()` produces a `MotionPrimitiveLibrary` the planner
-// uses unchanged.
+// no three.js). The learner drives a Rapier vehicle like a human player —
+// only steer/throttle/brake commands, NO teleports or forced velocities
+// during a trial. For each `(startSpeed, controls)` pair the car first
+// brakes itself to a stop, then accelerates physically to the target speed
+// via open-loop throttle, then applies the test controls for the primitive
+// duration while sample poses are recorded. The five-coefficient parametric
+// dynamics model (`LearnedVehicleParams`) is then least-squares fit to the
+// recorded trajectories with Nelder-Mead and fed into the standard
+// `characterizeVehicle()` to produce a planner-ready `MotionPrimitiveLibrary`.
+//
+// The only teleports in this module are at world setup (chassis spawned at
+// origin) — once trials start, the vehicle is purely physically driven.
 //
 // Used by `/learnprimitives` (interactive) and `demos/test/learn-primitives.
 // test.ts` (headless). No browser-only APIs anywhere in this module.
@@ -142,12 +147,14 @@ export interface SweepWorld {
   dispose: () => void;
 }
 
-/** Build a fresh Rapier world + ground + raycast vehicle ready for trials. */
+/** Build a fresh Rapier world + ground + raycast vehicle ready for trials.
+ *  The ground is large (1km×1km) because trials accumulate drift over the
+ *  full sweep — the car is driven continuously without teleports. */
 export async function createSweepWorld(agent: VehicleAgent = CARCHASE_AGENT): Promise<SweepWorld> {
   const rapier = await ensureRapier();
   const world = new rapier.World({ x: 0, y: -9.81, z: 0 });
   createGroundCollider(world, {
-    bounds: { x0: -200, x1: 200, z0: -200, z1: 200 },
+    bounds: { x0: -500, x1: 500, z0: -500, z1: 500 },
     pad: 20,
     friction: 1.5,
   });
@@ -157,8 +164,8 @@ export async function createSweepWorld(agent: VehicleAgent = CARCHASE_AGENT): Pr
     heading: 0,
     ...LEARN_VEHICLE_TUNING,
   });
-  // Settle the chassis on its suspension once at the start so subsequent
-  // teleports land on a vehicle whose wheels are already at rest length.
+  // Settle the chassis on its suspension once at the start so the wheels are
+  // at rest length before the first trial begins driving.
   for (let i = 0; i < 30; i++) {
     car.applyControls({ steer: 0, throttle: 0, brake: 0 });
     world.timestep = PHYSICS_DT;
@@ -204,8 +211,55 @@ function controlsToWheelCommand(
   return { steer, throttle, brake };
 }
 
-/** Run one trial: teleport to origin, apply open-loop controls for
- *  PRIMITIVE_DURATION, record poses in the trial-local frame. */
+/** Max wall ticks (1/60s each) spent driving to the target start speed. The
+ *  vehicle is fully physically driven — no setLinvel — so a generous cap
+ *  matters for high target speeds. */
+const MAX_RAMP_TICKS = 600; // up to 10s of simulated ramp-up
+const SPEED_TOL = 0.25;     // m/s — "close enough" to target start speed
+
+function physicsStep(sw: SweepWorld, cmd: { steer: number; throttle: number; brake: number }): void {
+  sw.car.applyControls(cmd);
+  sw.world.timestep = PHYSICS_DT;
+  sw.car.vehicle.updateVehicle(PHYSICS_DT);
+  sw.world.step();
+}
+
+/** Brake to a near-stop using ONLY the brake input. No teleport. */
+function brakeToStop(sw: SweepWorld, maxTicks = 200): void {
+  for (let i = 0; i < maxTicks; i++) {
+    const s = sw.car.readState(0);
+    if (Math.abs(s.speed) < 0.05) {
+      // A few extra ticks of full brake to let suspension settle.
+      for (let k = 0; k < 6; k++) physicsStep(sw, { steer: 0, throttle: 0, brake: 1 });
+      return;
+    }
+    physicsStep(sw, { steer: 0, throttle: 0, brake: 1 });
+  }
+}
+
+/** Drive the car to `target` m/s using only throttle/brake. Steers straight
+ *  (curvature 0). Returns the number of ticks actually used. */
+function driveToSpeed(sw: SweepWorld, target: number): number {
+  const wheelBase = 2 * LEARN_WHEEL_BASE;
+  for (let tick = 0; tick < MAX_RAMP_TICKS; tick++) {
+    const s = sw.car.readState(0);
+    if (Math.abs(s.speed - target) < SPEED_TOL) {
+      return tick;
+    }
+    const cmd = controlsToWheelCommand(s.speed, 0, target, wheelBase);
+    physicsStep(sw, cmd);
+  }
+  return MAX_RAMP_TICKS;
+}
+
+function rotate(dx: number, dz: number, c: number, s: number): [number, number] {
+  return [dx * c + dz * s, -dx * s + dz * c];
+}
+
+/** Run one trial: brake to stop, drive to the target start speed under
+ *  pure throttle/brake control (no teleport), then apply the test controls
+ *  for PRIMITIVE_DURATION while sample poses are recorded in the trial-local
+ *  frame (recording-start pose at origin, heading 0). */
 export function runTrial(
   sw: SweepWorld,
   startSpeed: number,
@@ -214,11 +268,22 @@ export function runTrial(
 ): TrialResult {
   const { car, world } = sw;
   const wheelBase = 2 * LEARN_WHEEL_BASE;
-  car.teleportWithSpeed({ x: 0, z: 0, heading: 0 }, startSpeed);
 
-  // Step 1/60s ticks, record evenly-spaced samples.
-  const samples: SampledPose[] = [{ x: 0, z: 0, heading: 0, speed: startSpeed, t: 0 }];
-  // Pick `PRIMITIVE_SUBSTEPS` tick indices that span the trial uniformly.
+  // Step 1: brake to a near-stop so each trial starts from a known dynamic
+  // state. No teleport — purely the brake input.
+  brakeToStop(sw);
+
+  // Step 2: physically accelerate (or reverse) to the target start speed.
+  driveToSpeed(sw, startSpeed);
+
+  // Step 3: capture the trial-local frame, then apply the test controls for
+  // PRIMITIVE_DURATION while recording.
+  const origin = car.readState(0);
+  const c0 = Math.cos(origin.heading);
+  const s0 = Math.sin(origin.heading);
+  const samples: SampledPose[] = [
+    { x: 0, z: 0, heading: 0, speed: origin.speed, t: 0 },
+  ];
   const sampleTicks = new Set<number>();
   for (let k = 1; k <= PRIMITIVE_SUBSTEPS; k++) {
     sampleTicks.add(Math.round((k * TICKS_PER_TRIAL) / PRIMITIVE_SUBSTEPS));
@@ -233,10 +298,14 @@ export function runTrial(
     world.step();
     if (sampleTicks.has(tick)) {
       const s = car.readState(0);
+      const [lx, lz] = rotate(s.x - origin.x, s.z - origin.z, c0, s0);
+      let lh = s.heading - origin.heading;
+      while (lh > Math.PI) lh -= 2 * Math.PI;
+      while (lh < -Math.PI) lh += 2 * Math.PI;
       samples.push({
-        x: s.x,
-        z: s.z,
-        heading: s.heading,
+        x: lx,
+        z: lz,
+        heading: lh,
         speed: s.speed,
         t: tick * PHYSICS_DT,
       });
