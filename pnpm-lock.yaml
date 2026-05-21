@@ -44,6 +44,9 @@ importers:
 
   demos:
     dependencies:
+      '@dimforge/rapier3d-compat':
+        specifier: ^0.14.0
+        version: 0.14.0
       '@kinocat/three':
         specifier: workspace:*
         version: link:../three

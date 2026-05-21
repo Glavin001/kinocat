@@ -1,5 +1,7 @@
 // kinocat/planner — IGHA* anytime, multi-resolution, time-extended planner.
 export { plan } from './ighastar';
+export { planVehicleOnce } from './plan-vehicle';
+export type { PlanVehicleRequest } from './plan-vehicle';
 export type {
   PlanRequest,
   PlanResult,

@@ -183,7 +183,16 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     const s = Math.sin(node.heading);
     let px = node.x;
     let pz = node.z;
-    for (let i = 0; i < primSweep.length; i++) {
+    // Sample 0 of every primitive sweep is the parent pose itself. Re-
+    // checking its footprint is redundant — the parent was either
+    // (a) accepted as the search start, or (b) produced as a successor
+    // whose own sweep was already cleared. Skipping it here also means a
+    // start state whose kinematic footprint slightly clips an obstacle (a
+    // chassis pinned against a wall in physics) can still expand any
+    // primitive that *moves out* of the clip. The segment check from
+    // sample 0 to sample 1 still rejects forward primitives that drive
+    // deeper into the wall, so we don't admit unsafe trajectories.
+    for (let i = 1; i < primSweep.length; i++) {
       const sp = primSweep[i]!;
       const wx = node.x + sp.x * c - sp.z * s;
       const wz = node.z + sp.x * s + sp.z * c;
@@ -204,7 +213,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
           return false;
         }
       }
-      if (this.sweepSegmentCheck && i > 0) {
+      if (this.sweepSegmentCheck) {
         this.rec.counters.collisionChecks++;
         if (!this.world.segmentClear(px, pz, wx, wz)) {
           this.rec.counters.collisionRejects++;
@@ -402,8 +411,17 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     return ok;
   }
 
-  checkValidity(start: VehicleState, goal: VehicleState): [boolean, boolean] {
-    return [this.poseClear(start), this.poseClear(goal)];
+  checkValidity(_start: VehicleState, goal: VehicleState): [boolean, boolean] {
+    // Always accept the start. In a chase / contact-rich physics simulation
+    // the chassis can spend frames slightly clipping a wall or another car,
+    // even though it is on the verge of breaking free. Refusing to plan
+    // from those states leaves the controller without any path at all and
+    // the chassis sits there until something else nudges it. The successor
+    // expansion in `sweepClear` skips the parent pose's footprint check, so
+    // any primitive whose post-start substeps are clear (notably reverse
+    // out of the wall) is still accepted as a valid escape — the planner
+    // figures out the way out instead of refusing the question.
+    return [true, this.poseClear(goal)];
   }
 
   reachedGoalRegion(node: Node<VehicleState>, goal: Node<VehicleState>): boolean {

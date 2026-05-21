@@ -240,3 +240,5 @@ export function navWorldFromTriangleMesh(
 export { annotateJumpLinks } from './offmesh';
 export { markTileRebuilt } from './tile-rebuild';
 export type { StaticAffordanceMetadata, JumpCandidate } from './types';
+export { navWorldFromMeshes } from './from-meshes';
+export type { NavWorldFromMeshesOptions } from './from-meshes';

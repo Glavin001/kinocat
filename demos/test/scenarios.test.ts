@@ -45,6 +45,10 @@ import {
   DOGFIGHT_TEST_MAX_EXPANSIONS,
   dogfightAirspace,
 } from '../app/lib/dogfight-scenarios';
+// Note: carchase scenario tests live in their own file
+// (`demos/test/carchase-scenarios.test.ts`) so they run in a parallel
+// vitest worker — adding them here pushed total wall time past the 60 s
+// birpc RPC timeout in CI.
 import type { VehicleState } from 'kinocat/agent';
 
 // These assert the *exact* configuration the demos ship with always finds a
@@ -647,6 +651,7 @@ describe('dogfight demo: interactive 3D pursuit', () => {
 // is enforced, not just claimed.
 const TESTED_DEMOS = new Set([
   'anytime', // 'anytime demo' — buildAnytime
+  'carchase', // 'carchase demo' — buildCarChaseSnapshot (Rapier + multi-AI ground pursuit)
   'catmouse', // 'catmouse demo' — buildCatAndMouseScenario (predict + intercept)
   'curves', // 'curves demo' — compareCurves
   'dogfight', // 'dogfight demo' — buildDogfightSnapshot (heightfield + multi-AI)
@@ -655,9 +660,11 @@ const TESTED_DEMOS = new Set([
   'humanoid', // 'humanoid demo' — buildHumanoid
   'jumplinks', // 'jumplinks demo' — buildJumpLinks
   'navmesh', // 'navmesh demo' — buildNavmesh / planNavmesh
+  'obstaclecourse', // 'obstaclecourse demo' — buildObstacleCourseSnapshot (single-car building-blocks)
   'plane', // 'aircraft demo' — waypoint/canyon/restricted/gauntlet/knife-edge
   'playground', // 'playground demo' — planPlayground
   'primitives', // 'primitives demo' — buildPrimitiveFan
+  'ramp', // 'ramp + affordance demo' — buildRampSnapshot (drivable ramp + BallisticJump)
   'reverse', // 'reverse demo' — planReverse
   'swarm', // 'swarm demo' — buildSwarm
   'world3d', // 'world3d demo' — planWorld3d

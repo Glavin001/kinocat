@@ -12,6 +12,12 @@ const groups: { heading: string; demos: Demo[] }[] = [
     heading: 'Flagship',
     demos: [
       {
+        href: '/carchase',
+        title: 'Car-chase — Rapier raycast vehicles + multi-AI pursuit',
+        desc: 'A cops-and-robbers stunt arena driven by Rapier.js DynamicRayCastVehicleControllers: three police cars pursue an AI evader through a downtown grid, an alley shortcut, a ramped jump gap, drift slalom, and boost pads. Each cop replans against the robber\'s published plan (PlanRegistry) and reads its siblings to fan out instead of stacking; the robber takes affordances (BoostPad / BallisticJump) opportunistically. Press T to take over the robber yourself — the cops re-target the human-driven chassis with no code change. Real Rapier raycast suspension + kinocat IGHA* on Reeds-Shepp curves.',
+        tag: '3D · interactive · rapier · multi-agent',
+      },
+      {
         href: '/dogfight',
         title: 'Dogfight — interactive 3D pursuit',
         desc: 'Pilot a fixed-wing aircraft with the keyboard while three kinocat-driven opponents pursue, intercept, and flank you through a continuous heightfield terrain, tall pylons, a sweeping barrier between twin peaks, and a drifting blimp. Each AI replans against the live predicted player trajectory; sibling AIs read each other from a shared plan registry. Demonstrates the new HeightfieldAirspace (real ground-elevation collision), time-aware multi-agent planning, anytime replanning, and a GOAP-style tactical layer above kinocat.',
@@ -22,6 +28,18 @@ const groups: { heading: string; demos: Demo[] }[] = [
         title: 'Interactive multi-agent flagship',
         desc: 'Opposing cross-traffic on a large procedural navcat terrain. Click a vehicle to select it, retarget its goal or drop hazards and watch every NPC replan live. A genuine boost & canyon jump the planner adopts, a misdirect it rejects on its own. Toggleable clearance & moving-obstacle broadphase.',
         tag: '3D · interactive · multi-agent',
+      },
+      {
+        href: '/ramp',
+        title: 'Ramp + Affordance — drivable ramp vs ballistic shortcut',
+        desc: 'A real drivable heightfield ramp the car physically climbs and launches off, paired with a BallisticJump Affordance the planner can take as a shortcut across a planner-only gap. Toggle the affordance to watch the planned path swap from the long detour to the jump. Execution is always real Rapier physics — the car always drives, never poses along the arc.',
+        tag: '3D · interactive · affordances',
+      },
+      {
+        href: '/obstaclecourse',
+        title: 'Obstacle course — kinocat building blocks',
+        desc: 'A single car on a small course with every kinocat building block toggleable from the HUD: heightfield terrain, cuboid buildings, jump ramp + affordance, boost pad, drift slalom, and a waypoint loop. Built entirely on the new core APIs (`kinocat/adapters/rapier`, `kinocat/adapters/three`, `planVehicleOnce`, `nudgeGoalClear`). Use it to sanity-check each piece in isolation before graduating to /carchase.',
+        tag: '3D · interactive · building-blocks',
       },
       {
         href: '/catmouse',

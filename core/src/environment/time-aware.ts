@@ -275,8 +275,16 @@ export class TimeAwareEnvironment<State extends HasXZT>
   }
 
   checkValidity(start: State, goal: State): [boolean, boolean] {
-    const [s, g] = this.base.checkValidity(start, goal);
-    return [s && !this.collides(start), g];
+    // Intentionally only delegate to the static (positional) base check for
+    // the start. Rejecting the start because some moving obstacle overlaps
+    // it at t=0 makes the planner allergic to its own initial conditions —
+    // when several agents (cops, the robber) cluster, every cop's predicted
+    // plan overlaps every other cop's start position, and they all bail
+    // simultaneously. The successor-expansion path still uses `collides()`
+    // to reject states that *remain* in conflict with a moving obstacle, so
+    // real time-windowed conflicts are still avoided; we just don't refuse
+    // to plan from a current pose we can't change.
+    return this.base.checkValidity(start, goal);
   }
 
   reachedGoalRegion(node: Node<State>, goal: Node<State>): boolean {

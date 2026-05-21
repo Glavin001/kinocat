@@ -8,9 +8,11 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "e2e:carchase": "node test/carchase-e2e.mjs"
   },
   "dependencies": {
+    "@dimforge/rapier3d-compat": "^0.14.0",
     "@kinocat/three": "workspace:*",
     "kinocat": "workspace:*",
     "navcat": "0.4.1",
