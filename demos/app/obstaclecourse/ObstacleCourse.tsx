@@ -36,6 +36,7 @@ import {
   createInflatedObstacleHelper,
   createNavBoundsHelper,
   createAgentFootprintHelper,
+  createRapierDebugRenderer,
 } from 'kinocat/adapters/three';
 import {
   OBS_AGENT,
@@ -68,6 +69,7 @@ export default function ObstacleCourse() {
   const [chase, setChase] = useState(true);
   const [showPath, setShowPath] = useState(true);
   const [showDebug, setShowDebug] = useState(false);
+  const [showRapierDebug, setShowRapierDebug] = useState(false);
   const [playerDriving, setPlayerDriving] = useState(false);
   const [blocks, setBlocks] = useState<ObsBlocks>(OBS_BLOCKS_ALL);
   const [ready, setReady] = useState(false);
@@ -78,6 +80,7 @@ export default function ObstacleCourse() {
   const chaseRef = useRef(chase);
   const showPathRef = useRef(showPath);
   const showDebugRef = useRef(showDebug);
+  const showRapierDebugRef = useRef(showRapierDebug);
   const playerDrivingRef = useRef(playerDriving);
   const blocksRef = useRef(blocks);
   const rebuildRef = useRef<(() => void) | null>(null);
@@ -85,6 +88,7 @@ export default function ObstacleCourse() {
   chaseRef.current = chase;
   showPathRef.current = showPath;
   showDebugRef.current = showDebug;
+  showRapierDebugRef.current = showRapierDebug;
   playerDrivingRef.current = playerDriving;
   blocksRef.current = blocks;
 
@@ -278,6 +282,11 @@ export default function ObstacleCourse() {
       color: C.car,
     });
 
+    // ---- rapier debug wireframe ----
+    const rapierDebug = createRapierDebugRenderer();
+    rapierDebug.mesh.visible = false;
+    scene.add(rapierDebug.mesh);
+
     // ---- car ----
     const car = createRaycastVehicle(world, {
       id: 'obs-car',
@@ -335,6 +344,7 @@ export default function ObstacleCourse() {
       if (k === 'c') setChase((v) => !v);
       if (k === '1') setShowPath((v) => !v);
       if (k === 'd') setShowDebug((v) => !v);
+      if (k === '2') setShowRapierDebug((v) => !v);
       if (k === 't') setPlayerDriving((v) => !v);
       if (k === 'r') {
         car.teleport({ x: obsSpawn().x, z: obsSpawn().z, heading: obsSpawn().heading });
@@ -449,6 +459,8 @@ export default function ObstacleCourse() {
       if (pathLine) pathLine.visible = showPathRef.current;
 
       debugGroup.visible = showDebugRef.current;
+      rapierDebug.mesh.visible = showRapierDebugRef.current;
+      if (showRapierDebugRef.current) rapierDebug.update(world);
       if (showDebugRef.current) {
         carFootprint.position.set(after.x, 0, after.z);
         carFootprint.rotation.y = -after.heading;
@@ -580,6 +592,12 @@ export default function ObstacleCourse() {
             shortcut="d"
             on={showDebug}
             onClick={() => setShowDebug((v) => !v)}
+          />
+          <ToggleButton
+            label="physics"
+            shortcut="2"
+            on={showRapierDebug}
+            onClick={() => setShowRapierDebug((v) => !v)}
           />
         </div>
         <div style={{ opacity: 0.55, marginTop: 8, fontSize: 11 }}>

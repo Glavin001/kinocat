@@ -183,14 +183,41 @@ export function createJumpRampHelper(
   ramp.position.set(spec.launch.x, spec.height / 2, spec.launch.z);
   group.add(ramp);
 
+  group.add(createJumpArcHelper(spec, { arcColor }));
+
+  return group;
+}
+
+export interface JumpArcOptions {
+  arcColor?: number;
+  /** Ground-Y of the launch point; arc starts here. Defaults to `spec.height`
+   *  which matches a cuboid ramp crest; pass the heightfield crest height for
+   *  drivable ramps. */
+  launchY?: number;
+  /** Extra clearance above arc apex. */
+  apexClearance?: number;
+}
+
+/** Affordance overlay: dashed parabolic arc from launch to land + landing
+ *  ring. No ramp body — pair with whatever physical surface your scene uses
+ *  (heightfield mound, wedge mesh, etc.). */
+export function createJumpArcHelper(
+  spec: JumpRampSpec,
+  opts: JumpArcOptions = {},
+): THREE.Group {
+  const group = new THREE.Group();
+  const arcColor = opts.arcColor ?? 0xffd0a0;
+  const launchY = opts.launchY ?? spec.height;
+  const apexY = launchY + (opts.apexClearance ?? 2);
+
   const pts: THREE.Vector3[] = [];
   const N = 24;
-  const apexY = spec.height + 2;
   for (let i = 0; i <= N; i++) {
     const u = i / N;
     const x = spec.launch.x + (spec.land.x - spec.launch.x) * u;
     const z = spec.launch.z + (spec.land.z - spec.launch.z) * u;
-    const y = 4 * apexY * u * (1 - u);
+    // Quadratic arc from (launch, launchY) through apex back to (land, 0).
+    const y = (1 - u) * launchY + 4 * (apexY - (launchY + 0) / 2) * u * (1 - u);
     pts.push(new THREE.Vector3(x, y + 0.3, z));
   }
   const arc = new THREE.Line(
@@ -466,6 +493,44 @@ export function createNavBoundsHelper(
     new THREE.BufferGeometry().setFromPoints(pts),
     new THREE.LineBasicMaterial({ color: opts.color ?? 0x66ffaa }),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Rapier debug renderer — draws all collider shapes as wireframe lines using
+// `world.debugRender()`. Call `create` once, then `update` every frame.
+
+export interface RapierDebugMesh {
+  mesh: THREE.LineSegments;
+  /** Call each frame (or when debug is visible) to refresh geometry. */
+  update(world: { debugRender(): { vertices: Float32Array; colors: Float32Array } }): void;
+}
+
+/** Create a lazily-updated wireframe overlay of every Rapier collider.
+ *  The returned `mesh` should be added to the scene; call `update(world)`
+ *  each frame to sync with the physics state. */
+export function createRapierDebugRenderer(): RapierDebugMesh {
+  const geo = new THREE.BufferGeometry();
+  const mat = new THREE.LineBasicMaterial({ vertexColors: true });
+  const mesh = new THREE.LineSegments(geo, mat);
+
+  return {
+    mesh,
+    update(world) {
+      const { vertices, colors } = world.debugRender();
+      geo.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+      // Rapier colors are RGBA (4 floats per vertex); THREE wants RGB (3).
+      const count = vertices.length / 3;
+      const rgb = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        rgb[i * 3] = colors[i * 4]!;
+        rgb[i * 3 + 1] = colors[i * 4 + 1]!;
+        rgb[i * 3 + 2] = colors[i * 4 + 2]!;
+      }
+      geo.setAttribute('color', new THREE.BufferAttribute(rgb, 3));
+      geo.attributes.position!.needsUpdate = true;
+      geo.attributes.color!.needsUpdate = true;
+    },
+  };
 }
 
 /** An agent footprint rectangle, in body-local coords. Move/rotate with

@@ -44,6 +44,7 @@ import {
   createInflatedObstacleHelper,
   createNavBoundsHelper,
   createAgentFootprintHelper,
+  createRapierDebugRenderer,
 } from 'kinocat/adapters/three';
 
 interface CopAI {
@@ -108,6 +109,7 @@ export default function CarChase() {
   const [showGoals, setShowGoals] = useState(true);
   const [showAff, setShowAff] = useState(true);
   const [showDebug, setShowDebug] = useState(false);
+  const [showRapierDebug, setShowRapierDebug] = useState(false);
   const [playerDriving, setPlayerDriving] = useState(false);
   const [ready, setReady] = useState(false);
   const [hud, setHud] = useState('');
@@ -122,6 +124,7 @@ export default function CarChase() {
   const showGoalsRef = useRef(showGoals);
   const showAffRef = useRef(showAff);
   const showDebugRef = useRef(showDebug);
+  const showRapierDebugRef = useRef(showRapierDebug);
   const playerDrivingRef = useRef(playerDriving);
   const resetRef = useRef<(() => void) | null>(null);
   pausedRef.current = paused;
@@ -130,6 +133,7 @@ export default function CarChase() {
   showGoalsRef.current = showGoals;
   showAffRef.current = showAff;
   showDebugRef.current = showDebug;
+  showRapierDebugRef.current = showRapierDebug;
   playerDrivingRef.current = playerDriving;
 
   useEffect(() => {
@@ -243,6 +247,11 @@ export default function CarChase() {
     }
     affordanceGroup.add(createWaypointLoopHelper(course.robberLoop));
 
+    // ---- rapier debug wireframe ----
+    const rapierDebug = createRapierDebugRenderer();
+    rapierDebug.mesh.visible = false;
+    scene.add(rapierDebug.mesh);
+
     // ---- spawn cars ------------------------------------------------------
     const poses = spawnPoses();
     const robberCar = spawnCar(world, {
@@ -347,6 +356,7 @@ export default function CarChase() {
       if (k === '2') setShowGoals((v) => !v);
       if (k === '3') setShowAff((v) => !v);
       if (k === 'd') setShowDebug((v) => !v);
+      if (k === '4') setShowRapierDebug((v) => !v);
       if (k === 't') setPlayerDriving((v) => !v);
       if (k === 'r') reset();
     };
@@ -647,6 +657,10 @@ export default function CarChase() {
       for (const l of copPathLines) if (l) l.visible = showPathsRef.current;
       affordanceGroup.visible = showAffRef.current;
 
+      // Rapier physics debug wireframe.
+      rapierDebug.mesh.visible = showRapierDebugRef.current;
+      if (showRapierDebugRef.current) rapierDebug.update(world);
+
       // Debug overlay (planner navmesh + agent footprints).
       debugGroup.visible = showDebugRef.current;
       if (showDebugRef.current) {
@@ -822,6 +836,12 @@ export default function CarChase() {
             shortcut="d"
             on={showDebug}
             onClick={() => setShowDebug((v) => !v)}
+          />
+          <ToggleButton
+            label="physics"
+            shortcut="4"
+            on={showRapierDebug}
+            onClick={() => setShowRapierDebug((v) => !v)}
           />
           <ActionButton
             label="reset"
