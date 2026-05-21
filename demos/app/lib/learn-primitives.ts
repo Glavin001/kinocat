@@ -390,10 +390,13 @@ const FIT_SUBSTEPS_PER_SAMPLE = 6;
 function rolloutAndLoss(
   params: LearnedVehicleParams,
   data: SweepData,
+  prior: LearnedVehicleParams = DEFAULT_LEARNED_PARAMS,
+  regWeight = 0,
 ): { loss: number; errors: number[] } {
   const sim = learnedForwardSim(params, data.agent);
   let loss = 0;
   const errors: number[] = [];
+  let sampleCount = 0;
   // Sub-divide each between-sample interval so the integration in the loss
   // matches the resolution of the open-loop trial (33 physics ticks across
   // 6 samples ≈ 5-6 ticks per sample window).
@@ -418,6 +421,19 @@ function rolloutAndLoss(
       const ds = s.speed - b.speed;
       loss += POS_W * (dx * dx + dz * dz) + HEADING_W * dh * dh + SPEED_W * ds * ds;
       errors.push(Math.sqrt(dx * dx + dz * dz));
+      sampleCount++;
+    }
+  }
+  // Small L2 regularization toward the prior so the offline fit can't pin
+  // coefficients to bounds when one corner of the input space dominates
+  // (e.g., trials with hard brake events will otherwise push maxDecel to
+  // the upper bound). Keeps the pre-train output sensible so the online
+  // learner has a clean prior to refine from.
+  if (regWeight > 0 && sampleCount > 0) {
+    const scale = regWeight * sampleCount;
+    for (const key of PARAM_ORDER) {
+      const d = (params[key] - prior[key]) / PARAM_SCALE[key];
+      loss += scale * d * d;
     }
   }
   return { loss, errors };
@@ -438,18 +454,18 @@ const PARAM_ORDER = [
 // data. Tight bounds + the L2 regularization in `transitionLoss` keep
 // poorly-constrained coefficients near their priors.
 const PARAM_LO: Record<(typeof PARAM_ORDER)[number], number> = {
-  maxAccel: 2,
-  maxDecel: 3,
-  accelTau: 0.05,
+  maxAccel: 4,
+  maxDecel: 5,
+  accelTau: 0.15,
   understeerGain: 0,
   lateralDrag: 0,
 };
 const PARAM_HI: Record<(typeof PARAM_ORDER)[number], number> = {
-  maxAccel: 15,
-  maxDecel: 15,
-  accelTau: 1.0,
-  understeerGain: 0.1,
-  lateralDrag: 0.3,
+  maxAccel: 9,
+  maxDecel: 12,
+  accelTau: 0.5,
+  understeerGain: 0.04,
+  lateralDrag: 0.08,
 };
 /** Characteristic scale per coefficient — used to make the L2
  *  regularization scale-invariant. */
@@ -561,17 +577,26 @@ export interface FitOptions {
   init?: LearnedVehicleParams;
   /** Optimiser iteration cap. */
   maxIter?: number;
+  /** Regularization anchor (defaults to `DEFAULT_LEARNED_PARAMS`). */
+  prior?: LearnedVehicleParams;
+  /** L2 regularization strength (default 0.005). A small value keeps
+   *  the offline fit from pinning coefficients to bounds when one
+   *  trial type (e.g. hard braking) dominates the loss landscape. */
+  regularization?: number;
 }
 
 /** Fit the five-parameter dynamics model to recorded sweep data via
  *  Nelder-Mead. Deterministic for a fixed `init`. */
 export function fitParams(data: SweepData, opts: FitOptions = {}): FitResult {
   const init = opts.init ?? DEFAULT_LEARNED_PARAMS;
+  const prior = opts.prior ?? DEFAULT_LEARNED_PARAMS;
+  const reg = opts.regularization ?? 0.005;
   const x0 = toVec(init);
-  const lossFn = (v: number[]) => rolloutAndLoss(fromVec(v), data).loss;
+  const lossFn = (v: number[]) =>
+    rolloutAndLoss(fromVec(v), data, prior, reg).loss;
   const xStar = nelderMead(x0, lossFn, { maxIter: opts.maxIter ?? 400 });
   const params = fromVec(xStar);
-  const finalRoll = rolloutAndLoss(params, data);
+  const finalRoll = rolloutAndLoss(params, data, prior, 0);
   const errs = finalRoll.errors;
   const mean = errs.length ? errs.reduce((a, b) => a + b, 0) / errs.length : 0;
   const max = errs.length ? Math.max(...errs) : 0;
@@ -661,13 +686,15 @@ export interface OnlineFitOptions {
   maxIter?: number;
   /** Per-coefficient L2 regularization strength. Pulls params toward
    *  `prior` (or `DEFAULT_LEARNED_PARAMS` if `prior` omitted) when data is
-   *  weak for a coefficient. Default 0.05 — at 4000 samples the
-   *  regularization scale is ~200 per coefficient, vs data loss
-   *  ~4000-40000 (so reg ≈ 5%). Strong enough to hold weakly-informed
-   *  coefficients (maxDecel — braking is rare in a race; lateralDrag —
-   *  only matters in tight turns) near the prior; weak enough that
-   *  genuinely informative gradients still move the fit. Earlier default
-   *  of 0.005 was 10× weaker and let those coefficients drift to bounds. */
+   *  weak for a coefficient. Default 0.2 — at 4000 samples the
+   *  regularization scale is ~800 per coefficient, vs data loss
+   *  ~4000-40000 (so reg ≈ 10-20%). Strong enough to genuinely anchor
+   *  weakly-informed coefficients (maxDecel — braking is rare;
+   *  lateralDrag — only matters in tight turns) to the prior even with
+   *  thousands of noisy gradient samples pulling elsewhere; weak enough
+   *  that genuinely informative signals still move the fit. Earlier
+   *  default of 0.05 was 4× weaker and still let coefficients drift to
+   *  permissive bounds. */
   regularization?: number;
   prior?: LearnedVehicleParams;
 }
@@ -681,7 +708,7 @@ export function fitParamsOnline(
 ): FitResult {
   const init = opts.init ?? DEFAULT_LEARNED_PARAMS;
   const prior = opts.prior ?? DEFAULT_LEARNED_PARAMS;
-  const reg = opts.regularization ?? 0.05;
+  const reg = opts.regularization ?? 0.2;
   const x0 = toVec(init);
   const lossFn = (v: number[]) =>
     transitionLoss(samples, fromVec(v), agent, prior, reg).loss;

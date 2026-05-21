@@ -54,7 +54,12 @@ import {
 
 const PHYSICS_DT = 1 / 60;
 const VEHICLE_SUBSTEPS = 4;
-const REPLAN_INTERVAL_MS = 500;
+// 300ms tick (~3.3 Hz). Both cars plan in the SAME tick callback so they
+// always plan at the same wall-time with the same per-car budget — fair
+// by construction. CPU = 2 × RACE_REPLAN_BUDGET_MS (120) / 300 = 80%
+// (was 120% with the old 500ms × 300 budget, which was over-saturated
+// and animation visibly choked).
+const REPLAN_INTERVAL_MS = 300;
 const WHEEL_BASE = 1.6;
 // Real tire grip on dry asphalt is ~9-10 m/s² (~1g). 12 keeps the cars
 // physically plausible — pure-pursuit won't follow a plan that demands more
@@ -133,7 +138,7 @@ interface CarRuntime {
 }
 
 interface OnlineLearnerState {
-  /** Current best-fit coefficients — used by the planner's library. */
+  /** Latest refit's coefficients — shown in the panel for transparency. */
   params: LearnedVehicleParams;
   /** L2-regularization anchor. If the user pre-trained offline this is the
    *  offline fit; online refits can deviate from it but only when race data
@@ -141,8 +146,29 @@ interface OnlineLearnerState {
    *  conservative defaults — that's why pre-training matters: it produces
    *  a meaningful prior the online learner can lean on. */
   priorParams: LearnedVehicleParams;
+  /** Params CURRENTLY baked into `car.lib` (what's actually racing). May
+   *  equal `params` (latest fit adopted) OR `bestParams` (rolled back
+   *  after a bad refit). Updating `car.lib` MUST also update this. */
+  libParams: LearnedVehicleParams;
+  /** Params that produced the best lap time so far. Always reflects a
+   *  configuration we KNOW works well. The car races with this whenever
+   *  the latest refit is significantly worse. */
+  bestParams: LearnedVehicleParams;
+  /** Best lap time recorded with this learner instance. NaN until the
+   *  first lap completes. */
+  bestLapTime: number;
+  /** Lap number (1-indexed) that produced `bestLapTime`. */
+  bestLapNumber: number;
+  /** True when `car.lib` was just reverted to `bestParams` because the
+   *  most recent lap was significantly worse than the best so far. The
+   *  HUD surfaces this with a "USING BEST" badge so the user knows the
+   *  live coef panel values aren't what's racing. Cleared when the
+   *  latest refit is adopted again. */
+  rollbackActive: boolean;
   samples: TransitionSample[];
   refitCount: number;
+  /** Refits where the rollback fired (latest refit hurt → reverted). */
+  rollbackCount: number;
   lastFitMs: number;
   lastMeanError: number;
   /** True while a refit is in flight (debounce). */
@@ -333,6 +359,12 @@ export default function RacePrimitives() {
             kinematic: learner?.kinematicHolding ?? false,
             learned: learner?.learnedHolding ?? false,
           }}
+          lapTimes={{
+            kinematic: learner?.kinematicLapTimes ?? [],
+            learned: learner?.learnedLapTimes ?? [],
+          }}
+          rollbackActive={learner?.rollbackActive ?? false}
+          bestLapNumber={learner?.bestLapNumber ?? 0}
         />
         {(phase === 'racing' || phase === 'finished') && learner && (
           <LearnerPanel snap={learner} />
@@ -441,12 +473,21 @@ interface SceneCallbacks {
 }
 
 interface LearnerSnapshot {
+  /** Latest refit (shown in the live coef panel). */
   params: LearnedVehicleParams;
   /** Anchor the live coefficients drifted FROM (pre-train fit, or
-   *  DEFAULT_LEARNED_PARAMS without pre-train). Surfaced so the user
-   *  can see at a glance how much the online refit has moved each
-   *  coefficient from its prior. */
+   *  DEFAULT_LEARNED_PARAMS without pre-train). Each online refit starts
+   *  from here, not from `params`, to prevent drift accumulation. */
   priorParams: LearnedVehicleParams;
+  /** Params that produced the best lap so far. When `rollbackActive` is
+   *  true, this is what's actually racing (not `params`). */
+  bestParams: LearnedVehicleParams;
+  bestLapTime: number;
+  bestLapNumber: number;
+  /** True when `car.lib` is built from `bestParams` because the last lap
+   *  was significantly slower than the best. */
+  rollbackActive: boolean;
+  rollbackCount: number;
   refitCount: number;
   sampleCount: number;
   lastFitMs: number;
@@ -631,8 +672,14 @@ async function setupScene(
   const learned = makeCar('learned', initialLearnedLib, C.learned, C.learnedPath, {
     params: initialLearnerParams,
     priorParams: initialLearnerParams,
+    libParams: initialLearnerParams,
+    bestParams: initialLearnerParams,
+    bestLapTime: Number.NaN,
+    bestLapNumber: 0,
+    rollbackActive: false,
     samples: [],
     refitCount: 0,
+    rollbackCount: 0,
     lastFitMs: 0,
     lastMeanError: 0,
     refitting: false,
@@ -923,32 +970,76 @@ async function setupScene(
   }
 
   /** Defer the (CPU-heavy) refit to a microtask so the animation loop
-   *  doesn't hitch. Only one refit at a time per car. */
+   *  doesn't hitch. Only one refit at a time per car.
+   *
+   *  Three things happen each call:
+   *  1. **Lap evaluation**: did the just-finished lap (driven with
+   *     `libParams`) beat the best so far? If yes, promote `libParams`
+   *     to `bestParams`/`bestLapTime`.
+   *  2. **Refit**: fit the 5 coefficients to the current sample buffer,
+   *     ALWAYS starting from `priorParams` (not the drifted current
+   *     params — that's how drift used to accumulate across laps).
+   *  3. **Adopt or rollback**: if the just-finished lap was much worse
+   *     than the best, revert `car.lib` to the best-known params so
+   *     racing performance never regresses. Otherwise adopt the new fit. */
   function scheduleRefit(car: CarRuntime): void {
     if (!car.learner || car.learner.refitting) return;
     car.learner.refitting = true;
     const samplesSnapshot = car.learner.samples.slice();
-    const initParams = car.learner.params;
+    const learner = car.learner;
+    // Evaluate the lap that JUST ENDED (driven with `libParams`) BEFORE
+    // running the refit. This is the only honest moment to credit the
+    // params that produced this lap.
+    const justFinishedLap =
+      car.lapTimes.length > 0 ? car.lapTimes[car.lapTimes.length - 1]! : Number.NaN;
+    if (
+      Number.isFinite(justFinishedLap) &&
+      (!Number.isFinite(learner.bestLapTime) || justFinishedLap < learner.bestLapTime)
+    ) {
+      // New best — record the params that produced it.
+      learner.bestLapTime = justFinishedLap;
+      learner.bestParams = learner.libParams;
+      learner.bestLapNumber = car.lapTimes.length;
+    }
+    // Hysteresis: 0.5s slop prevents oscillation between "adopt" and
+    // "rollback" from lap-to-lap noise.
+    const ROLLBACK_HYSTERESIS_S = 0.5;
+    const wasMuchWorse =
+      Number.isFinite(justFinishedLap) &&
+      Number.isFinite(learner.bestLapTime) &&
+      justFinishedLap > learner.bestLapTime + ROLLBACK_HYSTERESIS_S;
+
     setTimeout(() => {
-      const learner = car.learner;
-      if (!learner) return;
+      if (!car.learner) return;
       const t0 = performance.now();
       const fit = fitParamsOnline(samplesSnapshot, RACE_AGENT, {
-        init: initParams,
-        // Pull toward the OFFLINE fit (or DEFAULT_LEARNED_PARAMS if no
-        // pre-train) — keeps coefficients that race data poorly informs
-        // (esp. maxDecel: braking is rare in a race) near their honest
-        // baseline instead of drifting to silly values.
-        prior: car.learner!.priorParams,
+        // Init from PRIOR (not previous params) so drift from lap N
+        // doesn't poison lap N+1's starting point. Each refit explores
+        // from the same anchor; only genuinely informative gradients
+        // move it.
+        init: learner.priorParams,
+        prior: learner.priorParams,
         maxIter: 200,
       });
       learner.params = fit.params;
       learner.refitCount++;
       learner.lastFitMs = performance.now() - t0;
       learner.lastMeanError = fit.meanPosError;
-      // Rebuild the learned car's primitive library from the new params and
-      // swap it in. Next replan (within REPLAN_INTERVAL_MS) picks it up.
-      car.lib = buildLearnedRaceLibrary(fit.params);
+      // Adoption vs rollback: race with whichever lib we trust more.
+      if (wasMuchWorse) {
+        // Recent lap was significantly slower than best → revert.
+        car.lib = buildLearnedRaceLibrary(learner.bestParams);
+        learner.libParams = learner.bestParams;
+        learner.rollbackActive = true;
+        learner.rollbackCount++;
+      } else {
+        // First lap (no best yet) or within hysteresis of best → try
+        // the latest refit. If it underperforms, the next lap's check
+        // will roll back.
+        car.lib = buildLearnedRaceLibrary(fit.params);
+        learner.libParams = fit.params;
+        learner.rollbackActive = false;
+      }
       learner.refitting = false;
     }, REFIT_DEFER_MS);
   }
@@ -993,6 +1084,11 @@ async function setupScene(
         cb.onLearner({
           params: learned.learner.params,
           priorParams: learned.learner.priorParams,
+          bestParams: learned.learner.bestParams,
+          bestLapTime: learned.learner.bestLapTime,
+          bestLapNumber: learned.learner.bestLapNumber,
+          rollbackActive: learned.learner.rollbackActive,
+          rollbackCount: learned.learner.rollbackCount,
           refitCount: learned.learner.refitCount,
           sampleCount: learned.learner.samples.length,
           lastFitMs: learned.learner.lastFitMs,
@@ -1078,8 +1174,14 @@ async function setupScene(
       if (learned.learner) {
         learned.learner.samples = [];
         learned.learner.refitCount = 0;
+        learned.learner.rollbackCount = 0;
         learned.learner.params = initialLearnerParams;
         learned.learner.priorParams = initialLearnerParams;
+        learned.learner.libParams = initialLearnerParams;
+        learned.learner.bestParams = initialLearnerParams;
+        learned.learner.bestLapTime = Number.NaN;
+        learned.learner.bestLapNumber = 0;
+        learned.learner.rollbackActive = false;
         learned.learner.lastFitMs = 0;
         learned.learner.lastMeanError = 0;
         learned.lib = initialLearnedLib;
@@ -1225,10 +1327,16 @@ function MetricsOverlay({
   metrics,
   winner,
   holding,
+  lapTimes,
+  rollbackActive,
+  bestLapNumber,
 }: {
   metrics: { kinematic: RaceMetrics; learned: RaceMetrics };
   winner: 'kinematic' | 'learned' | 'tie' | null;
   holding: { kinematic: boolean; learned: boolean };
+  lapTimes: { kinematic: number[]; learned: number[] };
+  rollbackActive: boolean;
+  bestLapNumber: number;
 }) {
   return (
     <>
@@ -1239,6 +1347,8 @@ function MetricsOverlay({
         m={metrics.kinematic}
         highlight={winner === 'kinematic'}
         holding={holding.kinematic}
+        recentLaps={lapTimes.kinematic}
+        rollbackBadge={null}
       />
       <SideMetrics
         side="right"
@@ -1247,6 +1357,8 @@ function MetricsOverlay({
         m={metrics.learned}
         highlight={winner === 'learned'}
         holding={holding.learned}
+        recentLaps={lapTimes.learned}
+        rollbackBadge={rollbackActive ? `USING BEST (lap ${bestLapNumber})` : null}
       />
     </>
   );
@@ -1259,6 +1371,8 @@ function SideMetrics({
   m,
   highlight,
   holding,
+  recentLaps,
+  rollbackBadge,
 }: {
   side: 'left' | 'right';
   title: string;
@@ -1266,7 +1380,21 @@ function SideMetrics({
   m: RaceMetrics;
   highlight: boolean;
   holding: boolean;
+  recentLaps: number[];
+  rollbackBadge: string | null;
 }) {
+  // Stability over the last 5 laps — low std-dev means the car has
+  // settled into a consistent racing line, high means it's still
+  // oscillating between fits or fighting the course.
+  const last5 = recentLaps.slice(-5);
+  const mean5 =
+    last5.length > 0 ? last5.reduce((a, b) => a + b, 0) / last5.length : Number.NaN;
+  const std5 =
+    last5.length > 1
+      ? Math.sqrt(
+          last5.reduce((a, b) => a + (b - mean5) * (b - mean5), 0) / last5.length,
+        )
+      : Number.NaN;
   return (
     <div
       style={{
@@ -1299,6 +1427,21 @@ function SideMetrics({
             WAITING…
           </span>
         )}
+        {rollbackBadge && (
+          <span
+            style={{
+              marginLeft: 8,
+              color: '#a6e9ff',
+              fontWeight: 700,
+              fontSize: 10,
+              padding: '2px 6px',
+              border: '1px solid #55dcff',
+              borderRadius: 4,
+            }}
+          >
+            {rollbackBadge}
+          </span>
+        )}
       </div>
       <KV k="time" v={`${m.raceTime.toFixed(2)} s`} />
       <KV k="laps" v={`${m.laps}`} />
@@ -1310,6 +1453,14 @@ function SideMetrics({
       <KV
         k="last lap"
         v={Number.isFinite(m.lastLapTime) ? `${m.lastLapTime.toFixed(2)} s` : '—'}
+      />
+      <KV
+        k="mean (last 5)"
+        v={Number.isFinite(mean5) ? `${mean5.toFixed(2)} s` : '—'}
+      />
+      <KV
+        k="std-dev (last 5)"
+        v={Number.isFinite(std5) ? `${std5.toFixed(3)} s` : '—'}
       />
       <KV k="0.55s pred err (rms)" v={`${m.trackingErrorRms.toFixed(2)} m`} />
       <KV k="peak speed" v={`${m.peakSpeed.toFixed(1)} m/s`} />
@@ -1357,6 +1508,11 @@ function LearnerPanel({ snap }: { snap: LearnerSnapshot }) {
         <div>
           <div style={{ color: '#55dcff', fontWeight: 700, marginBottom: 6 }}>
             ONLINE LEARNER · {snap.refitCount} refit{snap.refitCount === 1 ? '' : 's'}
+            {snap.rollbackCount > 0 && (
+              <span style={{ color: '#ffd070' }}>
+                {' '}· {snap.rollbackCount} rollback{snap.rollbackCount === 1 ? '' : 's'}
+              </span>
+            )}
             {' '}· {snap.sampleCount} samples
             {snap.lastFitMs > 0 && (
               <span style={{ opacity: 0.65 }}>
@@ -1364,15 +1520,18 @@ function LearnerPanel({ snap }: { snap: LearnerSnapshot }) {
               </span>
             )}
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'auto auto auto', gap: '2px 12px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'auto auto auto auto', gap: '2px 12px' }}>
             <span style={{ opacity: 0.55 }}>coef</span>
-            <span style={{ opacity: 0.55, textAlign: 'right' }}>now</span>
+            <span style={{ opacity: 0.55, textAlign: 'right' }}>live</span>
+            <span style={{ opacity: 0.55, textAlign: 'right' }}>
+              best{Number.isFinite(snap.bestLapTime) ? ` (l${snap.bestLapNumber})` : ''}
+            </span>
             <span style={{ opacity: 0.55, textAlign: 'right' }}>prior</span>
-            <ParamRow k="maxAccel" v={snap.params.maxAccel} prior={snap.priorParams.maxAccel} unit="m/s²" />
-            <ParamRow k="maxDecel" v={snap.params.maxDecel} prior={snap.priorParams.maxDecel} unit="m/s²" />
-            <ParamRow k="accelTau" v={snap.params.accelTau} prior={snap.priorParams.accelTau} unit="s" digits={3} />
-            <ParamRow k="understeerGain" v={snap.params.understeerGain} prior={snap.priorParams.understeerGain} exp />
-            <ParamRow k="lateralDrag" v={snap.params.lateralDrag} prior={snap.priorParams.lateralDrag} exp />
+            <ParamRow k="maxAccel" v={snap.params.maxAccel} best={snap.bestParams.maxAccel} prior={snap.priorParams.maxAccel} unit="m/s²" />
+            <ParamRow k="maxDecel" v={snap.params.maxDecel} best={snap.bestParams.maxDecel} prior={snap.priorParams.maxDecel} unit="m/s²" />
+            <ParamRow k="accelTau" v={snap.params.accelTau} best={snap.bestParams.accelTau} prior={snap.priorParams.accelTau} unit="s" digits={3} />
+            <ParamRow k="understeerGain" v={snap.params.understeerGain} best={snap.bestParams.understeerGain} prior={snap.priorParams.understeerGain} exp />
+            <ParamRow k="lateralDrag" v={snap.params.lateralDrag} best={snap.bestParams.lateralDrag} prior={snap.priorParams.lateralDrag} exp />
           </div>
         </div>
         <LapTimeList
@@ -1397,6 +1556,7 @@ function LearnerPanel({ snap }: { snap: LearnerSnapshot }) {
 function ParamRow({
   k,
   v,
+  best,
   prior,
   unit,
   digits,
@@ -1404,6 +1564,7 @@ function ParamRow({
 }: {
   k: string;
   v: number;
+  best: number;
   prior: number;
   unit?: string;
   digits?: number;
@@ -1418,6 +1579,7 @@ function ParamRow({
         {fmt(v)}
         {unit ? ` ${unit}` : ''}
       </span>
+      <span style={{ color: '#a6e9ff', textAlign: 'right' }}>{fmt(best)}</span>
       <span style={{ opacity: 0.45, textAlign: 'right' }}>{fmt(prior)}</span>
     </>
   );
@@ -1446,8 +1608,6 @@ function SectorDeltaStrip({
       </div>
     );
   }
-  const kLap = kinematicSectors[lapsCompared - 1]!;
-  const lLap = learnedSectors[lapsCompared - 1]!;
   // sector i = time from previous gate to gate i (gate 0 from lap start).
   function sectorDeltas(cum: number[]): number[] {
     const out: number[] = [];
@@ -1456,14 +1616,43 @@ function SectorDeltaStrip({
     }
     return out;
   }
+  // Per-sector best across ALL completed laps (per car). Surfaced as
+  // a small ghost outline next to the current bar so the user can see
+  // whether THIS lap matched or beat the historical best for each gate
+  // — a "running personal best" view, independent of the
+  // current-lap vs current-lap delta.
+  function perSectorBests(allLaps: number[][]): number[] {
+    if (allLaps.length === 0) return [];
+    const m = allLaps[0]!.length;
+    const bests = new Array(m).fill(Number.POSITIVE_INFINITY) as number[];
+    for (const lap of allLaps) {
+      const deltas = sectorDeltas(lap);
+      for (let i = 0; i < Math.min(m, deltas.length); i++) {
+        if (deltas[i]! < bests[i]!) bests[i] = deltas[i]!;
+      }
+    }
+    return bests;
+  }
+  const kLap = kinematicSectors[lapsCompared - 1]!;
+  const lLap = learnedSectors[lapsCompared - 1]!;
   const kSec = sectorDeltas(kLap);
   const lSec = sectorDeltas(lLap);
+  const kBest = perSectorBests(kinematicSectors);
+  const lBest = perSectorBests(learnedSectors);
   const n = Math.min(kSec.length, lSec.length, sectorsPerLap);
   const deltas: number[] = [];
-  for (let i = 0; i < n; i++) deltas.push(kSec[i]! - lSec[i]!); // positive = learned faster
-  const maxAbs = Math.max(0.1, ...deltas.map(Math.abs));
+  const bestDeltas: number[] = [];
+  for (let i = 0; i < n; i++) {
+    deltas.push(kSec[i]! - lSec[i]!); // positive = learned faster THIS lap
+    bestDeltas.push(kBest[i]! - lBest[i]!); // best-vs-best (the "ceiling")
+  }
+  const maxAbs = Math.max(
+    0.1,
+    ...deltas.map(Math.abs),
+    ...bestDeltas.map(Math.abs),
+  );
   const W = 600;
-  const H = 70;
+  const H = 78;
   const padL = 38;
   const padR = 8;
   const padT = 6;
@@ -1476,7 +1665,7 @@ function SectorDeltaStrip({
   return (
     <div>
       <div style={{ color: '#7fd6ff', fontWeight: 700, marginBottom: 4 }}>
-        sector deltas · lap {lapsCompared} · cyan = learned faster · pink = kinematic faster
+        sector deltas · lap {lapsCompared} (filled) vs best-vs-best (outline) · cyan = learned faster · pink = kinematic faster
       </div>
       <svg
         viewBox={`0 0 ${W} ${H}`}
@@ -1490,9 +1679,27 @@ function SectorDeltaStrip({
           const x = padL + i * stride + (stride - barW) / 2;
           const color = d > 0 ? '#55dcff' : '#ff8aa0';
           const y = d > 0 ? midY - h : midY;
+          // Best-vs-best ghost outline at the same x position.
+          const bd = bestDeltas[i] ?? 0;
+          const bh = (Math.abs(bd) / maxAbs) * (plotH / 2);
+          const bColor = bd > 0 ? '#55dcff' : '#ff8aa0';
+          const by = bd > 0 ? midY - bh : midY;
           return (
             <g key={i}>
+              {/* current-lap filled bar */}
               <rect x={x} y={y} width={barW} height={h} fill={color} opacity={0.85} />
+              {/* best-vs-best outline (no fill) — the "ceiling" achievable so far */}
+              <rect
+                x={x - 1}
+                y={by}
+                width={barW + 2}
+                height={bh}
+                fill="none"
+                stroke={bColor}
+                strokeWidth={1}
+                strokeDasharray="2 2"
+                opacity={0.7}
+              />
               <text
                 x={x + barW / 2}
                 y={H - 4}

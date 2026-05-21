@@ -213,8 +213,15 @@ export function buildLearnedRaceLibrary(
 // ---------------------------------------------------------------------------
 // Per-tick planning helper.
 
-export const RACE_REPLAN_BUDGET_MS = 300;
-export const RACE_MAX_EXPANSIONS = 50000;
+// Planning happens for BOTH cars sequentially in the same setInterval
+// callback (`RacePrimitives.tsx` :: `replanTimer`) so they always plan at
+// the same wall time with the same per-car budget — fairness is structural.
+// Per-tick CPU = 2 × RACE_REPLAN_BUDGET_MS / REPLAN_INTERVAL_MS. We aim for
+// ~80% busy so the animation still runs: 2 × 120 / 300 = 80%.
+// 120ms / 3 segments = 40ms per planVehicleOnce — plenty for a 15-25m goal
+// at IGHA*'s ~1500 expansions/ms throughput.
+export const RACE_REPLAN_BUDGET_MS = 120;
+export const RACE_MAX_EXPANSIONS = 30000;
 export const RACE_TEST_MAX_EXPANSIONS = 60000;
 
 export interface RacePlanRequest {
