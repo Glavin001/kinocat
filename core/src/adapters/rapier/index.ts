@@ -11,6 +11,29 @@ import type { RapierBodyLike, RapierQuatLike, RapierWorldLike } from './types';
 
 export type { RapierBodyLike, RapierWorldLike, RapierVec3Like, RapierQuatLike } from './types';
 
+// Raycast vehicle wrapper + collider sugar — RAPIER WASM is required only at
+// runtime; the import is direct but tsup keeps `@dimforge/rapier3d-compat`
+// external so this subpath stays peer-dep-only.
+export {
+  ensureRapier,
+  createRaycastVehicle,
+  planToAckermannControls,
+  createBoxCollider,
+  createGroundCollider,
+  createHeightfieldCollider,
+} from './raycast-vehicle';
+export type {
+  CarHandle,
+  DriveTrain,
+  RaycastVehicleOptions,
+  AckermannConfig,
+  AckermannCommand,
+  BoxColliderOptions,
+  GroundColliderOptions,
+  HeightfieldColliderOptions,
+  HeightSampler,
+} from './raycast-vehicle';
+
 export interface RapierForwardSimOptions {
   world: RapierWorldLike;
   body: RapierBodyLike;

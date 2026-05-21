@@ -9,13 +9,9 @@
 // Architecture mirror: `demos/app/lib/dogfight-scenarios.ts` is the airborne
 // equivalent; many helpers here are direct ground-2D ports of its 3D ones
 // (selectTacticalMode / tacticalGoal / planAI).
-import { plan } from 'kinocat/planner';
+import { planVehicleOnce } from 'kinocat/planner';
 import type { PlanResult } from 'kinocat/planner';
-import {
-  InMemoryNavWorld,
-  VehicleEnvironment,
-  TimeAwareEnvironment,
-} from 'kinocat/environment';
+import { InMemoryNavWorld, nudgeGoalClear } from 'kinocat/environment';
 import type { NavPolygon } from 'kinocat/environment';
 import {
   PlanRegistry,
@@ -405,74 +401,35 @@ export function selectTacticalMode(
 }
 
 /** Translate a cop tactic into a goal `VehicleState`. The planner uses a
- *  generous goalRadius so these only need to be in the right neighbourhood. */
-
-// Mirror the inflation used when the planner builds its obstacle list (see
-// `buildCarChaseCourse`: `box(b.x, b.z, b.hx + 0.5, b.hz + 0.5)`). Add the
-// agent's circumscribed half-extent so a goal that passes this point check
-// is also guaranteed to pass the planner's `poseClear(goal)` footprint check
-// regardless of goal heading — otherwise the AI keeps proposing goals the
-// planner immediately rejects, producing 0-expansion empty plans for cops.
-const BUILDING_OBSTACLE_INFLATE = 0.5;
-function agentClearance(agent: VehicleAgent): number {
-  let hMax = 0;
-  for (const [fx, fz] of agent.footprint) {
-    const m = Math.max(Math.abs(fx), Math.abs(fz));
-    if (m > hMax) hMax = m;
+ *  generous goalRadius so these only need to be in the right neighbourhood.
+ *
+ *  Goal-nudging delegates to `kinocat/environment`'s generic helper, which
+ *  uses the same `NavWorld.footprintClear` predicate the planner's
+ *  `checkValidity` calls — so a goal accepted by `nudgeGoalToNavClear` is
+ *  guaranteed to plan. The InMemoryNavWorld is built lazily and cached per
+ *  course identity. */
+let cachedCourseObstacles: Array<[number, number][]> | null = null;
+let cachedNavWorld: InMemoryNavWorld | null = null;
+function navWorldFor(course: CarChaseCourse): InMemoryNavWorld {
+  if (cachedCourseObstacles !== course.obstacles) {
+    cachedNavWorld = new InMemoryNavWorld(course.polygons, course.obstacles);
+    cachedCourseObstacles = course.obstacles;
   }
-  return hMax + BUILDING_OBSTACLE_INFLATE;
+  return cachedNavWorld!;
 }
 
-/** True if (x,z) is inside any building footprint, inflated by `inflate`. */
-function pointInAnyBuilding(
-  x: number,
-  z: number,
-  buildings: BuildingSpec[],
-  inflate: number,
-): boolean {
-  for (const b of buildings) {
-    if (
-      x >= b.x - b.hx - inflate &&
-      x <= b.x + b.hx + inflate &&
-      z >= b.z - b.hz - inflate &&
-      z <= b.z + b.hz + inflate
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/** Walk the goal back along the (cop → goal) ray in `step` increments until
- *  it sits clear of every building, with enough margin that the agent's
- *  rotated footprint at the goal heading is also clear — i.e. matches the
- *  planner's `poseClear(goal)` predicate. Bounded by `maxSteps` so a
- *  degenerate layout can never spin forever — falls back to the cop's own
- *  pose, which the planner will always accept (cops are alive). */
-function nudgeGoalClear(
+function nudgeGoalToNavClear(
   goal: VehicleState,
-  cop: VehicleState,
-  buildings: BuildingSpec[],
-  agent: VehicleAgent = CARCHASE_AGENT,
+  near: VehicleState,
+  buildings: BuildingSpec[] | undefined,
+  course?: CarChaseCourse,
 ): VehicleState {
-  const inflate = agentClearance(agent);
-  if (!pointInAnyBuilding(goal.x, goal.z, buildings, inflate)) return goal;
-  const dx = cop.x - goal.x;
-  const dz = cop.z - goal.z;
-  const total = Math.hypot(dx, dz);
-  if (total < 1e-6) return cop;
-  const ux = dx / total;
-  const uz = dz / total;
-  const step = 4;
-  const maxSteps = Math.max(4, Math.ceil(total / step));
-  for (let i = 1; i <= maxSteps; i++) {
-    const nx = goal.x + ux * step * i;
-    const nz = goal.z + uz * step * i;
-    if (!pointInAnyBuilding(nx, nz, buildings, inflate)) {
-      return clampGoalToBounds({ ...goal, x: nx, z: nz });
-    }
-  }
-  return { ...goal, x: cop.x, z: cop.z };
+  // Building list is no longer needed for the check itself (the NavWorld
+  // owns inflated obstacle geometry); we only keep the parameter so callers
+  // pass `course.buildings` if they want nudging enabled.
+  if (!buildings || !course) return goal;
+  const nudged = nudgeGoalClear(goal, near, navWorldFor(course), CARCHASE_AGENT);
+  return clampGoalToBounds(nudged);
 }
 
 export function tacticalGoal(
@@ -481,6 +438,7 @@ export function tacticalGoal(
   cop: VehicleState,
   mode: CopTacticalMode,
   buildings?: BuildingSpec[],
+  course?: CarChaseCourse,
 ): VehicleState {
   const ahead = (t: number) => robberPredict(t) ?? robber;
   const dist = Math.hypot(robber.x - cop.x, robber.z - cop.z);
@@ -553,7 +511,7 @@ export function tacticalGoal(
     }
   }
   const clamped = clampGoalToBounds(goal);
-  return buildings ? nudgeGoalClear(clamped, cop, buildings) : clamped;
+  return nudgeGoalToNavClear(clamped, cop, buildings, course);
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +524,7 @@ export function robberGoal(
   loopIndex: number,
   cops: VehicleState[],
   buildings?: BuildingSpec[],
+  course?: CarChaseCourse,
 ): { goal: VehicleState; nextIndex: number } {
   // Advance to the next waypoint once close enough.
   const wp = loop[loopIndex]!;
@@ -608,7 +567,7 @@ export function robberGoal(
     t: 0,
   });
   return {
-    goal: buildings ? nudgeGoalClear(clamped, robber, buildings) : clamped,
+    goal: nudgeGoalToNavClear(clamped, robber, buildings, course),
     nextIndex: useIdx,
   };
 }
@@ -648,57 +607,31 @@ export interface CarChasePlanRequest {
   maxExpansions?: number;
 }
 
-// Re-use a single NavWorld per planning call would also work, but
-// rebuilding is cheap (no obstacles change at runtime here) and avoids a
-// hidden cross-NPC cache. For test determinism, the world IS rebuilt.
-function buildPlanningWorld(course: CarChaseCourse): InMemoryNavWorld {
-  return new InMemoryNavWorld(course.polygons, course.obstacles);
-}
-
 export const CARCHASE_REPLAN_BUDGET_MS = 120;
 export const CARCHASE_MAX_EXPANSIONS = 25000;
 /** Test budget — generous because the test runs one shot, not interactive. */
 export const CARCHASE_TEST_MAX_EXPANSIONS = 80000;
 
+/** Single-shot planning call for one car-chase AI. Thin wrapper around
+ *  `kinocat/planner`'s `planVehicleOnce` that pins the course-specific
+ *  affordances + 10 m affordance proximity. Everything else (env tuning,
+ *  agent radius for the moving-obstacle test, broadphase) comes from the
+ *  core defaults. */
 export function planCarChaseAI(
   req: CarChasePlanRequest,
 ): PlanResult<VehicleState> {
-  const world = buildPlanningWorld(req.course);
-  const affordances = carChaseAffordances(req.course);
-  const baseEnv = new VehicleEnvironment(world, CARCHASE_AGENT, CARCHASE_LIB, {
-    posCell: 1.5,
-    headingBuckets: 16,
-    speedQuant: 4,
-    levelDivisors: [4, 2, 1],
-    goalRadius: 4,
-    goalHeadingTol: Infinity,
-    sweepSegmentCheck: false,
-    analyticExpansion: { everyN: 6, step: 0.6 },
+  return planVehicleOnce({
+    start: req.state,
+    goal: req.goal,
+    world: new InMemoryNavWorld(req.course.polygons, req.course.obstacles),
+    agent: CARCHASE_AGENT,
+    lib: CARCHASE_LIB,
+    movingObstacles: req.movingObstacles,
+    affordances: carChaseAffordances(req.course),
+    timeOptions: { affordanceRadius: 10 },
+    deadlineMs: req.deadlineMs ?? CARCHASE_REPLAN_BUDGET_MS,
+    maxExpansions: req.maxExpansions ?? CARCHASE_MAX_EXPANSIONS,
   });
-  // Agent circumscribed radius for the dynamic-obstacle test.
-  let rCirc = 0;
-  for (const [vx, vz] of CARCHASE_AGENT.footprint) {
-    const r = Math.hypot(vx, vz);
-    if (r > rCirc) rCirc = r;
-  }
-  const env = new TimeAwareEnvironment(baseEnv, {
-    obstacles: req.movingObstacles,
-    agentRadius: rCirc,
-    affordances,
-    affordanceRadius: 10,
-    broadphase: { sampleStep: 0.5, maxSamples: 24 },
-  });
-  return plan(
-    {
-      start: req.state,
-      goal: req.goal,
-      environment: env,
-      options: {
-        maxExpansions: req.maxExpansions ?? CARCHASE_MAX_EXPANSIONS,
-      },
-    },
-    req.deadlineMs ?? CARCHASE_REPLAN_BUDGET_MS,
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -771,6 +704,7 @@ export function buildCarChaseSnapshot(): CarChaseSnapshot {
     0,
     SPAWN_COPS,
     course.buildings,
+    course,
   );
   const robberResult = planCarChaseAI({
     npcId: 'robber',
@@ -798,7 +732,7 @@ export function buildCarChaseSnapshot(): CarChaseSnapshot {
       const fromPlan = registry.predictNPC('robber')(t) as VehicleState | null;
       return fromPlan ?? predictRobberFromState(SPAWN_ROBBER, 4)(t);
     };
-    const goal = tacticalGoal(SPAWN_ROBBER, robberPredict, cop, mode, course.buildings);
+    const goal = tacticalGoal(SPAWN_ROBBER, robberPredict, cop, mode, course.buildings, course);
     const siblingIds = SPAWN_COPS.map((_, j) => `cop${j}`).filter(
       (_, j) => j !== i,
     );

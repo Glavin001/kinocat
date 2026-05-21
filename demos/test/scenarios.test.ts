@@ -699,6 +699,7 @@ const TESTED_DEMOS = new Set([
   'humanoid', // 'humanoid demo' — buildHumanoid
   'jumplinks', // 'jumplinks demo' — buildJumpLinks
   'navmesh', // 'navmesh demo' — buildNavmesh / planNavmesh
+  'obstaclecourse', // 'obstaclecourse demo' — buildObstacleCourseSnapshot (single-car building-blocks)
   'plane', // 'aircraft demo' — waypoint/canyon/restricted/gauntlet/knife-edge
   'playground', // 'playground demo' — planPlayground
   'primitives', // 'primitives demo' — buildPrimitiveFan

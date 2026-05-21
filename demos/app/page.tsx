@@ -30,6 +30,12 @@ const groups: { heading: string; demos: Demo[] }[] = [
         tag: '3D · interactive · multi-agent',
       },
       {
+        href: '/obstaclecourse',
+        title: 'Obstacle course — kinocat building blocks',
+        desc: 'A single car on a small course with every kinocat building block toggleable from the HUD: heightfield terrain, cuboid buildings, jump ramp + affordance, boost pad, drift slalom, and a waypoint loop. Built entirely on the new core APIs (`kinocat/adapters/rapier`, `kinocat/adapters/three`, `planVehicleOnce`, `nudgeGoalClear`). Use it to sanity-check each piece in isolation before graduating to /carchase.',
+        tag: '3D · interactive · building-blocks',
+      },
+      {
         href: '/catmouse',
         title: 'Cat & Mouse pursuit',
         desc: 'AI cats observe a non-cooperative mouse, build a predictor of its motion, and plan to the interception pose — where the mouse WILL be at arrival time, not where it is. Plans are shared via PlanRegistry so cats flank instead of pile up. Both species can take boost pads; a canyon split forces one cat to detour while another takes the jump affordance. Toggle "naive mode" to watch the cats lag the mouse without prediction.',

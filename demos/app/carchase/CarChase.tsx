@@ -32,6 +32,19 @@ import {
   spawnCar,
   type CarHandle,
 } from './rapierVehicle';
+import {
+  createBuildingHelper,
+  createJumpRampHelper,
+  createBoostPadHelper,
+  createDriftGateHelper,
+  createCarMeshHelper,
+  syncCarMesh as syncCarMeshCore,
+  createWaypointLoopHelper,
+  createGoalMarkerHelper,
+  createInflatedObstacleHelper,
+  createNavBoundsHelper,
+  createAgentFootprintHelper,
+} from 'kinocat/adapters/three';
 
 interface CopAI {
   id: string;
@@ -71,6 +84,10 @@ interface Banner {
 
 const NUM_COPS = 3;
 const CAPTURE_DISTANCE = 4.5;
+// Maximum vertical separation (world Y) for a capture to count. Without this
+// a cop sitting directly under a robber mid-air over the jump ramp registers
+// a bust, even though they are tens of metres apart vertically.
+const CAPTURE_VERTICAL = 2.0;
 const PHYSICS_DT = 1 / 60;
 // DynamicRayCastVehicleController is twitchy at 60 Hz on its own — sub-step
 // the vehicle update + world step together (vibe-land does the same with
@@ -189,19 +206,12 @@ export default function CarChase() {
 
     // Buildings.
     for (const b of course.buildings) {
-      const g = new THREE.BoxGeometry(b.hx * 2, b.height, b.hz * 2);
-      const m = new THREE.Mesh(
-        g,
-        new THREE.MeshStandardMaterial({ color: C.building }),
+      scene.add(
+        createBuildingHelper(b, {
+          color: Number.parseInt(C.building.slice(1), 16),
+          edgeColor: Number.parseInt(C.buildingEdge.slice(1), 16),
+        }),
       );
-      m.position.set(b.x, b.height / 2, b.z);
-      scene.add(m);
-      const edges = new THREE.LineSegments(
-        new THREE.EdgesGeometry(g),
-        new THREE.LineBasicMaterial({ color: C.buildingEdge }),
-      );
-      edges.position.copy(m.position);
-      scene.add(edges);
     }
 
     // Debug overlay: shows the planner's view of the world. Each visible
@@ -213,151 +223,25 @@ export default function CarChase() {
     const debugGroup = new THREE.Group();
     debugGroup.visible = false;
     scene.add(debugGroup);
-    {
-      const obsMat = new THREE.LineBasicMaterial({ color: 0xff66aa });
-      for (const b of course.buildings) {
-        const inflate = 0.5; // mirrors `box(b.x, b.z, b.hx + 0.5, b.hz + 0.5)` in carchase-scenarios.
-        const hx = b.hx + inflate;
-        const hz = b.hz + inflate;
-        const ring = [
-          [b.x - hx, b.z - hz],
-          [b.x + hx, b.z - hz],
-          [b.x + hx, b.z + hz],
-          [b.x - hx, b.z + hz],
-          [b.x - hx, b.z - hz],
-        ] as const;
-        const pts: THREE.Vector3[] = ring.map(
-          ([x, z]) => new THREE.Vector3(x, 0.15, z),
-        );
-        debugGroup.add(
-          new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), obsMat),
-        );
-      }
-      // Planning rectangle outline.
-      const r = CARCHASE_BOUNDS;
-      const boundsPts = [
-        new THREE.Vector3(r.x0, 0.1, r.z0),
-        new THREE.Vector3(r.x1, 0.1, r.z0),
-        new THREE.Vector3(r.x1, 0.1, r.z1),
-        new THREE.Vector3(r.x0, 0.1, r.z1),
-        new THREE.Vector3(r.x0, 0.1, r.z0),
-      ];
-      debugGroup.add(
-        new THREE.Line(
-          new THREE.BufferGeometry().setFromPoints(boundsPts),
-          new THREE.LineBasicMaterial({ color: 0x66ffaa }),
-        ),
-      );
+    for (const b of course.buildings) {
+      // 0.5 mirrors `box(b.x, b.z, b.hx + 0.5, b.hz + 0.5)` in carchase-scenarios.
+      debugGroup.add(createInflatedObstacleHelper(b, 0.5));
     }
+    debugGroup.add(createNavBoundsHelper(CARCHASE_BOUNDS));
 
-    // Jump ramps (visual + affordance markers).
+    // Jump ramps, boost pads, drift gates, waypoint loop — every affordance
+    // visual via the shared kinocat/three helpers so the obstacle-course demo
+    // and the car-chase demo render the same building blocks identically.
     const affordanceGroup = new THREE.Group();
     scene.add(affordanceGroup);
-    for (const j of course.jumps) {
-      // Launch ramp (the ramp body is already a static collider).
-      const g = new THREE.BoxGeometry(j.hx * 2, j.height, j.hz * 2);
-      const m = new THREE.Mesh(
-        g,
-        new THREE.MeshStandardMaterial({ color: C.ramp }),
-      );
-      m.position.set(j.launch.x, j.height / 2, j.launch.z);
-      scene.add(m);
-      // Affordance arc launch → land.
-      const pts: THREE.Vector3[] = [];
-      const N = 24;
-      for (let i = 0; i <= N; i++) {
-        const u = i / N;
-        const x = j.launch.x + (j.land.x - j.launch.x) * u;
-        const z = j.launch.z + (j.land.z - j.launch.z) * u;
-        const y = 4 * (j.height + 2) * u * (1 - u);
-        pts.push(new THREE.Vector3(x, y + 0.3, z));
-      }
-      const arc = new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints(pts),
-        new THREE.LineDashedMaterial({
-          color: 0xffd0a0,
-          dashSize: 2,
-          gapSize: 1.5,
-        }),
-      );
-      arc.computeLineDistances();
-      affordanceGroup.add(arc);
-      // Landing marker.
-      const land = new THREE.Mesh(
-        new THREE.RingGeometry(2, 2.6, 24),
-        new THREE.MeshBasicMaterial({
-          color: 0xffd0a0,
-          side: THREE.DoubleSide,
-          transparent: true,
-          opacity: 0.7,
-        }),
-      );
-      land.rotation.x = -Math.PI / 2;
-      land.position.set(j.land.x, 0.05, j.land.z);
-      affordanceGroup.add(land);
-    }
-
-    // Boost pads.
+    for (const j of course.jumps) affordanceGroup.add(createJumpRampHelper(j));
     for (const p of course.boostPads) {
-      const ring = new THREE.Mesh(
-        new THREE.TorusGeometry(2.4, 0.35, 10, 28),
-        new THREE.MeshStandardMaterial({
-          color: C.boostRing,
-          emissive: C.boostRing,
-          emissiveIntensity: 0.6,
-        }),
-      );
-      ring.rotation.x = Math.PI / 2;
-      ring.position.set(p.x, 0.6, p.z);
-      affordanceGroup.add(ring);
-      const pad = new THREE.Mesh(
-        new THREE.CircleGeometry(2.4, 28),
-        new THREE.MeshBasicMaterial({
-          color: C.boostPad,
-          transparent: true,
-          opacity: 0.6,
-          side: THREE.DoubleSide,
-        }),
-      );
-      pad.rotation.x = -Math.PI / 2;
-      pad.position.set(p.x, 0.06, p.z);
-      affordanceGroup.add(pad);
+      affordanceGroup.add(createBoostPadHelper({ x: p.x, z: p.z }));
     }
-
-    // Drift gates (cone pairs).
     for (const g of course.driftGates) {
-      const phi = g.heading + Math.PI / 2;
-      const off = 3;
-      for (const sign of [-1, 1] as const) {
-        const cone = new THREE.Mesh(
-          new THREE.ConeGeometry(0.45, 1.4, 12),
-          new THREE.MeshStandardMaterial({ color: C.gate, emissive: C.gate, emissiveIntensity: 0.4 }),
-        );
-        cone.position.set(
-          g.x + sign * off * Math.cos(phi),
-          0.7,
-          g.z + sign * off * Math.sin(phi),
-        );
-        affordanceGroup.add(cone);
-      }
+      affordanceGroup.add(createDriftGateHelper({ x: g.x, z: g.z, heading: g.heading }));
     }
-
-    // Robber waypoint loop polyline (faint).
-    {
-      const pts = course.robberLoop.map(
-        (w) => new THREE.Vector3(w.x, 0.1, w.z),
-      );
-      pts.push(pts[0]!.clone());
-      const line = new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints(pts),
-        new THREE.LineBasicMaterial({
-          color: 0x4a5570,
-          transparent: true,
-          opacity: 0.45,
-        }),
-      );
-      affordanceGroup.add(line);
-    }
+    affordanceGroup.add(createWaypointLoopHelper(course.robberLoop));
 
     // ---- spawn cars ------------------------------------------------------
     const poses = spawnPoses();
@@ -400,61 +284,11 @@ export default function CarChase() {
       });
     }
 
-    // Three meshes for the cars.
-    function buildCar(color: number): {
-      group: THREE.Group;
-      body: THREE.Mesh;
-      lightbar?: THREE.Mesh;
-    } {
-      const group = new THREE.Group();
-      const body = new THREE.Mesh(
-        new THREE.BoxGeometry(4.8, 1.0, 2.0),
-        new THREE.MeshStandardMaterial({ color, metalness: 0.4, roughness: 0.5 }),
-      );
-      body.position.y = 0.5;
-      group.add(body);
-      // Cabin.
-      const cabin = new THREE.Mesh(
-        new THREE.BoxGeometry(2.4, 0.7, 1.7),
-        new THREE.MeshStandardMaterial({ color: 0x101218, metalness: 0.6, roughness: 0.3 }),
-      );
-      cabin.position.set(-0.2, 1.35, 0);
-      group.add(cabin);
-      // Wheels (visual only — physics wheels are raycast).
-      const wheelMat = new THREE.MeshStandardMaterial({ color: 0x111111 });
-      for (const [fx, fz] of [
-        [1.6, -1.0],
-        [1.6, 1.0],
-        [-1.6, -1.0],
-        [-1.6, 1.0],
-      ] as const) {
-        const w = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.4, 0.4, 0.3, 14),
-          wheelMat,
-        );
-        w.rotation.x = Math.PI / 2;
-        w.position.set(fx, 0.4, fz);
-        group.add(w);
-      }
-      return { group, body };
-    }
-
-    const robberMesh = buildCar(C.robber);
+    // Three meshes for the cars — shared helper from kinocat/adapters/three.
+    const robberMesh = createCarMeshHelper({ color: C.robber });
     scene.add(robberMesh.group);
     const copMeshes = cops.map((co) => {
-      const c = buildCar(co.color);
-      // Lightbar.
-      const bar = new THREE.Mesh(
-        new THREE.BoxGeometry(1.4, 0.18, 1.6),
-        new THREE.MeshStandardMaterial({
-          color: 0x3322ff,
-          emissive: 0x3322ff,
-          emissiveIntensity: 0.7,
-        }),
-      );
-      bar.position.set(-0.2, 1.78, 0);
-      c.group.add(bar);
-      c.lightbar = bar;
+      const c = createCarMeshHelper({ color: co.color, withLightbar: true });
       scene.add(c.group);
       return c;
     });
@@ -481,51 +315,23 @@ export default function CarChase() {
       return line;
     }
 
-    // Goal markers.
-    function buildGoalMark(color: number): THREE.Mesh {
-      const m = new THREE.Mesh(
-        new THREE.OctahedronGeometry(1.1),
-        new THREE.MeshStandardMaterial({
-          color,
-          emissive: color,
-          emissiveIntensity: 0.6,
-          transparent: true,
-          opacity: 0.55,
-        }),
-      );
-      m.visible = false;
+    // Goal markers + per-car planner-footprint outlines via shared helpers.
+    const robberGoalMark = createGoalMarkerHelper({ color: C.robber });
+    scene.add(robberGoalMark);
+    const copGoalMarks = cops.map((co) => {
+      const m = createGoalMarkerHelper({ color: co.color });
       scene.add(m);
       return m;
-    }
-    const robberGoalMark = buildGoalMark(C.robber);
-    const copGoalMarks = cops.map((co) => buildGoalMark(co.color));
-
-    // Per-car footprint outlines drawn under the debug overlay. The agent
-    // half-extents come straight from `CARCHASE_AGENT.footprint` so this
-    // matches the exact rectangle the planner uses for collision checks.
-    function buildFootprint(color: number): THREE.Line {
-      let hx = 0;
-      let hz = 0;
-      for (const [fx, fz] of CARCHASE_AGENT.footprint) {
-        if (Math.abs(fx) > hx) hx = Math.abs(fx);
-        if (Math.abs(fz) > hz) hz = Math.abs(fz);
-      }
-      const local = [
-        new THREE.Vector3(hx, 0.2, hz),
-        new THREE.Vector3(hx, 0.2, -hz),
-        new THREE.Vector3(-hx, 0.2, -hz),
-        new THREE.Vector3(-hx, 0.2, hz),
-        new THREE.Vector3(hx, 0.2, hz),
-      ];
-      const line = new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints(local),
-        new THREE.LineBasicMaterial({ color }),
-      );
-      debugGroup.add(line);
-      return line;
-    }
-    const robberFootprint = buildFootprint(C.robber);
-    const copFootprints = cops.map((co) => buildFootprint(co.color));
+    });
+    const robberFootprint = createAgentFootprintHelper(CARCHASE_AGENT.footprint, {
+      color: C.robber,
+    });
+    debugGroup.add(robberFootprint);
+    const copFootprints = cops.map((co) => {
+      const fp = createAgentFootprintHelper(CARCHASE_AGENT.footprint, { color: co.color });
+      debugGroup.add(fp);
+      return fp;
+    });
 
     // ---- shared planning state -----------------------------------------
     const registry = new PlanRegistry();
@@ -593,6 +399,7 @@ export default function CarChase() {
         robber.loopIndex,
         cops.map((c) => c.car.readState(now)),
         course.buildings,
+        course,
       );
       robber.loopIndex = pick.nextIndex;
       const obstacles: MovingObstacle[] = cops.map((co) =>
@@ -637,7 +444,7 @@ export default function CarChase() {
         const p = registry.predictNPC('robber')(t) as VehicleState | null;
         return p ?? predictRobberFromState(robberState, 4)(t);
       };
-      const goal = tacticalGoal(robberState, robberPredict, copState, mode, course.buildings);
+      const goal = tacticalGoal(robberState, robberPredict, copState, mode, course.buildings, course);
       const siblingIds = cops
         .filter((o) => o.id !== co.id)
         .map((o) => o.id);
@@ -750,8 +557,11 @@ export default function CarChase() {
           robber.car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
         }
       } else {
-        // No plan yet → idle gently forward.
-        robber.car.applyControls({ steer: 0, throttle: 0.15, brake: 0 });
+        // No plan yet — coast in neutral instead of idling forward. The old
+        // behaviour applied 0.15 throttle until the first plan arrived, which
+        // on slopes is enough to creep into the nearest wall before the AI
+        // gets going (see bug-audit notes in the plan).
+        robber.car.applyControls({ steer: 0, throttle: 0, brake: 0 });
       }
       for (let i = 0; i < cops.length; i++) {
         const co = cops[i]!;
@@ -768,7 +578,7 @@ export default function CarChase() {
             continue;
           }
         }
-        co.car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
+        co.car.applyControls({ steer: 0, throttle: 0, brake: 0 });
       }
 
       // Canonical Rapier raycast-vehicle order: updateVehicle BEFORE
@@ -795,8 +605,14 @@ export default function CarChase() {
         if (co.capturedAtWall + CAPTURE_COOLDOWN_MS > now) continue;
         const dx = robberStateAfter.x - copStatesAfter[i]!.x;
         const dz = robberStateAfter.z - copStatesAfter[i]!.z;
+        // Vertical separation comes from the physics body translation, NOT
+        // from VehicleState (which is the XZ planning plane). A cop directly
+        // below a mid-air robber should NOT register a capture.
+        const robberY = robber.car.chassis.translation().y;
+        const copY = cops[i]!.car.chassis.translation().y;
+        const dy = robberY - copY;
         const d = Math.hypot(dx, dz);
-        if (d < CAPTURE_DISTANCE) {
+        if (d < CAPTURE_DISTANCE && Math.abs(dy) < CAPTURE_VERTICAL) {
           co.capturedAtWall = now;
           scoreRef.busts += 1;
           scoreRef.round += 1;
@@ -815,9 +631,9 @@ export default function CarChase() {
       }
 
       // ---- visual sync ----
-      syncCarMesh(robberMesh.group, robberStateAfter);
+      syncCarMeshCore(robberMesh.group, robberStateAfter);
       for (let i = 0; i < cops.length; i++) {
-        syncCarMesh(copMeshes[i]!.group, copStatesAfter[i]!);
+        syncCarMeshCore(copMeshes[i]!.group, copStatesAfter[i]!);
         // Blink the lightbar in pursuit.
         const bar = copMeshes[i]!.lightbar;
         if (bar) {
@@ -1049,13 +865,6 @@ function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
   return plan.slice(i);
 }
 
-function syncCarMesh(group: THREE.Group, s: VehicleState): void {
-  group.position.set(s.x, 0, s.z);
-  // The kinocat heading 0 = +X; three.js mesh forward (BoxGeometry) is +X
-  // when rotation.y = -heading (THREE uses Y-up right-handed; rotating around
-  // +Y by negative the planning heading aligns +X-forward correctly).
-  group.rotation.y = -s.heading;
-}
 // CARCHASE_AGENT is re-exported so the rapierVehicle helper can keep its
 // pure-pursuit config in lockstep with the planner agent.
 export { CARCHASE_AGENT };
