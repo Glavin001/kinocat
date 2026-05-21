@@ -374,7 +374,16 @@ export interface HeightfieldColliderOptions {
 
 /** Build a Rapier heightfield collider from a continuous `sampler(x, z)`. The
  *  same sampler can feed `kinocat/adapters/navcat` for slope-aware navmesh
- *  generation so physics and planner see the same terrain. */
+ *  generation so physics and planner see the same terrain.
+ *
+ *  NOTE on Rapier/parry3d convention: the user-facing Rapier docs claim
+ *  `nrows ↔ X axis, ncols ↔ Z axis`, but the underlying parry3d
+ *  `HeightField::vertex_at` actually maps `row index → Z`, `col index → X`
+ *  (i.e. `cell_height = scale.z / (nrows-1)`, `cell_width = scale.x / (ncols-1)`).
+ *  We follow the implementation, not the docs: `nrows` counts subdivisions
+ *  along Z, `ncols` counts subdivisions along X. Getting this wrong rotates
+ *  the heightfield 90° relative to the visual mesh.
+ */
 export function createHeightfieldCollider(
   world: RAPIER.World,
   opts: HeightfieldColliderOptions,
@@ -382,15 +391,22 @@ export function createHeightfieldCollider(
   const cellSize = opts.cellSize ?? 2;
   const widthW = opts.bounds.x1 - opts.bounds.x0;
   const depthW = opts.bounds.z1 - opts.bounds.z0;
-  const nrows = Math.max(1, Math.round(widthW / cellSize));
-  const ncols = Math.max(1, Math.round(depthW / cellSize));
-  // Rapier heightfield: heights buffer is (nrows+1)*(ncols+1) row-major,
-  // scales (sx, sy, sz) are the world extents along each axis.
+  // Rapier's `heightfield(nrows, ncols, heights, scale)` takes the
+  // SUBDIVISION counts (per testing on rapier3d-compat 0.14, passing
+  // vertex counts triggers a WASM unreachable trap inside parry3d). The
+  // heights buffer is the vertex grid of size `(nrows+1) * (ncols+1)`
+  // in column-major order. Per parry3d's HeightField source,
+  // `row index → Z axis`, `col index → X axis` (the user-facing Rapier
+  // docs say the opposite — the implementation is what runs). Getting
+  // the axis assignment wrong rotates the heightfield 90° relative to
+  // the visual mesh.
+  const nrows = Math.max(1, Math.round(depthW / cellSize));
+  const ncols = Math.max(1, Math.round(widthW / cellSize));
   const heights = new Float32Array((nrows + 1) * (ncols + 1));
   for (let j = 0; j <= ncols; j++) {
     for (let i = 0; i <= nrows; i++) {
-      const u = i / nrows;
-      const v = j / ncols;
+      const u = j / ncols; // col → X
+      const v = i / nrows; // row → Z
       const x = opts.bounds.x0 + u * widthW;
       const z = opts.bounds.z0 + v * depthW;
       heights[j * (nrows + 1) + i] = opts.sampler(x, z);
