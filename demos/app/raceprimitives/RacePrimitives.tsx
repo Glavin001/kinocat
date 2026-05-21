@@ -37,13 +37,13 @@ import {
   RACE_AGENT,
   RACE_BOUNDS,
   RACE_PALETTE as C,
+  RACE_START_SPEEDS,
+  raceControlSets,
   type RaceMetrics,
 } from '../lib/race-primitives-scenarios';
 import {
   buildLearnedLibrary,
   createSweepWorld,
-  defaultControlSets,
-  DEFAULT_START_SPEEDS,
   fitParams,
   fitParamsOnline,
   LEARN_VEHICLE_TUNING,
@@ -102,7 +102,14 @@ interface CarRuntime {
 }
 
 interface OnlineLearnerState {
+  /** Current best-fit coefficients — used by the planner's library. */
   params: LearnedVehicleParams;
+  /** L2-regularization anchor. If the user pre-trained offline this is the
+   *  offline fit; online refits can deviate from it but only when race data
+   *  provides strong evidence. Without a pre-train this is just the
+   *  conservative defaults — that's why pre-training matters: it produces
+   *  a meaningful prior the online learner can lean on. */
+  priorParams: LearnedVehicleParams;
   samples: TransitionSample[];
   refitCount: number;
   lastFitMs: number;
@@ -194,15 +201,15 @@ export default function RacePrimitives() {
       try {
         const data = await runSweep(sw, {
           agent: RACE_AGENT,
-          startSpeeds: DEFAULT_START_SPEEDS,
-          controlSets: defaultControlSets(RACE_AGENT),
+          startSpeeds: RACE_START_SPEEDS,
+          controlSets: raceControlSets(RACE_AGENT),
           onProgress: (done, total) => setLearnProgress({ done, total }),
           yieldEvery: 4,
           yieldFn: () => new Promise((r) => setTimeout(r, 0)),
         });
         const fit = fitParams(data);
         const kinematic = summariseKinematicGap(data);
-        const lib = buildLearnedLibrary(fit.params, { agent: RACE_AGENT });
+        const lib = buildLearnedRaceLibrary(fit.params);
         // Cache matches /learnprimitives' CachedRun shape so both demos can
         // share the same localStorage entry.
         const cached = {
@@ -442,6 +449,7 @@ async function setupScene(
   // control car; subsequent laps the model converges and the library improves.
   const learned = makeCar('learned', kinematicLib, C.learned, C.learnedPath, {
     params: initialLearnerParams,
+    priorParams: initialLearnerParams,
     samples: [],
     refitCount: 0,
     lastFitMs: 0,
@@ -687,6 +695,11 @@ async function setupScene(
       const t0 = performance.now();
       const fit = fitParamsOnline(samplesSnapshot, RACE_AGENT, {
         init: initParams,
+        // Pull toward the OFFLINE fit (or DEFAULT_LEARNED_PARAMS if no
+        // pre-train) — keeps coefficients that race data poorly informs
+        // (esp. maxDecel: braking is rare in a race) near their honest
+        // baseline instead of drifting to silly values.
+        prior: car.learner!.priorParams,
         maxIter: 200,
       });
       learner.params = fit.params;
@@ -807,6 +820,7 @@ async function setupScene(
         learned.learner.samples = [];
         learned.learner.refitCount = 0;
         learned.learner.params = initialLearnerParams;
+        learned.learner.priorParams = initialLearnerParams;
         learned.learner.lastFitMs = 0;
         learned.learner.lastMeanError = 0;
         learned.lib = kinematicLib;
@@ -1018,43 +1032,134 @@ function LearnerPanel({ snap }: { snap: LearnerSnapshot }) {
         padding: '10px 14px',
         color: '#cdd3de',
         font: '11px ui-monospace, monospace',
-        display: 'grid',
-        gridTemplateColumns: '1.2fr 1fr 1fr 1fr',
-        gap: 16,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 10,
       }}
     >
-      <div>
-        <div style={{ color: '#55dcff', fontWeight: 700, marginBottom: 6 }}>
-          ONLINE LEARNER · {snap.refitCount} refit{snap.refitCount === 1 ? '' : 's'}
-          {' '}· {snap.sampleCount} samples
-          {snap.lastFitMs > 0 && (
-            <span style={{ opacity: 0.65 }}>
-              {' '}· last fit {snap.lastFitMs.toFixed(0)}ms (mean err {snap.lastMeanError.toFixed(3)}m)
-            </span>
-          )}
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '2px 12px' }}>
-          <KV k="maxAccel" v={`${snap.params.maxAccel.toFixed(2)} m/s²`} />
-          <KV k="maxDecel" v={`${snap.params.maxDecel.toFixed(2)} m/s²`} />
-          <KV k="accelTau" v={`${snap.params.accelTau.toFixed(3)} s`} />
-          <KV k="understeerGain" v={snap.params.understeerGain.toExponential(2)} />
-          <KV k="lateralDrag" v={snap.params.lateralDrag.toExponential(2)} />
-        </div>
-      </div>
-      <LapTimeList
-        title="kinematic laps"
-        color="#ff8aa0"
-        laps={snap.kinematicLapTimes}
-      />
-      <LapTimeList
-        title="learned laps"
-        color="#55dcff"
-        laps={snap.learnedLapTimes}
-      />
-      <LapDeltaSpark
+      <LapTimeChart
         kinematic={snap.kinematicLapTimes}
         learned={snap.learnedLapTimes}
       />
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: '1.4fr 1fr 1fr 1fr',
+          gap: 16,
+          borderTop: '1px solid #1f2735',
+          paddingTop: 10,
+        }}
+      >
+        <div>
+          <div style={{ color: '#55dcff', fontWeight: 700, marginBottom: 6 }}>
+            ONLINE LEARNER · {snap.refitCount} refit{snap.refitCount === 1 ? '' : 's'}
+            {' '}· {snap.sampleCount} samples
+            {snap.lastFitMs > 0 && (
+              <span style={{ opacity: 0.65 }}>
+                {' '}· last fit {snap.lastFitMs.toFixed(0)}ms (mean err {snap.lastMeanError.toFixed(3)}m)
+              </span>
+            )}
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '2px 12px' }}>
+            <KV k="maxAccel" v={`${snap.params.maxAccel.toFixed(2)} m/s²`} />
+            <KV k="maxDecel" v={`${snap.params.maxDecel.toFixed(2)} m/s²`} />
+            <KV k="accelTau" v={`${snap.params.accelTau.toFixed(3)} s`} />
+            <KV k="understeerGain" v={snap.params.understeerGain.toExponential(2)} />
+            <KV k="lateralDrag" v={snap.params.lateralDrag.toExponential(2)} />
+          </div>
+        </div>
+        <LapTimeList
+          title="kinematic laps"
+          color="#ff8aa0"
+          laps={snap.kinematicLapTimes}
+        />
+        <LapTimeList
+          title="learned laps"
+          color="#55dcff"
+          laps={snap.learnedLapTimes}
+        />
+        <LapDeltaSpark
+          kinematic={snap.kinematicLapTimes}
+          learned={snap.learnedLapTimes}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** Inline SVG line chart of lap times for both cars over the last 24 laps.
+ *  Lower is better; the gap between the two lines IS the learning gap. */
+function LapTimeChart({
+  kinematic,
+  learned,
+}: {
+  kinematic: number[];
+  learned: number[];
+}) {
+  const WINDOW = 24;
+  const kSeries = kinematic.slice(-WINDOW);
+  const lSeries = learned.slice(-WINDOW);
+  const n = Math.max(kSeries.length, lSeries.length);
+  if (n === 0) {
+    return (
+      <div style={{ height: 90, opacity: 0.5, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        chart appears after the first lap completes…
+      </div>
+    );
+  }
+  const all = [...kSeries, ...lSeries];
+  const minT = Math.min(...all);
+  const maxT = Math.max(...all);
+  const pad = Math.max(0.05 * (maxT - minT || 1), 0.5);
+  const y0 = minT - pad;
+  const y1 = maxT + pad;
+  const W = 600;
+  const H = 110;
+  const padL = 38;
+  const padR = 8;
+  const padT = 8;
+  const padB = 18;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const xAt = (i: number) => padL + (n <= 1 ? plotW / 2 : (i / (n - 1)) * plotW);
+  const yAt = (t: number) => padT + plotH * (1 - (t - y0) / (y1 - y0));
+  function polyline(series: number[]): string {
+    return series.map((t, i) => `${i === 0 ? 'M' : 'L'}${xAt(i).toFixed(1)},${yAt(t).toFixed(1)}`).join(' ');
+  }
+  return (
+    <div>
+      <div style={{ color: '#7fd6ff', fontWeight: 700, marginBottom: 4 }}>
+        lap-time progression · lower is better · {n} lap{n === 1 ? '' : 's'} shown
+      </div>
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        preserveAspectRatio="none"
+        style={{ width: '100%', height: 110, display: 'block' }}
+      >
+        {/* y-axis labels */}
+        <text x={4} y={padT + 8} fill="#6b7280" fontSize={10}>{y1.toFixed(1)}s</text>
+        <text x={4} y={H - padB + 2} fill="#6b7280" fontSize={10}>{y0.toFixed(1)}s</text>
+        {/* gridlines */}
+        <line x1={padL} y1={padT} x2={W - padR} y2={padT} stroke="#1f2735" strokeWidth={1} />
+        <line x1={padL} y1={H - padB} x2={W - padR} y2={H - padB} stroke="#1f2735" strokeWidth={1} />
+        <line x1={padL} y1={(padT + H - padB) / 2} x2={W - padR} y2={(padT + H - padB) / 2} stroke="#1f2735" strokeDasharray="2 4" strokeWidth={1} />
+        {/* lines + points */}
+        <path d={polyline(kSeries)} fill="none" stroke="#ff8aa0" strokeWidth={2} />
+        {kSeries.map((t, i) => (
+          <circle key={`k${i}`} cx={xAt(i)} cy={yAt(t)} r={2.5} fill="#ff8aa0" />
+        ))}
+        <path d={polyline(lSeries)} fill="none" stroke="#55dcff" strokeWidth={2} />
+        {lSeries.map((t, i) => (
+          <circle key={`l${i}`} cx={xAt(i)} cy={yAt(t)} r={2.5} fill="#55dcff" />
+        ))}
+        {/* x-axis labels */}
+        <text x={padL} y={H - 4} fill="#6b7280" fontSize={10}>
+          lap {Math.max(1, (kinematic.length || learned.length) - n + 1)}
+        </text>
+        <text x={W - padR - 28} y={H - 4} fill="#6b7280" fontSize={10}>
+          lap {kinematic.length || learned.length}
+        </text>
+      </svg>
     </div>
   );
 }

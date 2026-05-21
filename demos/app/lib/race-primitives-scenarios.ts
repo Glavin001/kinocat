@@ -30,11 +30,7 @@ import {
   characterizeVehicle,
   MotionPrimitiveLibrary,
 } from 'kinocat/primitives';
-import {
-  buildLearnedLibrary,
-  defaultControlSets,
-  DEFAULT_START_SPEEDS,
-} from './learn-primitives';
+import { buildLearnedLibrary } from './learn-primitives';
 
 // ---------------------------------------------------------------------------
 // Course geometry. Deliberately empty of buildings — we want to isolate the
@@ -56,8 +52,12 @@ export const RACE_PALETTE = {
   startMarker: 0x55ff88,
 } as const;
 
-function pose(x: number, z: number, heading: number): VehicleState {
-  return { x, z, heading, speed: 0, t: 0 };
+/** Race waypoint pose. `speed` is set to the agent's cruise speed so the
+ *  planner produces FLOW-THROUGH plans (target end-speed > 0) rather than
+ *  plans that decelerate to a stop at every gate. Without this the cars
+ *  brake into every cone and lose all momentum. */
+function pose(x: number, z: number, heading: number, speed = 14): VehicleState {
+  return { x, z, heading, speed, t: 0 };
 }
 
 /** A challenging waypoint loop. Coordinates picked so the kinematic library
@@ -123,8 +123,15 @@ export function buildRaceCourse(): {
 
 export const RACE_AGENT: VehicleAgent = defaultVehicleAgent({
   minTurnRadius: 4.5,
-  maxSpeed: 14,
-  maxReverseSpeed: 5,
+  // Raised from 14 → 20 so the planner has real headroom. The Rapier chassis
+  // has no air drag and ~4kN of engine on ~580kg → it CAN reach 20 m/s on
+  // a flat surface, the only question is whether the planner gets there
+  // without inducing a crash through a tight gate. Kinematic library: "yes,
+  // take it at 20". Real chassis at 4.5m radius and 20 m/s needs 89 m/s²
+  // centripetal — way above tire grip — so it understeers. Learned library
+  // discovers that and plans entry-speeds accordingly.
+  maxSpeed: 20,
+  maxReverseSpeed: 6,
   footprint: [
     [2.4, 1.0],
     [-2.4, 1.0],
@@ -135,23 +142,65 @@ export const RACE_AGENT: VehicleAgent = defaultVehicleAgent({
   directionChangePenalty: 0.4,
 });
 
-/** Same control space as `defaultControlSets` so the kinematic and learned
- *  libraries cover identical (curvature, targetSpeed) combinations and the
- *  ONLY difference is the forward model. */
+/** Race-tuned control set with HIGH-SPEED cruise primitives so the planner
+ *  can be ambitious about straights and pay for it (or not) in the corners.
+ *  Same shape across kinematic + learned libraries — ONLY the forward model
+ *  differs. */
+export function raceControlSets(agent: VehicleAgent = RACE_AGENT): number[][] {
+  const k = 1 / agent.minTurnRadius;
+  const kHalf = k / 2;
+  return [
+    // Cruise at successive speeds — kinematic plan happily takes the
+    // 20 m/s straight bucket; learned plan picks up that it can sustain it.
+    [0, 20],
+    [0, 16],
+    [0, 12],
+    [0, 8],
+    [0, 4],
+    // Gentle turn at high speed — this is the most informative test:
+    // kinematic library says "take it at 18", real car loses speed and
+    // understeers, learned library plans 12-14.
+    [kHalf, 18],
+    [-kHalf, 18],
+    [kHalf, 12],
+    [-kHalf, 12],
+    // Full-lock turn at moderate speed — kinematic believes 10 m/s is fine
+    // at min turn radius (centripetal 22 m/s²); real chassis tops out at
+    // ~6.5 m/s; learned library plans accordingly.
+    [k, 10],
+    [-k, 10],
+    [k, 6],
+    [-k, 6],
+    // Reverse straight + gentle/tight turns.
+    [0, -6],
+    [kHalf, -5],
+    [-kHalf, -5],
+    [k, -3],
+    [-k, -3],
+  ];
+}
+
+/** Higher start-speed buckets to match the bigger max speed. */
+export const RACE_START_SPEEDS = [0, 6, 12, 18];
+
 export function buildKinematicLibrary(): MotionPrimitiveLibrary {
   return characterizeVehicle({
     forwardSim: kinematicForwardSim(RACE_AGENT),
-    controlSets: defaultControlSets(RACE_AGENT),
+    controlSets: raceControlSets(RACE_AGENT),
     duration: 0.55,
     substeps: 6,
-    startSpeeds: DEFAULT_START_SPEEDS,
+    startSpeeds: RACE_START_SPEEDS,
   });
 }
 
 export function buildLearnedRaceLibrary(
   params: LearnedVehicleParams,
 ): MotionPrimitiveLibrary {
-  return buildLearnedLibrary(params, { agent: RACE_AGENT });
+  return buildLearnedLibrary(params, {
+    agent: RACE_AGENT,
+    controlSets: raceControlSets(RACE_AGENT),
+    startSpeeds: RACE_START_SPEEDS,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -195,23 +244,43 @@ export interface WaypointPick {
   advanced: boolean;
 }
 
-/** Advance to the next waypoint once within `arriveRadius`. Loops forever.
- *  Default radius is tight (3m) so cars must actually hit each gate, not
- *  just brush past — exposes the kinematic planner's tendency to overshoot
- *  tight gates at speed. */
+/** Advance the loop index once within `arriveRadius` of the NEXT
+ *  not-yet-cleared waypoint, and return the goal pose the planner should
+ *  aim for. The goal is `lookahead` waypoints AHEAD of the next-uncleared
+ *  one — letting the planner stitch a smooth curve through the
+ *  intermediate gates instead of point-to-point hopping with a brake
+ *  zone at each one.
+ *
+ *  `arriveRadius` is sized so the handoff happens before pure-pursuit's
+ *  `goalTolerance = 2m` brake zone fires (worst-case at 20 m/s with 500ms
+ *  replans, the car covers ~10m between ticks → 12m is the margin).
+ *
+ *  Both cars MUST consume the same output of this function so the comparison
+ *  stays fair — the only variable between the two cars is the
+ *  motion-primitive library, never the goal stream. */
 export function pickNextWaypoint(
   state: VehicleState,
   waypoints: VehicleState[],
   loopIndex: number,
-  arriveRadius = 3,
+  arriveRadius = 12,
+  lookahead = 3,
 ): WaypointPick {
   const cur = waypoints[loopIndex]!;
   const d = Math.hypot(state.x - cur.x, state.z - cur.z);
+  let nextIndex = loopIndex;
+  let advanced = false;
   if (d < arriveRadius) {
-    const next = (loopIndex + 1) % waypoints.length;
-    return { goal: waypoints[next]!, nextIndex: next, advanced: true };
+    nextIndex = (loopIndex + 1) % waypoints.length;
+    advanced = true;
   }
-  return { goal: cur, nextIndex: loopIndex, advanced: false };
+  // Plan all the way through `lookahead` waypoints so the trajectory is
+  // smooth across multiple gates. lookahead=3 means we plan to the gate
+  // two-after the next not-yet-cleared one — the planner finds a path that
+  // naturally curves through the intermediate gates because that's the
+  // shortest feasible route, but it never has to brake-to-stop at any of
+  // them.
+  const goalIdx = (nextIndex + Math.max(1, lookahead) - 1) % waypoints.length;
+  return { goal: waypoints[goalIdx]!, nextIndex, advanced };
 }
 
 // ---------------------------------------------------------------------------

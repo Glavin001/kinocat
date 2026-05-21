@@ -413,19 +413,35 @@ const PARAM_ORDER = [
   'understeerGain',
   'lateralDrag',
 ] as const;
+// Bounds are intentionally tight around physically plausible values. They
+// matter MOST for online learning where some coefficients (esp. `maxDecel`,
+// `lateralDrag`) have very weak gradient signal in race data — without
+// bounds the optimiser would drift them to silly values that the planner
+// then uses, making the car drive worse, generating even less informative
+// data. Tight bounds + the L2 regularization in `transitionLoss` keep
+// poorly-constrained coefficients near their priors.
 const PARAM_LO: Record<(typeof PARAM_ORDER)[number], number> = {
-  maxAccel: 0.5,
-  maxDecel: 0.5,
-  accelTau: 0.02,
+  maxAccel: 2,
+  maxDecel: 3,
+  accelTau: 0.05,
   understeerGain: 0,
   lateralDrag: 0,
 };
 const PARAM_HI: Record<(typeof PARAM_ORDER)[number], number> = {
-  maxAccel: 30,
-  maxDecel: 30,
-  accelTau: 2,
-  understeerGain: 1,
-  lateralDrag: 5,
+  maxAccel: 15,
+  maxDecel: 15,
+  accelTau: 1.0,
+  understeerGain: 0.1,
+  lateralDrag: 0.3,
+};
+/** Characteristic scale per coefficient — used to make the L2
+ *  regularization scale-invariant. */
+const PARAM_SCALE: Record<(typeof PARAM_ORDER)[number], number> = {
+  maxAccel: 5,
+  maxDecel: 5,
+  accelTau: 0.2,
+  understeerGain: 0.02,
+  lateralDrag: 0.1,
 };
 
 function toVec(p: LearnedVehicleParams): number[] {
@@ -593,6 +609,8 @@ function transitionLoss(
   samples: ReadonlyArray<TransitionSample>,
   params: LearnedVehicleParams,
   agent: VehicleAgent,
+  prior: LearnedVehicleParams,
+  regWeight: number,
 ): { loss: number; errors: number[] } {
   const sim = learnedForwardSim(params, agent);
   let loss = 0;
@@ -606,12 +624,32 @@ function transitionLoss(
     loss += POS_W * (dx * dx + dz * dz) + HEADING_W * dh * dh + SPEED_W * ds * ds;
     errors.push(Math.sqrt(dx * dx + dz * dz));
   }
+  // L2 regularization toward the prior. Scale by `samples.length` so this
+  // term is meaningful relative to the data loss regardless of buffer size.
+  // Per-coefficient PARAM_SCALE makes the penalty equal-weight across
+  // coefficients with very different magnitudes (accelTau ~0.2 vs lateralDrag
+  // ~0.05 vs maxAccel ~7).
+  if (regWeight > 0 && samples.length > 0) {
+    const scale = regWeight * samples.length;
+    for (const k of PARAM_ORDER) {
+      const d = (params[k] - prior[k]) / PARAM_SCALE[k];
+      loss += scale * d * d;
+    }
+  }
   return { loss, errors };
 }
 
 export interface OnlineFitOptions {
   init?: LearnedVehicleParams;
   maxIter?: number;
+  /** Per-coefficient L2 regularization strength. Pulls params toward
+   *  `prior` (or `DEFAULT_LEARNED_PARAMS` if `prior` omitted) when data is
+   *  weak for a coefficient. Tuned empirically: 0.001-0.01 lets data lead,
+   *  >0.1 dominates. Default 0.005 — strong enough to keep maxDecel /
+   *  lateralDrag honest when race data is cruise-dominated, weak enough
+   *  that 1000+ samples of real evidence still moves the fit. */
+  regularization?: number;
+  prior?: LearnedVehicleParams;
 }
 
 /** Fit the 5-coefficient model directly to a buffer of one-step transitions
@@ -622,11 +660,14 @@ export function fitParamsOnline(
   opts: OnlineFitOptions = {},
 ): FitResult {
   const init = opts.init ?? DEFAULT_LEARNED_PARAMS;
+  const prior = opts.prior ?? DEFAULT_LEARNED_PARAMS;
+  const reg = opts.regularization ?? 0.005;
   const x0 = toVec(init);
-  const lossFn = (v: number[]) => transitionLoss(samples, fromVec(v), agent).loss;
+  const lossFn = (v: number[]) =>
+    transitionLoss(samples, fromVec(v), agent, prior, reg).loss;
   const xStar = nelderMead(x0, lossFn, { maxIter: opts.maxIter ?? 300 });
   const params = fromVec(xStar);
-  const finalRoll = transitionLoss(samples, params, agent);
+  const finalRoll = transitionLoss(samples, params, agent, prior, 0);
   const errs = finalRoll.errors;
   const mean = errs.length ? errs.reduce((a, b) => a + b, 0) / errs.length : 0;
   const max = errs.length ? Math.max(...errs) : 0;
