@@ -314,12 +314,23 @@ export function runTrial(
   return { index, startSpeed, controls, samples };
 }
 
+export interface SweepProgress {
+  done: number;
+  total: number;
+  /** The (startSpeed, controls) currently being tested — so a UI can show
+   *  "trial 23/54 · κ=+0.111 · v=12 m/s" instead of just a faceless count. */
+  startSpeed: number;
+  curvature: number;
+  targetSpeed: number;
+}
+
 export interface SweepOptions {
   agent?: VehicleAgent;
   startSpeeds?: number[];
   controlSets?: number[][];
-  /** Fired after each completed trial (1..total). */
-  onProgress?: (done: number, total: number) => void;
+  /** Fired after each completed trial (1..total) with the trial parameters
+   *  so a UI overlay can show what's being tested right now. */
+  onProgress?: (p: SweepProgress) => void;
   /** Awaited between trials so the browser can paint a progress bar. */
   yieldEvery?: number;
   yieldFn?: () => Promise<void>;
@@ -344,7 +355,13 @@ export async function runSweep(
       const c: [number, number] = [ctrl[0]!, ctrl[1]!];
       trials.push(runTrial(sw, speed, c, i));
       i++;
-      opts.onProgress?.(i, total);
+      opts.onProgress?.({
+        done: i,
+        total,
+        startSpeed: speed,
+        curvature: c[0],
+        targetSpeed: c[1],
+      });
       if (opts.yieldFn && i % yieldEvery === 0) await opts.yieldFn();
     }
   }
@@ -644,10 +661,13 @@ export interface OnlineFitOptions {
   maxIter?: number;
   /** Per-coefficient L2 regularization strength. Pulls params toward
    *  `prior` (or `DEFAULT_LEARNED_PARAMS` if `prior` omitted) when data is
-   *  weak for a coefficient. Tuned empirically: 0.001-0.01 lets data lead,
-   *  >0.1 dominates. Default 0.005 — strong enough to keep maxDecel /
-   *  lateralDrag honest when race data is cruise-dominated, weak enough
-   *  that 1000+ samples of real evidence still moves the fit. */
+   *  weak for a coefficient. Default 0.05 — at 4000 samples the
+   *  regularization scale is ~200 per coefficient, vs data loss
+   *  ~4000-40000 (so reg ≈ 5%). Strong enough to hold weakly-informed
+   *  coefficients (maxDecel — braking is rare in a race; lateralDrag —
+   *  only matters in tight turns) near the prior; weak enough that
+   *  genuinely informative gradients still move the fit. Earlier default
+   *  of 0.005 was 10× weaker and let those coefficients drift to bounds. */
   regularization?: number;
   prior?: LearnedVehicleParams;
 }
@@ -661,7 +681,7 @@ export function fitParamsOnline(
 ): FitResult {
   const init = opts.init ?? DEFAULT_LEARNED_PARAMS;
   const prior = opts.prior ?? DEFAULT_LEARNED_PARAMS;
-  const reg = opts.regularization ?? 0.005;
+  const reg = opts.regularization ?? 0.05;
   const x0 = toVec(init);
   const lossFn = (v: number[]) =>
     transitionLoss(samples, fromVec(v), agent, prior, reg).loss;

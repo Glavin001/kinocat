@@ -124,13 +124,15 @@ export function buildRaceCourse(): {
 
 export const RACE_AGENT: VehicleAgent = defaultVehicleAgent({
   minTurnRadius: 4.5,
-  // 16 m/s gives the planner real headroom on straights (kinematic library
-  // will plan a 14-16 m/s cruise) without making the slalom physically
-  // impossible (corner centripetal at 4.5m radius + 16 m/s = ~57 m/s²,
-  // well above tire grip — both libraries' plans will get clipped by the
-  // tracker's lateral-accel cap, but the LEARNED library plans more
-  // honest entry speeds so it gets clipped less).
-  maxSpeed: 16,
+  // 30 m/s = the Rapier chassis's physical ceiling on flat ground with the
+  // race tuning (~4kN engine on ~580kg, no air drag in Rapier). The planner's
+  // action space is `(curvature, targetSpeed)` per primitive — that IS
+  // up/down/maintain — and we want it free to choose any speed up to the
+  // physical limit. The kinematic library will plan 30 m/s through gentle
+  // turns the chassis CAN'T physically take; pure-pursuit will clip to
+  // ~10 m/s in tight corners; the learned library will plan honest entry
+  // speeds and execute cleanly.
+  maxSpeed: 30,
   maxReverseSpeed: 6,
   footprint: [
     [2.4, 1.0],
@@ -142,36 +144,40 @@ export const RACE_AGENT: VehicleAgent = defaultVehicleAgent({
   directionChangePenalty: 0.4,
 });
 
-/** Race-tuned control set with HIGH-SPEED cruise primitives so the planner
- *  can be ambitious about straights and pay for it (or not) in the corners.
- *  Same shape across kinematic + learned libraries — ONLY the forward model
+/** Race-tuned control set spanning the full speed envelope to chassis
+ *  ceiling. The planner picks one of these per 0.55s primitive — that's
+ *  its action space (curvature × targetSpeed = up/down/maintain). Same
+ *  list across kinematic + learned libraries; only the forward model
  *  differs. */
 export function raceControlSets(agent: VehicleAgent = RACE_AGENT): number[][] {
   const k = 1 / agent.minTurnRadius;
   const kHalf = k / 2;
   return [
-    // Cruise at successive speeds — kinematic plan happily takes the
-    // 16 m/s straight bucket; learned plan picks up that it can sustain it.
-    [0, 16],
+    // Straight at successive speeds. The 30 m/s primitive lets the planner
+    // commit to true top speed on the long straight; the 0 m/s primitive
+    // gives it a coast-to-stop option for braking zones.
+    [0, 30],
+    [0, 24],
+    [0, 18],
     [0, 12],
-    [0, 8],
-    [0, 4],
-    // Gentle turn at high speed — the most informative test:
-    // kinematic library says "take it at 14", real car loses speed and
-    // understeers, learned library plans 10-12.
-    [kHalf, 14],
-    [-kHalf, 14],
-    [kHalf, 10],
-    [-kHalf, 10],
-    // Full-lock turn at moderate speed — kinematic believes 10 m/s is fine
-    // at min turn radius (centripetal 22 m/s²); real chassis tops out at
-    // ~6.5 m/s; learned library plans accordingly.
-    [k, 10],
-    [-k, 10],
+    [0, 6],
+    [0, 0],
+    // Gentle turn at high speed — the most informative test: kinematic
+    // library says "take it at 24", real car loses speed and understeers,
+    // learned library plans 14-18.
+    [kHalf, 24],
+    [-kHalf, 24],
+    [kHalf, 16],
+    [-kHalf, 16],
+    // Full-lock turn — kinematic believes 12 m/s is fine at min turn
+    // radius (centripetal 32 m/s²); real chassis tops out at ~7 m/s;
+    // learned library plans 6-7 m/s entries.
+    [k, 12],
+    [-k, 12],
     [k, 6],
     [-k, 6],
     // Reverse straight + gentle/tight turns.
-    [0, -6],
+    [0, -8],
     [kHalf, -5],
     [-kHalf, -5],
     [k, -3],
@@ -179,8 +185,10 @@ export function raceControlSets(agent: VehicleAgent = RACE_AGENT): number[][] {
   ];
 }
 
-/** Start-speed buckets covering the full envelope from rest to cruise. */
-export const RACE_START_SPEEDS = [0, 6, 12];
+/** Start-speed buckets covering the full envelope from rest to top speed.
+ *  The planner picks the bucket nearest the car's current speed when
+ *  expanding a node. */
+export const RACE_START_SPEEDS = [0, 10, 20, 28];
 
 export function buildKinematicLibrary(): MotionPrimitiveLibrary {
   return characterizeVehicle({
@@ -205,8 +213,8 @@ export function buildLearnedRaceLibrary(
 // ---------------------------------------------------------------------------
 // Per-tick planning helper.
 
-export const RACE_REPLAN_BUDGET_MS = 200;
-export const RACE_MAX_EXPANSIONS = 30000;
+export const RACE_REPLAN_BUDGET_MS = 300;
+export const RACE_MAX_EXPANSIONS = 50000;
 export const RACE_TEST_MAX_EXPANSIONS = 60000;
 
 export interface RacePlanRequest {
@@ -315,14 +323,12 @@ export interface WaypointPick {
 /** Advance the loop index once within `arriveRadius` of the next-uncleared
  *  waypoint, and return THAT waypoint as the planner's goal.
  *
- *  Subtle: we deliberately do NOT lookahead-bypass to a later waypoint as
- *  the goal — for an alternating slalom course, the planner's shortest
- *  path to a far gate would diagonal STRAIGHT THROUGH the intermediate
- *  gates (bypassing them entirely), since the planner only knows about
- *  the goal pose, not the sequence of waypoints in between. We hit each
- *  gate by aiming for it directly; flow-through (no braking at the gate)
- *  is achieved by EXTENDING the plan past the goal in the caller
- *  (`RacePrimitives.tsx`) when the waypoint is cleared.
+ *  arriveRadius is tight (2.5m, ≈ the cone's visual ring) so each gate
+ *  feels HIT, not brushed past. Multi-segment planning in the caller
+ *  (`planThroughWaypoints` with count=3) ensures pure-pursuit's `atGoal`
+ *  brake zone only fires for the gate ~3-ahead, never the gate we're
+ *  approaching — so we can use a precise arrive radius without the car
+ *  braking at each waypoint.
  *
  *  Both cars MUST consume the same output of this function so the
  *  comparison stays fair — only the motion-primitive library varies. */
@@ -330,7 +336,7 @@ export function pickNextWaypoint(
   state: VehicleState,
   waypoints: VehicleState[],
   loopIndex: number,
-  arriveRadius = 12,
+  arriveRadius = 2.5,
 ): WaypointPick {
   const cur = waypoints[loopIndex]!;
   const d = Math.hypot(state.x - cur.x, state.z - cur.z);

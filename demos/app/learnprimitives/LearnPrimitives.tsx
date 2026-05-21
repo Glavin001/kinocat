@@ -108,7 +108,7 @@ export default function LearnPrimitives() {
         const sweepData = await runSweep(sw, {
           startSpeeds: DEFAULT_START_SPEEDS,
           controlSets: defaultControlSets(CARCHASE_AGENT),
-          onProgress: (done, total) => setProgress({ done, total }),
+          onProgress: (p) => setProgress({ done: p.done, total: p.total }),
           yieldEvery: 4,
           yieldFn: () => new Promise<void>((r) => setTimeout(r, 0)),
         });

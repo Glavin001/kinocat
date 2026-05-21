@@ -94,10 +94,19 @@ interface CarRuntime {
     planStartWall: number;
     loopIndex: number;
     goal: VehicleState | null;
+    /** Predicted end state of the plan's first primitive (t = 0.55s ahead)
+     *  recorded at plan-install time. When wall-time reaches the predicted
+     *  time, we compare predicted vs actual to get the per-primitive
+     *  prediction error — the honest measure of dynamics-model accuracy
+     *  (unlike the position-vs-elapsed-time metric which rewards
+     *  confidence over correctness on long straights). */
+    predictedEnd: { state: VehicleState; dueWall: number } | null;
   };
   lib: MotionPrimitiveLibrary;
   metrics: RaceMetrics;
-  trackingErrorAcc: { sumSq: number; count: number };
+  /** Per-primitive prediction error (plan said you'd be at X in 0.55s,
+   *  actually you ended up at Y). Honest dynamics-model accuracy metric. */
+  predErrorAcc: { sumSq: number; count: number };
   /** Total waypoints cleared since race start. */
   waypointsCleared: number;
   /** Last time (perf.now ms) the car moved measurably; used to detect stalls. */
@@ -107,6 +116,17 @@ interface CarRuntime {
   finishWall: number | null;
   /** Lap times completed in this race. */
   lapTimes: number[];
+  /** Per-lap × per-waypoint cumulative time within the lap. After each
+   *  completed lap, `sectorTimes[lapIdx][i]` = wall time the i-th gate
+   *  of that lap was crossed, relative to the lap's start. */
+  sectorTimes: number[][];
+  /** Sector crossings recorded so far in the IN-PROGRESS lap. Pushed
+   *  into `sectorTimes` on lap completion and reset. */
+  currentLapSectors: number[];
+  /** True when this car has finished its current lap and is holding at
+   *  the start line waiting for the other car to catch up. While held,
+   *  `raceTime` does not accumulate (to keep sector + lap timing pure). */
+  holdingForSync: boolean;
   /** Online learner — only populated for the 'learned' car. The kinematic
    *  car has no learner (control group). */
   learner?: OnlineLearnerState;
@@ -144,7 +164,14 @@ function loadLearnedParams(): LearnedVehicleParams | null {
 export default function RacePrimitives() {
   const containerRef = useRef<HTMLDivElement>(null);
   const [phase, setPhase] = useState<Phase>('loading');
-  const [learnProgress, setLearnProgress] = useState({ done: 0, total: 0 });
+  const [learnProgress, setLearnProgress] = useState<{
+    done: number;
+    total: number;
+    /** Last trial parameters, for the overlay's "currently testing" line. */
+    curvature?: number;
+    targetSpeed?: number;
+    startSpeed?: number;
+  }>({ done: 0, total: 0 });
   const [params, setParams] = useState<LearnedVehicleParams | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<{
@@ -214,7 +241,14 @@ export default function RacePrimitives() {
           agent: RACE_AGENT,
           startSpeeds: RACE_START_SPEEDS,
           controlSets: raceControlSets(RACE_AGENT),
-          onProgress: (done, total) => setLearnProgress({ done, total }),
+          onProgress: (p) =>
+            setLearnProgress({
+              done: p.done,
+              total: p.total,
+              curvature: p.curvature,
+              targetSpeed: p.targetSpeed,
+              startSpeed: p.startSpeed,
+            }),
           yieldEvery: 4,
           yieldFn: () => new Promise((r) => setTimeout(r, 0)),
         });
@@ -292,10 +326,106 @@ export default function RacePrimitives() {
       />
       <div style={{ flex: 1, position: 'relative' }}>
         <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
-        <MetricsOverlay metrics={metrics} winner={winner} />
+        <MetricsOverlay
+          metrics={metrics}
+          winner={winner}
+          holding={{
+            kinematic: learner?.kinematicHolding ?? false,
+            learned: learner?.learnedHolding ?? false,
+          }}
+        />
         {(phase === 'racing' || phase === 'finished') && learner && (
           <LearnerPanel snap={learner} />
         )}
+        {phase === 'learning' && (
+          <PretrainOverlay progress={learnProgress} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PretrainOverlay({
+  progress,
+}: {
+  progress: {
+    done: number;
+    total: number;
+    curvature?: number;
+    targetSpeed?: number;
+    startSpeed?: number;
+  };
+}) {
+  const pct = progress.total > 0 ? (progress.done / progress.total) * 100 : 0;
+  const trial =
+    progress.curvature !== undefined && progress.targetSpeed !== undefined
+      ? `κ = ${progress.curvature >= 0 ? '+' : ''}${progress.curvature.toFixed(3)} rad/m · target speed ${progress.targetSpeed.toFixed(1)} m/s · start ${(progress.startSpeed ?? 0).toFixed(1)} m/s`
+      : 'initialising…';
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        inset: 0,
+        background: 'rgba(10, 13, 20, 0.85)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 50,
+      }}
+    >
+      <div
+        style={{
+          minWidth: 420,
+          padding: 24,
+          background: '#0d1119',
+          border: '1px solid #1f2735',
+          borderRadius: 10,
+          color: '#cdd3de',
+          font: '12px ui-monospace, monospace',
+        }}
+      >
+        <div style={{ color: '#7fd6ff', fontWeight: 700, fontSize: 14, marginBottom: 8 }}>
+          Pre-training the learned model (offline)
+        </div>
+        <div style={{ opacity: 0.7, marginBottom: 14, lineHeight: 1.5 }}>
+          The learner is driving a Rapier vehicle through a deliberate sweep
+          of {progress.total || '…'} controlled trials (brake to stop →
+          accelerate to target speed → apply test controls → record) so it
+          covers braking, hard cornering, and reverse — situations that
+          race driving alone wouldn't sample. Result feeds the online
+          learner as a regularization prior.
+        </div>
+        <div style={{ marginBottom: 8 }}>
+          <span style={{ color: '#cdeaff' }}>
+            trial {progress.done}/{progress.total || '?'}
+          </span>
+          {progress.total > 0 && (
+            <span style={{ opacity: 0.55, marginLeft: 8 }}>
+              ({pct.toFixed(0)}%)
+            </span>
+          )}
+        </div>
+        <div
+          style={{
+            height: 8,
+            background: '#1f2735',
+            borderRadius: 4,
+            overflow: 'hidden',
+            marginBottom: 12,
+          }}
+        >
+          <div
+            style={{
+              width: `${pct}%`,
+              height: '100%',
+              background: '#7fd6ff',
+              transition: 'width 100ms linear',
+            }}
+          />
+        </div>
+        <div style={{ opacity: 0.7, fontSize: 11 }}>
+          currently testing: <span style={{ color: '#cdeaff' }}>{trial}</span>
+        </div>
       </div>
     </div>
   );
@@ -312,12 +442,24 @@ interface SceneCallbacks {
 
 interface LearnerSnapshot {
   params: LearnedVehicleParams;
+  /** Anchor the live coefficients drifted FROM (pre-train fit, or
+   *  DEFAULT_LEARNED_PARAMS without pre-train). Surfaced so the user
+   *  can see at a glance how much the online refit has moved each
+   *  coefficient from its prior. */
+  priorParams: LearnedVehicleParams;
   refitCount: number;
   sampleCount: number;
   lastFitMs: number;
   lastMeanError: number;
   kinematicLapTimes: number[];
   learnedLapTimes: number[];
+  /** Per-lap cumulative sector times (sectorTimes[lap][gate]). */
+  kinematicSectors: number[][];
+  learnedSectors: number[][];
+  /** Number of waypoints in one full lap — for sector-count labelling. */
+  sectorsPerLap: number;
+  kinematicHolding: boolean;
+  learnedHolding: boolean;
 }
 
 async function setupScene(
@@ -344,12 +486,19 @@ async function setupScene(
   const course = buildRaceCourse();
   const navWorld = new InMemoryNavWorld(course.polygons, course.obstacles);
   const kinematicLib = buildKinematicLibrary();
-  // BOTH cars start with the kinematic library. The learned car records its
-  // (state, controls, dt, next) transitions every tick and refits a 5-coef
-  // dynamics model after each completed lap; its library is rebuilt from
-  // the new params and swapped in. So the user sees lap 1 ≈ identical, then
-  // the learned car visibly improves each lap as the model converges.
   const initialLearnerParams = params ?? DEFAULT_LEARNED_PARAMS;
+  // If pre-train ran (params differs from DEFAULT_LEARNED_PARAMS),
+  // give the learned car its pre-trained library from lap 1 — otherwise
+  // the first 5 online refits would have to rediscover what pre-train
+  // already learned, and pre-train would look like it does nothing. With
+  // no pre-train, both cars start identical (kinematicLib) and the
+  // learned car learns from race data alone.
+  const hasPreTrain =
+    initialLearnerParams !== DEFAULT_LEARNED_PARAMS &&
+    !paramsEqual(initialLearnerParams, DEFAULT_LEARNED_PARAMS);
+  const initialLearnedLib = hasPreTrain
+    ? buildLearnedRaceLibrary(initialLearnerParams)
+    : kinematicLib;
 
   // ---- Per-car setup ----
   function makeCar(
@@ -457,25 +606,29 @@ async function setupScene(
         planStartWall: performance.now(),
         loopIndex: 0,
         goal: null,
+        predictedEnd: null,
       },
       lib,
       metrics: emptyMetrics(),
-      trackingErrorAcc: { sumSq: 0, count: 0 },
+      predErrorAcc: { sumSq: 0, count: 0 },
       waypointsCleared: 0,
       lastMoveWall: performance.now(),
       lastPos: { x: course.spawn.x, z: course.spawn.z },
       scene,
       finishWall: null,
       lapTimes: [],
+      sectorTimes: [],
+      currentLapSectors: [],
+      holdingForSync: false,
       learner,
     };
   }
 
   const kinematic = makeCar('kinematic', kinematicLib, C.kinematic, C.kinematicPath, undefined);
-  // Learned car ALSO starts with kinematic library — it learns from race data
-  // and rebuilds its library each lap. First lap will be identical to the
-  // control car; subsequent laps the model converges and the library improves.
-  const learned = makeCar('learned', kinematicLib, C.learned, C.learnedPath, {
+  // Learned car starts with the pre-trained library when available, else
+  // with the kinematic library. Either way, it refines per-lap online
+  // using race data via fitParamsOnline.
+  const learned = makeCar('learned', initialLearnedLib, C.learned, C.learnedPath, {
     params: initialLearnerParams,
     priorParams: initialLearnerParams,
     samples: [],
@@ -528,10 +681,14 @@ async function setupScene(
     car.ai.plan = null;
     car.ai.loopIndex = 0;
     car.ai.goal = null;
+    car.ai.predictedEnd = null;
     car.metrics = emptyMetrics();
-    car.trackingErrorAcc = { sumSq: 0, count: 0 };
+    car.predErrorAcc = { sumSq: 0, count: 0 };
     car.waypointsCleared = 0;
     car.lapTimes = [];
+    car.sectorTimes = [];
+    car.currentLapSectors = [];
+    car.holdingForSync = false;
     car.lastMoveWall = performance.now();
     car.lastPos = { x: course.spawn.x, z: course.spawn.z };
     car.finishWall = null;
@@ -546,43 +703,16 @@ async function setupScene(
     }
   }
 
+  /** Replan = planning only (no waypoint advancement, no lap detection —
+   *  those happen at 60Hz in `stepCar` so lap times aren't quantized to
+   *  the 500ms replan interval). Reads the car's current state and the
+   *  current `loopIndex` (which stepCar maintains), produces a fresh
+   *  3-waypoint stitched plan, and records the predicted end of the
+   *  first primitive for the prediction-error metric. */
   function replan(car: CarRuntime, now: number): void {
+    if (car.holdingForSync) return;
     const state = car.car.readState(now);
-    const pick = pickNextWaypoint(
-      { ...state, t: 0 },
-      course.waypoints,
-      car.ai.loopIndex,
-    );
-    if (pick.advanced) {
-      car.waypointsCleared++;
-      car.ai.loopIndex = pick.nextIndex;
-      // Lap completion = wrapping past index 0.
-      if (car.waypointsCleared % course.waypoints.length === 0) {
-        const lapEnd = car.metrics.raceTime;
-        const lap = lapEnd - car.metrics.lapStartTime;
-        car.metrics.laps++;
-        car.metrics.lastLapTime = lap;
-        car.metrics.bestLapTime = Number.isFinite(car.metrics.bestLapTime)
-          ? Math.min(car.metrics.bestLapTime, lap)
-          : lap;
-        car.metrics.lapStartTime = lapEnd;
-        car.lapTimes.push(lap);
-        // Online learning: refit the learned car's 5 coefficients from the
-        // transitions accumulated this lap (plus prior buffered laps, capped
-        // at ONLINE_SAMPLE_CAP for fit time). New params → rebuild library
-        // → planner uses better primitives starting next replan.
-        if (car.learner && car.learner.samples.length > 50) {
-          scheduleRefit(car);
-        }
-      }
-    }
-    car.ai.goal = pick.goal;
-    // Plan THROUGH the next 3 waypoints (or fewer if the loop is short),
-    // producing one continuous path. Each segment is short (~15-25m) so
-    // each planVehicleOnce call finishes well under the per-segment budget.
-    // pure-pursuit then follows a path that genuinely passes through every
-    // gate — no diagonal skips, no braking at any intermediate waypoint
-    // because pure-pursuit's `atGoal` only fires for the very last point.
+    car.ai.goal = course.waypoints[car.ai.loopIndex]!;
     const PLAN_LOOKAHEAD_COUNT = 3;
     const res = planThroughWaypoints({
       state: { ...state, t: 0 },
@@ -597,6 +727,19 @@ async function setupScene(
     if (res.segments > 0 && res.path.length > 1) {
       car.ai.plan = res.path;
       car.ai.planStartWall = now;
+      // Record the predicted state at the FIRST primitive's end (t≈0.55s
+      // ahead in plan time). When wall-time reaches that boundary, the
+      // step loop computes the prediction error: |actual - predicted|.
+      // This is the honest dynamics-model accuracy metric — kinematic
+      // overestimates how far the car will travel in 0.55s, learned
+      // matches it. (The OLD "tracking error" rewarded confidence over
+      // correctness on long straights because pure-pursuit's lookahead
+      // chases position regardless of planned speed.)
+      const firstEnd = res.path.find((p) => p.t > 0.05) ?? res.path[res.path.length - 1]!;
+      car.ai.predictedEnd = {
+        state: firstEnd,
+        dueWall: now + firstEnd.t * 1000,
+      };
       // Replace path line.
       if (car.pathLine) {
         car.scene.remove(car.pathLine);
@@ -618,18 +761,62 @@ async function setupScene(
 
   function stepCar(car: CarRuntime, now: number, dt: number): void {
     // Read state BEFORE the tick so we can record the transition for online
-    // learning (sample = state_before, controls, dt, state_after).
+    // learning (sample = state_before, controls, dt, state_after) and detect
+    // waypoint crossings precisely at 60Hz.
     const stateBefore = car.car.readState(now);
-    let recordedControls: [number, number] | null = null;
 
-    if (car.ai.plan && car.ai.plan.length > 1) {
+    // ---- Waypoint advance + lap detection (60Hz, was in replan @ 2Hz).
+    // Detecting at 60Hz means lap times are accurate to ~16ms instead of
+    // ~500ms, which kills the consistent ±0.50s delta artifact.
+    if (running && !car.holdingForSync) {
+      const pick = pickNextWaypoint(
+        { ...stateBefore, t: 0 },
+        course.waypoints,
+        car.ai.loopIndex,
+      );
+      if (pick.advanced) {
+        car.waypointsCleared++;
+        car.ai.loopIndex = pick.nextIndex;
+        // F1-style sector timing: record cumulative time since lap start.
+        const sectorTime = car.metrics.raceTime - car.metrics.lapStartTime;
+        car.currentLapSectors.push(sectorTime);
+        // Lap completion = wrapping past index 0.
+        if (car.waypointsCleared % course.waypoints.length === 0) {
+          const lapEnd = car.metrics.raceTime;
+          const lap = lapEnd - car.metrics.lapStartTime;
+          car.metrics.laps++;
+          car.metrics.lastLapTime = lap;
+          car.metrics.bestLapTime = Number.isFinite(car.metrics.bestLapTime)
+            ? Math.min(car.metrics.bestLapTime, lap)
+            : lap;
+          car.metrics.lapStartTime = lapEnd;
+          car.lapTimes.push(lap);
+          car.sectorTimes.push(car.currentLapSectors.slice());
+          car.currentLapSectors = [];
+          // Hold at the next waypoint until the other car catches up.
+          car.holdingForSync = true;
+          // Online learning: refit on the lap's accumulated transitions.
+          if (car.learner && car.learner.samples.length > 50) {
+            scheduleRefit(car);
+          }
+        }
+      }
+    }
+
+    // ---- Apply controls (pure-pursuit, OR sync-hold brake).
+    let recordedControls: [number, number] | null = null;
+    if (car.holdingForSync) {
+      // Brake firmly to a stop and hold. Sync hold should be brief — the
+      // other car catches up within seconds — but firm braking ensures the
+      // car doesn't drift through the next gate during the wait.
+      car.car.applyControls({ steer: 0, throttle: 0, brake: 1 });
+    } else if (car.ai.plan && car.ai.plan.length > 1) {
       const elapsed = (now - car.ai.planStartWall) / 1000;
       const live = trimPlan(car.ai.plan, elapsed);
       if (live.length >= 2) {
-        // Use purePursuit directly (vs planToAckermannControls) so we get
-        // back `targetSpeed` alongside steering/throttle/brake — that's the
-        // second component of the (κ, v_target) control vector the learner
-        // fits its 5-coef model against.
+        // purePursuit returns targetSpeed (which planToAckermannControls
+        // strips) — needed as the second component of (κ, v_target)
+        // for online learning samples.
         const cmd = purePursuit(stateBefore, live, {
           lookaheadMin: 3,
           lookaheadGain: 0.45,
@@ -641,8 +828,6 @@ async function setupScene(
           goalTolerance: 2,
           minTurnRadius: RACE_AGENT.minTurnRadius,
         });
-        // Curvature → Ackermann wheel angle, with the kinocat ↔ Rapier yaw
-        // sign-flip (planToAckermannControls applies the same flip).
         const steer = -Math.atan(cmd.steering * (2 * WHEEL_BASE));
         car.car.applyControls({ steer, throttle: cmd.throttle, brake: cmd.brake });
         recordedControls = [cmd.steering, cmd.targetSpeed];
@@ -654,7 +839,8 @@ async function setupScene(
       car.car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
       recordedControls = [0, 5];
     }
-    // Sub-stepped physics tick.
+
+    // ---- Sub-stepped physics.
     const subDt = dt / VEHICLE_SUBSTEPS;
     car.world.timestep = subDt;
     const filter = RAPIER.QueryFilterFlags.EXCLUDE_DYNAMIC;
@@ -664,9 +850,9 @@ async function setupScene(
     }
     const after = car.car.readState(now);
 
-    // Online learning: append the transition to the learner's rolling buffer.
-    // Only the learned car has a learner; the kinematic control car ignores.
-    if (car.learner && recordedControls && running) {
+    // ---- Online learning: append transition (only while actually driving;
+    // skip sync holds where controls are artificial braking).
+    if (car.learner && recordedControls && running && !car.holdingForSync) {
       car.learner.samples.push({
         state: stateBefore,
         controls: recordedControls,
@@ -678,11 +864,25 @@ async function setupScene(
       }
     }
 
-    // Metrics + visuals.
+    // ---- Prediction-error metric: when wall-time reaches the predicted
+    // primitive end, compare actual vs predicted. This is the HONEST
+    // dynamics-model accuracy: how well does the plan predict where the
+    // car will physically be 0.55s ahead? (Replaces the previous
+    // "tracking error" which mostly measured pure-pursuit's geometric
+    // chase and rewarded confident plans.)
+    if (car.ai.predictedEnd && now >= car.ai.predictedEnd.dueWall) {
+      const p = car.ai.predictedEnd.state;
+      const dx = after.x - p.x;
+      const dz = after.z - p.z;
+      car.predErrorAcc.sumSq += dx * dx + dz * dz;
+      car.predErrorAcc.count++;
+      const n = car.predErrorAcc.count;
+      car.metrics.trackingErrorRms = Math.sqrt(car.predErrorAcc.sumSq / n);
+      car.ai.predictedEnd = null;
+    }
+
+    // ---- Metrics + visuals.
     syncCarMesh(car.carMesh.group, after);
-    // Update ideal reference line: straight from chassis to the next-uncleared
-    // waypoint. Lets the viewer see how much the planner's curve deviates
-    // from the naive direct path.
     {
       const wp = course.waypoints[car.ai.loopIndex]!;
       const pts = [
@@ -694,19 +894,9 @@ async function setupScene(
       car.idealLine.computeLineDistances();
     }
     car.metrics.peakSpeed = Math.max(car.metrics.peakSpeed, Math.abs(after.speed));
-    if (running) car.metrics.raceTime += dt;
-    if (car.ai.plan && car.ai.plan.length > 1) {
-      const elapsed = (now - car.ai.planStartWall) / 1000;
-      const target = planAtTime(car.ai.plan, elapsed);
-      if (target) {
-        const dx = after.x - target.x;
-        const dz = after.z - target.z;
-        car.trackingErrorAcc.sumSq += dx * dx + dz * dz;
-        car.trackingErrorAcc.count++;
-        const n = car.trackingErrorAcc.count;
-        car.metrics.trackingErrorRms = Math.sqrt(car.trackingErrorAcc.sumSq / n);
-      }
-    }
+    // Race-time accumulates only while DRIVING; sync holds are paused so
+    // they don't pollute lap-time measurement.
+    if (running && !car.holdingForSync) car.metrics.raceTime += dt;
     car.metrics.waypointsCleared = car.waypointsCleared;
     car.metrics.laps = car.lapTimes.length;
     // Trail.
@@ -717,8 +907,8 @@ async function setupScene(
       car.trailLine.geometry.dispose();
       car.trailLine.geometry = new THREE.BufferGeometry().setFromPoints(car.trailPts);
     }
-    // Stall guard. Only operates if running.
-    if (running) {
+    // Stall guard: only when actually driving (not holding for sync).
+    if (running && !car.holdingForSync) {
       if (Math.hypot(after.x - car.lastPos.x, after.z - car.lastPos.z) > 0.5) {
         car.lastMoveWall = now;
         car.lastPos = { x: after.x, z: after.z };
@@ -784,17 +974,36 @@ async function setupScene(
     if (running) {
       stepCar(kinematic, now, dt);
       stepCar(learned, now, dt);
+      // Sync release: when BOTH cars have just finished the same lap,
+      // release both holds simultaneously so the next lap starts head-to-
+      // head. Until then, the leader holds at the start line.
+      if (kinematic.holdingForSync && learned.holdingForSync) {
+        kinematic.holdingForSync = false;
+        learned.holdingForSync = false;
+        // Force an immediate replan so neither car coasts on its stale
+        // pre-hold plan.
+        kinematic.ai.plan = null;
+        learned.ai.plan = null;
+        replan(kinematic, now);
+        replan(learned, now);
+      }
       cb.onMetrics(kinematic.metrics, learned.metrics);
       if (now - lastLearnerEmit > 250 && learned.learner) {
         lastLearnerEmit = now;
         cb.onLearner({
           params: learned.learner.params,
+          priorParams: learned.learner.priorParams,
           refitCount: learned.learner.refitCount,
           sampleCount: learned.learner.samples.length,
           lastFitMs: learned.learner.lastFitMs,
           lastMeanError: learned.learner.lastMeanError,
           kinematicLapTimes: kinematic.lapTimes.slice(),
           learnedLapTimes: learned.lapTimes.slice(),
+          kinematicSectors: kinematic.sectorTimes.map((s) => s.slice()),
+          learnedSectors: learned.sectorTimes.map((s) => s.slice()),
+          sectorsPerLap: course.waypoints.length,
+          kinematicHolding: kinematic.holdingForSync,
+          learnedHolding: learned.holdingForSync,
         });
       }
     }
@@ -873,7 +1082,7 @@ async function setupScene(
         learned.learner.priorParams = initialLearnerParams;
         learned.learner.lastFitMs = 0;
         learned.learner.lastMeanError = 0;
-        learned.lib = kinematicLib;
+        learned.lib = initialLearnedLib;
       }
     },
   };
@@ -881,6 +1090,17 @@ async function setupScene(
 
 // ---------------------------------------------------------------------------
 // Helpers.
+
+function paramsEqual(a: LearnedVehicleParams, b: LearnedVehicleParams): boolean {
+  const EPS = 1e-9;
+  return (
+    Math.abs(a.maxAccel - b.maxAccel) < EPS &&
+    Math.abs(a.maxDecel - b.maxDecel) < EPS &&
+    Math.abs(a.accelTau - b.accelTau) < EPS &&
+    Math.abs(a.understeerGain - b.understeerGain) < EPS &&
+    Math.abs(a.lateralDrag - b.lateralDrag) < EPS
+  );
+}
 
 function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
   let i = 0;
@@ -937,7 +1157,13 @@ function TopBar({
   onReset,
 }: {
   phase: Phase;
-  learnProgress: { done: number; total: number };
+  learnProgress: {
+    done: number;
+    total: number;
+    curvature?: number;
+    targetSpeed?: number;
+    startSpeed?: number;
+  };
   winner: 'kinematic' | 'learned' | 'tie' | null;
   params: LearnedVehicleParams | null;
   error: string | null;
@@ -998,9 +1224,11 @@ function TopBar({
 function MetricsOverlay({
   metrics,
   winner,
+  holding,
 }: {
   metrics: { kinematic: RaceMetrics; learned: RaceMetrics };
   winner: 'kinematic' | 'learned' | 'tie' | null;
+  holding: { kinematic: boolean; learned: boolean };
 }) {
   return (
     <>
@@ -1010,6 +1238,7 @@ function MetricsOverlay({
         color="#ff8aa0"
         m={metrics.kinematic}
         highlight={winner === 'kinematic'}
+        holding={holding.kinematic}
       />
       <SideMetrics
         side="right"
@@ -1017,6 +1246,7 @@ function MetricsOverlay({
         color="#55dcff"
         m={metrics.learned}
         highlight={winner === 'learned'}
+        holding={holding.learned}
       />
     </>
   );
@@ -1028,12 +1258,14 @@ function SideMetrics({
   color,
   m,
   highlight,
+  holding,
 }: {
   side: 'left' | 'right';
   title: string;
   color: string;
   m: RaceMetrics;
   highlight: boolean;
+  holding: boolean;
 }) {
   return (
     <div
@@ -1042,7 +1274,7 @@ function SideMetrics({
         top: 12,
         [side]: 12,
         background: 'rgba(13, 17, 25, 0.85)',
-        border: `1px solid ${highlight ? color : '#1f2735'}`,
+        border: `1px solid ${holding ? '#ffd070' : highlight ? color : '#1f2735'}`,
         borderRadius: 8,
         padding: '10px 14px',
         minWidth: 240,
@@ -1050,8 +1282,25 @@ function SideMetrics({
         color: '#cdd3de',
       }}
     >
-      <div style={{ color, fontWeight: 700, marginBottom: 6 }}>{title}</div>
-      <KV k="time" v={`${m.raceTime.toFixed(1)} s`} />
+      <div style={{ color, fontWeight: 700, marginBottom: 6 }}>
+        {title}
+        {holding && (
+          <span
+            style={{
+              marginLeft: 8,
+              color: '#ffd070',
+              fontWeight: 700,
+              fontSize: 10,
+              padding: '2px 6px',
+              border: '1px solid #ffd070',
+              borderRadius: 4,
+            }}
+          >
+            WAITING…
+          </span>
+        )}
+      </div>
+      <KV k="time" v={`${m.raceTime.toFixed(2)} s`} />
       <KV k="laps" v={`${m.laps}`} />
       <KV k="waypoints" v={`${m.waypointsCleared}`} />
       <KV
@@ -1062,7 +1311,7 @@ function SideMetrics({
         k="last lap"
         v={Number.isFinite(m.lastLapTime) ? `${m.lastLapTime.toFixed(2)} s` : '—'}
       />
-      <KV k="tracking err (rms)" v={`${m.trackingErrorRms.toFixed(2)} m`} />
+      <KV k="0.55s pred err (rms)" v={`${m.trackingErrorRms.toFixed(2)} m`} />
       <KV k="peak speed" v={`${m.peakSpeed.toFixed(1)} m/s`} />
     </div>
   );
@@ -1091,6 +1340,11 @@ function LearnerPanel({ snap }: { snap: LearnerSnapshot }) {
         kinematic={snap.kinematicLapTimes}
         learned={snap.learnedLapTimes}
       />
+      <SectorDeltaStrip
+        kinematicSectors={snap.kinematicSectors}
+        learnedSectors={snap.learnedSectors}
+        sectorsPerLap={snap.sectorsPerLap}
+      />
       <div
         style={{
           display: 'grid',
@@ -1110,12 +1364,15 @@ function LearnerPanel({ snap }: { snap: LearnerSnapshot }) {
               </span>
             )}
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '2px 12px' }}>
-            <KV k="maxAccel" v={`${snap.params.maxAccel.toFixed(2)} m/s²`} />
-            <KV k="maxDecel" v={`${snap.params.maxDecel.toFixed(2)} m/s²`} />
-            <KV k="accelTau" v={`${snap.params.accelTau.toFixed(3)} s`} />
-            <KV k="understeerGain" v={snap.params.understeerGain.toExponential(2)} />
-            <KV k="lateralDrag" v={snap.params.lateralDrag.toExponential(2)} />
+          <div style={{ display: 'grid', gridTemplateColumns: 'auto auto auto', gap: '2px 12px' }}>
+            <span style={{ opacity: 0.55 }}>coef</span>
+            <span style={{ opacity: 0.55, textAlign: 'right' }}>now</span>
+            <span style={{ opacity: 0.55, textAlign: 'right' }}>prior</span>
+            <ParamRow k="maxAccel" v={snap.params.maxAccel} prior={snap.priorParams.maxAccel} unit="m/s²" />
+            <ParamRow k="maxDecel" v={snap.params.maxDecel} prior={snap.priorParams.maxDecel} unit="m/s²" />
+            <ParamRow k="accelTau" v={snap.params.accelTau} prior={snap.priorParams.accelTau} unit="s" digits={3} />
+            <ParamRow k="understeerGain" v={snap.params.understeerGain} prior={snap.priorParams.understeerGain} exp />
+            <ParamRow k="lateralDrag" v={snap.params.lateralDrag} prior={snap.priorParams.lateralDrag} exp />
           </div>
         </div>
         <LapTimeList
@@ -1133,6 +1390,122 @@ function LearnerPanel({ snap }: { snap: LearnerSnapshot }) {
           learned={snap.learnedLapTimes}
         />
       </div>
+    </div>
+  );
+}
+
+function ParamRow({
+  k,
+  v,
+  prior,
+  unit,
+  digits,
+  exp,
+}: {
+  k: string;
+  v: number;
+  prior: number;
+  unit?: string;
+  digits?: number;
+  exp?: boolean;
+}) {
+  const fmt = (x: number) =>
+    exp ? x.toExponential(2) : x.toFixed(digits ?? 2);
+  return (
+    <>
+      <span style={{ opacity: 0.7 }}>{k}</span>
+      <span style={{ color: '#cdeaff', textAlign: 'right' }}>
+        {fmt(v)}
+        {unit ? ` ${unit}` : ''}
+      </span>
+      <span style={{ opacity: 0.45, textAlign: 'right' }}>{fmt(prior)}</span>
+    </>
+  );
+}
+
+/** Per-gate sector-delta bars for the most recently completed lap.
+ *  Each bar = (kinematic_sector_time − learned_sector_time) for that
+ *  gate-to-gate segment. Cyan bar above the line = learned was faster
+ *  on that segment; pink bar below = kinematic was faster. Reveals
+ *  WHERE on the course each library wins (e.g., "learned wins the
+ *  tight slalom but loses the long straight"). */
+function SectorDeltaStrip({
+  kinematicSectors,
+  learnedSectors,
+  sectorsPerLap,
+}: {
+  kinematicSectors: number[][];
+  learnedSectors: number[][];
+  sectorsPerLap: number;
+}) {
+  const lapsCompared = Math.min(kinematicSectors.length, learnedSectors.length);
+  if (lapsCompared === 0) {
+    return (
+      <div style={{ opacity: 0.5, padding: '4px 0' }}>
+        sector deltas appear after both cars complete a lap…
+      </div>
+    );
+  }
+  const kLap = kinematicSectors[lapsCompared - 1]!;
+  const lLap = learnedSectors[lapsCompared - 1]!;
+  // sector i = time from previous gate to gate i (gate 0 from lap start).
+  function sectorDeltas(cum: number[]): number[] {
+    const out: number[] = [];
+    for (let i = 0; i < cum.length; i++) {
+      out.push(i === 0 ? cum[0]! : cum[i]! - cum[i - 1]!);
+    }
+    return out;
+  }
+  const kSec = sectorDeltas(kLap);
+  const lSec = sectorDeltas(lLap);
+  const n = Math.min(kSec.length, lSec.length, sectorsPerLap);
+  const deltas: number[] = [];
+  for (let i = 0; i < n; i++) deltas.push(kSec[i]! - lSec[i]!); // positive = learned faster
+  const maxAbs = Math.max(0.1, ...deltas.map(Math.abs));
+  const W = 600;
+  const H = 70;
+  const padL = 38;
+  const padR = 8;
+  const padT = 6;
+  const padB = 16;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const midY = padT + plotH / 2;
+  const barW = (plotW / n) * 0.78;
+  const stride = plotW / n;
+  return (
+    <div>
+      <div style={{ color: '#7fd6ff', fontWeight: 700, marginBottom: 4 }}>
+        sector deltas · lap {lapsCompared} · cyan = learned faster · pink = kinematic faster
+      </div>
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        preserveAspectRatio="none"
+        style={{ width: '100%', height: H, display: 'block' }}
+      >
+        <text x={4} y={midY + 4} fill="#6b7280" fontSize={10}>{`±${maxAbs.toFixed(2)}s`}</text>
+        <line x1={padL} y1={midY} x2={W - padR} y2={midY} stroke="#1f2735" strokeWidth={1} />
+        {deltas.map((d, i) => {
+          const h = (Math.abs(d) / maxAbs) * (plotH / 2);
+          const x = padL + i * stride + (stride - barW) / 2;
+          const color = d > 0 ? '#55dcff' : '#ff8aa0';
+          const y = d > 0 ? midY - h : midY;
+          return (
+            <g key={i}>
+              <rect x={x} y={y} width={barW} height={h} fill={color} opacity={0.85} />
+              <text
+                x={x + barW / 2}
+                y={H - 4}
+                fill="#6b7280"
+                fontSize={9}
+                textAnchor="middle"
+              >
+                s{i + 1}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
     </div>
   );
 }
