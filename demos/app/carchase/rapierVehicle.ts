@@ -108,15 +108,31 @@ export function createCarChaseWorld(course: CarChaseCourse): CarChaseWorld {
 }
 
 // Chassis dimensions match the planner footprint (5 m × 2 m); height 1.0 m.
+// Kinocat heading convention: +X is forward, so the long axis is `x`.
 const CHASSIS_HALF = { x: 2.4, y: 0.5, z: 1.0 };
-const WHEEL_RADIUS = 0.4;
-const WHEEL_SUSPENSION_REST = 0.6;
+const WHEEL_RADIUS = 0.35;
+// Suspension rest length is short so wheels sit just below the chassis at
+// rest. Travel + radius (0.3 + 0.35 = 0.65 m) is what determines the wheel
+// raycast reach below the hub.
+const WHEEL_SUSPENSION_REST = 0.3;
+const WHEEL_SUSPENSION_TRAVEL = 0.2;
 const WHEEL_BASE = 1.6; // distance from chassis centre forward/back
 const WHEEL_TRACK = 0.85; // distance from chassis centre left/right
-// Engine + brake force tuned for the ~10 kg Rapier chassis so it actually
-// accelerates from rest under AI throttle ≈ 0.2 (low) up to 1.0 (full).
-const ENGINE_FORCE = 600;
-const BRAKE_FORCE = 80;
+// Density × volume gives the chassis mass. The cuboid volume is
+// 4.8 × 1.0 × 2.0 = 9.6 m³, so density 60 → ≈ 580 kg — sport-car ballpark.
+// Engine and brake forces are tuned around that mass: 4000 N rear-only on a
+// ~580 kg chassis ≈ 0.7 g acceleration (sporty but not insane).
+const CHASSIS_DENSITY = 60;
+const ENGINE_FORCE = 4000;
+const BRAKE_FORCE = 2000;
+// Per-wheel suspension tuning, matched to the vibe-land Rust reference which
+// has unit tests asserting steady contact and bounded heave on flat ground.
+const SUSPENSION_STIFFNESS = 80;
+const SUSPENSION_COMPRESSION = 0.83; // bullet/Rapier default
+const SUSPENSION_RELAXATION = 20;
+const SUSPENSION_MAX_FORCE = 12000;
+const FRICTION_SLIP = 1.8;
+const SIDE_FRICTION_STIFFNESS = 1.0;
 
 export interface SpawnCarOptions {
   position: { x: number; y?: number; z: number };
@@ -144,36 +160,48 @@ export function spawnCar(
   world: RAPIER.World,
   opts: SpawnCarOptions,
 ): CarHandle {
-  const cy = opts.position.y ?? CHASSIS_HALF.y + WHEEL_RADIUS + WHEEL_SUSPENSION_REST;
+  // Spawn the chassis just high enough that a fully-extended suspension
+  // places the wheels right at the ground plane (y=0). Hub is at chassis
+  // local y=0 (chassis center), so the wheel reaches `WHEEL_RADIUS +
+  // WHEEL_SUSPENSION_REST` below the hub.
+  const cy = opts.position.y ?? WHEEL_RADIUS + WHEEL_SUSPENSION_REST + 0.05;
   const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
     .setTranslation(opts.position.x, cy, opts.position.z)
     .setRotation(yawQuat(opts.heading))
-    .setLinearDamping(0.05)
+    .setLinearDamping(0.1)
     .setAngularDamping(0.5)
     .setCanSleep(false);
   const chassis = world.createRigidBody(bodyDesc);
   world.createCollider(
     RAPIER.ColliderDesc.cuboid(CHASSIS_HALF.x, CHASSIS_HALF.y, CHASSIS_HALF.z)
-      .setDensity(1.2)
-      .setFriction(0.6),
+      .setDensity(CHASSIS_DENSITY)
+      .setFriction(0.4)
+      .setRestitution(0.1),
     chassis,
   );
 
   const vehicle = world.createVehicleController(chassis);
   vehicle.indexUpAxis = 1; // Y up
-  // setIndexForwardAxis setter name is `setIndexForwardAxis` per Rapier d.ts.
+  // Rapier.js exposes the forward-axis as a (mis-named) setter:
+  //   set setIndexForwardAxis(axis: number)
+  // — so assignment is the only path. See
+  // https://github.com/dimforge/rapier.js/blob/master/src.ts/control/ray_cast_vehicle_controller.ts
   (vehicle as unknown as { setIndexForwardAxis: number }).setIndexForwardAxis = 0; // +X forward
   const dir = { x: 0, y: -1, z: 0 };
   const axle = { x: 0, y: 0, z: 1 };
+  // Wheel hubs sit at chassis vertical centre (y=0); suspension hangs
+  // downward from there. This matches the vibe-land reference (which has
+  // tests for steady contact + bounded heave) and gives the suspension full
+  // travel without clipping the chassis cuboid.
   const wheels: Array<[number, number]> = [
-    [+WHEEL_BASE, -WHEEL_TRACK], // front-right
-    [+WHEEL_BASE, +WHEEL_TRACK], // front-left
-    [-WHEEL_BASE, -WHEEL_TRACK], // rear-right
-    [-WHEEL_BASE, +WHEEL_TRACK], // rear-left
+    [+WHEEL_BASE, -WHEEL_TRACK], // 0: front-right (steered)
+    [+WHEEL_BASE, +WHEEL_TRACK], // 1: front-left  (steered)
+    [-WHEEL_BASE, -WHEEL_TRACK], // 2: rear-right  (driven)
+    [-WHEEL_BASE, +WHEEL_TRACK], // 3: rear-left   (driven)
   ];
   for (const [fx, fz] of wheels) {
     vehicle.addWheel(
-      { x: fx, y: -CHASSIS_HALF.y + 0.1, z: fz },
+      { x: fx, y: 0, z: fz },
       dir,
       axle,
       WHEEL_SUSPENSION_REST,
@@ -181,12 +209,13 @@ export function spawnCar(
     );
   }
   for (let i = 0; i < 4; i++) {
-    vehicle.setWheelSuspensionStiffness(i, 30);
-    vehicle.setWheelMaxSuspensionForce(i, 6000);
-    vehicle.setWheelSuspensionCompression(i, 4);
-    vehicle.setWheelSuspensionRelaxation(i, 2.5);
-    vehicle.setWheelFrictionSlip(i, 1.3);
-    vehicle.setWheelSideFrictionStiffness(i, 0.7);
+    vehicle.setWheelSuspensionStiffness(i, SUSPENSION_STIFFNESS);
+    vehicle.setWheelMaxSuspensionForce(i, SUSPENSION_MAX_FORCE);
+    vehicle.setWheelSuspensionCompression(i, SUSPENSION_COMPRESSION);
+    vehicle.setWheelSuspensionRelaxation(i, SUSPENSION_RELAXATION);
+    vehicle.setWheelMaxSuspensionTravel(i, WHEEL_SUSPENSION_TRAVEL);
+    vehicle.setWheelFrictionSlip(i, FRICTION_SLIP);
+    vehicle.setWheelSideFrictionStiffness(i, SIDE_FRICTION_STIFFNESS);
   }
 
   function readState(now: number): VehicleState {
@@ -204,13 +233,17 @@ export function spawnCar(
     const steer = clamp(c.steer, -0.6, 0.6);
     const throttle = clamp(c.throttle, -1, 1);
     const brake = clamp(c.brake, 0, 1);
-    // Front-wheel steering.
+    // Front-wheel steering (indices 0,1).
     vehicle.setWheelSteering(0, steer);
     vehicle.setWheelSteering(1, steer);
-    // AWD: engine force on every wheel so the chassis (~10 kg in Rapier
-    // units) actually accelerates from rest. Reverse uses the same wheels.
+    // RWD: engine force on rear wheels only (indices 2,3). RWD with front-
+    // steer gives natural understeer that's stable for the raycast vehicle
+    // solver; AWD on a 4-corner chassis tends to fishtail and overshoot.
     const engineForce = throttle * ENGINE_FORCE;
-    for (let i = 0; i < 4; i++) vehicle.setWheelEngineForce(i, engineForce);
+    vehicle.setWheelEngineForce(0, 0);
+    vehicle.setWheelEngineForce(1, 0);
+    vehicle.setWheelEngineForce(2, engineForce);
+    vehicle.setWheelEngineForce(3, engineForce);
     // Brake on all wheels.
     const brakeForce = brake * BRAKE_FORCE;
     for (let i = 0; i < 4; i++) vehicle.setWheelBrake(i, brakeForce);
@@ -258,7 +291,11 @@ export function planToControls(
   const wheelBase = 2 * WHEEL_BASE;
   const steer = Math.atan(cmd.steering * wheelBase);
   return {
-    steer,
+    // kinocat curvature → Rapier wheel angle. kinocat sign convention has
+    // +curvature rotate +X toward +Z; Rapier's +yaw (right-hand about +Y)
+    // rotates +X toward -Z. Negate at the boundary so positive plan curvature
+    // produces the matching physical yaw rate.
+    steer: -steer,
     throttle: cmd.throttle,
     brake: cmd.brake,
     atGoal: cmd.atGoal,
@@ -275,12 +312,21 @@ export function planToControls(
 
 export type { BuildingSpec, JumpSpec, CarChaseCourse };
 
+// kinocat heading convention: heading 0 = +X, +heading rotates +X toward +Z
+// (i.e. vx = cos h, vz = sin h). Rapier yaw is the standard right-hand
+// rotation about +Y, which sends +X toward -Z. The two are sign-flipped, so
+// every kinocat→Rapier orientation conversion goes through `-h`.
 function yawQuat(h: number): { x: number; y: number; z: number; w: number } {
-  return { x: 0, y: Math.sin(h / 2), z: 0, w: Math.cos(h / 2) };
+  const half = -h / 2;
+  return { x: 0, y: Math.sin(half), z: 0, w: Math.cos(half) };
 }
 
 function yawFromQuat(q: { x: number; y: number; z: number; w: number }): number {
-  return Math.atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.z * q.z));
+  const rapierYaw = Math.atan2(
+    2 * (q.w * q.y + q.x * q.z),
+    1 - 2 * (q.y * q.y + q.z * q.z),
+  );
+  return -rapierYaw;
 }
 
 function clamp(v: number, lo: number, hi: number): number {

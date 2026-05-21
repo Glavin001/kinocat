@@ -268,24 +268,42 @@ export const CARCHASE_AGENT: VehicleAgent = defaultVehicleAgent({
     [-2.4, -1.0],
     [2.4, -1.0],
   ],
-  reverseCostMultiplier: 2,
-  directionChangePenalty: 0.6,
+  // Reverse is only modestly more expensive than forward so the planner is
+  // willing to back out of a corner instead of grinding the chassis into a
+  // wall when the only path to the robber is behind it.
+  reverseCostMultiplier: 1.4,
+  directionChangePenalty: 0.4,
 });
 
 function buildPrimitiveLibrary(agent: VehicleAgent): MotionPrimitiveLibrary {
-  const k = 1 / agent.minTurnRadius;
+  const k = 1 / agent.minTurnRadius; // tightest forward turn
+  const kHalf = k / 2;               // wide forward turn
   return characterizeVehicle({
     forwardSim: kinematicForwardSim(agent),
+    // Three forward speeds × five curvatures plus three reverse curvatures
+    // gives the planner enough variety to (a) cruise straight, (b) negotiate
+    // tight corners at moderate speed, and (c) back-and-fill out of a
+    // wedged-against-a-wall failure.
     controlSets: [
-      [0, 10],
-      [k, 10],
-      [-k, 10],
-      [k / 2, 12],
-      [-k / 2, 12],
+      // Cruise / fast straight.
       [0, 14],
+      [0, 10],
+      // Forward gentle turns.
+      [kHalf, 12],
+      [-kHalf, 12],
+      // Forward tight turns at lower speed (more controllable on cuboid wheels).
+      [k, 8],
+      [-k, 8],
+      // Slow forward straight (for tight quarters).
+      [0, 5],
+      // Reverse straight.
       [0, -4],
-      [k, -4],
-      [-k, -4],
+      // Reverse gentle turns — the staple of "back out of a corner".
+      [kHalf, -4],
+      [-kHalf, -4],
+      // Reverse tight turns (for sharp three-point turns).
+      [k, -3],
+      [-k, -3],
     ],
     duration: 0.55,
     substeps: 5,
@@ -388,6 +406,23 @@ export function selectTacticalMode(
 
 /** Translate a cop tactic into a goal `VehicleState`. The planner uses a
  *  generous goalRadius so these only need to be in the right neighbourhood. */
+
+// Mirror the inflation used when the planner builds its obstacle list (see
+// `buildCarChaseCourse`: `box(b.x, b.z, b.hx + 0.5, b.hz + 0.5)`). Add the
+// agent's circumscribed half-extent so a goal that passes this point check
+// is also guaranteed to pass the planner's `poseClear(goal)` footprint check
+// regardless of goal heading — otherwise the AI keeps proposing goals the
+// planner immediately rejects, producing 0-expansion empty plans for cops.
+const BUILDING_OBSTACLE_INFLATE = 0.5;
+function agentClearance(agent: VehicleAgent): number {
+  let hMax = 0;
+  for (const [fx, fz] of agent.footprint) {
+    const m = Math.max(Math.abs(fx), Math.abs(fz));
+    if (m > hMax) hMax = m;
+  }
+  return hMax + BUILDING_OBSTACLE_INFLATE;
+}
+
 /** True if (x,z) is inside any building footprint, inflated by `inflate`. */
 function pointInAnyBuilding(
   x: number,
@@ -409,14 +444,18 @@ function pointInAnyBuilding(
 }
 
 /** Walk the goal back along the (cop → goal) ray in `step` increments until
- *  it sits clear of every building. Bounded by `maxSteps` so a degenerate
- *  layout can never spin forever — falls back to the cop's own pose. */
+ *  it sits clear of every building, with enough margin that the agent's
+ *  rotated footprint at the goal heading is also clear — i.e. matches the
+ *  planner's `poseClear(goal)` predicate. Bounded by `maxSteps` so a
+ *  degenerate layout can never spin forever — falls back to the cop's own
+ *  pose, which the planner will always accept (cops are alive). */
 function nudgeGoalClear(
   goal: VehicleState,
   cop: VehicleState,
   buildings: BuildingSpec[],
+  agent: VehicleAgent = CARCHASE_AGENT,
 ): VehicleState {
-  const inflate = 2; // ~footprint half-length, keeps the goal pose clear too.
+  const inflate = agentClearance(agent);
   if (!pointInAnyBuilding(goal.x, goal.z, buildings, inflate)) return goal;
   const dx = cop.x - goal.x;
   const dz = cop.z - goal.z;
@@ -433,7 +472,6 @@ function nudgeGoalClear(
       return clampGoalToBounds({ ...goal, x: nx, z: nz });
     }
   }
-  // Last resort — at least the cop's own pose is collision-free.
   return { ...goal, x: cop.x, z: cop.z };
 }
 

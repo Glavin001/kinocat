@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import RAPIER from '@dimforge/rapier3d-compat';
 import {
   PlanRegistry,
   asObstacle,
@@ -71,6 +72,11 @@ interface Banner {
 const NUM_COPS = 3;
 const CAPTURE_DISTANCE = 4.5;
 const PHYSICS_DT = 1 / 60;
+// DynamicRayCastVehicleController is twitchy at 60 Hz on its own — sub-step
+// the vehicle update + world step together (vibe-land does the same with
+// VEHICLE_CONTROLLER_SUBSTEPS = 4). This keeps the suspension stable and
+// prevents wheels from intermittently losing contact under turning load.
+const VEHICLE_SUBSTEPS = 4;
 const REPLAN_INTERVAL_MS = 80;
 const CAPTURE_COOLDOWN_MS = 2000;
 
@@ -84,6 +90,7 @@ export default function CarChase() {
   const [showPaths, setShowPaths] = useState(true);
   const [showGoals, setShowGoals] = useState(true);
   const [showAff, setShowAff] = useState(true);
+  const [showDebug, setShowDebug] = useState(false);
   const [playerDriving, setPlayerDriving] = useState(false);
   const [ready, setReady] = useState(false);
   const [hud, setHud] = useState('');
@@ -97,12 +104,15 @@ export default function CarChase() {
   const showPathsRef = useRef(showPaths);
   const showGoalsRef = useRef(showGoals);
   const showAffRef = useRef(showAff);
+  const showDebugRef = useRef(showDebug);
   const playerDrivingRef = useRef(playerDriving);
+  const resetRef = useRef<(() => void) | null>(null);
   pausedRef.current = paused;
   chaseRef.current = chase;
   showPathsRef.current = showPaths;
   showGoalsRef.current = showGoals;
   showAffRef.current = showAff;
+  showDebugRef.current = showDebug;
   playerDrivingRef.current = playerDriving;
 
   useEffect(() => {
@@ -192,6 +202,52 @@ export default function CarChase() {
       );
       edges.position.copy(m.position);
       scene.add(edges);
+    }
+
+    // Debug overlay: shows the planner's view of the world. Each visible
+    // building gets a wireframe of its INFLATED obstacle footprint (the
+    // polygon the planner actually navigates around — 0.5 m larger on each
+    // side than the visual building). The agent footprint of each car is
+    // also drawn so any sync issue between physics pose, planner pose, and
+    // visual mesh is immediately obvious. Toggled with [d].
+    const debugGroup = new THREE.Group();
+    debugGroup.visible = false;
+    scene.add(debugGroup);
+    {
+      const obsMat = new THREE.LineBasicMaterial({ color: 0xff66aa });
+      for (const b of course.buildings) {
+        const inflate = 0.5; // mirrors `box(b.x, b.z, b.hx + 0.5, b.hz + 0.5)` in carchase-scenarios.
+        const hx = b.hx + inflate;
+        const hz = b.hz + inflate;
+        const ring = [
+          [b.x - hx, b.z - hz],
+          [b.x + hx, b.z - hz],
+          [b.x + hx, b.z + hz],
+          [b.x - hx, b.z + hz],
+          [b.x - hx, b.z - hz],
+        ] as const;
+        const pts: THREE.Vector3[] = ring.map(
+          ([x, z]) => new THREE.Vector3(x, 0.15, z),
+        );
+        debugGroup.add(
+          new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), obsMat),
+        );
+      }
+      // Planning rectangle outline.
+      const r = CARCHASE_BOUNDS;
+      const boundsPts = [
+        new THREE.Vector3(r.x0, 0.1, r.z0),
+        new THREE.Vector3(r.x1, 0.1, r.z0),
+        new THREE.Vector3(r.x1, 0.1, r.z1),
+        new THREE.Vector3(r.x0, 0.1, r.z1),
+        new THREE.Vector3(r.x0, 0.1, r.z0),
+      ];
+      debugGroup.add(
+        new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints(boundsPts),
+          new THREE.LineBasicMaterial({ color: 0x66ffaa }),
+        ),
+      );
     }
 
     // Jump ramps (visual + affordance markers).
@@ -444,6 +500,33 @@ export default function CarChase() {
     const robberGoalMark = buildGoalMark(C.robber);
     const copGoalMarks = cops.map((co) => buildGoalMark(co.color));
 
+    // Per-car footprint outlines drawn under the debug overlay. The agent
+    // half-extents come straight from `CARCHASE_AGENT.footprint` so this
+    // matches the exact rectangle the planner uses for collision checks.
+    function buildFootprint(color: number): THREE.Line {
+      let hx = 0;
+      let hz = 0;
+      for (const [fx, fz] of CARCHASE_AGENT.footprint) {
+        if (Math.abs(fx) > hx) hx = Math.abs(fx);
+        if (Math.abs(fz) > hz) hz = Math.abs(fz);
+      }
+      const local = [
+        new THREE.Vector3(hx, 0.2, hz),
+        new THREE.Vector3(hx, 0.2, -hz),
+        new THREE.Vector3(-hx, 0.2, -hz),
+        new THREE.Vector3(-hx, 0.2, hz),
+        new THREE.Vector3(hx, 0.2, hz),
+      ];
+      const line = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(local),
+        new THREE.LineBasicMaterial({ color }),
+      );
+      debugGroup.add(line);
+      return line;
+    }
+    const robberFootprint = buildFootprint(C.robber);
+    const copFootprints = cops.map((co) => buildFootprint(co.color));
+
     // ---- shared planning state -----------------------------------------
     const registry = new PlanRegistry();
 
@@ -457,9 +540,11 @@ export default function CarChase() {
       if (k === '1') setShowPaths((v) => !v);
       if (k === '2') setShowGoals((v) => !v);
       if (k === '3') setShowAff((v) => !v);
+      if (k === 'd') setShowDebug((v) => !v);
       if (k === 't') setPlayerDriving((v) => !v);
       if (k === 'r') reset();
     };
+    resetRef.current = reset;
     const onKeyUp = (e: KeyboardEvent) => keys.delete(e.key.toLowerCase());
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
@@ -688,13 +773,17 @@ export default function CarChase() {
 
       // Canonical Rapier raycast-vehicle order: updateVehicle BEFORE
       // world.step so the wheel forces are integrated this tick (not the
-      // next one). Calling it after results in a 1-frame lag at best, and
-      // with the chassis at rest, the engine force is overwritten by the
-      // step's gravity before it ever produces motion.
-      world.timestep = PHYSICS_DT;
-      robber.car.vehicle.updateVehicle(PHYSICS_DT);
-      for (const co of cops) co.car.vehicle.updateVehicle(PHYSICS_DT);
-      world.step();
+      // next one). Sub-step both together so suspension stays stable.
+      // EXCLUDE_DYNAMIC keeps wheel rays from hitting other cars' chassis
+      // colliders — without it cars ride up on each other when close.
+      const subDt = PHYSICS_DT / VEHICLE_SUBSTEPS;
+      world.timestep = subDt;
+      const wheelFilter = RAPIER.QueryFilterFlags.EXCLUDE_DYNAMIC;
+      for (let s = 0; s < VEHICLE_SUBSTEPS; s++) {
+        robber.car.vehicle.updateVehicle(subDt, wheelFilter);
+        for (const co of cops) co.car.vehicle.updateVehicle(subDt, wheelFilter);
+        world.step();
+      }
 
       // Re-read post-step states for rendering + capture detection.
       const robberStateAfter = robber.car.readState(now);
@@ -741,6 +830,18 @@ export default function CarChase() {
       if (robberPathLine) robberPathLine.visible = showPathsRef.current;
       for (const l of copPathLines) if (l) l.visible = showPathsRef.current;
       affordanceGroup.visible = showAffRef.current;
+
+      // Debug overlay (planner navmesh + agent footprints).
+      debugGroup.visible = showDebugRef.current;
+      if (showDebugRef.current) {
+        robberFootprint.position.set(robberStateAfter.x, 0, robberStateAfter.z);
+        robberFootprint.rotation.y = -robberStateAfter.heading;
+        for (let i = 0; i < cops.length; i++) {
+          const s = copStatesAfter[i]!;
+          copFootprints[i]!.position.set(s.x, 0, s.z);
+          copFootprints[i]!.rotation.y = -s.heading;
+        }
+      }
 
       // Goal markers.
       robberGoalMark.visible = showGoalsRef.current && !!robber.goal;
@@ -856,9 +957,64 @@ export default function CarChase() {
         <div style={{ opacity: 0.7, marginTop: 6 }}>
           busts: {score.busts} · round: {score.round}
         </div>
+        <div
+          style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            gap: 4,
+            marginTop: 8,
+          }}
+        >
+          <ToggleButton
+            label="drive"
+            shortcut="t"
+            on={playerDriving}
+            onClick={() => setPlayerDriving((v) => !v)}
+          />
+          <ToggleButton
+            label="pause"
+            shortcut="p"
+            on={paused}
+            onClick={() => setPaused((v) => !v)}
+          />
+          <ToggleButton
+            label="chase cam"
+            shortcut="c"
+            on={chase}
+            onClick={() => setChase((v) => !v)}
+          />
+          <ToggleButton
+            label="paths"
+            shortcut="1"
+            on={showPaths}
+            onClick={() => setShowPaths((v) => !v)}
+          />
+          <ToggleButton
+            label="goals"
+            shortcut="2"
+            on={showGoals}
+            onClick={() => setShowGoals((v) => !v)}
+          />
+          <ToggleButton
+            label="affordances"
+            shortcut="3"
+            on={showAff}
+            onClick={() => setShowAff((v) => !v)}
+          />
+          <ToggleButton
+            label="debug navmesh"
+            shortcut="d"
+            on={showDebug}
+            onClick={() => setShowDebug((v) => !v)}
+          />
+          <ActionButton
+            label="reset"
+            shortcut="r"
+            onClick={() => resetRef.current?.()}
+          />
+        </div>
         <div style={{ opacity: 0.55, marginTop: 8, fontSize: 11 }}>
-          [t] take over robber · [wasd] drive · [space] brake · [p] pause ·
-          [c] chase · [1] paths · [2] goals · [3] affordances · [r] reset
+          [wasd] drive · [space] brake
         </div>
       </div>
       {banner && (
@@ -903,3 +1059,70 @@ function syncCarMesh(group: THREE.Group, s: VehicleState): void {
 // CARCHASE_AGENT is re-exported so the rapierVehicle helper can keep its
 // pure-pursuit config in lockstep with the planner agent.
 export { CARCHASE_AGENT };
+
+function ToggleButton({
+  label,
+  shortcut,
+  on,
+  onClick,
+}: {
+  label: string;
+  shortcut: string;
+  on: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        font: '11px ui-monospace, monospace',
+        padding: '4px 8px',
+        borderRadius: 6,
+        border: `1px solid ${on ? '#7fd6ff' : '#1f2735'}`,
+        background: on ? 'rgba(127, 214, 255, 0.18)' : 'rgba(20, 26, 38, 0.85)',
+        color: on ? '#cdeaff' : '#8c95a4',
+        cursor: 'pointer',
+        letterSpacing: 0.3,
+      }}
+      title={`Toggle ${label} ([${shortcut}])`}
+    >
+      <span style={{ opacity: 0.65, marginRight: 4 }}>[{shortcut}]</span>
+      {label}
+      <span style={{ marginLeft: 6, opacity: 0.85, fontWeight: 600 }}>
+        {on ? 'on' : 'off'}
+      </span>
+    </button>
+  );
+}
+
+function ActionButton({
+  label,
+  shortcut,
+  onClick,
+}: {
+  label: string;
+  shortcut: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        font: '11px ui-monospace, monospace',
+        padding: '4px 8px',
+        borderRadius: 6,
+        border: '1px solid #3b4456',
+        background: 'rgba(20, 26, 38, 0.85)',
+        color: '#cdd3de',
+        cursor: 'pointer',
+        letterSpacing: 0.3,
+      }}
+      title={`${label} ([${shortcut}])`}
+    >
+      <span style={{ opacity: 0.65, marginRight: 4 }}>[{shortcut}]</span>
+      {label}
+    </button>
+  );
+}
