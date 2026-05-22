@@ -13,7 +13,12 @@ import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import RAPIER from '@dimforge/rapier3d-compat';
-import { InMemoryNavWorld } from 'kinocat/environment';
+import {
+  InMemoryNavWorld,
+  rampHeightSampler,
+  combineHeightSamplers,
+} from 'kinocat/environment';
+import type { HeightSampler } from 'kinocat/environment';
 import type { VehicleState } from 'kinocat/agent';
 import {
   ensureRapier,
@@ -26,7 +31,6 @@ import {
 import {
   createGroundPlaneHelper,
   createBuildingHelper,
-  createJumpRampHelper,
   createBoostPadHelper,
   createDriftGateHelper,
   createCarMeshHelper,
@@ -36,6 +40,9 @@ import {
   createInflatedObstacleHelper,
   createNavBoundsHelper,
   createAgentFootprintHelper,
+  createHeightfieldMeshHelper,
+  createRampChevronsHelper,
+  createJumpArcHelper,
   createRapierDebugRenderer,
 } from 'kinocat/adapters/three';
 import {
@@ -58,7 +65,7 @@ const WHEEL_BASE = 1.6; // matches default in createRaycastVehicle
 
 // Gentle terrain so a flat-ground vehicle still copes. Bumps + bowls let us
 // see suspension behaviour without making the planner-vs-physics gap obvious.
-function heightSampler(x: number, z: number): number {
+function terrainSampler(x: number, z: number): number {
   return 0.6 * Math.sin(x / 18) + 0.6 * Math.cos(z / 14);
 }
 
@@ -174,36 +181,32 @@ export default function ObstacleCourse() {
       }
       coursePhysics = [];
 
-      // Heightfield (terrain) OR flat ground slab.
-      if (blocksRef.current.heightfield) {
-        // Visual mesh: shaded plane displaced by the sampler.
-        const w = OBS_BOUNDS.x1 - OBS_BOUNDS.x0;
-        const d = OBS_BOUNDS.z1 - OBS_BOUNDS.z0;
-        const segX = 60;
-        const segZ = 40;
-        const g = new THREE.PlaneGeometry(w, d, segX, segZ);
-        g.rotateX(-Math.PI / 2);
-        g.translate(mapCx, 0, mapCz);
-        const pos = g.attributes.position as THREE.BufferAttribute;
-        for (let i = 0; i < pos.count; i++) {
-          const x = pos.getX(i);
-          const z = pos.getZ(i);
-          pos.setY(i, heightSampler(x, z));
-        }
-        pos.needsUpdate = true;
-        g.computeVertexNormals();
+      // Heightfield surface = (optional) bumpy terrain max-blended with the
+      // drivable ramps. When neither block is on, fall back to a flat ground
+      // slab. Using a single heightfield for both means the car physically
+      // climbs the ramp via the same drivable surface as the /ramp demo —
+      // no cuboid colliders for ramps.
+      const samplers: HeightSampler[] = [];
+      if (blocksRef.current.heightfield) samplers.push(terrainSampler);
+      if (course.ramps.length > 0) samplers.push(rampHeightSampler(course.ramps));
+      if (samplers.length > 0) {
+        const sampler = combineHeightSamplers(...samplers);
         courseVisuals.add(
-          new THREE.Mesh(
-            g,
-            new THREE.MeshStandardMaterial({ color: C.ground, flatShading: true }),
-          ),
+          createHeightfieldMeshHelper({
+            bounds: OBS_BOUNDS,
+            sampler,
+            segmentsX: 60,
+            segmentsZ: 40,
+            groundColor: C.ground,
+            // Vertex-colour the ramp body brown above 0.2 m so the drivable
+            // ramp visually pops out of the bumpy terrain.
+            vertexColorAbove: course.ramps.length > 0 ? 0.2 : undefined,
+            aboveColor: C.ramp,
+          }),
         );
-        const grid = new THREE.GridHelper(Math.max(w, d), 24, 0x2a3040, 0x1a1f2c);
-        grid.position.set(mapCx, 0.02, mapCz);
-        courseVisuals.add(grid);
         coursePhysics.push(
           createHeightfieldCollider(world, {
-            sampler: heightSampler,
+            sampler,
             bounds: OBS_BOUNDS,
             cellSize: 2,
           }),
@@ -233,17 +236,18 @@ export default function ObstacleCourse() {
         );
       }
 
+      // Drivable ramps: directional chevrons on the surface + the jump
+      // affordance arc overlay. No cuboid collider — physics is the
+      // heightfield above.
+      for (const r of course.ramps) {
+        courseVisuals.add(createRampChevronsHelper(r));
+      }
       for (const j of course.jumps) {
-        courseVisuals.add(createJumpRampHelper(j));
-        coursePhysics.push(
-          createBoxCollider(world, {
-            x: j.launch.x,
-            y: j.height / 2,
-            z: j.launch.z,
-            hx: j.hx,
-            hy: j.height / 2,
-            hz: j.hz,
-          }),
+        courseVisuals.add(
+          createJumpArcHelper(
+            { launch: j.launch, land: j.land, hx: 0, hz: 0, height: j.height },
+            { launchY: j.height, apexClearance: 2 },
+          ),
         );
       }
 

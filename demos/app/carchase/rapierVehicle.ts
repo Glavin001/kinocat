@@ -9,11 +9,13 @@ import {
   createRaycastVehicle,
   createBoxCollider,
   createGroundCollider,
+  createHeightfieldCollider,
   ensureRapier as coreEnsureRapier,
   planToAckermannControls,
   type CarHandle as CoreCarHandle,
   type RaycastVehicleOptions,
 } from 'kinocat/adapters/rapier';
+import { rampHeightSampler } from 'kinocat/environment';
 import type {
   CarChaseCourse,
   BuildingSpec,
@@ -45,13 +47,20 @@ export type CarHandle = CoreCarHandle;
 export interface CarChaseWorld {
   world: RAPIER.World;
   staticHandles: number[];
-  rampBodies: Array<{ spec: JumpSpec; position: { x: number; y: number; z: number } }>;
 }
 
 const GRAVITY = { x: 0, y: -9.81, z: 0 };
 
-/** Build the static physics world for the car-chase course (flat ground,
- *  building + ramp cuboids). Pure delegation to the core collider helpers. */
+/** Build the static physics world for the car-chase course: flat ground
+ *  slab everywhere + a small per-ramp heightfield collider in the ramp's
+ *  immediate footprint + cuboid building colliders.
+ *
+ *  Why per-ramp heightfields instead of one over the whole course: a
+ *  120x90 heightfield (cellSize 2) feeding four sub-stepped raycast
+ *  vehicles slows the chassis acceleration to a crawl on this map —
+ *  every wheel raycast walks a much bigger BVH each substep. Keeping
+ *  the heightfield local (≈20x20 m per ramp) lets the rest of the map
+ *  stay on the cheap flat slab the carchase tuning was designed for. */
 export function createCarChaseWorld(course: CarChaseCourse): CarChaseWorld {
   const world = new RAPIER.World(GRAVITY);
   const staticHandles: number[] = [];
@@ -59,6 +68,30 @@ export function createCarChaseWorld(course: CarChaseCourse): CarChaseWorld {
   staticHandles.push(
     createGroundCollider(world, { bounds: CARCHASE_BOUNDS, pad: 20, friction: 1.5 }).handle,
   );
+
+  for (const r of course.ramps) {
+    // Pad the heightfield ~6 m past the ramp footprint so the lateral
+    // skirt / back-slope are fully captured. The pad keeps the
+    // sampled-mesh tile cheap (≈15x15 m) so wheel raycasts stay fast.
+    const pad = 6;
+    const halfL = r.length / 2 + (r.backSkirt ?? 2.5) + pad;
+    const halfW = r.width / 2 + (r.lateralSkirt ?? 1.5) + pad;
+    const c = Math.cos(r.heading);
+    const s = Math.sin(r.heading);
+    const cx = r.base.x;
+    const cz = r.base.z;
+    // World-axis AABB of the rotated ramp footprint + pad.
+    const ex = Math.abs(halfL * c) + Math.abs(halfW * s);
+    const ez = Math.abs(halfL * s) + Math.abs(halfW * c);
+    staticHandles.push(
+      createHeightfieldCollider(world, {
+        sampler: rampHeightSampler([r]),
+        bounds: { x0: cx - ex, x1: cx + ex, z0: cz - ez, z1: cz + ez },
+        cellSize: 2,
+        friction: 1.5,
+      }).handle,
+    );
+  }
 
   for (const b of course.buildings) {
     staticHandles.push(
@@ -73,25 +106,7 @@ export function createCarChaseWorld(course: CarChaseCourse): CarChaseWorld {
     );
   }
 
-  const rampBodies: CarChaseWorld['rampBodies'] = [];
-  for (const j of course.jumps) {
-    staticHandles.push(
-      createBoxCollider(world, {
-        x: j.launch.x,
-        y: j.height / 2,
-        z: j.launch.z,
-        hx: j.hx,
-        hy: j.height / 2,
-        hz: j.hz,
-      }).handle,
-    );
-    rampBodies.push({
-      spec: j,
-      position: { x: j.launch.x, y: j.height / 2, z: j.launch.z },
-    });
-  }
-
-  return { world, staticHandles, rampBodies };
+  return { world, staticHandles };
 }
 
 export interface SpawnCarOptions {

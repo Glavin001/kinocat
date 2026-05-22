@@ -18,6 +18,7 @@ import type { VehicleState } from '../../agent/types';
 import type { PurePursuitConfig } from '../../execute/types';
 import { purePursuit } from '../../execute/pure-pursuit';
 import { wrapAngle } from '../../internal/math';
+import type { HeightSampler } from '../../environment/ramp';
 
 let rapierReady: Promise<typeof RAPIER> | null = null;
 
@@ -360,8 +361,11 @@ export function createGroundCollider(
 
 // ---------------------------------------------------------------------------
 // Heightfield collider — same sampler can feed nav generation downstream.
+// The `HeightSampler` type lives in `kinocat/environment` so the same
+// `(x, z) => y` function can feed physics colliders, visual meshes, and
+// (eventually) slope-aware navmesh generation.
 
-export type HeightSampler = (x: number, z: number) => number;
+export type { HeightSampler } from '../../environment/ramp';
 
 export interface HeightfieldColliderOptions {
   sampler: HeightSampler;

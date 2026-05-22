@@ -11,8 +11,16 @@
 // (selectTacticalMode / tacticalGoal / planAI).
 import { planVehicleOnce } from 'kinocat/planner';
 import type { PlanResult } from 'kinocat/planner';
-import { InMemoryNavWorld, nudgeGoalClear } from 'kinocat/environment';
-import type { NavPolygon } from 'kinocat/environment';
+import {
+  InMemoryNavWorld,
+  nudgeGoalClear,
+  jumpSpecFromRamp,
+} from 'kinocat/environment';
+import type {
+  NavPolygon,
+  RampSpec,
+  RampJumpSpec,
+} from 'kinocat/environment';
 import {
   PlanRegistry,
   AffordanceRegistry,
@@ -86,28 +94,22 @@ export type BoostPadSpec = {
   exitDistance: number;
 };
 
-export type JumpSpec = {
-  id: string;
-  /** Launch ramp midpoint (XZ). */
-  launch: { x: number; z: number };
-  /** Landing pose (heading kept from approach). */
-  land: { x: number; z: number; heading: number };
-  /** Ramp body half-extents (used to render + collide). */
-  hx: number;
-  hz: number;
-  /** Ramp peak height. */
-  height: number;
-  /** Approach heading (radians, +X = 0). */
-  heading: number;
-};
+/** Re-exported under the historical car-chase name for back-compat with the
+ *  Rapier wiring + UI code that used to assume a cuboid ramp. New code can
+ *  use `RampJumpSpec` directly. */
+export type JumpSpec = RampJumpSpec;
 
 export interface CarChaseCourse {
   bounds: typeof CARCHASE_BOUNDS;
   polygons: NavPolygon[];
-  /** Building footprint vertex rings (CCW). */
+  /** Building footprint vertex rings (CCW). The ramp is NOT in this list —
+   *  it's a drivable heightfield surface in `ramps`. */
   obstacles: Array<[number, number][]>;
   buildings: BuildingSpec[];
   boostPads: BoostPadSpec[];
+  /** Drivable heightfield ramps the car physically climbs. */
+  ramps: RampSpec[];
+  /** `BallisticJump` affordance launch/land derived from each ramp. */
   jumps: JumpSpec[];
   driftGates: DriftGateSpec[];
   /** Closed loop of waypoints the robber drives in order (XZ + heading). */
@@ -171,31 +173,45 @@ export function buildCarChaseCourse(): CarChaseCourse {
   buildings.push({ x: -90, z: 20, hx: 4, hz: 4, height: 8 });
   buildings.push({ x: -70, z: 5, hx: 4, hz: 4, height: 8 });
 
-  // The jump ramp is a building footprint too (cars cannot drive THROUGH the
-  // ramp at plan-time — they use the jump affordance to leap over the gap).
-  const jumpRampX = -40;
-  const jumpRampZ = -50;
-  const jumpHeading = Math.PI; // approach from +X going -X
-  buildings.push({ x: jumpRampX, z: jumpRampZ, hx: 4, hz: 7, height: 5 });
+  // South ramp: a single drivable heightfield ramp the car climbs and (with
+  // the jump affordance) can leap off. Approach is from +X going -X
+  // (heading = π). The shared `rampHeightSampler` shapes the actual
+  // surface; here we only commit to the high-level pose + dimensions.
+  const ramps: RampSpec[] = [
+    {
+      id: 'jump-ramp-south',
+      base: { x: -40, z: -50 },
+      length: 10,
+      width: 8,
+      height: 3,
+      heading: Math.PI,
+    },
+  ];
 
+  // Off-mesh jump: from the ramp crest to a touchdown ~12 m past it
+  // (ballistic range at cruise — `jumpSpecFromRamp` does the math). The
+  // planner may take it as a shortcut but the ramp is also drivable; cops
+  // pick whichever is shorter to wherever the robber currently is. Both
+  // species can use this — the robber loves it for evasion.
+  //
+  // NOTE: unlike the /ramp demo we DO NOT add a planner-only "gap"
+  // obstacle past the ramp. The ramp lives inside a busy chase course;
+  // forcing every plan that touches the southwest quadrant to either
+  // detour or take the jump made cops miss the robber whenever it left
+  // that quadrant. Keeping the ramp open lets the planner choose its
+  // own trade-off per replan.
+  const jumps: JumpSpec[] = ramps.map((r) =>
+    jumpSpecFromRamp(r, { launchDist: 12 }),
+  );
+
+  // Light building inflation (0.5 m past the visual face). The real
+  // chassis-vs-wall margin comes from the inflated agent footprint in
+  // `CARCHASE_AGENT`; pushing this much higher closes the south pinch
+  // (z = -80 wall) and the downtown alley to the point where the
+  // planner can't find any path at all under budget.
   const obstacles: Array<[number, number][]> = buildings.map((b1) =>
     box(b1.x, b1.z, b1.hx + 0.5, b1.hz + 0.5),
   );
-
-  // Off-mesh jump: from just east of the ramp to just west of the landing,
-  // skipping over the ramp footprint. Costs a couple of seconds; usable by
-  // both species (robber loves it for evasion).
-  const jumps: JumpSpec[] = [
-    {
-      id: 'jump-ramp-south',
-      launch: { x: jumpRampX + 12, z: jumpRampZ },
-      land: { x: jumpRampX - 12, z: jumpRampZ, heading: jumpHeading },
-      hx: 4,
-      hz: 7,
-      height: 5,
-      heading: jumpHeading,
-    },
-  ];
 
   // Boost pads — one inside the downtown grid (rewards the robber for
   // committing to the alley shortcut), one on the west highway loop.
@@ -243,6 +259,7 @@ export function buildCarChaseCourse(): CarChaseCourse {
     obstacles,
     buildings,
     boostPads,
+    ramps,
     jumps,
     driftGates,
     robberLoop,
@@ -258,11 +275,19 @@ export const CARCHASE_AGENT: VehicleAgent = defaultVehicleAgent({
   minTurnRadius: 4.5,
   maxSpeed: 14,
   maxReverseSpeed: 5,
+  // Planner footprint is INFLATED past the actual chassis (2.4 × 1.0 m
+  // half-extents) so plans keep a clearance buffer from walls. Without
+  // this margin a tight Reeds-Shepp curve at full speed clips the inner
+  // curb during execution — the chassis touches the wall a frame before
+  // the planner thinks it should and the controller wedges there with
+  // no obvious recovery. ~0.25 m margin all around fixes the worst
+  // wall-grinding without closing the downtown alleys (avenues are
+  // ~18 m wide and we don't want to overshrink them).
   footprint: [
-    [2.4, 1.0],
-    [-2.4, 1.0],
-    [-2.4, -1.0],
-    [2.4, -1.0],
+    [2.65, 1.25],
+    [-2.65, 1.25],
+    [-2.65, -1.25],
+    [2.65, -1.25],
   ],
   // Reverse is only modestly more expensive than forward so the planner is
   // willing to back out of a corner instead of grinding the chassis into a
@@ -375,7 +400,21 @@ function wrapPi(a: number): number {
 }
 
 /** Cop tactic from robber-relative geometry. Spread by cop index so the
- *  squad fans out instead of stacking. */
+ *  squad fans out instead of stacking.
+ *
+ *  Two important "collapse to PURSUE" cases:
+ *  - **Slow robber.** INTERCEPT/CUTOFF/FLANK lead the robber along its
+ *    *current* heading. If the robber is stationary the lead point is just
+ *    empty space ahead of it — the cop drives there and parks, never
+ *    doubling back. Below `LEAD_MIN_SPEED` ignore tactics and head
+ *    straight at the robber.
+ *  - **Cop already close.** Once a cop is within `CLOSE_RANGE`, leading
+ *    by 10–20 m past the robber actively makes things worse (the cop
+ *    overshoots its target and drives away). Collapse to PURSUE so the
+ *    closing cop commits to the arrest. */
+const LEAD_MIN_SPEED = 3.0; // m/s — robber slower than this → pursue
+const CLOSE_RANGE = 18; // m — cop closer than this → pursue regardless
+
 export function selectTacticalMode(
   robber: VehicleState,
   cop: VehicleState,
@@ -386,6 +425,12 @@ export function selectTacticalMode(
   const dist = Math.hypot(dx, dz);
   // Bearing from cop to robber (signed off cop's nose).
   const bearing = wrapPi(Math.atan2(dz, dx) - cop.heading);
+  // Stationary / slow robber → tactics with a lead distance just park the
+  // cop in empty space ahead of where the robber WAS heading. Pursue
+  // directly so the cop always converges on the robber's actual pose.
+  if (Math.abs(robber.speed) < LEAD_MIN_SPEED) return 'PURSUE';
+  // Already close — commit to the arrest, don't try to lead past it.
+  if (dist < CLOSE_RANGE) return 'PURSUE';
   // Far away — regroup at a wider arc.
   if (dist > 80) return 'REGROUP';
   // Robber inside cop's forward cone at close range → just chase.
@@ -447,6 +492,13 @@ export function tacticalGoal(
   const speed = CARCHASE_AGENT.maxSpeed;
   const base = { speed, t: 0 };
 
+  // Lead distance scales with how fast the robber is actually moving.
+  // At cruise (≥8 m/s) we use the full nominal lead; below that we
+  // smoothly collapse toward 0 so a coasting robber doesn't leave the
+  // cop chasing empty pavement. (`selectTacticalMode` already promotes
+  // very-slow robbers to PURSUE; this handles the in-between band.)
+  const leadFrac = Math.min(1, Math.abs(robber.speed) / 8);
+
   let goal: VehicleState;
   switch (mode) {
     case 'PURSUE': {
@@ -454,8 +506,8 @@ export function tacticalGoal(
       const s = Math.sin(future.heading);
       goal = {
         ...base,
-        x: future.x - 8 * c,
-        z: future.z - 8 * s,
+        x: future.x - 8 * c * leadFrac,
+        z: future.z - 8 * s * leadFrac,
         heading: future.heading,
       };
       break;
@@ -463,10 +515,11 @@ export function tacticalGoal(
     case 'INTERCEPT': {
       const c = Math.cos(future.heading);
       const s = Math.sin(future.heading);
+      const lead = 10 * leadFrac;
       goal = {
         ...base,
-        x: future.x + 10 * c,
-        z: future.z + 10 * s,
+        x: future.x + lead * c,
+        z: future.z + lead * s,
         heading: future.heading + Math.PI,
       };
       break;
@@ -474,10 +527,11 @@ export function tacticalGoal(
     case 'CUTOFF': {
       const c = Math.cos(future.heading);
       const s = Math.sin(future.heading);
+      const lead = 20 * leadFrac;
       goal = {
         ...base,
-        x: future.x + 20 * c,
-        z: future.z + 20 * s,
+        x: future.x + lead * c,
+        z: future.z + lead * s,
         heading: future.heading,
       };
       break;
@@ -488,10 +542,13 @@ export function tacticalGoal(
       const phi = future.heading + (sign * Math.PI) / 2;
       const c = Math.cos(phi);
       const s = Math.sin(phi);
+      // Flanks still keep a lateral offset (otherwise all cops stack on
+      // the robber), but shrink with robber speed too.
+      const lateral = 14 * Math.max(0.35, leadFrac);
       goal = {
         ...base,
-        x: future.x + 14 * c,
-        z: future.z + 14 * s,
+        x: future.x + lateral * c,
+        z: future.z + lateral * s,
         heading: future.heading,
       };
       break;
@@ -518,6 +575,29 @@ export function tacticalGoal(
 // Robber AI — picks the next waypoint on the course loop. Adds a small bias
 // AWAY from the nearest cop's predicted position so it isn't a fixed track.
 
+// Don't aim at a waypoint that has a cop sitting on top of it — driving
+// straight into the arrest is the robber's worst move. If the *next*
+// scheduled waypoint is inside this radius of any cop, skip forward
+// through the loop until we find one that isn't.
+const ROBBER_AVOID_COP_RADIUS = 22; // m
+// Cap waypoint look-ahead so an unlucky cop placement (cops surround the
+// whole loop) doesn't infinite-loop. After this many skips we accept the
+// blocked waypoint and rely on the planner's moving-obstacle avoidance.
+const ROBBER_MAX_WP_SKIPS = 3;
+
+function waypointBlockedByCop(
+  wp: { x: number; z: number },
+  cops: ReadonlyArray<VehicleState>,
+  radius: number,
+): boolean {
+  for (const c of cops) {
+    const dx = wp.x - c.x;
+    const dz = wp.z - c.z;
+    if (dx * dx + dz * dz < radius * radius) return true;
+  }
+  return false;
+}
+
 export function robberGoal(
   robber: VehicleState,
   loop: CarChaseCourse['robberLoop'],
@@ -526,15 +606,26 @@ export function robberGoal(
   buildings?: BuildingSpec[],
   course?: CarChaseCourse,
 ): { goal: VehicleState; nextIndex: number } {
-  // Advance to the next waypoint once close enough.
+  // 1. Advance to the next waypoint once close enough to the current one.
   const wp = loop[loopIndex]!;
   const reach = Math.hypot(robber.x - wp.x, robber.z - wp.z);
-  const useIdx = reach < 8 ? (loopIndex + 1) % loop.length : loopIndex;
+  let useIdx = reach < 8 ? (loopIndex + 1) % loop.length : loopIndex;
+
+  // 2. Skip forward through the loop past any waypoint a cop is camping
+  //    on. Bounded by ROBBER_MAX_WP_SKIPS so we don't spin forever when
+  //    the squad surrounds the loop.
+  for (let skip = 0; skip < ROBBER_MAX_WP_SKIPS; skip++) {
+    const candidate = loop[useIdx]!;
+    if (!waypointBlockedByCop(candidate, cops, ROBBER_AVOID_COP_RADIUS)) break;
+    useIdx = (useIdx + 1) % loop.length;
+  }
   const target = loop[useIdx]!;
 
-  // Compute a per-tick avoidance offset: vector away from the closest cop,
-  // clamped to ±12 m perpendicular to the target heading. Small enough not to
-  // derail the loop, big enough to make the path interesting.
+  // 3. Compute a per-tick avoidance offset: project the (robber - cop)
+  //    vector onto the perpendicular of the target heading, signed so we
+  //    nudge AWAY from the cop. Clamped to ±5 m so the offset stays
+  //    inside the downtown avenue (avenue half-width is ~8 m after
+  //    building inflation) and never pushes the goal into a wall.
   let nearestDx = 0;
   let nearestDz = 0;
   let nearestD2 = Infinity;
@@ -552,10 +643,6 @@ export function robberGoal(
   const perpS = Math.sin(target.heading + Math.PI / 2);
   let offset = 0;
   if (nearestD2 < 50 * 50) {
-    // Project the away-vector onto the perpendicular of the target heading.
-    // Clamp to ±5 m so the offset stays inside the downtown avenue (avenue
-    // half-width is ~8 m after building inflation) and never pushes the goal
-    // into a building wall.
     const dot = nearestDx * perpC + nearestDz * perpS;
     offset = Math.max(-5, Math.min(5, dot));
   }
@@ -567,6 +654,9 @@ export function robberGoal(
     t: 0,
   });
   return {
+    // `nudgeGoalToNavClear` pushes the goal out of any inflated obstacle
+    // footprint — combined with the cop-skip above, the robber should
+    // never plan straight at a wall OR at a cop.
     goal: nudgeGoalToNavClear(clamped, robber, buildings, course),
     nextIndex: useIdx,
   };

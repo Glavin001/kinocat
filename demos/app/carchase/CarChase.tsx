@@ -34,7 +34,7 @@ import {
 } from './rapierVehicle';
 import {
   createBuildingHelper,
-  createJumpRampHelper,
+  createJumpArcHelper,
   createBoostPadHelper,
   createDriftGateHelper,
   createCarMeshHelper,
@@ -44,8 +44,11 @@ import {
   createInflatedObstacleHelper,
   createNavBoundsHelper,
   createAgentFootprintHelper,
+  createHeightfieldMeshHelper,
+  createRampChevronsHelper,
   createRapierDebugRenderer,
 } from 'kinocat/adapters/three';
+import { rampHeightSampler } from 'kinocat/environment';
 
 interface CopAI {
   id: string;
@@ -59,6 +62,20 @@ interface CopAI {
   lastExpansions: number;
   lastBudgetMs: number;
   capturedAtWall: number;
+  // Wall-clock when the cop first entered the capture radius of the robber
+  // in the current contact run. -Infinity when not currently touching. Used
+  // to require sustained contact (see `CAPTURE_HOLD_MS`) before a bust —
+  // a fender-bump shouldn't count as an arrest.
+  contactSinceWall: number;
+  // Wall-clock when speed last exceeded `STUCK_SPEED`. If we've been
+  // crawling longer than `STUCK_TRIGGER_MS` the per-tick controls do a
+  // reverse burst (see `UNSTICK_BURST_MS`) to back away from whatever
+  // wall the chassis got pinned against.
+  lastMovedWall: number;
+  // Wall-clock when the current reverse burst started. -Infinity if not
+  // burst-reversing. Set when stuck-trigger fires, cleared when burst
+  // duration elapses.
+  unstickUntilWall: number;
 }
 
 interface RobberAI {
@@ -70,6 +87,14 @@ interface RobberAI {
   lastReplanWall: number;
   lastExpansions: number;
   lastBudgetMs: number;
+  // Wall-clock when the AI robber's speed last exceeded the "stuck" floor.
+  // If the AI is in charge and we haven't moved for `ROBBER_STUCK_MS`, we
+  // force-advance the waypoint loop in case the current target is behind
+  // a wall (or otherwise unreachable from the current pose).
+  lastMovedWall: number;
+  // Same role as `CopAI.unstickUntilWall` — wall-clock the active reverse
+  // burst ends; -Infinity when not burst-reversing.
+  unstickUntilWall: number;
 }
 
 interface Score {
@@ -97,6 +122,22 @@ const PHYSICS_DT = 1 / 60;
 const VEHICLE_SUBSTEPS = 4;
 const REPLAN_INTERVAL_MS = 80;
 const CAPTURE_COOLDOWN_MS = 2000;
+// A bust requires the cop to stay inside the capture radius for this many
+// ms. A drive-by bump only counts as a tag, not an arrest — the cop has
+// to actually pin the robber. Reset when contact breaks.
+const CAPTURE_HOLD_MS = 2500;
+// AI-robber "stuck" detector. If `|speed| < ROBBER_STUCK_SPEED` for this
+// long, advance the loopIndex to break out of an unreachable waypoint.
+const ROBBER_STUCK_MS = 1800;
+const ROBBER_STUCK_SPEED = 0.6;
+// Unstick reverse burst — applied to ANY AI car (cop or robber) that's
+// been below `STUCK_SPEED` for `STUCK_TRIGGER_MS`. The car reverses
+// throttle for `UNSTICK_BURST_MS` with a small counter-steer; after the
+// burst it goes back to following its plan (which has likely been
+// replanned from the new pose by then).
+const STUCK_SPEED = 0.6;
+const STUCK_TRIGGER_MS = 1200;
+const UNSTICK_BURST_MS = 700;
 
 const COP_COLORS = [0xff5566, 0xffaa44, 0xff66dd];
 
@@ -189,23 +230,24 @@ export default function CarChase() {
     const physics = createCarChaseWorld(course);
     const world = physics.world;
 
-    // Ground visual: a flat plane matching the planning rectangle.
+    // Ground visual: heightfield mesh sampled from the same
+    // `rampHeightSampler` the physics world uses, so visuals + colliders
+    // match. When there are no ramps the sampler is constantly 0 and the
+    // mesh degenerates to a flat slab — same look as the old plane.
     {
-      const w = CARCHASE_BOUNDS.x1 - CARCHASE_BOUNDS.x0;
-      const d = CARCHASE_BOUNDS.z1 - CARCHASE_BOUNDS.z0;
-      const g = new THREE.PlaneGeometry(w, d, 1, 1);
-      g.rotateX(-Math.PI / 2);
-      g.translate(mapCx, 0, mapCz);
-      const m = new THREE.Mesh(
-        g,
-        new THREE.MeshStandardMaterial({ color: C.ground }),
+      const groundColor = Number.parseInt(C.ground.slice(1), 16);
+      const rampColor = Number.parseInt(C.ramp.slice(1), 16);
+      scene.add(
+        createHeightfieldMeshHelper({
+          bounds: CARCHASE_BOUNDS,
+          sampler: rampHeightSampler(course.ramps),
+          segmentsX: 120,
+          segmentsZ: 90,
+          groundColor,
+          vertexColorAbove: course.ramps.length > 0 ? 0.2 : undefined,
+          aboveColor: rampColor,
+        }),
       );
-      scene.add(m);
-
-      // Grid overlay for spatial reference.
-      const grid = new THREE.GridHelper(Math.max(w, d), 24, 0x2a3040, 0x1a1f2c);
-      grid.position.set(mapCx, 0.02, mapCz);
-      scene.add(grid);
     }
 
     // Buildings.
@@ -238,7 +280,18 @@ export default function CarChase() {
     // and the car-chase demo render the same building blocks identically.
     const affordanceGroup = new THREE.Group();
     scene.add(affordanceGroup);
-    for (const j of course.jumps) affordanceGroup.add(createJumpRampHelper(j));
+    // Drivable ramps: chevrons on the surface for launch-direction clarity
+    // + a `createJumpArcHelper` overlay per ramp showing the affordance
+    // shortcut over the planner-only gap.
+    for (const r of course.ramps) affordanceGroup.add(createRampChevronsHelper(r));
+    for (const j of course.jumps) {
+      affordanceGroup.add(
+        createJumpArcHelper(
+          { launch: j.launch, land: j.land, hx: 0, hz: 0, height: j.height },
+          { launchY: j.height, apexClearance: 2 },
+        ),
+      );
+    }
     for (const p of course.boostPads) {
       affordanceGroup.add(createBoostPadHelper({ x: p.x, z: p.z }));
     }
@@ -268,6 +321,8 @@ export default function CarChase() {
       lastReplanWall: -Infinity,
       lastExpansions: 0,
       lastBudgetMs: 0,
+      lastMovedWall: performance.now(),
+      unstickUntilWall: -Infinity,
     };
     const cops: CopAI[] = [];
     for (let i = 0; i < NUM_COPS; i++) {
@@ -290,6 +345,9 @@ export default function CarChase() {
         lastExpansions: 0,
         lastBudgetMs: 0,
         capturedAtWall: -Infinity,
+        contactSinceWall: -Infinity,
+        lastMovedWall: performance.now(),
+        unstickUntilWall: -Infinity,
       });
     }
 
@@ -374,11 +432,16 @@ export default function CarChase() {
       });
       robber.plan = null;
       robber.loopIndex = 0;
+      robber.lastMovedWall = performance.now();
+      robber.unstickUntilWall = -Infinity;
       for (let i = 0; i < cops.length; i++) {
         const s = p.cops[i % p.cops.length]!;
         cops[i]!.car.teleport({ x: s.x, z: s.z, heading: s.heading });
         cops[i]!.plan = null;
         cops[i]!.capturedAtWall = -Infinity;
+        cops[i]!.contactSinceWall = -Infinity;
+        cops[i]!.lastMovedWall = performance.now();
+        cops[i]!.unstickUntilWall = -Infinity;
       }
       registry.publish('robber', []);
       for (const co of cops) registry.publish(co.id, []);
@@ -403,6 +466,16 @@ export default function CarChase() {
     // ---- planning helpers ----------------------------------------------
     function planRobber(now: number) {
       const robberState = robber.car.readState(now);
+      // Stuck detector: if the AI robber's been crawling for too long,
+      // skip the current waypoint before computing a new goal. Cleared
+      // every replan where we observe meaningful motion. (Player-driven
+      // mode never reaches planRobber, so this only fires for the AI.)
+      if (Math.abs(robberState.speed) > ROBBER_STUCK_SPEED) {
+        robber.lastMovedWall = now;
+      } else if (now - robber.lastMovedWall > ROBBER_STUCK_MS) {
+        robber.loopIndex = (robber.loopIndex + 1) % course.robberLoop.length;
+        robber.lastMovedWall = now;
+      }
       const pick = robberGoal(
         robberState,
         course.robberLoop,
@@ -450,9 +523,13 @@ export default function CarChase() {
       // Predict the robber from its published plan first; constant-velocity
       // fallback so cops still have something to chase before the robber
       // finishes its first plan.
+      // Horizon must exceed the tactical-goal `eta` (max 6 s) or
+      // `tacticalGoal` quietly falls back to robber's CURRENT pose for
+      // anything past 4 s — fine for nearby cops, but for player-driven
+      // mode this stops cops from leading the robber's predicted path.
       const robberPredict: Predict<VehicleState> = (t) => {
         const p = registry.predictNPC('robber')(t) as VehicleState | null;
-        return p ?? predictRobberFromState(robberState, 4)(t);
+        return p ?? predictRobberFromState(robberState, 8)(t);
       };
       const goal = tacticalGoal(robberState, robberPredict, copState, mode, course.buildings, course);
       const siblingIds = cops
@@ -555,6 +632,8 @@ export default function CarChase() {
           throttle: accel,
           brake,
         });
+      } else if (maybeUnstick(robber, robberState, now)) {
+        // Reverse burst is active — controls already applied.
       } else if (robber.plan && robber.plan.length > 1) {
         const elapsed = (now - robber.planStartWall) / 1000;
         // Walk the plan with elapsed time: trim the path to states at or
@@ -577,8 +656,12 @@ export default function CarChase() {
         const co = cops[i]!;
         if (co.capturedAtWall + CAPTURE_COOLDOWN_MS > now) {
           co.car.applyControls({ steer: 0, throttle: 0, brake: 1 });
+          // Don't accumulate "stuck" time during the post-bust freeze.
+          co.lastMovedWall = now;
+          co.unstickUntilWall = -Infinity;
           continue;
         }
+        if (maybeUnstick(co, copStates[i]!, now)) continue;
         if (co.plan && co.plan.length > 1) {
           const elapsed = (now - co.planStartWall) / 1000;
           const live = trimPlan(co.plan, elapsed);
@@ -588,7 +671,24 @@ export default function CarChase() {
             continue;
           }
         }
-        co.car.applyControls({ steer: 0, throttle: 0, brake: 0 });
+        // Fallback "dumb pursuit": planner failed or plan exhausted, but a
+        // stationary cop is worse than a cop driving toward the robber.
+        // Steer toward the robber's current XZ and throttle forward (or
+        // reverse if the robber is behind us). The next replan tick will
+        // hopefully produce a real plan; meanwhile we close distance.
+        const cs = copStates[i]!;
+        const dxr = robberState.x - cs.x;
+        const dzr = robberState.z - cs.z;
+        const bearing = Math.atan2(dzr, dxr) - cs.heading;
+        // Wrap to (-pi, pi].
+        const wrapped = Math.atan2(Math.sin(bearing), Math.cos(bearing));
+        const forward = Math.abs(wrapped) < Math.PI / 2;
+        const steer = Math.max(-1, Math.min(1, (forward ? wrapped : Math.atan2(Math.sin(Math.PI - wrapped), Math.cos(Math.PI - wrapped))) / 0.55));
+        co.car.applyControls({
+          steer: steer * 0.55,
+          throttle: forward ? 0.6 : -0.4,
+          brake: 0,
+        });
       }
 
       // Canonical Rapier raycast-vehicle order: updateVehicle BEFORE
@@ -610,40 +710,75 @@ export default function CarChase() {
       const copStatesAfter = cops.map((co) => co.car.readState(now));
 
       // ---- capture detection ----
+      // A bust requires the cop to stay inside the capture radius for
+      // `CAPTURE_HOLD_MS` continuous milliseconds. Each cop tracks when its
+      // current contact run began (`contactSinceWall`); breaking contact
+      // resets that timer. Drive-by fender bumps therefore tag but don't
+      // arrest — the cop has to actually pin the robber.
+      const robberY = robber.car.chassis.translation().y;
       for (let i = 0; i < cops.length; i++) {
         const co = cops[i]!;
-        if (co.capturedAtWall + CAPTURE_COOLDOWN_MS > now) continue;
+        if (co.capturedAtWall + CAPTURE_COOLDOWN_MS > now) {
+          co.contactSinceWall = -Infinity;
+          continue;
+        }
         const dx = robberStateAfter.x - copStatesAfter[i]!.x;
         const dz = robberStateAfter.z - copStatesAfter[i]!.z;
         // Vertical separation comes from the physics body translation, NOT
         // from VehicleState (which is the XZ planning plane). A cop directly
-        // below a mid-air robber should NOT register a capture.
-        const robberY = robber.car.chassis.translation().y;
+        // below a mid-air robber should NOT count as touching.
         const copY = cops[i]!.car.chassis.translation().y;
         const dy = robberY - copY;
         const d = Math.hypot(dx, dz);
-        if (d < CAPTURE_DISTANCE && Math.abs(dy) < CAPTURE_VERTICAL) {
-          co.capturedAtWall = now;
-          scoreRef.busts += 1;
-          scoreRef.round += 1;
-          setScore({ ...scoreRef });
-          flashBanner(`Busted by ${co.id}! Round ${scoreRef.round}`, '#ffd070', 1400);
-          // Knock the robber back to a fresh waypoint, cops freeze briefly.
-          const p = spawnPoses();
-          robber.car.teleport({
-            x: p.robber.x,
-            z: p.robber.z,
-            heading: p.robber.heading,
-          });
-          robber.plan = null;
-          robber.loopIndex = 0;
+        const touching = d < CAPTURE_DISTANCE && Math.abs(dy) < CAPTURE_VERTICAL;
+        if (!touching) {
+          co.contactSinceWall = -Infinity;
+          continue;
         }
+        if (co.contactSinceWall === -Infinity) co.contactSinceWall = now;
+        if (now - co.contactSinceWall < CAPTURE_HOLD_MS) continue;
+        co.capturedAtWall = now;
+        co.contactSinceWall = -Infinity;
+        scoreRef.busts += 1;
+        scoreRef.round += 1;
+        setScore({ ...scoreRef });
+        flashBanner(`Busted by ${co.id}! Round ${scoreRef.round}`, '#ffd070', 1400);
+        // Knock the robber back to a fresh waypoint, cops freeze briefly.
+        const p = spawnPoses();
+        robber.car.teleport({
+          x: p.robber.x,
+          z: p.robber.z,
+          heading: p.robber.heading,
+        });
+        robber.plan = null;
+        robber.loopIndex = 0;
+        robber.lastMovedWall = now;
+        // Also reset the OTHER cops' contact timers — the robber just
+        // teleported, so any in-progress hold from a sibling is stale.
+        for (const other of cops) if (other !== co) other.contactSinceWall = -Infinity;
       }
 
       // ---- visual sync ----
+      // syncCarMeshCore only updates X, Z, and yaw. Because the ramp is a
+      // real drivable heightfield surface now, cars physically climb it
+      // and (with the jump affordance) launch into the air — we MUST also
+      // sync world-Y and the full chassis quaternion so the mesh follows
+      // the chassis through the arc, not glued to y=0.
       syncCarMeshCore(robberMesh.group, robberStateAfter);
+      {
+        const tr = robber.car.chassis.translation();
+        const qr = robber.car.chassis.rotation();
+        robberMesh.group.position.y = tr.y;
+        robberMesh.group.quaternion.set(qr.x, qr.y, qr.z, qr.w);
+      }
       for (let i = 0; i < cops.length; i++) {
         syncCarMeshCore(copMeshes[i]!.group, copStatesAfter[i]!);
+        {
+          const tr = cops[i]!.car.chassis.translation();
+          const qr = cops[i]!.car.chassis.rotation();
+          copMeshes[i]!.group.position.y = tr.y;
+          copMeshes[i]!.group.quaternion.set(qr.x, qr.y, qr.z, qr.w);
+        }
         // Blink the lightbar in pursuit.
         const bar = copMeshes[i]!.lightbar;
         if (bar) {
@@ -708,10 +843,19 @@ export default function CarChase() {
           `robber: plan=${robber.plan?.length ?? 0} exp=${robber.lastExpansions} budget=${robber.lastBudgetMs.toFixed(0)}ms loop=${robber.loopIndex}`,
         );
         setCopStatus(
-          cops.map(
-            (co) =>
-              `${co.id} · ${co.mode} · plan=${co.plan?.length ?? 0} exp=${co.lastExpansions} ${co.lastBudgetMs.toFixed(0)}ms${co.capturedAtWall + CAPTURE_COOLDOWN_MS > now ? ' [COOLDOWN]' : ''}`,
-          ),
+          cops.map((co) => {
+            const cooldown = co.capturedAtWall + CAPTURE_COOLDOWN_MS > now;
+            const holding =
+              !cooldown && co.contactSinceWall !== -Infinity
+                ? ((now - co.contactSinceWall) / 1000).toFixed(1)
+                : null;
+            const tag = cooldown
+              ? ' [COOLDOWN]'
+              : holding !== null
+                ? ` [HOLD ${holding}/${(CAPTURE_HOLD_MS / 1000).toFixed(1)}s]`
+                : '';
+            return `${co.id} · ${co.mode} · plan=${co.plan?.length ?? 0} exp=${co.lastExpansions} ${co.lastBudgetMs.toFixed(0)}ms${tag}`;
+          }),
         );
       }
 
@@ -883,6 +1027,53 @@ function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
   let i = 0;
   while (i < plan.length - 1 && plan[i + 1]!.t <= elapsed) i++;
   return plan.slice(i);
+}
+
+/** Anything that holds a car handle plus the stuck-detector bookkeeping.
+ *  Both RobberAI and CopAI satisfy this — the helper doesn't care which.
+ *  Mutates `lastMovedWall` / `unstickUntilWall` on the passed-in object. */
+interface UnstickTarget {
+  car: CarHandle;
+  lastMovedWall: number;
+  unstickUntilWall: number;
+}
+
+/** Detect a wedged AI car (speed ≈ 0 for too long) and apply a short
+ *  reverse burst to back away from whatever wall the chassis is pinned
+ *  against. Returns true when controls were applied this tick (caller
+ *  should skip its normal plan-following).
+ *
+ *  The burst alternates direction by car id so two cars stuck against
+ *  each other don't both reverse the same way and re-wedge. */
+function maybeUnstick(
+  target: UnstickTarget,
+  state: VehicleState,
+  now: number,
+): boolean {
+  // Active burst — keep applying reverse controls until it elapses.
+  if (target.unstickUntilWall > now) {
+    // Counter-steer based on a stable hash of the car id so the squad
+    // fans out instead of all reversing in the same arc.
+    const sign = (target.car.id.charCodeAt(target.car.id.length - 1) % 2) * 2 - 1;
+    target.car.applyControls({ steer: 0.4 * sign, throttle: -0.7, brake: 0 });
+    return true;
+  }
+  // Not actively bursting — update the moved-recently timestamp and
+  // (re)arm the burst if the wedge condition holds.
+  if (Math.abs(state.speed) > STUCK_SPEED) {
+    target.lastMovedWall = now;
+    return false;
+  }
+  if (now - target.lastMovedWall > STUCK_TRIGGER_MS) {
+    target.unstickUntilWall = now + UNSTICK_BURST_MS;
+    // Reset the moved timer so we don't re-arm immediately after the
+    // burst ends (give it some time to actually move).
+    target.lastMovedWall = now;
+    const sign = (target.car.id.charCodeAt(target.car.id.length - 1) % 2) * 2 - 1;
+    target.car.applyControls({ steer: 0.4 * sign, throttle: -0.7, brake: 0 });
+    return true;
+  }
+  return false;
 }
 
 // CARCHASE_AGENT is re-exported so the rapierVehicle helper can keep its
