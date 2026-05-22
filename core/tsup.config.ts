@@ -14,6 +14,7 @@ const entry = {
   'adapters/navcat/index': 'src/adapters/navcat/index.ts',
   'adapters/rapier/index': 'src/adapters/rapier/index.ts',
   'adapters/three/index': 'src/adapters/three/index.ts',
+  'worker/index': 'src/worker/index.ts',
 };
 
 export default defineConfig([

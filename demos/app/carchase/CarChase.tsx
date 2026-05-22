@@ -11,11 +11,14 @@ import {
 } from 'kinocat/predict';
 import type { Predict, MovingObstacle } from 'kinocat/predict';
 import type { VehicleState } from 'kinocat/agent';
+import type { ObstacleDescriptor, WorkerPlanResponse } from 'kinocat/worker';
 import {
   CARCHASE_AGENT,
   CARCHASE_BOUNDS,
+  CARCHASE_LIB,
   CARCHASE_PALETTE as C,
   buildCarChaseCourse,
+  dehydrateObstacle,
   planCarChaseAI,
   predictRobberFromState,
   robberGoal,
@@ -25,6 +28,7 @@ import {
   type CarChaseCourse,
   type CopTacticalMode,
 } from '../lib/carchase-scenarios';
+import { CarChasePlannerHost } from './plannerWorkerHost';
 import {
   createCarChaseWorld,
   ensureRapier,
@@ -185,9 +189,24 @@ export default function CarChase() {
     let cleanup: (() => void) | null = null;
 
     (async () => {
-      await ensureRapier();
-      if (disposed) return;
-      cleanup = setupScene(mount);
+      // Init Rapier + planner worker in parallel.
+      const workerHost = new CarChasePlannerHost();
+      const course = buildCarChaseCourse();
+      const [, useWorker] = await Promise.all([
+        ensureRapier(),
+        workerHost
+          .init(course, CARCHASE_AGENT, CARCHASE_LIB)
+          .then(() => true)
+          .catch((err) => {
+            console.warn('Planner worker unavailable, using main-thread fallback:', err);
+            return false;
+          }),
+      ]);
+      if (disposed) {
+        workerHost.dispose();
+        return;
+      }
+      cleanup = setupScene(mount, course, useWorker ? workerHost : null);
       setReady(true);
     })();
 
@@ -199,7 +218,11 @@ export default function CarChase() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function setupScene(mount: HTMLDivElement): () => void {
+  function setupScene(
+    mount: HTMLDivElement,
+    course: CarChaseCourse,
+    workerHost: CarChasePlannerHost | null,
+  ): () => void {
     const W0 = window.innerWidth;
     const H0 = window.innerHeight;
 
@@ -226,7 +249,6 @@ export default function CarChase() {
     scene.add(sun);
 
     // ---- course + physics ------------------------------------------------
-    const course: CarChaseCourse = buildCarChaseCourse();
     const physics = createCarChaseWorld(course);
     const world = physics.world;
 
@@ -464,12 +486,69 @@ export default function CarChase() {
     }
 
     // ---- planning helpers ----------------------------------------------
-    function planRobber(now: number) {
+    // Track in-flight worker requests so we don't double-dispatch.
+    const inflightReqIds = new Map<string, number>();
+    const inflightSendTimes = new Map<number, number>();
+    let nextReqId = 0;
+
+    function applyPlanResult(
+      npcId: string,
+      resp: { found: boolean; path: VehicleState[]; stats: { expansions: number } },
+      budgetMs: number,
+    ) {
+      if (npcId === 'robber') {
+        robber.lastBudgetMs = budgetMs;
+        robber.lastExpansions = resp.stats.expansions;
+        robber.lastReplanWall = performance.now();
+        if (resp.found && resp.path.length > 1) {
+          robber.plan = resp.path;
+          robber.planStartWall = performance.now();
+          registry.publish('robber', resp.path);
+          if (showPathsRef.current)
+            robberPathLine = replacePathLine(robberPathLine, resp.path, C.robberPath);
+        }
+      } else {
+        const ci = cops.findIndex((c) => c.id === npcId);
+        if (ci < 0) return;
+        const co = cops[ci]!;
+        co.lastBudgetMs = budgetMs;
+        co.lastExpansions = resp.stats.expansions;
+        co.lastReplanWall = performance.now();
+        if (resp.found && resp.path.length > 1) {
+          co.plan = resp.path;
+          co.planStartWall = performance.now();
+          registry.publish(co.id, resp.path);
+          if (showPathsRef.current)
+            copPathLines[ci] = replacePathLine(
+              copPathLines[ci] ?? null,
+              resp.path,
+              C.copPath,
+            );
+        }
+      }
+    }
+
+    // Wire up async result handler when using worker.
+    if (workerHost) {
+      workerHost.onResult((resp: WorkerPlanResponse) => {
+        const currentReqId = inflightReqIds.get(resp.npcId);
+        if (currentReqId !== resp.reqId) return; // stale
+        inflightReqIds.delete(resp.npcId);
+        const sendTime = inflightSendTimes.get(resp.reqId) ?? performance.now();
+        inflightSendTimes.delete(resp.reqId);
+        const budgetMs = performance.now() - sendTime;
+        applyPlanResult(resp.npcId, resp, budgetMs);
+      });
+    }
+
+    function prepareRobberReplan(now: number): {
+      npcId: string;
+      start: VehicleState;
+      goal: VehicleState;
+      obstacles: ObstacleDescriptor[];
+    } | null {
+      if (playerDrivingRef.current) return null;
       const robberState = robber.car.readState(now);
-      // Stuck detector: if the AI robber's been crawling for too long,
-      // skip the current waypoint before computing a new goal. Cleared
-      // every replan where we observe meaningful motion. (Player-driven
-      // mode never reaches planRobber, so this only fires for the AI.)
       if (Math.abs(robberState.speed) > ROBBER_STUCK_SPEED) {
         robber.lastMovedWall = now;
       } else if (now - robber.lastMovedWall > ROBBER_STUCK_MS) {
@@ -485,107 +564,109 @@ export default function CarChase() {
         course,
       );
       robber.loopIndex = pick.nextIndex;
-      const obstacles: MovingObstacle[] = cops.map((co) =>
-        asObstacle(
-          registry.predictNPC(co.id) as Predict<{ x: number; z: number }> | null
-            ? (registry.predictNPC(co.id) as Predict<{ x: number; z: number }>)
-            : constantVelocity(co.car.readState(now), 4),
-          2.6,
-        ),
-      );
-      const t0 = performance.now();
-      const res = planCarChaseAI({
-        npcId: 'robber',
-        state: { ...robberState, t: 0 },
-        goal: { ...pick.goal, t: 0 },
-        movingObstacles: obstacles,
-        registry,
-        course,
-      });
-      const dt = performance.now() - t0;
-      robber.lastBudgetMs = dt;
-      robber.lastExpansions = res.stats.expansions;
-      robber.lastReplanWall = now;
       robber.goal = pick.goal;
-      if (res.found && res.path.length > 1) {
-        robber.plan = res.path;
-        robber.planStartWall = now;
-        registry.publish('robber', res.path);
-        if (showPathsRef.current)
-          robberPathLine = replacePathLine(robberPathLine, res.path, C.robberPath);
-      }
+      const obstacles: ObstacleDescriptor[] = cops.map((co) =>
+        dehydrateObstacle(co.id, registry, co.car.readState(now), 2.6, 4),
+      );
+      return {
+        npcId: 'robber',
+        start: { ...robberState, t: 0 },
+        goal: { ...pick.goal, t: 0 },
+        obstacles,
+      };
     }
 
-    function planCop(co: CopAI, copIndex: number, now: number) {
+    function prepareCopReplan(co: CopAI, copIndex: number, now: number): {
+      npcId: string;
+      start: VehicleState;
+      goal: VehicleState;
+      obstacles: ObstacleDescriptor[];
+    } {
       const robberState = robber.car.readState(now);
       const copState = co.car.readState(now);
       const mode = selectTacticalMode(robberState, copState, copIndex);
-      // Predict the robber from its published plan first; constant-velocity
-      // fallback so cops still have something to chase before the robber
-      // finishes its first plan.
-      // Horizon must exceed the tactical-goal `eta` (max 6 s) or
-      // `tacticalGoal` quietly falls back to robber's CURRENT pose for
-      // anything past 4 s — fine for nearby cops, but for player-driven
-      // mode this stops cops from leading the robber's predicted path.
       const robberPredict: Predict<VehicleState> = (t) => {
         const p = registry.predictNPC('robber')(t) as VehicleState | null;
         return p ?? predictRobberFromState(robberState, 8)(t);
       };
       const goal = tacticalGoal(robberState, robberPredict, copState, mode, course.buildings, course);
+      co.mode = mode;
+      co.goal = goal;
       const siblingIds = cops
         .filter((o) => o.id !== co.id)
         .map((o) => o.id);
-      const obstacles: MovingObstacle[] = [
-        asObstacle(robberPredict, 2.6),
-        ...siblingIds.map((sid) =>
-          asObstacle(
-            registry.predictNPC(sid) as Predict<{ x: number; z: number }>,
-            2.6,
-          ),
-        ),
+      const obstacles: ObstacleDescriptor[] = [
+        dehydrateObstacle('robber', registry, robberState, 2.6, 8),
+        ...siblingIds.map((sid) => {
+          const sibCop = cops.find((c) => c.id === sid)!;
+          return dehydrateObstacle(sid, registry, sibCop.car.readState(now), 2.6, 4);
+        }),
       ];
-      const t0 = performance.now();
-      const res = planCarChaseAI({
+      return {
         npcId: co.id,
-        state: { ...copState, t: 0 },
+        start: { ...copState, t: 0 },
         goal: { ...goal, t: 0 },
-        movingObstacles: obstacles,
-        registry,
-        course,
-      });
-      const dt = performance.now() - t0;
-      co.mode = mode;
-      co.goal = goal;
-      co.lastBudgetMs = dt;
-      co.lastExpansions = res.stats.expansions;
-      co.lastReplanWall = now;
-      if (res.found && res.path.length > 1) {
-        co.plan = res.path;
-        co.planStartWall = now;
-        registry.publish(co.id, res.path);
-        if (showPathsRef.current)
-          copPathLines[copIndex] = replacePathLine(
-            copPathLines[copIndex] ?? null,
-            res.path,
-            C.copPath,
-          );
-      }
+        obstacles,
+      };
     }
 
     // ---- replan scheduler ----------------------------------------------
-    // Round-robin across robber + cops. The robber gets a slot every other
-    // tick so it keeps moving smartly.
+    // Round-robin across robber + cops. When a worker is available, dispatch
+    // is non-blocking; results arrive asynchronously via onResult. Otherwise
+    // fall back to synchronous main-thread planning.
     let replanCursor = 0;
     const replanTimer = window.setInterval(() => {
       if (pausedRef.current) return;
       const now = performance.now();
       const slot = replanCursor % (NUM_COPS + 1);
+
       if (slot === 0) {
-        if (!playerDrivingRef.current) planRobber(now);
+        const prep = prepareRobberReplan(now);
+        if (!prep) { replanCursor += 1; return; }
+        if (workerHost) {
+          if (inflightReqIds.has('robber')) { replanCursor += 1; return; }
+          const reqId = nextReqId++;
+          inflightReqIds.set('robber', reqId);
+          inflightSendTimes.set(reqId, performance.now());
+          workerHost.requestPlan({ type: 'plan', reqId, ...prep });
+        } else {
+          // Synchronous fallback.
+          const obstacles: MovingObstacle[] = prep.obstacles.map((d) =>
+            d.kind === 'plan'
+              ? (() => { const r = new PlanRegistry(); r.publish('_', d.path); return asObstacle(r.predictNPC('_'), d.radius); })()
+              : asObstacle(constantVelocity(d.state, d.horizon), d.radius),
+          );
+          const t0 = performance.now();
+          const res = planCarChaseAI({
+            npcId: 'robber', state: prep.start, goal: prep.goal,
+            movingObstacles: obstacles, registry, course,
+          });
+          applyPlanResult('robber', res, performance.now() - t0);
+        }
       } else {
         const ci = (slot - 1) % NUM_COPS;
         const co = cops[ci]!;
-        if (co.capturedAtWall + CAPTURE_COOLDOWN_MS < now) planCop(co, ci, now);
+        if (co.capturedAtWall + CAPTURE_COOLDOWN_MS > now) { replanCursor += 1; return; }
+        const prep = prepareCopReplan(co, ci, now);
+        if (workerHost) {
+          if (inflightReqIds.has(co.id)) { replanCursor += 1; return; }
+          const reqId = nextReqId++;
+          inflightReqIds.set(co.id, reqId);
+          inflightSendTimes.set(reqId, performance.now());
+          workerHost.requestPlan({ type: 'plan', reqId, ...prep });
+        } else {
+          const obstacles: MovingObstacle[] = prep.obstacles.map((d) =>
+            d.kind === 'plan'
+              ? (() => { const r = new PlanRegistry(); r.publish('_', d.path); return asObstacle(r.predictNPC('_'), d.radius); })()
+              : asObstacle(constantVelocity(d.state, d.horizon), d.radius),
+          );
+          const t0 = performance.now();
+          const res = planCarChaseAI({
+            npcId: co.id, state: prep.start, goal: prep.goal,
+            movingObstacles: obstacles, registry, course,
+          });
+          applyPlanResult(co.id, res, performance.now() - t0);
+        }
       }
       replanCursor += 1;
     }, REPLAN_INTERVAL_MS);
@@ -867,6 +948,7 @@ export default function CarChase() {
     return () => {
       stopped = true;
       window.clearInterval(replanTimer);
+      workerHost?.dispose();
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('resize', onResize);

@@ -34,6 +34,7 @@ import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
 import type { VehicleAgent, VehicleState } from 'kinocat/agent';
 import { characterizeVehicle } from 'kinocat/primitives';
 import { MotionPrimitiveLibrary } from 'kinocat/primitives';
+import type { ObstacleDescriptor } from 'kinocat/worker';
 
 // ---------------------------------------------------------------------------
 // Palette — kept on this module so headless asserts can reference it too.
@@ -722,6 +723,25 @@ export function planCarChaseAI(
     deadlineMs: req.deadlineMs ?? CARCHASE_REPLAN_BUDGET_MS,
     maxExpansions: req.maxExpansions ?? CARCHASE_MAX_EXPANSIONS,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Obstacle dehydration — extracts the data backing a MovingObstacle closure
+// into a plain-data ObstacleDescriptor for structured-clone transfer to a
+// Web Worker. The worker rehydrates via `rehydrateObstacle()`.
+
+export function dehydrateObstacle(
+  npcId: string,
+  registry: PlanRegistry,
+  fallbackState: VehicleState,
+  radius: number,
+  horizon = 4,
+): ObstacleDescriptor {
+  const pub = registry.get(npcId);
+  if (pub && pub.states.length > 0) {
+    return { kind: 'plan', path: pub.states as VehicleState[], radius };
+  }
+  return { kind: 'cv', state: fallbackState, horizon, radius };
 }
 
 // ---------------------------------------------------------------------------
