@@ -607,10 +607,13 @@ export function robberGoal(
   buildings?: BuildingSpec[],
   course?: CarChaseCourse,
 ): { goal: VehicleState; nextIndex: number } {
-  // 1. Advance to the next waypoint once close enough to the current one.
+  // 1. Advance to the next waypoint well before reaching the current one.
+  //    At maxSpeed 14 m/s, 20 m gives ~1.4 s of lead time — enough for a
+  //    full replan cycle (~440 ms worst case) so the robber never pauses.
+  const ROBBER_WP_ADVANCE_DIST = 20;
   const wp = loop[loopIndex]!;
   const reach = Math.hypot(robber.x - wp.x, robber.z - wp.z);
-  let useIdx = reach < 8 ? (loopIndex + 1) % loop.length : loopIndex;
+  let useIdx = reach < ROBBER_WP_ADVANCE_DIST ? (loopIndex + 1) % loop.length : loopIndex;
 
   // 2. Skip forward through the loop past any waypoint a cop is camping
   //    on. Bounded by ROBBER_MAX_WP_SKIPS so we don't spin forever when

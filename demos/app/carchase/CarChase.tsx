@@ -681,6 +681,31 @@ export default function CarChase() {
     const replanTimer = window.setInterval(() => {
       if (pausedRef.current) return;
       const now = performance.now();
+
+      // Emergency robber replan: if the active plan is nearly exhausted,
+      // steal this slot so the robber never runs out of plan mid-chase.
+      if (
+        !playerDrivingRef.current &&
+        workerHost &&
+        !inflightReqIds.has('robber') &&
+        robber.plan &&
+        robber.plan.length > 0
+      ) {
+        const elapsed = (now - robber.planStartWall) / 1000;
+        const planEnd = robber.plan[robber.plan.length - 1]!.t;
+        if (planEnd - elapsed < 0.6) {
+          const prep = prepareRobberReplan(now);
+          if (prep) {
+            const reqId = nextReqId++;
+            inflightReqIds.set('robber', reqId);
+            inflightSendTimes.set(reqId, performance.now());
+            workerHost.requestPlan({ type: 'plan', reqId, ...prep });
+            replanCursor += 1;
+            return;
+          }
+        }
+      }
+
       const slot = replanCursor % (NUM_COPS + 1);
 
       if (slot === 0) {
@@ -791,8 +816,17 @@ export default function CarChase() {
         if (live.length >= 2) {
           const cmd = planToControls(robberState, live);
           robber.car.applyControls(cmd);
+        } else if (robber.goal) {
+          // Plan exhausted — steer toward the goal at moderate speed so the
+          // robber keeps moving while a new plan is computed.
+          const dx = robber.goal.x - robberState.x;
+          const dz = robber.goal.z - robberState.z;
+          const bearing = Math.atan2(dz, dx) - robberState.heading;
+          const wrapped = Math.atan2(Math.sin(bearing), Math.cos(bearing));
+          const steer = Math.max(-0.55, Math.min(0.55, wrapped / 0.8));
+          robber.car.applyControls({ steer, throttle: 0.5, brake: 0 });
         } else {
-          robber.car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
+          robber.car.applyControls({ steer: 0, throttle: 0.3, brake: 0 });
         }
       } else {
         // No plan yet — coast in neutral instead of idling forward. The old
