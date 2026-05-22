@@ -80,6 +80,11 @@ interface CopAI {
   // burst-reversing. Set when stuck-trigger fires, cleared when burst
   // duration elapses.
   unstickUntilWall: number;
+  // Auto-reset tracking: how many reverse bursts fired in the current window.
+  burstCount: number;
+  firstBurstWall: number;
+  lastResetWall: number;
+  tiltedSinceWall: number;
 }
 
 interface RobberAI {
@@ -99,6 +104,11 @@ interface RobberAI {
   // Same role as `CopAI.unstickUntilWall` — wall-clock the active reverse
   // burst ends; -Infinity when not burst-reversing.
   unstickUntilWall: number;
+  // Auto-reset tracking.
+  burstCount: number;
+  firstBurstWall: number;
+  lastResetWall: number;
+  tiltedSinceWall: number;
 }
 
 interface Score {
@@ -142,6 +152,14 @@ const ROBBER_STUCK_SPEED = 0.6;
 const STUCK_SPEED = 0.6;
 const STUCK_TRIGGER_MS = 1200;
 const UNSTICK_BURST_MS = 700;
+// Auto-reset — last-resort teleport back to spawn when the reverse burst
+// can't free the car (repeated failures) or the car is flipped/fallen.
+const RESET_BURST_THRESHOLD = 3;
+const RESET_BURST_WINDOW_MS = 6000;
+const RESET_FLIP_MS = 2000;
+const RESET_FLIP_UP_Y = 0.5;
+const RESET_FALL_Y = -10;
+const RESET_COOLDOWN_MS = 5000;
 
 const COP_COLORS = [0xff5566, 0xffaa44, 0xff66dd];
 
@@ -172,6 +190,7 @@ export default function CarChase() {
   const showRapierDebugRef = useRef(showRapierDebug);
   const playerDrivingRef = useRef(playerDriving);
   const resetRef = useRef<(() => void) | null>(null);
+  const resetCarRef = useRef<(() => void) | null>(null);
   pausedRef.current = paused;
   chaseRef.current = chase;
   showPathsRef.current = showPaths;
@@ -345,6 +364,10 @@ export default function CarChase() {
       lastBudgetMs: 0,
       lastMovedWall: performance.now(),
       unstickUntilWall: -Infinity,
+      burstCount: 0,
+      firstBurstWall: -Infinity,
+      lastResetWall: -Infinity,
+      tiltedSinceWall: -Infinity,
     };
     const cops: CopAI[] = [];
     for (let i = 0; i < NUM_COPS; i++) {
@@ -370,6 +393,10 @@ export default function CarChase() {
         contactSinceWall: -Infinity,
         lastMovedWall: performance.now(),
         unstickUntilWall: -Infinity,
+        burstCount: 0,
+        firstBurstWall: -Infinity,
+        lastResetWall: -Infinity,
+        tiltedSinceWall: -Infinity,
       });
     }
 
@@ -439,8 +466,10 @@ export default function CarChase() {
       if (k === '4') setShowRapierDebug((v) => !v);
       if (k === 't') setPlayerDriving((v) => !v);
       if (k === 'r') reset();
+      if (k === 'f') resetCar();
     };
     resetRef.current = reset;
+    resetCarRef.current = resetCar;
     const onKeyUp = (e: KeyboardEvent) => keys.delete(e.key.toLowerCase());
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
@@ -456,6 +485,10 @@ export default function CarChase() {
       robber.loopIndex = 0;
       robber.lastMovedWall = performance.now();
       robber.unstickUntilWall = -Infinity;
+      robber.burstCount = 0;
+      robber.firstBurstWall = -Infinity;
+      robber.lastResetWall = -Infinity;
+      robber.tiltedSinceWall = -Infinity;
       for (let i = 0; i < cops.length; i++) {
         const s = p.cops[i % p.cops.length]!;
         cops[i]!.car.teleport({ x: s.x, z: s.z, heading: s.heading });
@@ -464,6 +497,10 @@ export default function CarChase() {
         cops[i]!.contactSinceWall = -Infinity;
         cops[i]!.lastMovedWall = performance.now();
         cops[i]!.unstickUntilWall = -Infinity;
+        cops[i]!.burstCount = 0;
+        cops[i]!.firstBurstWall = -Infinity;
+        cops[i]!.lastResetWall = -Infinity;
+        cops[i]!.tiltedSinceWall = -Infinity;
       }
       registry.publish('robber', []);
       for (const co of cops) registry.publish(co.id, []);
@@ -471,6 +508,32 @@ export default function CarChase() {
       scoreRef.round = 1;
       setScore({ ...scoreRef });
       flashBanner('Reset', '#9bd0ff', 800);
+    }
+
+    function resetCar() {
+      resetCarInPlace(robber);
+      registry.publish('robber', []);
+      flashBanner('Car Reset!', '#ffcc44', 800);
+    }
+
+    /** Reset a single car in-place: fix rotation to upright, nudge back
+     *  slightly along the heading to clear whatever it's stuck on. */
+    function resetCarInPlace(target: UnstickTarget & { plan: VehicleState[] | null }) {
+      const state = target.car.readState(performance.now());
+      // Nudge 3 m backward along heading to clear the obstacle.
+      const nudge = 3;
+      target.car.teleport({
+        x: state.x - Math.cos(state.heading) * nudge,
+        z: state.z - Math.sin(state.heading) * nudge,
+        heading: state.heading,
+      });
+      target.plan = null;
+      target.lastMovedWall = performance.now();
+      target.unstickUntilWall = -Infinity;
+      target.burstCount = 0;
+      target.firstBurstWall = -Infinity;
+      target.lastResetWall = performance.now();
+      target.tiltedSinceWall = -Infinity;
     }
 
     const scoreRef = { busts: 0, round: 1 };
@@ -698,7 +761,12 @@ export default function CarChase() {
       const copStates = cops.map((co) => co.car.readState(now));
 
       // ---- drive each car (set wheel forces BEFORE world.step) ----
-      if (playerDrivingRef.current) {
+      // Auto-reset check runs for all cars regardless of control mode —
+      // detects flips, falls, and repeated stuck failures.
+      const sp = spawnPoses();
+      if (maybeAutoReset(robber, sp.robber, now)) {
+        registry.publish('robber', []);
+      } else if (playerDrivingRef.current) {
         // Player drives robber with WASD. ArrowKeys mirror WASD so the demo
         // works regardless of layout. Space = handbrake.
         const accel =
@@ -735,6 +803,11 @@ export default function CarChase() {
       }
       for (let i = 0; i < cops.length; i++) {
         const co = cops[i]!;
+        const copSpawn = sp.cops[i % sp.cops.length]!;
+        if (maybeAutoReset(co, copSpawn, now)) {
+          registry.publish(co.id, []);
+          continue;
+        }
         if (co.capturedAtWall + CAPTURE_COOLDOWN_MS > now) {
           co.car.applyControls({ steer: 0, throttle: 0, brake: 1 });
           // Don't accumulate "stuck" time during the post-bust freeze.
@@ -834,6 +907,10 @@ export default function CarChase() {
         robber.plan = null;
         robber.loopIndex = 0;
         robber.lastMovedWall = now;
+        robber.unstickUntilWall = -Infinity;
+        robber.burstCount = 0;
+        robber.firstBurstWall = -Infinity;
+        robber.tiltedSinceWall = -Infinity;
         // Also reset the OTHER cops' contact timers — the robber just
         // teleported, so any in-progress hold from a sibling is stale.
         for (const other of cops) if (other !== co) other.contactSinceWall = -Infinity;
@@ -1070,13 +1147,18 @@ export default function CarChase() {
             onClick={() => setShowRapierDebug((v) => !v)}
           />
           <ActionButton
-            label="reset"
+            label="reset all"
             shortcut="r"
             onClick={() => resetRef.current?.()}
           />
+          <ActionButton
+            label="reset car"
+            shortcut="f"
+            onClick={() => resetCarRef.current?.()}
+          />
         </div>
         <div style={{ opacity: 0.55, marginTop: 8, fontSize: 11 }}>
-          [wasd] drive · [space] brake
+          [wasd] drive · [space] brake · [f] reset car
         </div>
       </div>
       {banner && (
@@ -1118,6 +1200,10 @@ interface UnstickTarget {
   car: CarHandle;
   lastMovedWall: number;
   unstickUntilWall: number;
+  burstCount: number;
+  firstBurstWall: number;
+  lastResetWall: number;
+  tiltedSinceWall: number;
 }
 
 /** Detect a wedged AI car (speed ≈ 0 for too long) and apply a short
@@ -1151,11 +1237,83 @@ function maybeUnstick(
     // Reset the moved timer so we don't re-arm immediately after the
     // burst ends (give it some time to actually move).
     target.lastMovedWall = now;
+    // Track burst count for auto-reset escalation.
+    if (now - target.firstBurstWall > RESET_BURST_WINDOW_MS) {
+      target.burstCount = 1;
+      target.firstBurstWall = now;
+    } else {
+      target.burstCount++;
+    }
     const sign = (target.car.id.charCodeAt(target.car.id.length - 1) % 2) * 2 - 1;
     target.car.applyControls({ steer: 0.4 * sign, throttle: -0.7, brake: 0 });
     return true;
   }
   return false;
+}
+
+/** Last-resort auto-reset: fix the car in-place when it's hopelessly stuck
+ *  (repeated burst failures), flipped on its side, or fallen off the map.
+ *  Nudges the car backward along its heading to clear the obstacle.
+ *  Falls back to spawnPose only when the car is off-world. */
+function maybeAutoReset(
+  target: UnstickTarget & { plan: VehicleState[] | null },
+  spawnPose: { x: number; z: number; heading: number },
+  now: number,
+): boolean {
+  if (now - target.lastResetWall < RESET_COOLDOWN_MS) return false;
+
+  const t = target.car.chassis.translation();
+  const q = target.car.chassis.rotation();
+  // Up-vector Y component from quaternion: how upright the chassis is.
+  const upY = 1 - 2 * (q.x * q.x + q.z * q.z);
+
+  let shouldReset = false;
+  let useSpawn = false;
+
+  // Fallen off the world — teleport back to spawn since position is invalid.
+  if (t.y < RESET_FALL_Y) {
+    shouldReset = true;
+    useSpawn = true;
+  }
+
+  // Flipped/tilted for too long.
+  if (upY < RESET_FLIP_UP_Y) {
+    if (target.tiltedSinceWall === -Infinity) target.tiltedSinceWall = now;
+    if (now - target.tiltedSinceWall > RESET_FLIP_MS) shouldReset = true;
+  } else {
+    target.tiltedSinceWall = -Infinity;
+  }
+
+  // Repeated burst failures within the window.
+  if (
+    target.burstCount >= RESET_BURST_THRESHOLD &&
+    now - target.firstBurstWall <= RESET_BURST_WINDOW_MS
+  ) {
+    shouldReset = true;
+  }
+
+  if (!shouldReset) return false;
+
+  if (useSpawn) {
+    target.car.teleport(spawnPose);
+  } else {
+    // Reset in-place: fix rotation, nudge 3 m backward along heading.
+    const state = target.car.readState(now);
+    const nudge = 3;
+    target.car.teleport({
+      x: state.x - Math.cos(state.heading) * nudge,
+      z: state.z - Math.sin(state.heading) * nudge,
+      heading: state.heading,
+    });
+  }
+  target.plan = null;
+  target.lastMovedWall = now;
+  target.unstickUntilWall = -Infinity;
+  target.burstCount = 0;
+  target.firstBurstWall = -Infinity;
+  target.lastResetWall = now;
+  target.tiltedSinceWall = -Infinity;
+  return true;
 }
 
 // CARCHASE_AGENT is re-exported so the rapierVehicle helper can keep its
