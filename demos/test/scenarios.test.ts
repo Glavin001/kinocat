@@ -659,12 +659,14 @@ const TESTED_DEMOS = new Set([
   'flagship', // 'flagship demo' — buildFlagship (large multi-agent navcat)
   'humanoid', // 'humanoid demo' — buildHumanoid
   'jumplinks', // 'jumplinks demo' — buildJumpLinks
+  'learnprimitives', // 'learnprimitives demo' — autonomous motion-primitive learner (Rapier)
   'navmesh', // 'navmesh demo' — buildNavmesh / planNavmesh
   'obstaclecourse', // 'obstaclecourse demo' — buildObstacleCourseSnapshot (single-car building-blocks)
   'plane', // 'aircraft demo' — waypoint/canyon/restricted/gauntlet/knife-edge
   'playground', // 'playground demo' — planPlayground
+  'raceprimitives', // 'raceprimitives demo' — side-by-side kinematic vs learned library race
+  'ramp', // 'ramp + affordance demo' — drivable heightfield ramp + planner-only BallisticJump
   'primitives', // 'primitives demo' — buildPrimitiveFan
-  'ramp', // 'ramp + affordance demo' — buildRampSnapshot (drivable ramp + BallisticJump)
   'reverse', // 'reverse demo' — planReverse
   'swarm', // 'swarm demo' — buildSwarm
   'world3d', // 'world3d demo' — planWorld3d

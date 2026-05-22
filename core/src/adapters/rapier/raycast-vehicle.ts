@@ -42,6 +42,13 @@ export interface CarHandle {
   applyControls(c: { steer: number; throttle: number; brake: number }): void;
   /** Hard reset to a pose (e.g. on /R). */
   teleport(pose: { x: number; z: number; heading: number }): void;
+  /** Like {@link teleport} but with a forward speed (m/s) imparted along the
+   *  new heading. Angular velocity is zeroed. Used by the autonomous
+   *  motion-primitive learner to start trials at non-zero speed. */
+  teleportWithSpeed(
+    pose: { x: number; z: number; heading: number },
+    speed: number,
+  ): void;
   dispose(): void;
 }
 
@@ -237,6 +244,19 @@ export function createRaycastVehicle(
     chassis.setAngvel({ x: 0, y: 0, z: 0 }, true);
   }
 
+  function teleportWithSpeed(
+    pose: { x: number; z: number; heading: number },
+    speed: number,
+  ) {
+    chassis.setTranslation({ x: pose.x, y: cy, z: pose.z }, true);
+    chassis.setRotation(yawQuat(pose.heading), true);
+    chassis.setLinvel(
+      { x: speed * Math.cos(pose.heading), y: 0, z: speed * Math.sin(pose.heading) },
+      true,
+    );
+    chassis.setAngvel({ x: 0, y: 0, z: 0 }, true);
+  }
+
   function dispose() {
     world.removeVehicleController(vehicle);
     world.removeRigidBody(chassis);
@@ -249,6 +269,7 @@ export function createRaycastVehicle(
     readState,
     applyControls,
     teleport,
+    teleportWithSpeed,
     dispose,
   };
 }
