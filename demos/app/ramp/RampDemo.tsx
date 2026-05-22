@@ -27,6 +27,8 @@ import {
   createNavBoundsHelper,
   createAgentFootprintHelper,
   createJumpArcHelper,
+  createHeightfieldMeshHelper,
+  createRampChevronsHelper,
   createRapierDebugRenderer,
 } from 'kinocat/adapters/three';
 import {
@@ -162,76 +164,19 @@ export default function RampDemo() {
     const courseVisuals = new THREE.Group();
     scene.add(courseVisuals);
 
-    const w = RAMP_BOUNDS.x1 - RAMP_BOUNDS.x0;
-    const d = RAMP_BOUNDS.z1 - RAMP_BOUNDS.z0;
-    const segX = 120;
-    const segZ = 60;
-    const g = new THREE.PlaneGeometry(w, d, segX, segZ);
-    g.rotateX(-Math.PI / 2);
-    g.translate(mapCx, 0, mapCz);
-    const pos = g.attributes.position as THREE.BufferAttribute;
-    for (let i = 0; i < pos.count; i++) {
-      const x = pos.getX(i);
-      const z = pos.getZ(i);
-      pos.setY(i, sampler(x, z));
-    }
-    pos.needsUpdate = true;
-    g.computeVertexNormals();
-    // Vertex-colour the ramp body brown vs ground blue-grey.
-    const colors = new Float32Array(pos.count * 3);
-    const groundCol = new THREE.Color(C.ground);
-    const rampCol = new THREE.Color(C.ramp);
-    for (let i = 0; i < pos.count; i++) {
-      const y = pos.getY(i);
-      const c = y > 0.05 ? rampCol : groundCol;
-      colors[i * 3 + 0] = c.r;
-      colors[i * 3 + 1] = c.g;
-      colors[i * 3 + 2] = c.b;
-    }
-    g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     courseVisuals.add(
-      new THREE.Mesh(
-        g,
-        new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true }),
-      ),
+      createHeightfieldMeshHelper({
+        bounds: RAMP_BOUNDS,
+        sampler,
+        segmentsX: 120,
+        segmentsZ: 60,
+        groundColor: C.ground,
+        vertexColorAbove: 0.05,
+        aboveColor: C.ramp,
+      }),
     );
-    const grid = new THREE.GridHelper(Math.max(w, d), 24, 0x2a3040, 0x1a1f2c);
-    grid.position.set(mapCx, 0.02, mapCz);
-    courseVisuals.add(grid);
-
-    // Directional chevrons on each ramp surface so the launch direction is
-    // visually unambiguous (otherwise a heightfield ramp viewed from the
-    // chase-cam angle looks like a generic mound).
     for (const r of course.ramps) {
-      const c = Math.cos(r.heading);
-      const s = Math.sin(r.heading);
-      // Three chevrons spaced along the ramp, sized half the ramp width.
-      const chevHalf = r.width * 0.25;
-      for (let k = 1; k <= 3; k++) {
-        const u = k / 4; // 0.25, 0.5, 0.75 along the ramp
-        const along = -r.length / 2 + u * r.length;
-        const cx = r.base.x + along * c;
-        const cz = r.base.z + along * s;
-        // Height at chevron midpoint, plus a tiny lift to avoid z-fighting.
-        const cy = r.height * u + 0.05;
-        // Chevron = "v" pointing along +heading, lying flat on the ramp top.
-        const tipX = cx + chevHalf * 0.7 * c;
-        const tipZ = cz + chevHalf * 0.7 * s;
-        const backLX = cx - chevHalf * 0.7 * c - chevHalf * s;
-        const backLZ = cz - chevHalf * 0.7 * s + chevHalf * c;
-        const backRX = cx - chevHalf * 0.7 * c + chevHalf * s;
-        const backRZ = cz - chevHalf * 0.7 * s - chevHalf * c;
-        const pts = [
-          new THREE.Vector3(backLX, cy, backLZ),
-          new THREE.Vector3(tipX, cy, tipZ),
-          new THREE.Vector3(backRX, cy, backRZ),
-        ];
-        const chev = new THREE.Line(
-          new THREE.BufferGeometry().setFromPoints(pts),
-          new THREE.LineBasicMaterial({ color: 0xffe066, linewidth: 2 }),
-        );
-        courseVisuals.add(chev);
-      }
+      courseVisuals.add(createRampChevronsHelper(r));
     }
 
     // Affordance arc overlay (only when affordances enabled).

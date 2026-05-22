@@ -52,6 +52,10 @@
     "./adapters/three": {
       "types": "./dist/adapters/three/index.d.ts",
       "default": "./dist/adapters/three/index.js"
+    },
+    "./worker": {
+      "types": "./dist/worker/index.d.ts",
+      "default": "./dist/worker/index.js"
     }
   },
   "scripts": {

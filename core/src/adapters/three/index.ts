@@ -14,6 +14,7 @@
 
 import * as THREE from 'three';
 import type { VehicleState } from '../../agent/types';
+import type { HeightSampler, RampSpec } from '../../environment/ramp';
 
 export interface PlanarPoint {
   x: number;
@@ -109,6 +110,142 @@ export function createGroundPlaneHelper(opts: GroundPlaneOptions): THREE.Group {
     );
     grid.position.set(cx, 0.02, cz);
     group.add(grid);
+  }
+  return group;
+}
+
+export interface HeightfieldMeshOptions {
+  bounds: BoundsXZ;
+  sampler: HeightSampler;
+  /** Plane subdivisions along X. Default 60. Bump for sharper ramp lips. */
+  segmentsX?: number;
+  /** Plane subdivisions along Z. Default 60. */
+  segmentsZ?: number;
+  /** Color used when `vertexColorAbove` is undefined or `y <= vertexColorAbove`. */
+  groundColor?: number | string;
+  /** When set, vertices with `y > vertexColorAbove` use `aboveColor` (e.g. a
+   *  brown ramp on blue-grey ground). */
+  vertexColorAbove?: number;
+  /** Color for vertices above the threshold. Defaults to `0x915b3a`. */
+  aboveColor?: number | string;
+  /** Add a grid helper overlay matching the bounds. Default true. */
+  withGrid?: boolean;
+  gridDivisions?: number;
+  gridColor?: number;
+  gridSubColor?: number;
+  flatShading?: boolean;
+}
+
+/** Build a displaced `PlaneGeometry` mesh from a `HeightSampler`, optionally
+ *  vertex-coloured at a height threshold. The same sampler should be fed to
+ *  `createHeightfieldCollider` so physics + visual agree.
+ *
+ *  Note on resolution: keep the segment counts coarser than the Rapier
+ *  heightfield's cellSize (e.g. cellSize=2 -> ~60 segments across a 120 m
+ *  span). Very fine triangulation at sharp ramp lips can WASM-trap the
+ *  raycast-vehicle wheel queries. */
+export function createHeightfieldMeshHelper(
+  opts: HeightfieldMeshOptions,
+): THREE.Group {
+  const w = opts.bounds.x1 - opts.bounds.x0;
+  const d = opts.bounds.z1 - opts.bounds.z0;
+  const cx = (opts.bounds.x0 + opts.bounds.x1) / 2;
+  const cz = (opts.bounds.z0 + opts.bounds.z1) / 2;
+  const segX = opts.segmentsX ?? 60;
+  const segZ = opts.segmentsZ ?? 60;
+  const g = new THREE.PlaneGeometry(w, d, segX, segZ);
+  g.rotateX(-Math.PI / 2);
+  g.translate(cx, 0, cz);
+  const pos = g.attributes.position as THREE.BufferAttribute;
+  for (let i = 0; i < pos.count; i++) {
+    pos.setY(i, opts.sampler(pos.getX(i), pos.getZ(i)));
+  }
+  pos.needsUpdate = true;
+  g.computeVertexNormals();
+  const groundColor = opts.groundColor ?? 0x1a2233;
+  let material: THREE.Material;
+  if (opts.vertexColorAbove !== undefined) {
+    const colors = new Float32Array(pos.count * 3);
+    const lo = new THREE.Color(groundColor);
+    const hi = new THREE.Color(opts.aboveColor ?? 0x915b3a);
+    for (let i = 0; i < pos.count; i++) {
+      const c = pos.getY(i) > opts.vertexColorAbove ? hi : lo;
+      colors[i * 3 + 0] = c.r;
+      colors[i * 3 + 1] = c.g;
+      colors[i * 3 + 2] = c.b;
+    }
+    g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    material = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      flatShading: opts.flatShading ?? true,
+    });
+  } else {
+    material = new THREE.MeshStandardMaterial({
+      color: groundColor,
+      flatShading: opts.flatShading ?? true,
+    });
+  }
+  const group = new THREE.Group();
+  group.add(new THREE.Mesh(g, material));
+  if (opts.withGrid ?? true) {
+    const grid = new THREE.GridHelper(
+      Math.max(w, d),
+      opts.gridDivisions ?? 24,
+      opts.gridColor ?? 0x2a3040,
+      opts.gridSubColor ?? 0x1a1f2c,
+    );
+    grid.position.set(cx, 0.02, cz);
+    group.add(grid);
+  }
+  return group;
+}
+
+export interface RampChevronsOptions {
+  color?: number;
+  /** Number of chevrons along the ramp. Default 3. */
+  count?: number;
+  /** Chevron half-width as a fraction of ramp width. Default 0.25. */
+  widthScale?: number;
+  /** Y lift above ramp surface to avoid z-fighting. Default 0.05. */
+  yLift?: number;
+}
+
+/** Yellow chevrons painted along the top of a drivable ramp so the launch
+ *  direction is unambiguous from any camera angle (heightfield mounds
+ *  otherwise read as generic terrain). */
+export function createRampChevronsHelper(
+  ramp: RampSpec,
+  opts: RampChevronsOptions = {},
+): THREE.Group {
+  const group = new THREE.Group();
+  const color = opts.color ?? 0xffe066;
+  const count = opts.count ?? 3;
+  const widthScale = opts.widthScale ?? 0.25;
+  const yLift = opts.yLift ?? 0.05;
+  const c = Math.cos(ramp.heading);
+  const s = Math.sin(ramp.heading);
+  const chevHalf = ramp.width * widthScale;
+  for (let k = 1; k <= count; k++) {
+    const u = k / (count + 1);
+    const along = -ramp.length / 2 + u * ramp.length;
+    const cx = ramp.base.x + along * c;
+    const cz = ramp.base.z + along * s;
+    const cy = ramp.height * u + yLift;
+    const tipX = cx + chevHalf * 0.7 * c;
+    const tipZ = cz + chevHalf * 0.7 * s;
+    const backLX = cx - chevHalf * 0.7 * c - chevHalf * s;
+    const backLZ = cz - chevHalf * 0.7 * s + chevHalf * c;
+    const backRX = cx - chevHalf * 0.7 * c + chevHalf * s;
+    const backRZ = cz - chevHalf * 0.7 * s - chevHalf * c;
+    const chev = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(backLX, cy, backLZ),
+        new THREE.Vector3(tipX, cy, tipZ),
+        new THREE.Vector3(backRX, cy, backRZ),
+      ]),
+      new THREE.LineBasicMaterial({ color }),
+    );
+    group.add(chev);
   }
   return group;
 }

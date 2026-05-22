@@ -10,8 +10,17 @@
 // `nudgeGoalClear`, `kinocat/adapters/*`) compose cleanly.
 import { planVehicleOnce } from 'kinocat/planner';
 import type { PlanResult } from 'kinocat/planner';
-import { InMemoryNavWorld, nudgeGoalClear } from 'kinocat/environment';
-import type { NavPolygon, NavWorld } from 'kinocat/environment';
+import {
+  InMemoryNavWorld,
+  nudgeGoalClear,
+  jumpSpecFromRamp,
+} from 'kinocat/environment';
+import type {
+  NavPolygon,
+  NavWorld,
+  RampSpec,
+  RampJumpSpec,
+} from 'kinocat/environment';
 import {
   AffordanceRegistry,
   createBoostAffordance,
@@ -44,16 +53,6 @@ export interface ObsBuildingSpec {
   hx: number;
   hz: number;
   height: number;
-}
-
-export interface ObsJumpSpec {
-  id: string;
-  launch: { x: number; z: number };
-  land: { x: number; z: number; heading: number };
-  hx: number;
-  hz: number;
-  height: number;
-  heading: number;
 }
 
 export interface ObsBoostSpec {
@@ -94,7 +93,12 @@ export interface ObstacleCourse {
   polygons: NavPolygon[];
   obstacles: Array<[number, number][]>;
   buildings: ObsBuildingSpec[];
-  jumps: ObsJumpSpec[];
+  /** Drivable heightfield ramps (built via `rampHeightSampler`). Each ramp
+   *  also has a `BallisticJump` Affordance entry so the planner *can* leap
+   *  it instead of climbing — but climbing is the default. */
+  ramps: RampSpec[];
+  /** Affordance launch/land for each ramp, derived from `ramps`. */
+  jumps: RampJumpSpec[];
   boosts: ObsBoostSpec[];
   driftGates: ObsGateSpec[];
   waypoints: VehicleState[];
@@ -139,30 +143,24 @@ export function buildObstacleCourse(
       ]
     : [];
 
-  // Jump ramp: a low cuboid spanning a "no-drive" strip; the affordance lets
-  // the car leap over it instead.
-  const jumps: ObsJumpSpec[] = blocks.ramp
+  // Drivable heightfield ramp. The same `RampSpec` + `rampHeightSampler`
+  // pipeline as the /ramp demo; the affordance is a planner-only shortcut,
+  // physics is always real raycast-vehicle (the car climbs the ramp).
+  const ramps: RampSpec[] = blocks.ramp
     ? [
         {
-          id: 'obs-jump',
-          launch: { x: 15, z: 0 },
-          land: { x: 25, z: 0, heading: 0 },
-          hx: 3,
-          hz: 5,
-          height: 4,
+          id: 'obs-ramp',
+          base: { x: 18, z: 0 },
+          length: 10,
+          width: 6,
+          height: 2,
           heading: 0,
         },
       ]
     : [];
-  // Mirror the ramp footprint as an obstacle so the planner has to take the
-  // jump instead of driving through it.
-  const rampObstacles = jumps.map((j) => ({
-    x: j.launch.x,
-    z: j.launch.z,
-    hx: j.hx,
-    hz: j.hz,
-    height: j.height,
-  }));
+  const jumps: RampJumpSpec[] = ramps.map((r) =>
+    jumpSpecFromRamp(r, { launchDist: 8 }),
+  );
 
   const boosts: ObsBoostSpec[] = blocks.boost
     ? [
@@ -191,9 +189,8 @@ export function buildObstacleCourse(
     : [];
 
   // Collision obstacles passed to the planner: every cuboid the car must go
-  // around. (The heightfield is purely visual + physics in this scenario;
-  // see plan in case-by-case toggle below.)
-  const allBlockers = [...buildings, ...rampObstacles, ...driftPillars];
+  // around. Ramps are NOT in this list — the car drives over them.
+  const allBlockers = [...buildings, ...driftPillars];
   const obstacles: Array<[number, number][]> = allBlockers.map((s) =>
     box(s.x, s.z, s.hx + BUILDING_INFLATE, s.hz + BUILDING_INFLATE),
   );
@@ -218,6 +215,7 @@ export function buildObstacleCourse(
     polygons,
     obstacles,
     buildings: [...buildings, ...driftPillars],
+    ramps,
     jumps,
     boosts,
     driftGates,
