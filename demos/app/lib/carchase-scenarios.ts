@@ -701,7 +701,7 @@ export interface CarChasePlanRequest {
 export const CARCHASE_REPLAN_BUDGET_MS = 120;
 export const CARCHASE_MAX_EXPANSIONS = 25000;
 /** Test budget — generous because the test runs one shot, not interactive. */
-export const CARCHASE_TEST_MAX_EXPANSIONS = 80000;
+export const CARCHASE_TEST_MAX_EXPANSIONS = 25000;
 
 /** Single-shot planning call for one car-chase AI. Thin wrapper around
  *  `kinocat/planner`'s `planVehicleOnce` that pins the course-specific
@@ -823,7 +823,10 @@ export function buildCarChaseSnapshot(): CarChaseSnapshot {
     movingObstacles: robberCopPreds,
     registry,
     course,
-    deadlineMs: Infinity,
+    // 250 ms wall budget is plenty for the spawn matchup and keeps the
+    // test file under the vitest worker RPC timeout when combined with the
+    // other slow scenarios (dogfight + swarm) in this run.
+    deadlineMs: 250,
     maxExpansions: CARCHASE_TEST_MAX_EXPANSIONS,
   });
   if (robberResult.found) registry.publish('robber', robberResult.path);

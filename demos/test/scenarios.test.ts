@@ -45,10 +45,10 @@ import {
   DOGFIGHT_TEST_MAX_EXPANSIONS,
   dogfightAirspace,
 } from '../app/lib/dogfight-scenarios';
-import {
-  buildCarChaseSnapshot,
-  CARCHASE_TEST_MAX_EXPANSIONS,
-} from '../app/lib/carchase-scenarios';
+// Note: carchase scenario tests live in their own file
+// (`demos/test/carchase-scenarios.test.ts`) so they run in a parallel
+// vitest worker — adding them here pushed total wall time past the 60 s
+// birpc RPC timeout in CI.
 import type { VehicleState } from 'kinocat/agent';
 
 // These assert the *exact* configuration the demos ship with always finds a
@@ -645,45 +645,6 @@ describe('dogfight demo: interactive 3D pursuit', () => {
   });
 });
 
-// Car-chase: InMemoryNavWorld + VehicleEnvironment + TimeAwareEnvironment +
-// AffordanceRegistry + PlanRegistry, ground-driving version of the dogfight
-// pursuit. Snapshot asserts robber + every cop produce a plan against the
-// spawn matchup the demo loads with.
-describe('carchase demo: interactive cops & robbers', () => {
-  it('the robber and every cop find a plan against the spawn matchup', () => {
-    const s = buildCarChaseSnapshot();
-    expect(s.cops.length).toBe(3);
-    expect(s.robber.result.found).toBe(true);
-    expect(s.robber.result.path.length).toBeGreaterThanOrEqual(2);
-    expect(s.robber.result.stats.expansions).toBeLessThan(
-      CARCHASE_TEST_MAX_EXPANSIONS,
-    );
-    for (const co of s.cops) {
-      expect(co.result.found).toBe(true);
-      expect(co.result.path.length).toBeGreaterThanOrEqual(2);
-      expect(co.result.stats.expansions).toBeLessThan(
-        CARCHASE_TEST_MAX_EXPANSIONS,
-      );
-      // Time monotonicity along the plan — required by the time-aware env.
-      for (let i = 1; i < co.result.path.length; i++) {
-        expect(co.result.path[i]!.t).toBeGreaterThan(
-          co.result.path[i - 1]!.t - 1e-9,
-        );
-      }
-    }
-  });
-
-  it('the spawn course has every advertised feature wired up', () => {
-    const s = buildCarChaseSnapshot();
-    // Stunt arena features required by the demo description.
-    expect(s.course.jumps.length).toBeGreaterThanOrEqual(1);
-    expect(s.course.boostPads.length).toBeGreaterThanOrEqual(2);
-    expect(s.course.driftGates.length).toBeGreaterThanOrEqual(2);
-    expect(s.course.robberLoop.length).toBeGreaterThanOrEqual(6);
-    expect(s.course.buildings.length).toBeGreaterThan(8);
-  });
-});
-
 // Coverage manifest: every demo route under demos/app/<slug>/page.tsx MUST
 // have a headless scenario asserted above. This fails CI if a new demo ships
 // without a test (or if a tested demo is deleted), so "all demos are covered"
@@ -703,6 +664,7 @@ const TESTED_DEMOS = new Set([
   'plane', // 'aircraft demo' — waypoint/canyon/restricted/gauntlet/knife-edge
   'playground', // 'playground demo' — planPlayground
   'primitives', // 'primitives demo' — buildPrimitiveFan
+  'ramp', // 'ramp + affordance demo' — buildRampSnapshot (drivable ramp + BallisticJump)
   'reverse', // 'reverse demo' — planReverse
   'swarm', // 'swarm demo' — buildSwarm
   'world3d', // 'world3d demo' — planWorld3d

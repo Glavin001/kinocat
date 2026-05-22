@@ -28,9 +28,11 @@ describe('ramp + affordance demo', () => {
     expect(sampler(r.base.x + r.length / 2, 0)).toBeCloseTo(r.height, 1);
     // Foot of the up-slope is at ground level.
     expect(sampler(r.base.x - r.length / 2, 0)).toBeCloseTo(0, 5);
-    // Past the crest the sampler returns 0 — heightfield sample-step gives
-    // the lip the car launches off.
-    expect(sampler(r.base.x + r.length / 2 + 1, 0)).toBe(0);
+    // Past the crest the back-slope skirt (~2.5 m) ramps the height down to
+    // 0 over the lip the car launches off; well beyond it the sampler is 0
+    // again. (A vertical lip / triangle would intermittently trap Rapier's
+    // WASM raycaster, so the implementation deliberately smooths it.)
+    expect(sampler(r.base.x + r.length / 2 + 5, 0)).toBe(0);
     // Way out laterally is flat ground too.
     expect(sampler(0, 20)).toBe(0);
   });
