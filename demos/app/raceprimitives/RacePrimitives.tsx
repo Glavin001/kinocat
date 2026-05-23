@@ -30,6 +30,7 @@ import {
 import {
   buildKinematicLibrary,
   buildLearnedRaceLibrary,
+  buildLearnedRaceLibraryV2,
   buildRaceCourse,
   emptyMetrics,
   pickNextWaypoint,
@@ -51,6 +52,15 @@ import {
   summariseKinematicGap,
   type TransitionSample,
 } from '../lib/learn-primitives';
+import { ModelLab } from '../components/ModelLab';
+import {
+  loadV2Model,
+  saveV2Model,
+  clearV2Model,
+  buildV2ModelDownloadUrl,
+  type PersistedV2Model,
+} from '../lib/v2-model-persistence';
+import type { LearnedVehicleModel } from 'kinocat/agent';
 
 const PHYSICS_DT = 1 / 60;
 const VEHICLE_SUBSTEPS = 4;
@@ -211,6 +221,11 @@ export default function RacePrimitives() {
   }>({ kinematic: emptyMetrics(), learned: emptyMetrics() });
   const [learner, setLearner] = useState<LearnerSnapshot | null>(null);
   const [winner, setWinner] = useState<'kinematic' | 'learned' | 'tie' | null>(null);
+  // v2 model state (Phase-2 addition). When `useV2 && v2Model != null`, the
+  // learned car's library is built from v2 instead of legacy.
+  const [v2Model, setV2Model] = useState<LearnedVehicleModel | null>(null);
+  const [v2Meta, setV2Meta] = useState<PersistedV2Model['meta'] | null>(null);
+  const [useV2, setUseV2] = useState(false);
 
   const sceneRef = useRef<{
     cleanup: () => void;
@@ -227,9 +242,18 @@ export default function RacePrimitives() {
     const p = loadLearnedParams();
     setParams(p ?? DEFAULT_LEARNED_PARAMS);
     setPhase('ready');
+    // Also try to load a previously-trained v2 model so the user can
+    // immediately toggle "use v2" without retraining each visit.
+    const v2 = loadV2Model();
+    if (v2) {
+      setV2Model(v2.model);
+      setV2Meta(v2.meta);
+    }
   }, []);
 
   // Mount the Three.js + Rapier scene as soon as initial params are decided.
+  // Also re-mounts when the v2 toggle changes (rebuilds the learned car's
+  // primitive library from the v2 model or back to the legacy path).
   useEffect(() => {
     if (!params || phase === 'loading' || phase === 'learning') return;
     const mount = containerRef.current;
@@ -240,6 +264,9 @@ export default function RacePrimitives() {
       try {
         await ensureRapier();
         if (disposed) return;
+        const learnedLibraryOverride = (useV2 && v2Model)
+          ? buildLearnedRaceLibraryV2(v2Model)
+          : undefined;
         const setup = await setupScene(mount, params, {
           onMetrics: (km, lm) => setMetrics({ kinematic: km, learned: lm }),
           onLearner: (snap) => setLearner(snap),
@@ -247,7 +274,7 @@ export default function RacePrimitives() {
             setWinner(w);
             setPhase('finished');
           },
-        });
+        }, { learnedLibraryOverride });
         sceneRef.current = setup;
         cleanup = setup.cleanup;
       } catch (e) {
@@ -259,7 +286,8 @@ export default function RacePrimitives() {
       cleanup?.();
       sceneRef.current = null;
     };
-  }, [params, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
+    // Re-mount when params, v2 toggle, or v2 model identity change.
+  }, [params, useV2, v2Model, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function runInlineLearn() {
     setError(null);
@@ -348,6 +376,41 @@ export default function RacePrimitives() {
     setPhase('ready');
   }
 
+  function onV2Trained(model: LearnedVehicleModel, diag: import('kinocat/learning').ModelDiagnostics, trialsUsed: number) {
+    const mid1s = diag.openLoopDivergence.find((r) => r.tSec >= 1.0);
+    const legacyMid = diag.baselines['legacyV1']?.find((r) => r.tSec >= 1.0);
+    const kinMid = diag.baselines['kinematic']?.find((r) => r.tSec >= 1.0);
+    const meta: PersistedV2Model['meta'] = {
+      trialsUsed,
+      openLoopRmsAt1s: mid1s?.posRms ?? 0,
+      legacyRmsAt1s: legacyMid?.posRms,
+      kinematicRmsAt1s: kinMid?.posRms,
+      createdAt: Date.now(),
+    };
+    saveV2Model(model, meta);
+    setV2Model(model);
+    setV2Meta(meta);
+  }
+
+  function onV2Clear() {
+    clearV2Model();
+    setV2Model(null);
+    setV2Meta(null);
+    setUseV2(false);
+  }
+
+  function onV2Export() {
+    if (!v2Model || !v2Meta) return;
+    const url = buildV2ModelDownloadUrl(v2Model, v2Meta);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `kinocat-v2-model-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <div
       style={{
@@ -394,6 +457,15 @@ export default function RacePrimitives() {
         {phase === 'learning' && (
           <PretrainOverlay progress={learnProgress} />
         )}
+        <ModelLab
+          onTrained={onV2Trained}
+          loadedMeta={v2Meta}
+          onClearLoaded={v2Meta ? onV2Clear : undefined}
+          onExport={v2Model ? onV2Export : undefined}
+          useV2={useV2}
+          onToggleUseV2={setUseV2}
+          hasV2Model={v2Model !== null}
+        />
       </div>
     </div>
   );
@@ -525,10 +597,21 @@ interface LearnerSnapshot {
   learnedHolding: boolean;
 }
 
+interface SceneOptions {
+  /** When supplied, overrides the legacy `buildLearnedRaceLibrary(params)`
+   *  for the LEARNED car's primitive library. Used to demo the v2 model
+   *  with the same race pipeline. Online refitting is suppressed while this
+   *  override is active (the v2 model is trained offline; mixing online
+   *  refits of the legacy 5-param model would race a stale v1 library while
+   *  the v2-derived primitive library is what the planner is searching). */
+  learnedLibraryOverride?: MotionPrimitiveLibrary;
+}
+
 async function setupScene(
   mount: HTMLDivElement,
   params: LearnedVehicleParams,
   cb: SceneCallbacks,
+  options: SceneOptions = {},
 ): Promise<{
   cleanup: () => void;
   start: () => void;
@@ -559,9 +642,9 @@ async function setupScene(
   const hasPreTrain =
     initialLearnerParams !== DEFAULT_LEARNED_PARAMS &&
     !paramsEqual(initialLearnerParams, DEFAULT_LEARNED_PARAMS);
-  const initialLearnedLib = hasPreTrain
-    ? buildLearnedRaceLibrary(initialLearnerParams)
-    : kinematicLib;
+  const initialLearnedLib = options.learnedLibraryOverride
+    ?? (hasPreTrain ? buildLearnedRaceLibrary(initialLearnerParams) : kinematicLib);
+  const v2Override = Boolean(options.learnedLibraryOverride);
 
   // ---- Per-car setup ----
   function makeCar(
@@ -690,22 +773,28 @@ async function setupScene(
   const kinematic = makeCar('kinematic', kinematicLib, C.kinematic, C.kinematicPath, undefined);
   // Learned car starts with the pre-trained library when available, else
   // with the kinematic library. Either way, it refines per-lap online
-  // using race data via fitParamsOnline.
-  const learned = makeCar('learned', initialLearnedLib, C.learned, C.learnedPath, {
-    params: initialLearnerParams,
-    priorParams: initialLearnerParams,
-    libParams: initialLearnerParams,
-    bestParams: initialLearnerParams,
-    bestLapTime: Number.NaN,
-    bestLapNumber: 0,
-    rollbackActive: false,
-    samples: [],
-    refitCount: 0,
-    rollbackCount: 0,
-    lastFitMs: 0,
-    lastMeanError: 0,
-    refitting: false,
-  });
+  // using race data via fitParamsOnline. When the v2 override is active,
+  // online refitting is suppressed (passing `undefined`) so the offline-
+  // trained v2 library is what's actually driving — mixing in an online
+  // refit of the legacy 5-param model would silently shadow the v2 lib.
+  const learnerState: OnlineLearnerState | undefined = v2Override
+    ? undefined
+    : {
+        params: initialLearnerParams,
+        priorParams: initialLearnerParams,
+        libParams: initialLearnerParams,
+        bestParams: initialLearnerParams,
+        bestLapTime: Number.NaN,
+        bestLapNumber: 0,
+        rollbackActive: false,
+        samples: [],
+        refitCount: 0,
+        rollbackCount: 0,
+        lastFitMs: 0,
+        lastMeanError: 0,
+        refitting: false,
+      };
+  const learned = makeCar('learned', initialLearnedLib, C.learned, C.learnedPath, learnerState);
 
   // ---- Cameras: one perspective chase-cam per car. Stays slightly above and
   // behind the chassis so the user can see the wheels, suspension, and the

@@ -20,7 +20,7 @@ import { planVehicleOnce } from 'kinocat/planner';
 import type { PlanResult } from 'kinocat/planner';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavPolygon, NavWorld } from 'kinocat/environment';
-import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
+import { defaultVehicleAgent, kinematicForwardSim, learnedForwardSimV2 } from 'kinocat/agent';
 import type {
   LearnedVehicleParams,
   VehicleAgent,
@@ -29,6 +29,7 @@ import type {
 import {
   characterizeVehicle,
   MotionPrimitiveLibrary,
+  type ForwardSim,
 } from 'kinocat/primitives';
 import { buildLearnedLibrary } from './learn-primitives';
 
@@ -206,6 +207,46 @@ export function buildLearnedRaceLibrary(
   return buildLearnedLibrary(params, {
     agent: RACE_AGENT,
     controlSets: raceControlSets(RACE_AGENT),
+    startSpeeds: RACE_START_SPEEDS,
+  });
+}
+
+/** v2 race library: wraps the v2 learned forward sim with a small adapter
+ *  that maps the existing race control vocabulary `(curvature, targetSpeed)`
+ *  to v2's native `(steer, driveForce, brakeForce)`. This lets the v2 model
+ *  drop into the existing race pipeline (pure-pursuit + RACE_AGENT
+ *  primitive library shape) without rewriting the execution layer.
+ *
+ *  The adapter is the SAME mapping the original `controlsToWheelCommand`
+ *  in learn-primitives.ts uses, so v2 sees the same kind of controller
+ *  sequence the real racing car would issue. */
+export function buildLearnedRaceLibraryV2(
+  model: import('kinocat/agent').LearnedVehicleModel,
+): MotionPrimitiveLibrary {
+  const wheelBase = 1.6;
+  const inner = learnedForwardSimV2(model);
+  const maxDrive = model.config.maxDriveForce;
+  const maxBrake = model.config.maxBrakeForce;
+  const adapted: ForwardSim<VehicleState> = (s, controls, dt) => {
+    const curvature = controls[0] ?? 0;
+    const targetSpeed = controls[1] ?? 0;
+    const steer = -Math.atan(curvature * (2 * wheelBase));
+    const errMag = Math.abs(targetSpeed) - Math.abs(s.speed);
+    const gear = targetSpeed >= 0 ? 1 : -1;
+    let driveForce = 0;
+    let brakeForce = 0;
+    if (errMag > 0) {
+      driveForce = gear * Math.min(1, errMag / 6) * maxDrive;
+    } else if (errMag < 0) {
+      brakeForce = Math.min(1, -errMag / 8) * maxBrake;
+    }
+    return inner(s, [steer, driveForce, brakeForce], dt);
+  };
+  return characterizeVehicle({
+    forwardSim: adapted,
+    controlSets: raceControlSets(RACE_AGENT),
+    duration: 0.55,
+    substeps: 6,
     startSpeeds: RACE_START_SPEEDS,
   });
 }
