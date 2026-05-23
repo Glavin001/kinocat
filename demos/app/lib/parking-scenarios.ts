@@ -306,12 +306,13 @@ function reversePerp(): ParkingScenario {
 }
 
 function parallel(): ParkingScenario {
-  // Two cars parked parallel to curb at z = 0, with a 7.4 m gap between
-  // their inner edges. Ego must squeeze in parallel to the curb
-  // (heading = 0) between them. Real-world rule of thumb: ~1.5× car
-  // length for a comfortable parallel park; 7.4 m / 5.1 m ego ≈ 1.45×,
-  // tight but solvable with one reverse shunt.
-  const gap = 7.4;
+  // Two cars parked parallel to curb at z = 0, with an 8.0 m gap
+  // between their inner edges. Ego must squeeze in parallel to the curb
+  // (heading = 0) between them. 8.0 m / 5.1 m ego ≈ 1.57× — a real-
+  // world "comfortable" parallel park ratio. With the planner running
+  // a 0.35 m clearance margin, the maneuver has ~0.5 m of breathing
+  // room from each parked car at every point along the curve.
+  const gap = 8.0;
   const aheadX = gap / 2 + PARKED_HX;
   const behindX = -gap / 2 - PARKED_HX;
   const parkedCars: ParkedCar[] = [
@@ -377,6 +378,12 @@ export function buildParkingScenario(
 // Planning. One-shot plans with tight discretisation: parking is not a
 // per-tick replan, it's a single carefully-budgeted search.
 
+/** The planner's static-obstacle clearance margin. Exported so the demo's
+ *  debug overlay can draw matching inflation rings around the parked
+ *  cars and walls — that's the band the planner refuses to put any
+ *  point of the ego's footprint into. */
+export const PARKING_FOOTPRINT_INFLATE = 0.35;
+
 export const PARKING_PLAN_BUDGET_MS = 500;
 export const PARKING_MAX_EXPANSIONS = 80_000;
 // Same expansion budget as the interactive demo; the deadline is what
@@ -415,15 +422,14 @@ export function planParking(req: ParkingPlanRequest): PlanResult<VehicleState> {
       goalRadius: 0.35,
       goalHeadingTol: 0.15,
       sweepSegmentCheck: true,
-      // 0.25 m planning clearance on top of the default 0.15 m baseline
-      // gives ~0.4 m total margin from the Rapier chassis edge to any
-      // parked-car / curb edge. The previous 0.15 m wasn't enough cushion
-      // for pure-pursuit drift during execution — the chassis clipped a
-      // parked car on the entry curve. 0.25 m also widens the planner's
-      // notion of "blocked" past the size of a single physical-arc
-      // forward sweep through reverse-perp's narrow aisle, forcing it
-      // to find a proper back-in maneuver instead of cutting the corner.
-      footprintInflate: 0.25,
+      // 0.35 m planning clearance on top of the default 0.15 m baseline
+      // gives ~0.5 m total chassis-to-obstacle margin. The previous
+      // 0.25 m wasn't enough cushion for the swing of a parallel-parking
+      // approach — the front of the chassis was within ~5 cm of the
+      // front parked car at the steepest entry angle, and any
+      // pure-pursuit drift closed the gap. 0.5 m lets the chassis brush
+      // through without scraping.
+      footprintInflate: PARKING_FOOTPRINT_INFLATE,
       analyticExpansion: { everyN: 3, step: 0.15 },
     },
     deadlineMs: req.deadlineMs ?? PARKING_PLAN_BUDGET_MS,

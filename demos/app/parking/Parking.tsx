@@ -40,6 +40,7 @@ import {
   PARKING_PALETTE as C,
   PARKING_SCENARIOS,
   PARKING_LABELS,
+  PARKING_FOOTPRINT_INFLATE,
   buildParkingScenario,
   planParking,
   type ParkingScenarioId,
@@ -126,6 +127,10 @@ export default function Parking() {
     let scenePhysics: RAPIER.Collider[] = [];
     let sceneVisuals = new THREE.Group();
     scene.add(sceneVisuals);
+    // The obstacle-clearance overlay rings each parked car / wall with
+    // the planner's footprintInflate band; rebuilt per scenario inside
+    // `buildSceneFor` and toggled by the debug HUD button.
+    let sceneObstacleClearance: THREE.Group = new THREE.Group();
 
     function buildSceneFor(s: ParkingScenario) {
       scene.remove(sceneVisuals);
@@ -201,6 +206,25 @@ export default function Parking() {
           }),
         );
       }
+
+      // Debug-only: ring each obstacle with the planner's clearance band.
+      // The planner refuses to put any point of the ego's footprint
+      // inside this band, so the user can read off "the visible chassis
+      // can touch the parked-car wall, but the planning footprint —
+      // which is what the search reasoned about — kept this much margin".
+      sceneObstacleClearance = new THREE.Group();
+      sceneObstacleClearance.visible = showDebugRef.current;
+      for (const obstacle of s.obstacles) {
+        const aabb = polygonAabb(obstacle);
+        sceneObstacleClearance.add(
+          createObstacleClearanceRing(
+            aabb,
+            PARKING_FOOTPRINT_INFLATE,
+            0xff66aa,
+          ),
+        );
+      }
+      sceneVisuals.add(sceneObstacleClearance);
     }
 
     function createStallMarker(stall: ParkingScenario['targetStall']): THREE.Group {
@@ -502,6 +526,7 @@ export default function Parking() {
       if (pathLine) pathLine.visible = showPathRef.current;
 
       debugGroup.visible = showDebugRef.current;
+      sceneObstacleClearance.visible = showDebugRef.current;
       if (showDebugRef.current) {
         footprint.position.set(after.x, 0, after.z);
         footprint.rotation.y = -after.heading;
@@ -676,6 +701,46 @@ function splitAtGearCusps(plan: VehicleState[]): VehicleState[][] {
   }
   if (cur.length >= 2) out.push(cur);
   return out;
+}
+
+/** Axis-aligned bounding box of a 2D polygon — the planner's collision
+ *  obstacles are axis-aligned rectangles already (built via the scenario
+ *  `box(...)` helper) so this is exact, not a conservative envelope. */
+function polygonAabb(
+  poly: ReadonlyArray<readonly [number, number]>,
+): { x0: number; x1: number; z0: number; z1: number } {
+  let x0 = Infinity;
+  let x1 = -Infinity;
+  let z0 = Infinity;
+  let z1 = -Infinity;
+  for (const [x, z] of poly) {
+    if (x < x0) x0 = x;
+    if (x > x1) x1 = x;
+    if (z < z0) z0 = z;
+    if (z > z1) z1 = z;
+  }
+  return { x0, x1, z0, z1 };
+}
+
+/** Pink outline around an obstacle AABB at +`inflate` on every side —
+ *  the visible representation of the planner's footprintInflate band. */
+function createObstacleClearanceRing(
+  aabb: { x0: number; x1: number; z0: number; z1: number },
+  inflate: number,
+  color: number,
+): THREE.Line {
+  const y = 0.12;
+  const ring = [
+    new THREE.Vector3(aabb.x0 - inflate, y, aabb.z0 - inflate),
+    new THREE.Vector3(aabb.x1 + inflate, y, aabb.z0 - inflate),
+    new THREE.Vector3(aabb.x1 + inflate, y, aabb.z1 + inflate),
+    new THREE.Vector3(aabb.x0 - inflate, y, aabb.z1 + inflate),
+    new THREE.Vector3(aabb.x0 - inflate, y, aabb.z0 - inflate),
+  ];
+  return new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(ring),
+    new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.6 }),
+  );
 }
 
 function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
