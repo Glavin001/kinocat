@@ -419,6 +419,15 @@ export interface RaceMetrics {
   trackingErrorRms: number;
   /** Peak speed observed (m/s). */
   peakSpeed: number;
+  /** Most recent control values applied to the wheels — surfaced in the
+   *  HUD so the user can see what the planner is actually asking the car
+   *  to do. `targetSpeed` is the pure-pursuit cruise-target setpoint. */
+  liveControls: {
+    steer: number;        // rad (kinocat sign; positive = curve +X→+Z)
+    throttle: number;     // [-1, 1]
+    brake: number;        // [0, 1]
+    targetSpeed: number;  // m/s the pure-pursuit tracker is aiming at
+  };
 }
 
 export function emptyMetrics(): RaceMetrics {
@@ -431,6 +440,7 @@ export function emptyMetrics(): RaceMetrics {
     lastLapTime: Number.NaN,
     trackingErrorRms: 0,
     peakSpeed: 0,
+    liveControls: { steer: 0, throttle: 0, brake: 0, targetSpeed: 0 },
   };
 }
 

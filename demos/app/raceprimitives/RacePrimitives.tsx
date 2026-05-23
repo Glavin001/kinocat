@@ -107,6 +107,11 @@ interface CarRuntime {
    *  waypoint — lets the viewer compare the planner's actual curve to the
    *  naïve "drive in a straight line to the cone" trajectory. */
   idealLine: THREE.Line;
+  /** Small sphere at the pure-pursuit lookahead point — the spot on the
+   *  plan the tracker is actively chasing this tick. Visualizes the
+   *  difference between "where the plan goes long-term" (pathLine) and
+   *  "where the car is steering toward right now" (lookaheadMarker). */
+  lookaheadMarker: THREE.Mesh;
   trailLine: THREE.Line;
   trailPts: THREE.Vector3[];
   ai: {
@@ -758,6 +763,15 @@ async function setupScene(
     const ideal = new THREE.Line(idealGeo, idealMat);
     ideal.computeLineDistances();
     scene.add(ideal);
+    // Pure-pursuit lookahead marker — small bright sphere in the car's
+    // color, sitting at the spot on the plan the tracker is steering
+    // toward this tick.
+    const lookaheadMarker = new THREE.Mesh(
+      new THREE.SphereGeometry(0.5, 12, 8),
+      new THREE.MeshBasicMaterial({ color: pathColor, transparent: true, opacity: 0.85 }),
+    );
+    lookaheadMarker.position.set(course.spawn.x, 0.5, course.spawn.z);
+    scene.add(lookaheadMarker);
     return {
       id,
       color,
@@ -767,6 +781,7 @@ async function setupScene(
       carMesh,
       pathLine: null,
       idealLine: ideal,
+      lookaheadMarker,
       trailLine: trail,
       trailPts: [new THREE.Vector3(course.spawn.x, 0.15, course.spawn.z)],
       ai: {
@@ -881,6 +896,7 @@ async function setupScene(
       (car.pathLine.material as THREE.Material).dispose();
       car.pathLine = null;
     }
+    car.lookaheadMarker.visible = false;
   }
 
   /** Replan = planning only (no waypoint advancement, no lap detection —
@@ -893,7 +909,13 @@ async function setupScene(
     if (car.holdingForSync) return;
     const state = car.car.readState(now);
     car.ai.goal = course.waypoints[car.ai.loopIndex]!;
-    const PLAN_LOOKAHEAD_COUNT = 3;
+    // Lookahead: number of consecutive gates the planner sees per replan.
+    // More = the planner can pick an entry to gate N that sets up a better
+    // exit toward gate N+1, N+2, ... (proper racing-line optimization
+    // emerges naturally from a longer-horizon time-cost search). Each
+    // segment gets totalBudgetMs / count, so don't push this so high that
+    // per-segment budget falls below ~20ms.
+    const PLAN_LOOKAHEAD_COUNT = 5;
     const res = planThroughWaypoints({
       state: { ...state, t: 0 },
       waypoints: course.waypoints,
@@ -990,6 +1012,7 @@ async function setupScene(
       // other car catches up within seconds — but firm braking ensures the
       // car doesn't drift through the next gate during the wait.
       car.car.applyControls({ steer: 0, throttle: 0, brake: 1 });
+      car.metrics.liveControls = { steer: 0, throttle: 0, brake: 1, targetSpeed: 0 };
     } else if (car.ai.plan && car.ai.plan.length > 1) {
       const elapsed = (now - car.ai.planStartWall) / 1000;
       const live = trimPlan(car.ai.plan, elapsed);
@@ -1011,13 +1034,25 @@ async function setupScene(
         const steer = -Math.atan(cmd.steering * (2 * WHEEL_BASE));
         car.car.applyControls({ steer, throttle: cmd.throttle, brake: cmd.brake });
         recordedControls = [cmd.steering, cmd.targetSpeed];
+        car.metrics.liveControls = {
+          steer: cmd.steering, throttle: cmd.throttle, brake: cmd.brake,
+          targetSpeed: cmd.targetSpeed,
+        };
+        // Lookahead marker — bright sphere at the spot the tracker is
+        // chasing this tick.
+        car.lookaheadMarker.position.set(cmd.lookahead.x, 0.5, cmd.lookahead.z);
+        car.lookaheadMarker.visible = true;
       } else {
         car.car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
         recordedControls = [0, 5];
+        car.metrics.liveControls = { steer: 0, throttle: 0.2, brake: 0, targetSpeed: 5 };
+        car.lookaheadMarker.visible = false;
       }
     } else {
       car.car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
       recordedControls = [0, 5];
+      car.metrics.liveControls = { steer: 0, throttle: 0.2, brake: 0, targetSpeed: 5 };
+      car.lookaheadMarker.visible = false;
     }
 
     // ---- Sub-stepped physics.
@@ -1612,6 +1647,16 @@ function SideMetrics({
       />
       <KV k="0.55s pred err (rms)" v={`${m.trackingErrorRms.toFixed(2)} m`} />
       <KV k="peak speed" v={`${m.peakSpeed.toFixed(1)} m/s`} />
+      <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid #1f2735', opacity: 0.85 }}>
+        <div style={{ fontSize: 10, opacity: 0.7, marginBottom: 2 }}>LIVE CONTROLS</div>
+        <KV
+          k="steer"
+          v={`${m.liveControls.steer >= 0 ? '+' : ''}${m.liveControls.steer.toFixed(3)} rad`}
+        />
+        <KV k="throttle" v={`${(m.liveControls.throttle * 100).toFixed(0)}%`} />
+        <KV k="brake" v={`${(m.liveControls.brake * 100).toFixed(0)}%`} />
+        <KV k="target spd" v={`${m.liveControls.targetSpeed.toFixed(1)} m/s`} />
+      </div>
     </div>
   );
 }
