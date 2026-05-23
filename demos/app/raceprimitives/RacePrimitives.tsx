@@ -64,6 +64,11 @@ import {
   buildV2ModelDownloadUrl,
   type PersistedV2Model,
 } from '../lib/v2-model-persistence';
+import {
+  buildDebugReport,
+  copyToClipboard,
+  downloadMarkdown,
+} from '../lib/debug-report';
 import type { LearnedVehicleModel } from 'kinocat/agent';
 
 const PHYSICS_DT = 1 / 60;
@@ -83,6 +88,10 @@ const WHEEL_BASE = 1.6;
 // executes cleanly. With the previous TRACKER_MAX_LATERAL_ACCEL=25 the
 // tracker would let the car attempt impossible turns and slide off-map.
 const TRACKER_MAX_LATERAL_ACCEL = 12;
+// Multi-goal A* lookahead: number of consecutive gates the planner sees
+// per replan. Module-scope so the debug-report export can include it
+// alongside other planner-config snapshots.
+const PLAN_LOOKAHEAD_COUNT = 2;
 // Online-learning buffer cap. ~60Hz × ~30s/lap = 1800 samples/lap; 4000
 // covers ~2 laps of real driving, refit converges in well under a second.
 const ONLINE_SAMPLE_CAP = 4000;
@@ -442,6 +451,56 @@ export default function RacePrimitives() {
     URL.revokeObjectURL(url);
   }
 
+  // ms timestamp when the "Export debug" button last fired — used to
+  // show a brief "copied + downloaded" confirmation toast.
+  const [debugExportedAt, setDebugExportedAt] = useState(0);
+
+  async function onExportDebug() {
+    // Build the kinematic + v2 libraries on demand to capture their
+    // current shape (controls + per-bucket durations) in the report. We
+    // could re-use the in-scene libraries but rebuilding from the same
+    // sources guarantees the report matches what /primitive-explorer
+    // would show right now.
+    const kinematicLibrary = (await import('../lib/race-primitives-scenarios'))
+      .buildKinematicLibrary();
+    const learnedLibrary = v2Model
+      ? (await import('../lib/race-primitives-scenarios')).buildLearnedRaceLibraryV2(v2Model)
+      : null;
+    const course = (await import('../lib/race-primitives-scenarios')).buildRaceCourse();
+    const md = buildDebugReport({
+      phase,
+      useV2,
+      v2Active,
+      winner,
+      v2Model,
+      v2Meta,
+      kinematicMetrics: metrics.kinematic,
+      learnedMetrics: metrics.learned,
+      kinematicLapTimes: learner?.kinematicLapTimes ?? [],
+      learnedLapTimes: learner?.learnedLapTimes ?? [],
+      kinematicSectors: learner?.kinematicSectors ?? [],
+      learnedSectors: learner?.learnedSectors ?? [],
+      waypointCount: course.waypoints.length,
+      kinematicLibrary,
+      learnedLibrary,
+      startSpeeds: RACE_START_SPEEDS,
+      plannerConfig: {
+        lookaheadCount: PLAN_LOOKAHEAD_COUNT,
+        replanIntervalMs: REPLAN_INTERVAL_MS,
+        perCarBudgetMs: RACE_REPLAN_BUDGET_MS,
+        plannerGateRadius: RACE_PLANNER_GATE_RADIUS,
+        advanceRadius: 2.5,
+        trackerMaxLateralAccel: TRACKER_MAX_LATERAL_ACCEL,
+      },
+    });
+    const filename = `kinocat-raceprimitives-debug-${new Date().toISOString().replace(/[:.]/g, '-')}.md`;
+    // Always download; also try to copy so the user can paste straight
+    // into a chat for diagnosis.
+    downloadMarkdown(md, filename);
+    await copyToClipboard(md);
+    setDebugExportedAt(Date.now());
+  }
+
   return (
     <div
       style={{
@@ -467,6 +526,8 @@ export default function RacePrimitives() {
         onStop={stopRace}
         onReset={resetRace}
         onClearCache={clearCache}
+        onExportDebug={onExportDebug}
+        debugExportedAt={debugExportedAt}
       />
       <div style={{ flex: 1, position: 'relative' }}>
         <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
@@ -916,17 +977,10 @@ async function setupScene(
     if (car.holdingForSync) return;
     const state = car.car.readState(now);
     car.ai.goal = course.waypoints[car.ai.loopIndex]!;
-    // Lookahead: number of consecutive gates the planner sees per replan.
-    // Multi-goal A* solves ONE search over the (chassis × gate-index) joint
-    // state space, so the planner GLOBALLY trades off entries to gate i
-    // against exits toward gate i+1 — proper racing-line behavior (wide
-    // entry / late apex / early exit) emerges from the time-cost search
-    // across all N gates simultaneously.
-    //
-    // Joint state space is N× larger than single-gate, so within a 120ms
-    // budget 2 gates @ multi-goal is the right balance (3 sometimes timed
-    // out on tight slalom sections).
-    const PLAN_LOOKAHEAD_COUNT = 2;
+    // Lookahead is hoisted to module scope as PLAN_LOOKAHEAD_COUNT so the
+    // debug-report export can include it; multi-goal A* solves ONE search
+    // over (chassis × gate-index) joint state space, with 2 gates fitting
+    // the 120 ms per-car budget on this course.
     const gates: VehicleState[] = [];
     for (let i = 0; i < PLAN_LOOKAHEAD_COUNT; i++) {
       const idx = (car.ai.loopIndex + i) % course.waypoints.length;
@@ -1476,6 +1530,8 @@ function TopBar({
   onStop,
   onReset,
   onClearCache,
+  onExportDebug,
+  debugExportedAt,
 }: {
   phase: Phase;
   learnProgress: {
@@ -1498,7 +1554,14 @@ function TopBar({
   onStop: () => void;
   onReset: () => void;
   onClearCache: () => void;
+  /** Generate + download + clipboard-copy a Markdown debug report of
+   *  the live page state (model, race, libraries, planner config). */
+  onExportDebug: () => void;
+  /** ms-since-epoch the last export fired — used to show a brief
+   *  "copied + downloaded" confirmation. */
+  debugExportedAt: number;
 }) {
+  const justExported = debugExportedAt > 0 && Date.now() - debugExportedAt < 3000;
   const subtitle = v2Active
     ? 'kinematic vs offline-trained v2 · online refit off'
     : 'kinematic vs online-learning · learned car refits each lap';
@@ -1568,6 +1631,11 @@ function TopBar({
           </>
         )}
         {error && <Status warning>err: {error}</Status>}
+        {/* Export-debug button — always present so diagnosis works in
+            every phase. Shows a brief "copied · saved" confirmation. */}
+        <Btn onClick={onExportDebug} secondary title="Generate Markdown debug report — copied to clipboard and downloaded as .md">
+          {justExported ? '✓ copied · saved' : '🐛 export debug'}
+        </Btn>
       </div>
     </div>
   );
@@ -2401,15 +2469,18 @@ function Btn({
   children,
   onClick,
   secondary,
+  title,
 }: {
   children: React.ReactNode;
   onClick: () => void;
   secondary?: boolean;
+  title?: string;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
+      title={title}
       style={{
         font: '11px ui-monospace, monospace',
         padding: '6px 12px',
@@ -2419,6 +2490,7 @@ function Btn({
         color: secondary ? '#8c95a4' : '#cdeaff',
         cursor: 'pointer',
         letterSpacing: 0.3,
+        whiteSpace: 'nowrap',
       }}
     >
       {children}
