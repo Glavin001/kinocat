@@ -364,6 +364,31 @@ export async function runOfflineTraining(
     opts.onEvent?.({ type: 'trial-batch', round, collected: collected.length, discarded });
 
     // Fit on accumulated trials.
+    // Per-parameter regularization scales: how far each coefficient can
+    // drift from the default prior before the regularization penalty
+    // grows significantly. Larger scale = looser. Tighter scales pull
+    // weakly-constrained coefficients (the ones that pin to bounds when
+    // unregularized) toward physically-grounded defaults. Hand-tuned to
+    // the parameter magnitudes — see PARAM_NAMES ordering in vehicle-
+    // model.ts (paramsV2ToVec).
+    const REG_SCALES: LearnedVehicleParamsV2 = {
+      engineScale: 0.10,
+      reverseEffScale: 0.15,
+      brakeScale: 0.30,
+      accelTau: 0.10,
+      gripScale: 0.15,
+      frictionCircleSlack: 0.10,
+      steerRatio: 0.15,
+      understeerOffThrottle: 0.005,
+      understeerPowerOn: 0.005,
+      yawRateTau: 0.08,
+      lateralDamping: 2.5,
+      lateralFromSteer: 0.30,
+      slipDrag: 0.30,
+      loadTransferCoeff: 0.02,
+      driveDeadzone: 80,
+      rollingResistance: 0.05,
+    };
     const fit = runParametricFit<LearnedVehicleParamsV2, VehicleState, WheeledControls, LearnableVehicleConfig>({
       init: model.params,
       encode: paramsV2ToVec,
@@ -374,6 +399,16 @@ export async function runOfflineTraining(
       controlsToVec,
       maxIter: round === 0 ? 200 : 120,
       onProgress: (e) => opts.onEvent?.({ type: 'fit-progress', round, phase: 'parametric', event: e }),
+      // Pull toward DEFAULT_LEARNED_PARAMS_V2 to prevent the fit from
+      // pinning coefficients to bounds. 0.05 strength × ~4000 samples ≈
+      // 200 reg per param-diff — meaningful next to a typical data loss
+      // around ~15k while still letting data move the fit when it has
+      // strong evidence.
+      regularization: {
+        strength: 0.05,
+        priorVec: paramsV2ToVec(DEFAULT_LEARNED_PARAMS_V2),
+        scales: paramsV2ToVec(REG_SCALES),
+      },
     });
     model = { ...model, params: fit.params };
 

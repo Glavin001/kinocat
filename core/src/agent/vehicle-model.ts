@@ -126,43 +126,51 @@ export const DEFAULT_LEARNED_PARAMS_V2: LearnedVehicleParamsV2 = {
   rollingResistance: 0.05,
 };
 
-/** Bounds for parametric fit — physically plausible ranges. */
+/** Bounds for parametric fit — PHYSICALLY plausible ranges. Looser
+ *  bounds let the fit pin parameters to walls when the model lacks
+ *  expressiveness for some trial (e.g. brakeScale=3.5 means the model
+ *  predicts 119% more brake decel than Rapier delivers — unphysical;
+ *  frictionCircleSlack<1 says the chassis exceeds its own friction
+ *  limit, which is incoherent). The bounds here describe the actual
+ *  Rapier raycast vehicle's range; the regularization in the fit
+ *  (training-driver.ts) adds soft pull toward DEFAULT_LEARNED_PARAMS_V2
+ *  on top. */
 export const PARAMS_V2_LO: LearnedVehicleParamsV2 = {
-  engineScale: 0.4,
-  reverseEffScale: 0.5,
-  brakeScale: 0.5,
-  accelTau: 0.05,
-  gripScale: 0.5,
-  frictionCircleSlack: 0.7,
-  steerRatio: 0.6,
+  engineScale: 0.7,           // chassis can't deliver < 70% of commanded force
+  reverseEffScale: 0.7,
+  brakeScale: 0.8,            // Rapier brakeForce maps ~1:1 to chassis decel
+  accelTau: 0.08,
+  gripScale: 0.7,
+  frictionCircleSlack: 0.95,  // < 1 = chassis exceeds its own friction limit → incoherent
+  steerRatio: 0.7,
   understeerOffThrottle: 0,
-  understeerPowerOn: -0.02,
-  yawRateTau: 0.05,
-  lateralDamping: 1,
-  lateralFromSteer: 0,
+  understeerPowerOn: -0.01,
+  yawRateTau: 0.1,            // chassis inertia is real — < 100 ms is unphysical
+  lateralDamping: 2,
+  lateralFromSteer: 0.2,      // must be positive (steering DOES produce sideslip)
   slipDrag: 0,
   loadTransferCoeff: 0,
   driveDeadzone: 0,
-  rollingResistance: 0,
+  rollingResistance: 0.02,
 };
 
 export const PARAMS_V2_HI: LearnedVehicleParamsV2 = {
-  engineScale: 1.3,
-  reverseEffScale: 1.2,
-  brakeScale: 3.5,
-  accelTau: 0.8,
-  gripScale: 1.5,
-  frictionCircleSlack: 1.3,
-  steerRatio: 1.6,
-  understeerOffThrottle: 0.08,
-  understeerPowerOn: 0.06,
-  yawRateTau: 0.5,
-  lateralDamping: 12,
-  lateralFromSteer: 2.5,
-  slipDrag: 2.0,
-  loadTransferCoeff: 0.15,
-  driveDeadzone: 400,
-  rollingResistance: 0.4,
+  engineScale: 1.05,          // > 100% means the model "amplifies" commanded force — unphysical
+  reverseEffScale: 1.1,
+  brakeScale: 2.0,            // generous upper to allow some over-fit, well short of the old 3.5
+  accelTau: 0.6,
+  gripScale: 1.3,
+  frictionCircleSlack: 1.3,   // allows brief tire-slip excursions past µ·g but not 2×
+  steerRatio: 1.3,
+  understeerOffThrottle: 0.05, // 0.05 × 784 (at v=28) = 40× yaw attenuation — already extreme
+  understeerPowerOn: 0.04,
+  yawRateTau: 0.4,
+  lateralDamping: 9,          // > 9 means sideslip decays in < 0.1 s → unphysical for car chassis
+  lateralFromSteer: 1.5,
+  slipDrag: 1.5,
+  loadTransferCoeff: 0.1,
+  driveDeadzone: 250,
+  rollingResistance: 0.2,
 };
 
 export const PARAMS_V2_ORDER: (keyof LearnedVehicleParamsV2)[] = [
