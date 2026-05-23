@@ -64,6 +64,19 @@ export interface VehicleEnvOptions {
    * admissibility) scales the grid term. Disabled by default; `{}` enables.
    */
   gridHeuristic?: false | { weight?: number };
+  /**
+   * Extra clearance buffer (world units) inflated onto the agent's footprint
+   * for collision queries against the static `NavWorld`. The physics chassis
+   * keeps its real dimensions; the planner just refuses paths that bring the
+   * vehicle within `footprintInflate` of any obstacle edge. Defaults to 0.
+   *
+   * Implemented as a per-vertex outward offset from the footprint centroid
+   * (exact Minkowski offset for axis-aligned rectangles — the common
+   * vehicle case — conservative for any convex polygon). The agent's stored
+   * footprint is untouched; only the polygon passed into
+   * `NavWorld.footprintClear()` is enlarged.
+   */
+  footprintInflate?: number;
 }
 
 interface DriveEdgeData {
@@ -101,6 +114,14 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   private hGoalH = NaN;
   private readonly cbEnabled: boolean;
   private readonly rCirc: number;
+  /** Circumscribed radius used by the clearance broadphase — equal to
+   *  `rCirc + footprintInflate` so an early-accept still covers the
+   *  inflated polygon. */
+  private readonly rCircCB: number;
+  /** Per-vertex outward-inflated footprint used for static collision queries;
+   *  identical to `agent.footprint` when `footprintInflate` is 0 (the default).
+   *  See `inflateFootprintLocal()` for the offset rule. */
+  private readonly inflatedFootprint: ReadonlyArray<readonly [number, number]>;
   private readonly ghEnabled: boolean;
   private readonly ghWeight: number;
   private ghGoalX = NaN;
@@ -140,6 +161,14 @@ export class VehicleEnvironment implements Environment<VehicleState> {
       if (r > rc) rc = r;
     }
     this.rCirc = rc;
+    this.inflatedFootprint = inflateFootprintLocal(
+      this.agent.footprint,
+      opts.footprintInflate ?? 0,
+    );
+    // Broadphase early-accept must use the inflated radius so a "disk is
+    // clear" answer still implies the *inflated* footprint is clear.
+    const cbRadius = rc + Math.max(opts.footprintInflate ?? 0, 0);
+    this.rCircCB = cbRadius;
     this.cbEnabled =
       opts.clearanceBroadphase === true &&
       typeof this.world.clearanceAt === 'function';
@@ -203,10 +232,10 @@ export class VehicleEnvironment implements Environment<VehicleState> {
       let cleared = false;
       if (this.cbEnabled) {
         const cl = this.world.clearanceAt!(wx, wz);
-        if (cl !== null && cl >= this.rCirc) cleared = true;
+        if (cl !== null && cl >= this.rCircCB) cleared = true;
       }
       if (!cleared) {
-        const fp = placeFootprint(this.agent.footprint, wx, wz, wh);
+        const fp = placeFootprint(this.inflatedFootprint, wx, wz, wh);
         this.rec.counters.collisionChecks++;
         if (!this.world.footprintClear(fp)) {
           this.rec.counters.collisionRejects++;
@@ -299,7 +328,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     let px = a.x;
     let pz = a.z;
     for (const p of poses) {
-      const fp = placeFootprint(this.agent.footprint, p.x, p.y, p.theta);
+      const fp = placeFootprint(this.inflatedFootprint, p.x, p.y, p.theta);
       this.rec.counters.collisionChecks++;
       if (!this.world.footprintClear(fp)) {
         this.rec.counters.collisionRejects++;
@@ -405,7 +434,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   private poseClear(s: VehicleState): boolean {
     this.rec.counters.collisionChecks++;
     const ok = this.world.footprintClear(
-      placeFootprint(this.agent.footprint, s.x, s.z, s.heading),
+      placeFootprint(this.inflatedFootprint, s.x, s.z, s.heading),
     );
     if (!ok) this.rec.counters.collisionRejects++;
     return ok;
@@ -430,4 +459,29 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     if (dist(a.x, a.z, b.x, b.z) > this.goalRadius) return false;
     return Math.abs(angleDiff(a.heading, b.heading)) <= this.goalHeadingTol;
   }
+}
+
+/** Inflate a local-frame footprint polygon outward from its centroid by
+ *  `inflate` world-units along each axis sign. Exact Minkowski offset for
+ *  axis-aligned rectangles centred on origin (the common vehicle case);
+ *  a conservative enlargement for any convex polygon. Returns the input
+ *  unchanged when `inflate <= 0`. */
+function inflateFootprintLocal(
+  local: ReadonlyArray<readonly [number, number]>,
+  inflate: number,
+): ReadonlyArray<readonly [number, number]> {
+  if (!(inflate > 0)) return local;
+  let cx = 0;
+  let cz = 0;
+  for (const [x, z] of local) {
+    cx += x;
+    cz += z;
+  }
+  cx /= local.length;
+  cz /= local.length;
+  return local.map(([x, z]) => {
+    const sx = x > cx ? 1 : x < cx ? -1 : 0;
+    const sz = z > cz ? 1 : z < cz ? -1 : 0;
+    return [x + sx * inflate, z + sz * inflate] as [number, number];
+  });
 }

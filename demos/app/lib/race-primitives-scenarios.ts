@@ -243,6 +243,11 @@ export function planRace(req: RacePlanRequest): PlanResult<VehicleState> {
     world,
     agent: RACE_AGENT,
     lib: req.lib,
+    // RACE_AGENT keeps its footprint matching the physics chassis (so
+    // dynamics fits the same body); the inflation here gives the planner
+    // a ~20 cm static-obstacle margin so high-speed cornering doesn't
+    // shave the inner curb during execution.
+    envOptions: { footprintInflate: 0.2 },
     deadlineMs: req.deadlineMs ?? RACE_REPLAN_BUDGET_MS,
     maxExpansions: req.maxExpansions ?? RACE_MAX_EXPANSIONS,
   });
