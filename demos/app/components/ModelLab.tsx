@@ -16,6 +16,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, BarChart, Bar, ResponsiveContainer,
 } from 'recharts';
 import { runOfflineTraining, type TrainingEvent } from '../lib/training-driver';
+import { useIsMobile } from '../lib/use-is-mobile';
 import type { LearnedVehicleModel } from 'kinocat/agent';
 import type { ModelDiagnostics, FitProgressEvent } from 'kinocat/learning';
 
@@ -43,6 +44,7 @@ interface RoundSnapshot {
 }
 
 export function ModelLab(props: ModelLabProps) {
+  const isMobile = useIsMobile();
   const [open, setOpen] = useState(false);
   const [rounds, setRounds] = useState(3);
   const [trialsPerRound, setTrialsPerRound] = useState(48);
@@ -128,6 +130,111 @@ export function ModelLab(props: ModelLabProps) {
   }
 
   const showResults = roundHistory.length > 0 || props.loadedMeta !== null;
+  const panelBody = (
+    <>
+      <Section title="Training">
+        <Row>
+          <SliderField label={`Rounds: ${rounds}`} value={rounds} min={1} max={6} onChange={setRounds} disabled={status === 'running'} />
+          <SliderField label={`Trials/round: ${trialsPerRound}`} value={trialsPerRound} min={16} max={96} step={8} onChange={setTrialsPerRound} disabled={status === 'running'} />
+        </Row>
+        <Row>
+          <SliderField label={`Trial ticks: ${trialTicks} (~${(trialTicks / 60).toFixed(1)}s)`} value={trialTicks} min={60} max={240} step={30} onChange={setTrialTicks} disabled={status === 'running'} />
+          <SliderField label={`RNG seed: ${seed}`} value={seed} min={1} max={999} onChange={setSeed} disabled={status === 'running'} />
+        </Row>
+        <Row>
+          {status !== 'running' ? (
+            <button onClick={startTraining} style={primaryBtnStyle}>Train v2 model</button>
+          ) : (
+            <button onClick={cancelTraining} style={dangerBtnStyle}>Cancel</button>
+          )}
+          {props.hasV2Model && (
+            <label style={toggleStyle}>
+              <input type="checkbox" checked={props.useV2} onChange={(e) => props.onToggleUseV2(e.target.checked)} />
+              Use v2 library for learned car
+            </label>
+          )}
+          {props.hasV2Model && props.onExport && (
+            <button onClick={props.onExport} style={ghostBtnStyle}>Export</button>
+          )}
+          {props.hasV2Model && props.onClearLoaded && (
+            <button onClick={props.onClearLoaded} style={ghostBtnStyle}>Clear cached</button>
+          )}
+        </Row>
+      </Section>
+
+      {status === 'running' && (
+        <Section title={`Progress — Round ${currentRound + 1}/${rounds}`}>
+          <KV k="Trials collected" v={String(trialsCollected)} />
+          <KV k="Trials discarded" v={String(trialsDiscarded)} />
+          {latestLoss !== null && <KV k="Latest loss" v={latestLoss.toFixed(4)} />}
+        </Section>
+      )}
+
+      {error && (
+        <Section title="Error">
+          <pre style={{ color: '#ff5566', whiteSpace: 'pre-wrap', fontSize: 11 }}>{error}</pre>
+        </Section>
+      )}
+
+      {showResults && (
+        <ResultsView roundHistory={roundHistory} loadedMeta={props.loadedMeta ?? undefined} />
+      )}
+    </>
+  );
+
+  if (isMobile) {
+    // Mobile: small floating launcher button at the top-right (so it
+    // doesn't fight for space with the per-car stat panels). Tapping it
+    // opens a full-width bottom-sheet over a dim backdrop.
+    return (
+      <>
+        <button
+          onClick={() => setOpen(true)}
+          style={{
+            position: 'absolute', top: 8, right: 8, zIndex: 40,
+            background: 'rgba(13, 17, 25, 0.92)', color: '#cdd3de',
+            border: '1px solid #223044', borderRadius: 6,
+            padding: '6px 10px', font: '11px ui-monospace, monospace',
+            cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6,
+          }}
+        >
+          Model Lab
+          {props.hasV2Model && <span style={{ color: '#55dcff' }}>●</span>}
+        </button>
+        {open && (
+          <>
+            <div
+              onClick={() => setOpen(false)}
+              style={{
+                position: 'fixed', inset: 0, background: 'rgba(0, 0, 0, 0.55)',
+                zIndex: 60,
+              }}
+            />
+            <div
+              style={{
+                position: 'fixed', left: 0, right: 0, bottom: 0,
+                maxHeight: '85vh', overflowY: 'auto',
+                background: '#0d1119', color: '#cdd3de',
+                font: '12px ui-monospace, monospace',
+                borderTop: '1px solid #223044',
+                borderTopLeftRadius: 12, borderTopRightRadius: 12,
+                padding: '12px 14px 24px', zIndex: 61,
+                boxShadow: '0 -8px 24px rgba(0, 0, 0, 0.6)',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+                <div style={{ fontWeight: 700 }}>
+                  Model Lab {props.hasV2Model && <span style={{ color: '#55dcff' }}>● v2 ready</span>}
+                </div>
+                <button onClick={() => setOpen(false)} style={ghostBtnStyle}>Close</button>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>{panelBody}</div>
+            </div>
+          </>
+        )}
+      </>
+    );
+  }
 
   return (
     <div style={panelOuterStyle(open)}>
@@ -135,57 +242,7 @@ export function ModelLab(props: ModelLabProps) {
         {open ? '▼ Model Lab' : '▲ Model Lab'}
         {props.hasV2Model && <span style={{ marginLeft: 8, color: '#55dcff' }}>● v2 ready</span>}
       </button>
-      {open && (
-        <div style={panelContentStyle}>
-          <Section title="Training">
-            <Row>
-              <SliderField label={`Rounds: ${rounds}`} value={rounds} min={1} max={6} onChange={setRounds} disabled={status === 'running'} />
-              <SliderField label={`Trials/round: ${trialsPerRound}`} value={trialsPerRound} min={16} max={96} step={8} onChange={setTrialsPerRound} disabled={status === 'running'} />
-            </Row>
-            <Row>
-              <SliderField label={`Trial ticks: ${trialTicks} (~${(trialTicks / 60).toFixed(1)}s)`} value={trialTicks} min={60} max={240} step={30} onChange={setTrialTicks} disabled={status === 'running'} />
-              <SliderField label={`RNG seed: ${seed}`} value={seed} min={1} max={999} onChange={setSeed} disabled={status === 'running'} />
-            </Row>
-            <Row>
-              {status !== 'running' ? (
-                <button onClick={startTraining} style={primaryBtnStyle}>Train v2 model</button>
-              ) : (
-                <button onClick={cancelTraining} style={dangerBtnStyle}>Cancel</button>
-              )}
-              {props.hasV2Model && (
-                <label style={toggleStyle}>
-                  <input type="checkbox" checked={props.useV2} onChange={(e) => props.onToggleUseV2(e.target.checked)} />
-                  Use v2 library for learned car
-                </label>
-              )}
-              {props.hasV2Model && props.onExport && (
-                <button onClick={props.onExport} style={ghostBtnStyle}>Export</button>
-              )}
-              {props.hasV2Model && props.onClearLoaded && (
-                <button onClick={props.onClearLoaded} style={ghostBtnStyle}>Clear cached</button>
-              )}
-            </Row>
-          </Section>
-
-          {status === 'running' && (
-            <Section title={`Progress — Round ${currentRound + 1}/${rounds}`}>
-              <KV k="Trials collected" v={String(trialsCollected)} />
-              <KV k="Trials discarded" v={String(trialsDiscarded)} />
-              {latestLoss !== null && <KV k="Latest loss" v={latestLoss.toFixed(4)} />}
-            </Section>
-          )}
-
-          {error && (
-            <Section title="Error">
-              <pre style={{ color: '#ff5566', whiteSpace: 'pre-wrap', fontSize: 11 }}>{error}</pre>
-            </Section>
-          )}
-
-          {showResults && (
-            <ResultsView roundHistory={roundHistory} loadedMeta={props.loadedMeta ?? undefined} />
-          )}
-        </div>
-      )}
+      {open && <div style={panelContentStyle}>{panelBody}</div>}
     </div>
   );
 }
@@ -298,19 +355,20 @@ function ResultsView({ roundHistory, loadedMeta }: ResultsViewProps) {
 function panelOuterStyle(open: boolean): React.CSSProperties {
   return {
     position: 'absolute',
-    top: 0,
-    right: 0,
-    width: open ? 460 : 'auto',
+    top: 8,
+    right: 8,
+    width: open ? 'min(420px, calc(100vw - 32px))' : 'auto',
+    maxWidth: 'calc(100vw - 32px)',
     background: 'rgba(10, 13, 20, 0.95)',
     border: '1px solid #223044',
-    borderRadius: 4,
-    margin: 8,
+    borderRadius: 6,
     fontFamily: 'ui-monospace, monospace',
     fontSize: 12,
     color: '#cdd3de',
     zIndex: 40,
-    maxHeight: 'calc(100vh - 80px)',
+    maxHeight: 'calc(100vh - 100px)',
     overflow: 'auto',
+    boxShadow: open ? '0 6px 24px rgba(0, 0, 0, 0.4)' : 'none',
   };
 }
 

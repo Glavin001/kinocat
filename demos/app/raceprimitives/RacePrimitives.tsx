@@ -56,6 +56,7 @@ import {
   type TransitionSample,
 } from '../lib/learn-primitives';
 import { ModelLab } from '../components/ModelLab';
+import { useIsMobile } from '../lib/use-is-mobile';
 import {
   loadV2Model,
   saveV2Model,
@@ -212,6 +213,7 @@ function loadLearnedParams(): LearnedVehicleParams | null {
 
 export default function RacePrimitives() {
   const containerRef = useRef<HTMLDivElement>(null);
+  const isMobile = useIsMobile(820); // 820 leaves room for desktop side-by-side
   const [phase, setPhase] = useState<Phase>('loading');
   const [learnProgress, setLearnProgress] = useState<{
     done: number;
@@ -459,6 +461,7 @@ export default function RacePrimitives() {
         params={params}
         error={error}
         v2Active={v2Active}
+        isMobile={isMobile}
         onLearn={runInlineLearn}
         onStart={startRace}
         onStop={stopRace}
@@ -470,6 +473,7 @@ export default function RacePrimitives() {
         <MetricsOverlay
           metrics={metrics}
           winner={winner}
+          isMobile={isMobile}
           holding={{
             kinematic: learner?.kinematicHolding ?? false,
             learned: learner?.learnedHolding ?? false,
@@ -482,7 +486,7 @@ export default function RacePrimitives() {
           bestLapNumber={learner?.bestLapNumber ?? 0}
         />
         {(phase === 'racing' || phase === 'finished') && learner && (
-          <LearnerPanel snap={learner} v2Active={v2Active} v2Meta={v2Meta} />
+          <LearnerPanel snap={learner} v2Active={v2Active} v2Meta={v2Meta} isMobile={isMobile} />
         )}
         {phase === 'learning' && (
           <PretrainOverlay progress={learnProgress} />
@@ -1450,6 +1454,7 @@ function TopBar({
   params,
   error,
   v2Active,
+  isMobile,
   onLearn,
   onStart,
   onStop,
@@ -1471,6 +1476,7 @@ function TopBar({
    *  library — online refitting is disabled in that mode, so the status
    *  text changes accordingly. */
   v2Active: boolean;
+  isMobile: boolean;
   onLearn: () => void;
   onStart: () => void;
   onStop: () => void;
@@ -1478,54 +1484,75 @@ function TopBar({
   onClearCache: () => void;
 }) {
   const subtitle = v2Active
-    ? 'kinematic (control) vs offline-trained v2 model · online refit disabled while v2 is active'
-    : 'kinematic (control) vs online-learning · both start with the same library, learned car refits 5 coefficients from race data each lap';
+    ? 'kinematic vs offline-trained v2 · online refit off'
+    : 'kinematic vs online-learning · learned car refits each lap';
   const racingStatus = v2Active
-    ? 'racing… (learned car using v2 library — offline-trained, no online refit)'
-    : 'racing… (the learned car refits every lap)';
+    ? (isMobile ? 'racing · v2' : 'racing… (learned car using v2 library — offline-trained, no online refit)')
+    : (isMobile ? 'racing · online' : 'racing… (the learned car refits every lap)');
   return (
     <div
       style={{
         display: 'flex',
-        alignItems: 'center',
-        gap: 12,
-        padding: '10px 14px',
+        flexDirection: isMobile ? 'column' : 'row',
+        alignItems: isMobile ? 'stretch' : 'center',
+        gap: isMobile ? 6 : 12,
+        padding: isMobile ? '8px 10px' : '10px 14px',
         borderBottom: '1px solid #1f2735',
         background: '#0d1119',
       }}
     >
-      <div style={{ color: '#7fd6ff', fontWeight: 700 }}>race the primitives</div>
-      <div style={{ opacity: 0.65 }}>{subtitle}</div>
-      <div style={{ flex: 1 }} />
-      {phase === 'loading' && <Status>loading…</Status>}
-      {phase === 'learning' && (
-        <Status>
-          pre-training… collecting trials {learnProgress.done}/{learnProgress.total || '?'}
-        </Status>
-      )}
-      {phase === 'ready' && params && (
-        <>
-          <Status>ready{v2Active ? ' · v2 active' : ''}</Status>
-          <Btn onClick={onStart}>start race</Btn>
-          <Btn onClick={onLearn} secondary>pre-train</Btn>
-          <Btn onClick={onReset} secondary>reset</Btn>
-          <Btn onClick={onClearCache} secondary>clear cache</Btn>
-        </>
-      )}
-      {phase === 'racing' && (
-        <>
-          <Status>{racingStatus}</Status>
-          <Btn onClick={onStop}>stop</Btn>
-        </>
-      )}
-      {phase === 'finished' && (
-        <>
-          <Status>stopped{v2Active ? ' · v2 active' : ''}</Status>
-          <Btn onClick={onStart}>race again</Btn>
-          <Btn onClick={onReset} secondary>reset</Btn>
-        </>
-      )}
-      {error && <Status warning>err: {error}</Status>}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+        <div style={{ color: '#7fd6ff', fontWeight: 700, whiteSpace: 'nowrap' }}>race the primitives</div>
+        {!isMobile && (
+          <div style={{ opacity: 0.65, fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {subtitle}
+          </div>
+        )}
+      </div>
+      {!isMobile && <div style={{ flex: 1 }} />}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          flexWrap: isMobile ? 'wrap' : 'nowrap',
+          overflowX: isMobile ? 'auto' : 'visible',
+          // Prevent flex shrink so buttons stay readable on mobile scroll.
+          minWidth: 0,
+        }}
+      >
+        {phase === 'loading' && <Status>loading…</Status>}
+        {phase === 'learning' && (
+          <Status>
+            {isMobile
+              ? `pre-training ${learnProgress.done}/${learnProgress.total || '?'}`
+              : `pre-training… collecting trials ${learnProgress.done}/${learnProgress.total || '?'}`}
+          </Status>
+        )}
+        {phase === 'ready' && params && (
+          <>
+            <Status>ready{v2Active ? ' · v2' : ''}</Status>
+            <Btn onClick={onStart}>start race</Btn>
+            <Btn onClick={onLearn} secondary>pre-train</Btn>
+            <Btn onClick={onReset} secondary>reset</Btn>
+            <Btn onClick={onClearCache} secondary>clear</Btn>
+          </>
+        )}
+        {phase === 'racing' && (
+          <>
+            <Status>{racingStatus}</Status>
+            <Btn onClick={onStop}>stop</Btn>
+          </>
+        )}
+        {phase === 'finished' && (
+          <>
+            <Status>stopped{v2Active ? ' · v2' : ''}</Status>
+            <Btn onClick={onStart}>race again</Btn>
+            <Btn onClick={onReset} secondary>reset</Btn>
+          </>
+        )}
+        {error && <Status warning>err: {error}</Status>}
+      </div>
     </div>
   );
 }
@@ -1533,6 +1560,7 @@ function TopBar({
 function MetricsOverlay({
   metrics,
   winner,
+  isMobile,
   holding,
   lapTimes,
   rollbackActive,
@@ -1540,11 +1568,50 @@ function MetricsOverlay({
 }: {
   metrics: { kinematic: RaceMetrics; learned: RaceMetrics };
   winner: 'kinematic' | 'learned' | 'tie' | null;
+  isMobile: boolean;
   holding: { kinematic: boolean; learned: boolean };
   lapTimes: { kinematic: number[]; learned: number[] };
   rollbackActive: boolean;
   bestLapNumber: number;
 }) {
+  // Mobile: compact stacked summary row at the top of the viewport. Tap a
+  // card to expand its full stats (LIVE CONTROLS + tracking error + …).
+  if (isMobile) {
+    return (
+      <div
+        style={{
+          position: 'absolute',
+          top: 8,
+          left: 8,
+          right: 8,
+          display: 'grid',
+          gridTemplateColumns: '1fr 1fr',
+          gap: 6,
+          zIndex: 30,
+          pointerEvents: 'none',
+        }}
+      >
+        <CompactCarCard
+          title="KINEMATIC"
+          color="#ff8aa0"
+          m={metrics.kinematic}
+          highlight={winner === 'kinematic'}
+          holding={holding.kinematic}
+          recentLaps={lapTimes.kinematic}
+          rollbackBadge={null}
+        />
+        <CompactCarCard
+          title="LEARNED"
+          color="#55dcff"
+          m={metrics.learned}
+          highlight={winner === 'learned'}
+          holding={holding.learned}
+          recentLaps={lapTimes.learned}
+          rollbackBadge={rollbackActive ? `BEST l${bestLapNumber}` : null}
+        />
+      </div>
+    );
+  }
   return (
     <>
       <SideMetrics
@@ -1568,6 +1635,71 @@ function MetricsOverlay({
         rollbackBadge={rollbackActive ? `USING BEST (lap ${bestLapNumber})` : null}
       />
     </>
+  );
+}
+
+/** Tightly-packed per-car card for mobile. Tap to expand for full stats. */
+function CompactCarCard({
+  title, color, m, highlight, holding, recentLaps, rollbackBadge,
+}: {
+  title: string; color: string; m: RaceMetrics; highlight: boolean;
+  holding: boolean; recentLaps: number[]; rollbackBadge: string | null;
+}) {
+  const [open, setOpen] = useState(false);
+  const last5 = recentLaps.slice(-5);
+  const mean5 = last5.length > 0 ? last5.reduce((a, b) => a + b, 0) / last5.length : Number.NaN;
+  return (
+    <div
+      onClick={() => setOpen((v) => !v)}
+      style={{
+        background: 'rgba(13, 17, 25, 0.92)',
+        border: `1px solid ${holding ? '#ffd070' : highlight ? color : '#1f2735'}`,
+        borderRadius: 6,
+        padding: '6px 8px',
+        color: '#cdd3de',
+        font: '11px ui-monospace, monospace',
+        pointerEvents: 'auto',
+        cursor: 'pointer',
+        boxShadow: highlight ? `0 0 12px ${color}66` : 'none',
+        overflow: 'hidden',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+        <span style={{ color, fontWeight: 700, fontSize: 10, letterSpacing: 0.5 }}>{title}</span>
+        {holding && <span style={{ color: '#ffd070', fontSize: 9, padding: '1px 4px', border: '1px solid #ffd070', borderRadius: 3 }}>WAIT</span>}
+        {rollbackBadge && <span style={{ color: '#a6e9ff', fontSize: 9, padding: '1px 4px', border: '1px solid #55dcff', borderRadius: 3 }}>{rollbackBadge}</span>}
+        <span style={{ marginLeft: 'auto', opacity: 0.6, fontSize: 9 }}>{open ? '▼' : '▶'}</span>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', columnGap: 6, rowGap: 1 }}>
+        <span style={{ opacity: 0.6 }}>t</span>
+        <span style={{ textAlign: 'right' }}>{m.raceTime.toFixed(1)}s</span>
+        <span style={{ opacity: 0.6 }}>lap</span>
+        <span style={{ textAlign: 'right' }}>{m.laps} · {Number.isFinite(m.bestLapTime) ? `${m.bestLapTime.toFixed(2)}s` : '—'}</span>
+        {open && (
+          <>
+            <span style={{ opacity: 0.6 }}>last</span>
+            <span style={{ textAlign: 'right' }}>{Number.isFinite(m.lastLapTime) ? `${m.lastLapTime.toFixed(2)}s` : '—'}</span>
+            <span style={{ opacity: 0.6 }}>mean5</span>
+            <span style={{ textAlign: 'right' }}>{Number.isFinite(mean5) ? `${mean5.toFixed(2)}s` : '—'}</span>
+            <span style={{ opacity: 0.6 }}>wp</span>
+            <span style={{ textAlign: 'right' }}>{m.waypointsCleared}</span>
+            <span style={{ opacity: 0.6 }}>spd</span>
+            <span style={{ textAlign: 'right' }}>{Math.abs(m.liveControls.targetSpeed).toFixed(1)} → {m.peakSpeed.toFixed(1)} m/s</span>
+            <span style={{ opacity: 0.6 }}>thr</span>
+            <span style={{ textAlign: 'right' }}>
+              {(m.liveControls.throttle * 100).toFixed(0)}%
+              {m.liveControls.brake > 0 && ` · brk ${(m.liveControls.brake * 100).toFixed(0)}%`}
+            </span>
+            <span style={{ opacity: 0.6 }}>steer</span>
+            <span style={{ textAlign: 'right' }}>
+              {m.liveControls.steer >= 0 ? '+' : ''}{m.liveControls.steer.toFixed(2)}
+            </span>
+            <span style={{ opacity: 0.6 }}>err</span>
+            <span style={{ textAlign: 'right' }}>{m.trackingErrorRms.toFixed(2)}m</span>
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -1685,43 +1817,81 @@ function SideMetrics({
   );
 }
 
-function LearnerPanel({ snap, v2Active, v2Meta }: {
+function LearnerPanel({ snap, v2Active, v2Meta, isMobile }: {
   snap: LearnerSnapshot;
   v2Active: boolean;
   v2Meta?: PersistedV2Model['meta'] | null;
+  isMobile: boolean;
 }) {
+  // On mobile the panel is collapsible (chart + sector deltas only when
+  // expanded) so it doesn't eat the viewport. The expand toggle defaults
+  // to closed because the per-car cards at the top already show laps.
+  const [open, setOpen] = useState(!isMobile);
   return (
     <div
       style={{
         position: 'absolute',
-        bottom: 12,
-        left: 12,
-        right: 12,
-        background: 'rgba(13, 17, 25, 0.88)',
+        bottom: isMobile ? 0 : 12,
+        left: isMobile ? 0 : 12,
+        right: isMobile ? 0 : 12,
+        background: 'rgba(13, 17, 25, 0.94)',
         border: '1px solid #1f2735',
-        borderRadius: 8,
-        padding: '10px 14px',
+        borderTopLeftRadius: 8,
+        borderTopRightRadius: 8,
+        borderBottomLeftRadius: isMobile ? 0 : 8,
+        borderBottomRightRadius: isMobile ? 0 : 8,
+        padding: isMobile ? '6px 10px 10px' : '10px 14px',
         color: '#cdd3de',
         font: '11px ui-monospace, monospace',
         display: 'flex',
         flexDirection: 'column',
-        gap: 10,
+        gap: isMobile ? 6 : 10,
+        maxHeight: isMobile ? '60vh' : 'none',
+        overflowY: isMobile ? 'auto' : 'visible',
+        zIndex: 20,
       }}
     >
-      <LapTimeChart
-        kinematic={snap.kinematicLapTimes}
-        learned={snap.learnedLapTimes}
-      />
-      <SectorDeltaStrip
-        kinematicSectors={snap.kinematicSectors}
-        learnedSectors={snap.learnedSectors}
-        sectorsPerLap={snap.sectorsPerLap}
-      />
+      {isMobile && (
+        <button
+          onClick={() => setOpen((v) => !v)}
+          style={{
+            background: 'transparent', border: 'none', color: '#cdd3de',
+            font: 'inherit', cursor: 'pointer', textAlign: 'left',
+            padding: '2px 0', display: 'flex', alignItems: 'center', gap: 8,
+          }}
+        >
+          <span style={{ opacity: 0.6 }}>{open ? '▼' : '▶'}</span>
+          <span style={{ color: '#55dcff', fontWeight: 700 }}>
+            {v2Active ? 'V2 MODEL' : 'ONLINE LEARNER'}
+          </span>
+          {!open && Number.isFinite(snap.kinematicLapTimes[snap.kinematicLapTimes.length - 1] ?? NaN) && (
+            <span style={{ opacity: 0.7, marginLeft: 'auto' }}>
+              {snap.kinematicLapTimes.length} laps · tap to expand
+            </span>
+          )}
+        </button>
+      )}
+      {open && (
+        <>
+          <LapTimeChart
+            kinematic={snap.kinematicLapTimes}
+            learned={snap.learnedLapTimes}
+          />
+          <SectorDeltaStrip
+            kinematicSectors={snap.kinematicSectors}
+            learnedSectors={snap.learnedSectors}
+            sectorsPerLap={snap.sectorsPerLap}
+          />
+        </>
+      )}
+      {open && (
       <div
         style={{
           display: 'grid',
-          gridTemplateColumns: '1.4fr 1fr 1fr 1fr',
-          gap: 16,
+          gridTemplateColumns: isMobile
+            ? 'minmax(0, 1fr)'
+            : 'minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr)',
+          gap: isMobile ? 10 : 16,
           borderTop: '1px solid #1f2735',
           paddingTop: 10,
         }}
@@ -1805,6 +1975,7 @@ function LearnerPanel({ snap, v2Active, v2Meta }: {
           learned={snap.learnedLapTimes}
         />
       </div>
+      )}
     </div>
   );
 }
