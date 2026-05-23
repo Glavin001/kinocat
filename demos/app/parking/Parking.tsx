@@ -204,28 +204,27 @@ export default function Parking() {
     }
 
     function createStallMarker(stall: ParkingScenario['targetStall']): THREE.Group {
+      // Stall extents are stored in chassis-local frame (hx along the car's
+      // forward axis, hz across). Build the marker as a thin flat box so
+      // the orientation rotates intuitively about world Y by `-heading`
+      // (matches the syncCarMesh convention).
       const group = new THREE.Group();
       const plate = new THREE.Mesh(
-        new THREE.PlaneGeometry(stall.hz * 2, stall.hx * 2),
+        new THREE.BoxGeometry(stall.hx * 2, 0.02, stall.hz * 2),
         new THREE.MeshBasicMaterial({
           color: C.stallEmpty,
           transparent: true,
           opacity: 0.6,
-          side: THREE.DoubleSide,
         }),
       );
-      plate.rotation.x = -Math.PI / 2;
-      plate.rotation.z = -stall.heading;
-      plate.position.set(stall.x, 0.02, stall.z);
-      group.add(plate);
       const border = new THREE.LineSegments(
-        new THREE.EdgesGeometry(new THREE.PlaneGeometry(stall.hz * 2, stall.hx * 2)),
+        new THREE.EdgesGeometry(new THREE.BoxGeometry(stall.hx * 2, 0.04, stall.hz * 2)),
         new THREE.LineBasicMaterial({ color: 0xffd070 }),
       );
-      border.rotation.x = -Math.PI / 2;
-      border.rotation.z = -stall.heading;
-      border.position.set(stall.x, 0.05, stall.z);
+      group.add(plate);
       group.add(border);
+      group.position.set(stall.x, 0.03, stall.z);
+      group.rotation.y = -stall.heading;
       return group;
     }
 
@@ -309,7 +308,7 @@ export default function Parking() {
       lastBudgetMs: 0,
     };
 
-    function replan() {
+    function replan(deadlineMs: number) {
       const state = carHandle.readState(performance.now());
       ai.goal = scenario.goal;
       const t0 = performance.now();
@@ -317,6 +316,7 @@ export default function Parking() {
         scenario,
         state: { ...state, t: 0 },
         world: navWorld,
+        deadlineMs,
       });
       ai.lastBudgetMs = performance.now() - t0;
       ai.lastExpansions = res.stats.expansions;
@@ -324,10 +324,24 @@ export default function Parking() {
         ai.plan = res.path;
         ai.planStartWall = performance.now();
         if (showPathRef.current) replacePathLine(res.path);
-      } else {
+      } else if (ai.plan === null) {
+        // Only clobber the previous plan if we had nothing — a periodic
+        // replan that fails (e.g. the car briefly clips an obstacle and
+        // the start pose is rejected) shouldn't strand the controller.
         ai.plan = null;
       }
     }
+
+    // Periodic replan corrects for pure-pursuit drift mid-maneuver. The
+    // tight ~250 ms cap keeps the demo responsive after the first plan
+    // (which is given a longer budget below); subsequent replans usually
+    // start from a state close to the existing path and finish fast.
+    const REPLAN_INTERVAL_MS = 600;
+    const REPLAN_DEADLINE_MS = 250;
+    // First-shot plan gets a longer budget so the harder scenarios
+    // (reverse-perp, parallel) actually find a path on scene load instead
+    // of stranding the car.
+    const FIRST_PLAN_DEADLINE_MS = 2000;
 
     function rebuildScenario(id: ParkingScenarioId) {
       scenario = buildParkingScenario(id);
@@ -339,13 +353,13 @@ export default function Parking() {
         heading: scenario.spawn.heading,
       });
       ai.plan = null;
-      replan();
+      replan(FIRST_PLAN_DEADLINE_MS);
     }
     rebuildRef.current = rebuildScenario;
 
     // First build.
     buildSceneFor(scenario);
-    replan();
+    replan(FIRST_PLAN_DEADLINE_MS);
 
     // Input.
     const onKeyDown = (e: KeyboardEvent) => {
@@ -362,10 +376,29 @@ export default function Parking() {
           z: scenario.spawn.z,
           heading: scenario.spawn.heading,
         });
-        replan();
+        ai.plan = null;
+        replan(FIRST_PLAN_DEADLINE_MS);
       }
     };
     window.addEventListener('keydown', onKeyDown);
+
+    // Periodic correction.
+    const replanTimer = window.setInterval(() => {
+      if (pausedRef.current) return;
+      const state = carHandle.readState(performance.now());
+      const dGoal = Math.hypot(
+        state.x - scenario.goal.x,
+        state.z - scenario.goal.z,
+      );
+      const dHead = Math.abs(angleDiff(state.heading, scenario.goal.heading));
+      // Already at the goal — stop replanning, the brake-when-no-plan
+      // branch in tick() will hold the car still.
+      if (dGoal < 0.5 && dHead < 0.2 && Math.abs(state.speed) < 0.3) {
+        ai.plan = null;
+        return;
+      }
+      replan(REPLAN_DEADLINE_MS);
+    }, REPLAN_INTERVAL_MS);
 
     const onResize = () => {
       const w = window.innerWidth;
@@ -463,6 +496,7 @@ export default function Parking() {
 
     return () => {
       stopped = true;
+      window.clearInterval(replanTimer);
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('resize', onResize);
       carHandle.dispose();
@@ -564,6 +598,13 @@ export default function Parking() {
       </div>
     </div>
   );
+}
+
+function angleDiff(a: number, b: number): number {
+  let d = a - b;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return d;
 }
 
 function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
