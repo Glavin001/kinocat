@@ -134,7 +134,13 @@ const PHYSICS_DT = 1 / 60;
 // VEHICLE_CONTROLLER_SUBSTEPS = 4). This keeps the suspension stable and
 // prevents wheels from intermittently losing contact under turning load.
 const VEHICLE_SUBSTEPS = 4;
-const REPLAN_INTERVAL_MS = 80;
+// Slot interval for the round-robin replan scheduler. With NUM_COPS+1 = 4
+// agents and a worker pool (one worker per agent), each agent's slot fires
+// every `REPLAN_INTERVAL_MS * (NUM_COPS + 1)` ms. 25 ms × 4 = ~10 Hz per
+// agent — the in-flight gate skips the rare slot where the previous plan is
+// still running (cop plans can land near the 120 ms deadline cap on
+// obstacle-dense scenes).
+const REPLAN_INTERVAL_MS = 25;
 const CAPTURE_COOLDOWN_MS = 2000;
 // A bust requires the cop to stay inside the capture radius for this many
 // ms. A drive-by bump only counts as a tag, not an arrest — the cop has
@@ -211,10 +217,14 @@ export default function CarChase() {
       // Init Rapier + planner worker in parallel.
       const workerHost = new CarChasePlannerHost();
       const course = buildCarChaseCourse();
+      // One worker per agent (robber + each cop) so the four plans of a
+      // replan round run in parallel instead of serializing through a single
+      // worker. Per-agent in-flight gating still happens in the scheduler.
+      const npcIds = ['robber', ...Array.from({ length: NUM_COPS }, (_, i) => `cop${i}`)];
       const [, useWorker] = await Promise.all([
         ensureRapier(),
         workerHost
-          .init(course, CARCHASE_AGENT, CARCHASE_LIB)
+          .init(course, CARCHASE_AGENT, CARCHASE_LIB, npcIds)
           .then(() => true)
           .catch((err) => {
             console.warn('Planner worker unavailable, using main-thread fallback:', err);
