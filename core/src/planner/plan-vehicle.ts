@@ -57,18 +57,14 @@ const DEFAULT_ENV_OPTIONS: VehicleEnvOptions = {
   levelDivisors: [4, 2, 1],
   goalRadius: 4,
   goalHeadingTol: Infinity,
-  // `sweepSegmentCheck` validates the straight XZ segment between
-  // consecutive primitive sub-samples, catching plans where a long sub-step
-  // straddles an obstacle that neither endpoint touches. Defaulted ON here
-  // (was previously OFF) — the cost is small per expansion and the safety
-  // matches `VehicleEnvironment`'s own default.
-  sweepSegmentCheck: true,
-  // Analytic-shot step halved from 0.6 to 0.3 m. At minTurnRadius ~ 4 m a
-  // 0.6 m sample spacing along a tight Reeds-Shepp arc lets a footprint
-  // corner sweep between samples and clip an obstacle the planner never
-  // queried. 0.3 m halves that worst-case gap while still cheap because
-  // analytic shots are amortised by `everyN`.
-  analyticExpansion: { everyN: 6, step: 0.3 },
+  // Per-tick chase / waypoint AIs (carchase, obstaclecourse, raceprimitives)
+  // hit a fixed expansion ceiling per replan; the tighter `sweepSegmentCheck`
+  // / shorter `analyticStep` settings that the parking demo wants
+  // measurably reduce the number of plans found within that ceiling. Keep
+  // the defaults backward-compatible and let callers opt in via
+  // `envOptions` (the parking scenario module does exactly that).
+  sweepSegmentCheck: false,
+  analyticExpansion: { everyN: 6, step: 0.6 },
 };
 
 const DEFAULT_TIME_OPTIONS: Omit<TimeAwareOptions, 'obstacles' | 'affordances'> = {
