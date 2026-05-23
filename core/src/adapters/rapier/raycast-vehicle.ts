@@ -303,13 +303,23 @@ export function planToAckermannControls(
   // purePursuit returns curvature (1/radius). Ackermann steering:
   //   steer = atan(curvature * wheelBase)
   const steer = Math.atan(cmd.steering * cfg.wheelBase);
+  // purePursuit's `throttle` is a NON-NEGATIVE magnitude in [0, 1] —
+  // the direction lives in `targetSpeed`'s sign. Rapier's applyControls
+  // takes a SIGNED throttle in [-1, 1] (negative = engine drives in
+  // reverse). Convert at the boundary by multiplying by sign(targetSpeed)
+  // so a reverse plan actually backs the chassis up. Without this, the
+  // engine drove forward even when the plan called for reverse — visible
+  // in the parking demo as "the planner produced a back-in maneuver but
+  // the car drove off the opposite direction".
+  const gearSign =
+    cmd.targetSpeed > 1e-6 ? 1 : cmd.targetSpeed < -1e-6 ? -1 : 0;
   return {
     // kinocat curvature → Rapier wheel angle. kinocat sign convention has
     // +curvature rotate +X toward +Z; Rapier's +yaw (right-hand about +Y)
     // rotates +X toward -Z. Negate at the boundary so positive plan curvature
     // produces the matching physical yaw rate.
     steer: -steer,
-    throttle: cmd.throttle,
+    throttle: cmd.throttle * gearSign,
     brake: cmd.brake,
     atGoal: cmd.atGoal,
     lookahead: cmd.lookahead,

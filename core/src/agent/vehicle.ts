@@ -2,11 +2,17 @@ import type { VehicleAgent, VehicleState } from './types';
 import type { ForwardSim } from '../primitives/types';
 import { clamp, wrapAngle } from '../internal/math';
 
+// Default footprint sized to encompass the default Rapier raycast-vehicle
+// chassis (half-extents 2.4 × 1.0, see adapters/rapier/raycast-vehicle.ts)
+// plus a 0.15 m baseline clearance buffer all around. Sizing the planning
+// polygon below the physics chassis lets paths clip walls during execution;
+// keeping a small buffer here means any default-built agent plans with
+// real-world wall margin out of the box.
 const DEFAULT_FOOTPRINT: [number, number][] = [
-  [1.6, 0.9],
-  [-1.6, 0.9],
-  [-1.6, -0.9],
-  [1.6, -0.9],
+  [2.55, 1.15],
+  [-2.55, 1.15],
+  [-2.55, -1.15],
+  [2.55, -1.15],
 ];
 
 export function defaultVehicleAgent(overrides: Partial<VehicleAgent> = {}): VehicleAgent {

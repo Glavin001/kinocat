@@ -662,6 +662,7 @@ const TESTED_DEMOS = new Set([
   'learnprimitives', // 'learnprimitives demo' — autonomous motion-primitive learner (Rapier)
   'navmesh', // 'navmesh demo' — buildNavmesh / planNavmesh
   'obstaclecourse', // 'obstaclecourse demo' — buildObstacleCourseSnapshot (single-car building-blocks)
+  'parking', // 'parking demo' — buildParkingSnapshot (tight-clearance forward/reverse/parallel)
   'plane', // 'aircraft demo' — waypoint/canyon/restricted/gauntlet/knife-edge
   'playground', // 'playground demo' — planPlayground
   'raceprimitives', // 'raceprimitives demo' — side-by-side kinematic vs learned library race

@@ -340,6 +340,10 @@ export function planObstacleCourse(
     agent: OBS_AGENT,
     lib: OBS_LIB,
     affordances: obsAffordances(req.course),
+    // OBS_AGENT's polygon (2.2×0.95) is slightly under the physics
+    // chassis (2.4×1.0). Add a 0.3 m static-obstacle margin so plans
+    // keep clear of the cuboid buildings/curb during execution.
+    envOptions: { footprintInflate: 0.3 },
     deadlineMs: req.deadlineMs ?? OBS_REPLAN_BUDGET_MS,
     maxExpansions: req.maxExpansions ?? OBS_MAX_EXPANSIONS,
   });

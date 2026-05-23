@@ -57,6 +57,12 @@ const DEFAULT_ENV_OPTIONS: VehicleEnvOptions = {
   levelDivisors: [4, 2, 1],
   goalRadius: 4,
   goalHeadingTol: Infinity,
+  // Per-tick chase / waypoint AIs (carchase, obstaclecourse, raceprimitives)
+  // hit a fixed expansion ceiling per replan; the tighter `sweepSegmentCheck`
+  // / shorter `analyticStep` settings that the parking demo wants
+  // measurably reduce the number of plans found within that ceiling. Keep
+  // the defaults backward-compatible and let callers opt in via
+  // `envOptions` (the parking scenario module does exactly that).
   sweepSegmentCheck: false,
   analyticExpansion: { everyN: 6, step: 0.6 },
 };

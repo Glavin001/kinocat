@@ -42,6 +42,12 @@ const groups: { heading: string; demos: Demo[] }[] = [
         tag: '3D · interactive · building-blocks',
       },
       {
+        href: '/parking',
+        title: 'Tight parking — spatial accuracy under sub-meter clearances',
+        desc: 'Three parking scenarios in a single demo — forward pull-in, reverse perpendicular, and parallel parking — all running the same kinocat planner but with the new `footprintInflate` clearance margin and a sub-meter discretisation (posCell 0.3 m, 10° heading buckets, 0.15 m analytic-shot sampling). Stress-tests the spatial-accuracy improvements that flow through to /carchase, /obstaclecourse, and /raceprimitives.',
+        tag: '3D · interactive · accuracy',
+      },
+      {
         href: '/catmouse',
         title: 'Cat & Mouse pursuit',
         desc: 'AI cats observe a non-cooperative mouse, build a predictor of its motion, and plan to the interception pose — where the mouse WILL be at arrival time, not where it is. Plans are shared via PlanRegistry so cats flank instead of pile up. Both species can take boost pads; a canyon split forces one cat to detour while another takes the jump affordance. Toggle "naive mode" to watch the cats lag the mouse without prediction.',
