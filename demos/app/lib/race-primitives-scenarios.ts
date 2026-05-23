@@ -265,6 +265,18 @@ export const RACE_REPLAN_BUDGET_MS = 120;
 export const RACE_MAX_EXPANSIONS = 30000;
 export const RACE_TEST_MAX_EXPANSIONS = 60000;
 
+/** Radius (m) within which `pickNextWaypoint` advances loopIndex to the
+ *  next gate. The visual cone is ~0.8 m radius with a 2 m ring; 2.5 m
+ *  feels "hit" without being pixel-precise. */
+export const RACE_ARRIVE_RADIUS = 2.5;
+
+/** Radius (m) the multi-goal planner uses for its "gate reached" check.
+ *  Strictly less than RACE_ARRIVE_RADIUS so EVERY valid plan brings the
+ *  chassis close enough that pickNextWaypoint will advance — prevents the
+ *  "plan says I clipped the gate, real chassis overshot by ε, loopIndex
+ *  stays, U-turn back" failure mode. */
+export const RACE_PLANNER_GATE_RADIUS = 1.8;
+
 export interface RacePlanRequest {
   state: VehicleState;
   goal: VehicleState;
@@ -422,7 +434,7 @@ export function pickNextWaypoint(
   state: VehicleState,
   waypoints: VehicleState[],
   loopIndex: number,
-  arriveRadius = 2.5,
+  arriveRadius = RACE_ARRIVE_RADIUS,
 ): WaypointPick {
   const cur = waypoints[loopIndex]!;
   const d = Math.hypot(state.x - cur.x, state.z - cur.z);

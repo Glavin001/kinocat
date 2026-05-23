@@ -39,6 +39,7 @@ import {
   RACE_AGENT,
   RACE_BOUNDS,
   RACE_PALETTE as C,
+  RACE_PLANNER_GATE_RADIUS,
   RACE_REPLAN_BUDGET_MS,
   RACE_START_SPEEDS,
   raceControlSets,
@@ -914,21 +915,31 @@ async function setupScene(
     // Lookahead: number of consecutive gates the planner sees per replan.
     // Multi-goal A* solves ONE search over the (chassis × gate-index) joint
     // state space, so the planner GLOBALLY trades off entries to gate i
-    // against exits toward gate i+1, i+2 — proper racing-line behavior
-    // (wide entry / late apex / early exit) emerges from the time-cost
-    // search across all N gates simultaneously.
+    // against exits toward gate i+1 — proper racing-line behavior (wide
+    // entry / late apex / early exit) emerges from the time-cost search
+    // across all N gates simultaneously.
     //
-    // Trade-off: the joint state space is ~N× larger than single-gate, so
-    // 3 gates @ 120ms is roughly the practical cap on this course. Bumping
-    // to 5 caused per-replan timeouts in testing (the chained-per-gate
-    // approach handled 5 because each segment was an independent smaller
-    // search; the global version is strictly more work per node).
-    const PLAN_LOOKAHEAD_COUNT = 3;
+    // Joint state space is N× larger than single-gate, so within a 120ms
+    // budget 2 gates @ multi-goal is the right balance (3 sometimes timed
+    // out on tight slalom sections).
+    const PLAN_LOOKAHEAD_COUNT = 2;
     const gates: VehicleState[] = [];
     for (let i = 0; i < PLAN_LOOKAHEAD_COUNT; i++) {
       const idx = (car.ai.loopIndex + i) % course.waypoints.length;
       gates.push({ ...course.waypoints[idx]!, t: 0 });
     }
+    // GATE-RADIUS COUPLING: the demo advances `loopIndex` once the chassis
+    // is within `RACE_ARRIVE_RADIUS` (2.5 m) of the current waypoint.
+    // If the planner's gate radius were ≥ that, the planner could find a
+    // "valid" plan that just clips the wider radius but never actually
+    // brings the chassis close enough to advance. Result: the car passes
+    // the gate, loopIndex stays put, next replan asks for the same gate
+    // again from a position past it, and the plan U-turns back — the
+    // "freakout" loop. The v2 model is especially sensitive because its
+    // predictions are accurate so it picks marginal-clearance plans; the
+    // kinematic model over-predicts curvature so its plans accidentally
+    // have more margin. Setting planner radius < advance radius
+    // GUARANTEES every valid plan leads to an advance.
     const res = planRaceMultiGoal({
       state: { ...state, t: 0 },
       gates,
@@ -937,6 +948,7 @@ async function setupScene(
       obstacles: course.obstacles,
       world: navWorld,
       deadlineMs: RACE_REPLAN_BUDGET_MS,
+      gateRadius: RACE_PLANNER_GATE_RADIUS,
     });
     if (res.found && res.path.length > 1) {
       car.ai.plan = res.path;
