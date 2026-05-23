@@ -17,6 +17,10 @@ import {
   PARAMS_V2_ORDER,
   buildParametricOnlyModel,
   type LearnedVehicleModel,
+  buildMLPInput,
+  MLP_INPUT_DIM,
+  MLP_OUTPUT_DIM,
+  learnedForwardSimV2,
   kinematicForwardSim,
   learnedForwardSim,
   DEFAULT_LEARNED_PARAMS,
@@ -27,6 +31,7 @@ import {
   type Trial,
   type TrialStore,
   runParametricFit,
+  runResidualMLPFit,
   evaluateModel,
   type ModelDiagnostics,
   type FitProgressEvent,
@@ -241,15 +246,25 @@ function evaluate(
     steer: controls[0] ?? 0, driveForce: controls[1] ?? 0, brakeForce: controls[2] ?? 0,
   }), dt);
 
+  // Use the FULL learnedForwardSimV2 (parametric + residual-ensemble) so
+  // the headline open-loop divergence reflects what the planner will
+  // actually see at race time. When the ensemble is empty (no residual
+  // trained yet), this falls back to parametric-only.
   return evaluateModel<VehicleState, WheeledControls, LearnableVehicleConfig>({
     trials: heldOut,
     horizons,
     controlsToVec,
     extractMetricFields: (s) => ({ x: s.x, z: s.z, heading: s.heading, speed: s.speed }),
-    model: { make: (cfg) => parametricForwardV2(model.params, cfg) },
+    model: { make: () => learnedForwardSimV2(model) },
     baselines: {
       kinematic: { make: () => composedSim(kinematicForwardSim(agent), wheeledToLegacy) },
       legacyV1: { make: () => composedSim(learnedForwardSim(DEFAULT_LEARNED_PARAMS, agent), wheeledToLegacy) },
+      // Parametric-only (no residual MLP) — shown so the user can see
+      // how much the residual ensemble contributed on top of the
+      // parametric fit alone.
+      parametricOnly: {
+        make: () => parametricForwardV2(model.params, model.config),
+      },
     },
   });
 }
@@ -412,6 +427,65 @@ export async function runOfflineTraining(
     });
     model = { ...model, params: fit.params };
 
+    // Residual MLP fit. The parametric model alone cannot represent
+    // Rapier's full nonlinear behavior (engine torque falloff at speed,
+    // tire slip, suspension load transfer, etc) — so several coefficients
+    // tended to pin to bounds when the parametric fit ran solo. The
+    // residual MLP ensemble learns the per-tick correction the parametric
+    // can't, dropping open-loop prediction error substantially without
+    // forcing the parametric into unphysical regions.
+    //
+    // Only fit residual after enough rounds of trial data have built up,
+    // and only on the final round (the parametric needs to be at its
+    // final fit before residual training — fitting residual against an
+    // intermediate parametric would baked-in stale corrections).
+    const isFinalRound = round === rounds - 1;
+    if (isFinalRound && store.size() >= 16) {
+      const baselineSim = parametricForwardV2(model.params, config);
+      const residualFit = runResidualMLPFit<VehicleState, WheeledControls, LearnableVehicleConfig>({
+        trials: store.all(),
+        makeBaselineSim: () => baselineSim,
+        encodeInput: (s, ctrl, cfg) => buildMLPInput(s, ctrl, cfg),
+        encodeResidual: (actual, baseline) => [
+          actual.x - baseline.x,
+          actual.z - baseline.z,
+          wrapAngleResidual(actual.heading - baseline.heading),
+          actual.speed - baseline.speed,
+          (actual.yawRate ?? 0) - (baseline.yawRate ?? 0),
+          (actual.lateralVelocity ?? 0) - (baseline.lateralVelocity ?? 0),
+        ],
+        controlsToVec,
+        mlpShape: { inputDim: MLP_INPUT_DIM, hiddenDims: [32, 32], outputDim: MLP_OUTPUT_DIM },
+        ensembleSize: 3,
+        seed: 42,
+        epochs: 200,
+        batchSize: 64,
+        learningRate: 1e-3,
+        valSplit: 0.2,
+        // Reference dt for the per-sample residual. Samples are recorded
+        // every `sampleEveryN` physics ticks @ 60 Hz, so each sample
+        // interval = sampleEveryN / 60 seconds.
+        fitSubstepsPerSample: 6,
+        onProgress: (e) => {
+          // Reuse the fit-progress event channel so the existing UI can
+          // see the MLP loss curve drop.
+          opts.onEvent?.({
+            type: 'fit-progress',
+            round,
+            phase: 'parametric', // (UI reuses the same chart)
+            event: { iter: e.epoch, loss: e.trainLoss, perComponent: undefined },
+          });
+        },
+      });
+      model = {
+        ...model,
+        residualEnsemble: residualFit.ensemble,
+        // Each sample interval = (sampleEveryN ticks) / 60 Hz seconds.
+        // Default sampleEveryN = 6 → 0.1s reference dt.
+        residualReferenceDt: sampleEveryN / 60,
+      };
+    }
+
     // Evaluate.
     finalDiag = evaluate(store, model);
     // Populate coverage with bin keys we'll use for active exploration in the next round.
@@ -422,6 +496,13 @@ export async function runOfflineTraining(
   harness.dispose();
   opts.onEvent?.({ type: 'done', totalTrials: store.size(), finalModel: model, finalDiagnostics: finalDiag });
   return { model, trials: store, finalDiagnostics: finalDiag };
+}
+
+function wrapAngleResidual(a: number): number {
+  let d = a;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return d;
 }
 
 /** Recompute coverage with `(speedBin, steerBin)` cell keys so the active

@@ -63,3 +63,8 @@ export {
   MLP_INPUT_DIM,
   MLP_OUTPUT_DIM,
 } from './vehicle-model';
+
+// MLP serialization (used by the demo's v2-model-persistence to round-trip
+// trained residual ensembles through localStorage / JSON download).
+export type { MLP } from '../internal/mlp';
+export { serializeMLP, deserializeMLP } from '../internal/mlp';
