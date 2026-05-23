@@ -225,7 +225,17 @@ export default function RacePrimitives() {
   // learned car's library is built from v2 instead of legacy.
   const [v2Model, setV2Model] = useState<LearnedVehicleModel | null>(null);
   const [v2Meta, setV2Meta] = useState<PersistedV2Model['meta'] | null>(null);
-  const [useV2, setUseV2] = useState(false);
+  const [useV2, setUseV2State] = useState(false);
+  // Persist the toggle so the user doesn't have to re-enable v2 on every
+  // page reload after they've trained a model.
+  const setUseV2 = (v: boolean) => {
+    setUseV2State(v);
+    if (typeof window !== 'undefined') {
+      try {
+        window.localStorage.setItem('kinocat:v2-toggle:v1', v ? '1' : '0');
+      } catch { /* quota; ignore */ }
+    }
+  };
   const v2Active = useV2 && v2Model !== null;
 
   const sceneRef = useRef<{
@@ -249,6 +259,12 @@ export default function RacePrimitives() {
     if (v2) {
       setV2Model(v2.model);
       setV2Meta(v2.meta);
+    }
+    if (typeof window !== 'undefined') {
+      try {
+        const v = window.localStorage.getItem('kinocat:v2-toggle:v1');
+        if (v === '1') setUseV2State(true);
+      } catch { /* ignore */ }
     }
   }, []);
 
@@ -457,8 +473,8 @@ export default function RacePrimitives() {
           rollbackActive={learner?.rollbackActive ?? false}
           bestLapNumber={learner?.bestLapNumber ?? 0}
         />
-        {(phase === 'racing' || phase === 'finished') && learner && !v2Active && (
-          <LearnerPanel snap={learner} />
+        {(phase === 'racing' || phase === 'finished') && learner && (
+          <LearnerPanel snap={learner} v2Active={v2Active} v2Meta={v2Meta} />
         )}
         {phase === 'learning' && (
           <PretrainOverlay progress={learnProgress} />
@@ -1196,20 +1212,24 @@ async function setupScene(
         replan(learned, now);
       }
       cb.onMetrics(kinematic.metrics, learned.metrics);
-      if (now - lastLearnerEmit > 250 && learned.learner) {
+      // Emit the comparison snapshot in BOTH modes (legacy + v2). The lap-
+      // times / sector-deltas are universal; only the per-coef refit fields
+      // are legacy-only and get safe defaults when v2 is driving.
+      if (now - lastLearnerEmit > 250) {
         lastLearnerEmit = now;
+        const lz = learned.learner;
         cb.onLearner({
-          params: learned.learner.params,
-          priorParams: learned.learner.priorParams,
-          bestParams: learned.learner.bestParams,
-          bestLapTime: learned.learner.bestLapTime,
-          bestLapNumber: learned.learner.bestLapNumber,
-          rollbackActive: learned.learner.rollbackActive,
-          rollbackCount: learned.learner.rollbackCount,
-          refitCount: learned.learner.refitCount,
-          sampleCount: learned.learner.samples.length,
-          lastFitMs: learned.learner.lastFitMs,
-          lastMeanError: learned.learner.lastMeanError,
+          params: lz?.params ?? DEFAULT_LEARNED_PARAMS,
+          priorParams: lz?.priorParams ?? DEFAULT_LEARNED_PARAMS,
+          bestParams: lz?.bestParams ?? DEFAULT_LEARNED_PARAMS,
+          bestLapTime: lz?.bestLapTime ?? Number.NaN,
+          bestLapNumber: lz?.bestLapNumber ?? 0,
+          rollbackActive: lz?.rollbackActive ?? false,
+          rollbackCount: lz?.rollbackCount ?? 0,
+          refitCount: lz?.refitCount ?? 0,
+          sampleCount: lz?.samples.length ?? 0,
+          lastFitMs: lz?.lastFitMs ?? 0,
+          lastMeanError: lz?.lastMeanError ?? 0,
           kinematicLapTimes: kinematic.lapTimes.slice(),
           learnedLapTimes: learned.lapTimes.slice(),
           kinematicSectors: kinematic.sectorTimes.map((s) => s.slice()),
@@ -1596,7 +1616,11 @@ function SideMetrics({
   );
 }
 
-function LearnerPanel({ snap }: { snap: LearnerSnapshot }) {
+function LearnerPanel({ snap, v2Active, v2Meta }: {
+  snap: LearnerSnapshot;
+  v2Active: boolean;
+  v2Meta?: PersistedV2Model['meta'] | null;
+}) {
   return (
     <div
       style={{
@@ -1633,42 +1657,77 @@ function LearnerPanel({ snap }: { snap: LearnerSnapshot }) {
           paddingTop: 10,
         }}
       >
-        <div>
-          <div style={{ color: '#55dcff', fontWeight: 700, marginBottom: 6 }}>
-            ONLINE LEARNER · {snap.refitCount} refit{snap.refitCount === 1 ? '' : 's'}
-            {snap.rollbackCount > 0 && (
-              <span style={{ color: '#ffd070' }}>
-                {' '}· {snap.rollbackCount} rollback{snap.rollbackCount === 1 ? '' : 's'}
-              </span>
-            )}
-            {' '}· {snap.sampleCount} samples
-            {snap.lastFitMs > 0 && (
+        {v2Active ? (
+          <div>
+            <div style={{ color: '#55dcff', fontWeight: 700, marginBottom: 6 }}>
+              V2 LEARNED MODEL · offline-trained
               <span style={{ opacity: 0.65 }}>
-                {' '}· last fit {snap.lastFitMs.toFixed(0)}ms (mean err {snap.lastMeanError.toFixed(3)}m)
+                {' '}· online refit disabled
               </span>
-            )}
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              {v2Meta && (
+                <>
+                  <KV k="trials used" v={`${v2Meta.trialsUsed}`} />
+                  <KV k="open-loop RMS @ 1s" v={`${v2Meta.openLoopRmsAt1s.toFixed(3)} m`} />
+                  {v2Meta.legacyRmsAt1s !== undefined && (
+                    <KV
+                      k="vs legacy 5-param"
+                      v={`${v2Meta.legacyRmsAt1s.toFixed(3)} m (${((1 - v2Meta.openLoopRmsAt1s / v2Meta.legacyRmsAt1s) * 100).toFixed(1)}% better)`}
+                    />
+                  )}
+                  {v2Meta.kinematicRmsAt1s !== undefined && (
+                    <KV
+                      k="vs kinematic"
+                      v={`${v2Meta.kinematicRmsAt1s.toFixed(3)} m`}
+                    />
+                  )}
+                  <KV k="trained" v={new Date(v2Meta.createdAt).toLocaleString()} />
+                </>
+              )}
+              {!v2Meta && (
+                <span style={{ opacity: 0.65 }}>v2 model active (no meta available)</span>
+              )}
+            </div>
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'auto auto auto auto', gap: '2px 12px' }}>
-            <span style={{ opacity: 0.55 }}>coef</span>
-            <span style={{ opacity: 0.55, textAlign: 'right' }}>live</span>
-            <span style={{ opacity: 0.55, textAlign: 'right' }}>
-              best{Number.isFinite(snap.bestLapTime) ? ` (l${snap.bestLapNumber})` : ''}
-            </span>
-            <span style={{ opacity: 0.55, textAlign: 'right' }}>prior</span>
-            <ParamRow k="maxAccel" v={snap.params.maxAccel} best={snap.bestParams.maxAccel} prior={snap.priorParams.maxAccel} unit="m/s²" />
-            <ParamRow k="maxDecel" v={snap.params.maxDecel} best={snap.bestParams.maxDecel} prior={snap.priorParams.maxDecel} unit="m/s²" />
-            <ParamRow k="accelTau" v={snap.params.accelTau} best={snap.bestParams.accelTau} prior={snap.priorParams.accelTau} unit="s" digits={3} />
-            <ParamRow k="understeerGain" v={snap.params.understeerGain} best={snap.bestParams.understeerGain} prior={snap.priorParams.understeerGain} exp />
-            <ParamRow k="lateralDrag" v={snap.params.lateralDrag} best={snap.bestParams.lateralDrag} prior={snap.priorParams.lateralDrag} exp />
+        ) : (
+          <div>
+            <div style={{ color: '#55dcff', fontWeight: 700, marginBottom: 6 }}>
+              ONLINE LEARNER · {snap.refitCount} refit{snap.refitCount === 1 ? '' : 's'}
+              {snap.rollbackCount > 0 && (
+                <span style={{ color: '#ffd070' }}>
+                  {' '}· {snap.rollbackCount} rollback{snap.rollbackCount === 1 ? '' : 's'}
+                </span>
+              )}
+              {' '}· {snap.sampleCount} samples
+              {snap.lastFitMs > 0 && (
+                <span style={{ opacity: 0.65 }}>
+                  {' '}· last fit {snap.lastFitMs.toFixed(0)}ms (mean err {snap.lastMeanError.toFixed(3)}m)
+                </span>
+              )}
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'auto auto auto auto', gap: '2px 12px' }}>
+              <span style={{ opacity: 0.55 }}>coef</span>
+              <span style={{ opacity: 0.55, textAlign: 'right' }}>live</span>
+              <span style={{ opacity: 0.55, textAlign: 'right' }}>
+                best{Number.isFinite(snap.bestLapTime) ? ` (l${snap.bestLapNumber})` : ''}
+              </span>
+              <span style={{ opacity: 0.55, textAlign: 'right' }}>prior</span>
+              <ParamRow k="maxAccel" v={snap.params.maxAccel} best={snap.bestParams.maxAccel} prior={snap.priorParams.maxAccel} unit="m/s²" />
+              <ParamRow k="maxDecel" v={snap.params.maxDecel} best={snap.bestParams.maxDecel} prior={snap.priorParams.maxDecel} unit="m/s²" />
+              <ParamRow k="accelTau" v={snap.params.accelTau} best={snap.bestParams.accelTau} prior={snap.priorParams.accelTau} unit="s" digits={3} />
+              <ParamRow k="understeerGain" v={snap.params.understeerGain} best={snap.bestParams.understeerGain} prior={snap.priorParams.understeerGain} exp />
+              <ParamRow k="lateralDrag" v={snap.params.lateralDrag} best={snap.bestParams.lateralDrag} prior={snap.priorParams.lateralDrag} exp />
+            </div>
           </div>
-        </div>
+        )}
         <LapTimeList
           title="kinematic laps"
           color="#ff8aa0"
           laps={snap.kinematicLapTimes}
         />
         <LapTimeList
-          title="learned laps"
+          title={v2Active ? 'learned (v2) laps' : 'learned laps'}
           color="#55dcff"
           laps={snap.learnedLapTimes}
         />
