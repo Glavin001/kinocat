@@ -944,6 +944,7 @@ async function setupScene(
     // kinematic model over-predicts curvature so its plans accidentally
     // have more margin. Setting planner radius < advance radius
     // GUARANTEES every valid plan leads to an advance.
+    const tReplanStart = performance.now();
     const res = planRaceMultiGoal({
       state: { ...state, t: 0 },
       gates,
@@ -954,6 +955,20 @@ async function setupScene(
       deadlineMs: RACE_REPLAN_BUDGET_MS,
       gateRadius: RACE_PLANNER_GATE_RADIUS,
     });
+    const replanMs = performance.now() - tReplanStart;
+    // Update per-replan diagnostics so the HUD can show why a car is
+    // slower (replan timing out → stale plan → degraded line vs
+    // planner finding plans cleanly each tick).
+    const d = car.metrics.planDiagnostics;
+    d.lastReplanMs = replanMs;
+    d.lastReplanFound = res.found && res.path.length > 1;
+    d.totalReplans += 1;
+    if (d.lastReplanFound) {
+      d.successfulReplans += 1;
+      d.consecutiveFailedReplans = 0;
+    } else {
+      d.consecutiveFailedReplans += 1;
+    }
     if (res.found && res.path.length > 1) {
       car.ai.plan = res.path;
       car.ai.planStartWall = now;
@@ -1137,6 +1152,7 @@ async function setupScene(
       car.idealLine.computeLineDistances();
     }
     car.metrics.peakSpeed = Math.max(car.metrics.peakSpeed, Math.abs(after.speed));
+    car.metrics.planDiagnostics.planAgeMs = now - car.ai.planStartWall;
     // Race-time accumulates only while DRIVING; sync holds are paused so
     // they don't pollute lap-time measurement.
     if (running && !car.holdingForSync) car.metrics.raceTime += dt;
@@ -1696,6 +1712,24 @@ function CompactCarCard({
             </span>
             <span style={{ opacity: 0.6 }}>err</span>
             <span style={{ textAlign: 'right' }}>{m.trackingErrorRms.toFixed(2)}m</span>
+            <span style={{ opacity: 0.6 }}>plan</span>
+            <span style={{
+              textAlign: 'right',
+              color: !m.planDiagnostics.lastReplanFound ? '#ff5566'
+                : m.planDiagnostics.lastReplanMs > 100 ? '#ffd070'
+                : '#cdd3de',
+            }}>
+              {m.planDiagnostics.lastReplanMs.toFixed(0)}ms{m.planDiagnostics.lastReplanFound ? '' : ' FAIL'}
+            </span>
+            <span style={{ opacity: 0.6 }}>age</span>
+            <span style={{
+              textAlign: 'right',
+              color: m.planDiagnostics.planAgeMs > 800 ? '#ff5566'
+                : m.planDiagnostics.planAgeMs > 400 ? '#ffd070'
+                : '#cdd3de',
+            }}>
+              {m.planDiagnostics.planAgeMs.toFixed(0)}ms
+            </span>
           </>
         )}
       </div>
@@ -1812,6 +1846,47 @@ function SideMetrics({
         <KV k="throttle" v={`${(m.liveControls.throttle * 100).toFixed(0)}%`} />
         <KV k="brake" v={`${(m.liveControls.brake * 100).toFixed(0)}%`} />
         <KV k="target spd" v={`${m.liveControls.targetSpeed.toFixed(1)} m/s`} />
+      </div>
+      <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid #1f2735', opacity: 0.85 }}>
+        <div style={{ fontSize: 10, opacity: 0.7, marginBottom: 2 }}>PLANNER</div>
+        {(() => {
+          const d = m.planDiagnostics;
+          const ok = d.successfulReplans / Math.max(1, d.totalReplans);
+          const replanColor =
+            !d.lastReplanFound ? '#ff5566'
+              : d.lastReplanMs > 100 ? '#ffd070'
+              : '#cdd3de';
+          const ageColor =
+            d.planAgeMs > 800 ? '#ff5566'
+              : d.planAgeMs > 400 ? '#ffd070'
+              : '#cdd3de';
+          return (
+            <>
+              <KV
+                k="last replan"
+                v={
+                  <span style={{ color: replanColor }}>
+                    {d.lastReplanMs.toFixed(0)}ms · {d.lastReplanFound ? 'ok' : 'FAIL'}
+                  </span>
+                }
+              />
+              <KV
+                k="plan age"
+                v={<span style={{ color: ageColor }}>{d.planAgeMs.toFixed(0)} ms</span>}
+              />
+              <KV
+                k="success rate"
+                v={`${(ok * 100).toFixed(0)}% (${d.successfulReplans}/${d.totalReplans})`}
+              />
+              {d.consecutiveFailedReplans > 0 && (
+                <KV
+                  k="failed streak"
+                  v={<span style={{ color: '#ff5566' }}>{d.consecutiveFailedReplans}</span>}
+                />
+              )}
+            </>
+          );
+        })()}
       </div>
     </div>
   );
@@ -2291,7 +2366,7 @@ function LapDeltaSpark({
   );
 }
 
-function KV({ k, v }: { k: string; v: string }) {
+function KV({ k, v }: { k: string; v: string | React.ReactNode }) {
   return (
     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
       <span style={{ opacity: 0.7 }}>{k}</span>

@@ -478,6 +478,28 @@ export interface RaceMetrics {
     brake: number;        // [0, 1]
     targetSpeed: number;  // m/s the pure-pursuit tracker is aiming at
   };
+  /** Per-replan diagnostics — surfaced in the HUD so the user can see
+   *  WHY a car is slower (e.g. replans timing out → stale plans → poor
+   *  racing line). */
+  planDiagnostics: {
+    /** Wall-clock ms the most recent replan took. */
+    lastReplanMs: number;
+    /** True when the most recent replan returned `found: true`. False
+     *  means the previous plan is still running (graceful fallback). */
+    lastReplanFound: boolean;
+    /** Number of consecutive failed replans (resets on a success). High
+     *  values mean the planner has been failing repeatedly — the car
+     *  is on a stale plan. */
+    consecutiveFailedReplans: number;
+    /** Wall-clock ms since the currently-executing plan was installed.
+     *  Plans older than the replan interval mean failed replans aren't
+     *  refreshing the plan in time. */
+    planAgeMs: number;
+    /** Total successful replans this race (for sanity). */
+    successfulReplans: number;
+    /** Total replan attempts this race. */
+    totalReplans: number;
+  };
 }
 
 export function emptyMetrics(): RaceMetrics {
@@ -491,6 +513,14 @@ export function emptyMetrics(): RaceMetrics {
     trackingErrorRms: 0,
     peakSpeed: 0,
     liveControls: { steer: 0, throttle: 0, brake: 0, targetSpeed: 0 },
+    planDiagnostics: {
+      lastReplanMs: 0,
+      lastReplanFound: false,
+      consecutiveFailedReplans: 0,
+      planAgeMs: 0,
+      successfulReplans: 0,
+      totalReplans: 0,
+    },
   };
 }
 
