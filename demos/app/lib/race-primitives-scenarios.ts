@@ -16,7 +16,7 @@
 // (`RacePrimitives.tsx`) and the headless test import the course + AI helpers
 // from here.
 
-import { planVehicleOnce } from 'kinocat/planner';
+import { planVehicleOnce, planVehicleMultiGoal } from 'kinocat/planner';
 import type { PlanResult } from 'kinocat/planner';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavPolygon, NavWorld } from 'kinocat/environment';
@@ -286,6 +286,44 @@ export function planRace(req: RacePlanRequest): PlanResult<VehicleState> {
     lib: req.lib,
     deadlineMs: req.deadlineMs ?? RACE_REPLAN_BUDGET_MS,
     maxExpansions: req.maxExpansions ?? RACE_MAX_EXPANSIONS,
+  });
+}
+
+export interface RaceMultiGoalRequest {
+  state: VehicleState;
+  /** Ordered sequence of gates the chassis must pass through. */
+  gates: VehicleState[];
+  lib: MotionPrimitiveLibrary;
+  world?: NavWorld;
+  polygons: NavPolygon[];
+  obstacles: Array<[number, number][]>;
+  deadlineMs?: number;
+  maxExpansions?: number;
+  /** Position radius for "gate reached" check. Default 4 m. */
+  gateRadius?: number;
+}
+
+/** Single A* through an ordered SEQUENCE of gates. Unlike `planRace`
+ *  (one goal pose) or chained `planRace` calls (N independent goals),
+ *  this lets the planner GLOBALLY trade off entries to gate i against
+ *  exits toward gate i+1, i+2, ... — the racing-line problem.
+ *
+ *  Same time-cost as `planRace`; same goal radius. The only constraint
+ *  is "pass within `gateRadius` of each gate in order" — no heading,
+ *  no speed, exactly what the user asked for. */
+export function planRaceMultiGoal(req: RaceMultiGoalRequest): PlanResult<VehicleState> {
+  const world = req.world ?? new InMemoryNavWorld(req.polygons, req.obstacles);
+  return planVehicleMultiGoal({
+    start: req.state,
+    gates: req.gates,
+    world,
+    agent: RACE_AGENT,
+    lib: req.lib,
+    deadlineMs: req.deadlineMs ?? RACE_REPLAN_BUDGET_MS,
+    // Larger budget than single-goal because the search space is N× larger
+    // (chassis pose × gate index).
+    maxExpansions: req.maxExpansions ?? RACE_MAX_EXPANSIONS * 2,
+    gateRadius: req.gateRadius,
   });
 }
 

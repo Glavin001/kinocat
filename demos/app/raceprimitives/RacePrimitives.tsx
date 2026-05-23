@@ -35,9 +35,11 @@ import {
   emptyMetrics,
   pickNextWaypoint,
   planThroughWaypoints,
+  planRaceMultiGoal,
   RACE_AGENT,
   RACE_BOUNDS,
   RACE_PALETTE as C,
+  RACE_REPLAN_BUDGET_MS,
   RACE_START_SPEEDS,
   raceControlSets,
   type RaceMetrics,
@@ -902,31 +904,41 @@ async function setupScene(
   /** Replan = planning only (no waypoint advancement, no lap detection —
    *  those happen at 60Hz in `stepCar` so lap times aren't quantized to
    *  the 500ms replan interval). Reads the car's current state and the
-   *  current `loopIndex` (which stepCar maintains), produces a fresh
-   *  3-waypoint stitched plan, and records the predicted end of the
-   *  first primitive for the prediction-error metric. */
+   *  current `loopIndex` (which stepCar maintains), runs a SINGLE multi-
+   *  goal A* through the next N waypoints, and records the predicted
+   *  end of the first primitive for the prediction-error metric. */
   function replan(car: CarRuntime, now: number): void {
     if (car.holdingForSync) return;
     const state = car.car.readState(now);
     car.ai.goal = course.waypoints[car.ai.loopIndex]!;
     // Lookahead: number of consecutive gates the planner sees per replan.
-    // More = the planner can pick an entry to gate N that sets up a better
-    // exit toward gate N+1, N+2, ... (proper racing-line optimization
-    // emerges naturally from a longer-horizon time-cost search). Each
-    // segment gets totalBudgetMs / count, so don't push this so high that
-    // per-segment budget falls below ~20ms.
-    const PLAN_LOOKAHEAD_COUNT = 5;
-    const res = planThroughWaypoints({
+    // Multi-goal A* solves ONE search over the (chassis × gate-index) joint
+    // state space, so the planner GLOBALLY trades off entries to gate i
+    // against exits toward gate i+1, i+2 — proper racing-line behavior
+    // (wide entry / late apex / early exit) emerges from the time-cost
+    // search across all N gates simultaneously.
+    //
+    // Trade-off: the joint state space is ~N× larger than single-gate, so
+    // 3 gates @ 120ms is roughly the practical cap on this course. Bumping
+    // to 5 caused per-replan timeouts in testing (the chained-per-gate
+    // approach handled 5 because each segment was an independent smaller
+    // search; the global version is strictly more work per node).
+    const PLAN_LOOKAHEAD_COUNT = 3;
+    const gates: VehicleState[] = [];
+    for (let i = 0; i < PLAN_LOOKAHEAD_COUNT; i++) {
+      const idx = (car.ai.loopIndex + i) % course.waypoints.length;
+      gates.push({ ...course.waypoints[idx]!, t: 0 });
+    }
+    const res = planRaceMultiGoal({
       state: { ...state, t: 0 },
-      waypoints: course.waypoints,
-      fromIdx: car.ai.loopIndex,
-      count: PLAN_LOOKAHEAD_COUNT,
+      gates,
       lib: car.lib,
       polygons: course.polygons,
       obstacles: course.obstacles,
       world: navWorld,
+      deadlineMs: RACE_REPLAN_BUDGET_MS,
     });
-    if (res.segments > 0 && res.path.length > 1) {
+    if (res.found && res.path.length > 1) {
       car.ai.plan = res.path;
       car.ai.planStartWall = now;
       // Record the predicted state at the FIRST primitive's end (t≈0.55s
