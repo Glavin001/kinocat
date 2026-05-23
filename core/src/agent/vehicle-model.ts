@@ -97,11 +97,26 @@ export const DEFAULT_LEARNED_PARAMS_V2: LearnedVehicleParamsV2 = {
   reverseEffScale: 0.9,
   brakeScale: 1.6,
   accelTau: 0.2,
-  gripScale: 0.95,
-  frictionCircleSlack: 1.05,
+  // Slightly more optimistic than the conservative prior so untrained
+  // models don't immediately reject high-speed turns. Trained models
+  // will move away from these via the fitter — but bad starting points
+  // can cause the planner to produce a degenerate action space, hiding
+  // v2's value (see /primitive-explorer hull stats).
+  gripScale: 1.0,
+  // Friction-circle slack > 1 = the model accepts brief excursions past
+  // the linear µ·g cap (Rapier's tire model does the same via slip).
+  // 1.2 means up to ~20% transient over-use is allowed in commanded
+  // accel; clamps still kick in for sustained over-use.
+  frictionCircleSlack: 1.2,
   steerRatio: 1.0,
-  understeerOffThrottle: 0.012,
-  understeerPowerOn: 0.004,
+  // Halved understeer gain: the prior value attenuated yaw rate by 10×
+  // at 28 m/s (1 + 0.012·784 = 10.4×), which made every high-speed
+  // turn primitive collapse to the same near-straight outcome under
+  // the friction-circle clamp. 0.006 → 5.7× attenuation at 28 m/s
+  // still respects high-speed understeer physics but leaves room for
+  // distinguishable gentle-turn primitives at the top speed bucket.
+  understeerOffThrottle: 0.006,
+  understeerPowerOn: 0.002,
   yawRateTau: 0.18,
   lateralDamping: 4.5,
   lateralFromSteer: 0.6,

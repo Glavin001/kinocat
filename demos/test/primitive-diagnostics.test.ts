@@ -8,10 +8,16 @@ import {
 } from '../app/lib/primitive-diagnostics';
 import {
   buildKinematicLibrary,
+  buildLearnedRaceLibrary,
   buildLearnedRaceLibraryV2,
   RACE_START_SPEEDS,
 } from '../app/lib/race-primitives-scenarios';
-import { buildParametricOnlyModel, DEFAULT_LEARNED_PARAMS_V2, DEFAULT_LEARNABLE_CONFIG } from 'kinocat/agent';
+import {
+  buildParametricOnlyModel,
+  DEFAULT_LEARNED_PARAMS_V2,
+  DEFAULT_LEARNABLE_CONFIG,
+  DEFAULT_LEARNED_PARAMS,
+} from 'kinocat/agent';
 import type { MotionPrimitive } from 'kinocat/primitives';
 
 function makeStubPrimitive(opts: {
@@ -128,21 +134,45 @@ describe('diagnoseLibrary — real race libraries', () => {
     expect(d.hullAreaM2).toBeGreaterThanOrEqual(0);
   });
 
-  it('comparing kinematic vs v2 at non-zero speed surfaces real mismatch', () => {
+  it('comparing kinematic vs legacy-v1 (same control vocab) surfaces real mismatch', () => {
+    // v2 library uses native wheeled controls [steer, drive, brake]; the
+    // kinematic library uses [curvature, targetSpeed]. Different control
+    // vocabularies → per-control mismatch is undefined (intentional). For
+    // the pairing sanity check use the LEGACY 5-param learned library
+    // which still uses the (curvature, targetSpeed) adapter and so shares
+    // controls with kinematic.
     const kin = buildKinematicLibrary();
+    const legacy = buildLearnedRaceLibrary(DEFAULT_LEARNED_PARAMS);
+    const speed = RACE_START_SPEEDS[2]!; // 20 m/s — high enough to show divergence
+    const kinAtSpeed = kin.lookup(speed);
+    const legacyAtSpeed = legacy.lookup(speed);
+    const d = diagnoseLibrary(kinAtSpeed, legacyAtSpeed);
+    expect(d.pairedMismatches).toBeDefined();
+    expect(d.pairedMismatches!.length).toBe(kinAtSpeed.length);
+    expect(d.meanMismatch!).toBeGreaterThan(0.05);
+    expect(d.largestMismatch).toBeDefined();
+  });
+
+  it('v2 race library has a non-degenerate fan at every speed bucket', () => {
+    // The KEY visible signal that the fix landed: v2 should produce
+    // distinguishable endpoints at all four buckets (0/10/20/28), not
+    // collapse to ~0 hull at the speed extremes.
     const v2 = buildLearnedRaceLibraryV2(
       buildParametricOnlyModel(DEFAULT_LEARNED_PARAMS_V2, DEFAULT_LEARNABLE_CONFIG),
     );
-    const speed = RACE_START_SPEEDS[2]!; // 20 m/s — high enough to show divergence
-    const kinAtSpeed = kin.lookup(speed);
-    const v2AtSpeed = v2.lookup(speed);
-    const d = diagnoseLibrary(kinAtSpeed, v2AtSpeed);
-    expect(d.pairedMismatches).toBeDefined();
-    expect(d.pairedMismatches!.length).toBe(kinAtSpeed.length);
-    // At high speed, the two models MUST disagree by more than millimetres,
-    // otherwise the v2 model isn't doing anything useful.
-    expect(d.meanMismatch!).toBeGreaterThan(0.05);
-    expect(d.largestMismatch).toBeDefined();
+    for (const speed of RACE_START_SPEEDS) {
+      const prims = v2.lookup(speed);
+      expect(prims.length).toBeGreaterThanOrEqual(6);
+      const d = diagnoseLibrary(prims);
+      // Forward endpoint span across x — primitives MUST cover meaningful
+      // forward distance (chassis accelerated / decelerated / coasted).
+      const xSpan = d.forwardEndpointBBox.xMax - d.forwardEndpointBBox.xMin;
+      expect(xSpan, `xSpan at speed ${speed}`).toBeGreaterThan(0.3);
+      // Reachable area > 0.5 m² — confirms the action space isn't 1-D
+      // (the old adapter-based v2 had hull = 0.2 m² at v=0, 0.4 m² at
+      // v=28; both effectively unusable for planning).
+      expect(d.hullAreaM2, `hull at speed ${speed}`).toBeGreaterThan(0.5);
+    }
   });
 
   it('comparing kinematic vs kinematic gives zero mismatch (sanity)', () => {

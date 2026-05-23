@@ -91,15 +91,25 @@ function specFor(cell: CellSpec, ticks: number, sampleEveryNTicks: number, id: s
   };
 }
 
-/** Build the seed grid (round 0): broad coverage. */
+/** Build the seed grid (round 0): broad coverage.
+ *
+ *  IMPORTANT: includes high-speed (16, 20, 24, 28 m/s) trials so the fit
+ *  has direct evidence for understeer / friction-circle behavior at race
+ *  speeds. The earlier 0/4/8/12 grid trained a model that was essentially
+ *  default-extrapolated at the speeds where the race actually happens —
+ *  visible in /primitive-explorer as a collapsed v2 fan at 20+ m/s. */
 export function buildSeedGrid(): CellSpec[] {
-  const speeds = [0, 4, 8, 12];
+  const lowSpeeds = [0, 4, 8, 12];
+  const highSpeeds = [16, 20, 24, 28];
   const driveStrong = DEFAULT_VEHICLE_OPTS.engineForce * 0.85;
   const driveMid = DEFAULT_VEHICLE_OPTS.engineForce * 0.5;
+  const driveLow = DEFAULT_VEHICLE_OPTS.engineForce * 0.25;
   const brakeMid = DEFAULT_VEHICLE_OPTS.brakeForce * 0.7;
+  const brakeLow = DEFAULT_VEHICLE_OPTS.brakeForce * 0.3;
   const maxSt = DEFAULT_VEHICLE_OPTS.maxSteerAngle;
   const cells: CellSpec[] = [];
-  for (const v of speeds) {
+  // Low-speed grid: full set of throttle / brake / turn variations
+  for (const v of lowSpeeds) {
     cells.push({ startSpeed: v, steer: 0, driveForce: driveStrong, brakeForce: 0 });
     cells.push({ startSpeed: v, steer: 0, driveForce: 0, brakeForce: brakeMid });
     cells.push({ startSpeed: v, steer: 0, driveForce: 0, brakeForce: 0 }); // coast
@@ -109,16 +119,38 @@ export function buildSeedGrid(): CellSpec[] {
     cells.push({ startSpeed: v, steer: -maxSt, driveForce: driveMid * 0.7, brakeForce: 0 });
     cells.push({ startSpeed: v, steer: +maxSt * 0.5, driveForce: 0, brakeForce: brakeMid * 0.6 });
   }
+  // High-speed grid: gentle-turn + brake-into-corner trials. Tight turns
+  // at high speed saturate the friction circle and don't add information
+  // about understeer slope (they all clamp); GENTLE turns at high speed
+  // are the diagnostic regime for the understeer coefficient.
+  for (const v of highSpeeds) {
+    cells.push({ startSpeed: v, steer: 0, driveForce: driveStrong, brakeForce: 0 });   // top-speed cruise
+    cells.push({ startSpeed: v, steer: 0, driveForce: 0, brakeForce: brakeMid });      // brake from speed
+    cells.push({ startSpeed: v, steer: 0, driveForce: 0, brakeForce: 0 });             // coast from speed
+    cells.push({ startSpeed: v, steer: +maxSt * 0.2, driveForce: driveLow, brakeForce: 0 });  // VERY gentle right turn
+    cells.push({ startSpeed: v, steer: -maxSt * 0.2, driveForce: driveLow, brakeForce: 0 });  // VERY gentle left turn
+    cells.push({ startSpeed: v, steer: +maxSt * 0.4, driveForce: 0, brakeForce: 0 });          // moderate-coast turn
+    cells.push({ startSpeed: v, steer: -maxSt * 0.4, driveForce: 0, brakeForce: 0 });
+    cells.push({ startSpeed: v, steer: +maxSt * 0.3, driveForce: 0, brakeForce: brakeLow });   // trail-brake gentle
+    cells.push({ startSpeed: v, steer: -maxSt * 0.3, driveForce: 0, brakeForce: brakeLow });
+  }
   return cells;
 }
 
-/** Extreme-input probes that exercise saturation regimes. */
+/** Extreme-input probes that exercise saturation regimes. Include some
+ *  high-speed scenarios so the model sees data at race speeds. */
 export function extremeProbes(): CellSpec[] {
   return [
     { startSpeed: 8,  steer: DEFAULT_VEHICLE_OPTS.maxSteerAngle, driveForce: DEFAULT_VEHICLE_OPTS.engineForce, brakeForce: 0 },
     { startSpeed: 12, steer: -DEFAULT_VEHICLE_OPTS.maxSteerAngle, driveForce: DEFAULT_VEHICLE_OPTS.engineForce, brakeForce: 0 },
     { startSpeed: 10, steer: DEFAULT_VEHICLE_OPTS.maxSteerAngle, driveForce: 0, brakeForce: DEFAULT_VEHICLE_OPTS.brakeForce },
     { startSpeed: 12, steer: 0, driveForce: -DEFAULT_VEHICLE_OPTS.engineForce * 0.5, brakeForce: 0 },
+    // High-speed extreme probes — the friction-circle saturation regime
+    // the v2 race library specifically needs grounded.
+    { startSpeed: 20, steer: DEFAULT_VEHICLE_OPTS.maxSteerAngle * 0.3, driveForce: 0, brakeForce: DEFAULT_VEHICLE_OPTS.brakeForce * 0.5 },
+    { startSpeed: 24, steer: 0, driveForce: 0, brakeForce: DEFAULT_VEHICLE_OPTS.brakeForce },           // full brake from high
+    { startSpeed: 28, steer: DEFAULT_VEHICLE_OPTS.maxSteerAngle * 0.15, driveForce: 0, brakeForce: 0 }, // gentle top-speed turn
+    { startSpeed: 28, steer: -DEFAULT_VEHICLE_OPTS.maxSteerAngle * 0.15, driveForce: 0, brakeForce: 0 },
   ];
 }
 
@@ -231,7 +263,9 @@ function buildExplorationCells(
   rng: () => number,
 ): ExplorationCell<CellSpec>[] {
   const out: ExplorationCell<CellSpec>[] = [];
-  const speeds = [0, 4, 8, 12];
+  // Match the broadened seed grid: include race-relevant speeds 16-28
+  // so active rounds also probe high-speed regimes.
+  const speeds = [0, 4, 8, 12, 16, 20, 24, 28];
   const steerLevels = [-0.5, 0, 0.5];
   const driveMid = DEFAULT_VEHICLE_OPTS.engineForce * 0.5;
   for (let si = 0; si < speeds.length; si++) {

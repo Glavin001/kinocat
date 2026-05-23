@@ -29,7 +29,6 @@ import type {
 import {
   characterizeVehicle,
   MotionPrimitiveLibrary,
-  type ForwardSim,
 } from 'kinocat/primitives';
 import { buildLearnedLibrary } from './learn-primitives';
 
@@ -211,44 +210,163 @@ export function buildLearnedRaceLibrary(
   });
 }
 
-/** v2 race library: wraps the v2 learned forward sim with a small adapter
- *  that maps the existing race control vocabulary `(curvature, targetSpeed)`
- *  to v2's native `(steer, driveForce, brakeForce)`. This lets the v2 model
- *  drop into the existing race pipeline (pure-pursuit + RACE_AGENT
- *  primitive library shape) without rewriting the execution layer.
+/** v2 race library: drives the v2 learned forward sim with its NATIVE
+ *  action vocabulary `(steer, driveForce, brakeForce)` — no curvature /
+ *  target-speed adapter. The legacy adapter hid a 1-step P-controller
+ *  under every primitive, washing out the distinct intent each control
+ *  was supposed to express and collapsing the v2 reachable-area hull to
+ *  near-zero at speed extremes (see /primitive-explorer).
  *
- *  The adapter is the SAME mapping the original `controlsToWheelCommand`
- *  in learn-primitives.ts uses, so v2 sees the same kind of controller
- *  sequence the real racing car would issue. */
+ *  Three architectural choices make this work:
+ *
+ *  1. PER-BUCKET DURATION. A 0.55 s primitive at v=0 covers ~0.9 m (the
+ *     acceleration phase dominates and all controls produce nearly the
+ *     same endpoint). At v=28 a 0.55 s primitive covers ~15 m (plenty
+ *     of room to discriminate; the friction-circle saturates tight
+ *     turns regardless). Per-bucket: 1.5 / 0.8 / 0.55 / 0.4 s.
+ *
+ *  2. SPEED-AWARE CONTROL SETS. Each bucket only includes controls that
+ *     produce DISTINGUISHABLE endpoints at that speed. At v=0 we add
+ *     accelerate-and-turn primitives (turn-while-spooling-up). At v=28
+ *     we drop full-lock turns (friction circle clamps them to the same
+ *     near-straight outcome) and add gentle-turn + brake-into-corner
+ *     variants instead.
+ *
+ *  3. NATIVE DYNAMICS. The forward sim is `learnedForwardSimV2` driven
+ *     directly with the wheeled-controls vector — no adapter. The v2
+ *     model was trained on these inputs; this is the action space it
+ *     understands. */
 export function buildLearnedRaceLibraryV2(
   model: import('kinocat/agent').LearnedVehicleModel,
 ): MotionPrimitiveLibrary {
-  const wheelBase = 1.6;
   const inner = learnedForwardSimV2(model);
-  const maxDrive = model.config.maxDriveForce;
-  const maxBrake = model.config.maxBrakeForce;
-  const adapted: ForwardSim<VehicleState> = (s, controls, dt) => {
-    const curvature = controls[0] ?? 0;
-    const targetSpeed = controls[1] ?? 0;
-    const steer = -Math.atan(curvature * (2 * wheelBase));
-    const errMag = Math.abs(targetSpeed) - Math.abs(s.speed);
-    const gear = targetSpeed >= 0 ? 1 : -1;
-    let driveForce = 0;
-    let brakeForce = 0;
-    if (errMag > 0) {
-      driveForce = gear * Math.min(1, errMag / 6) * maxDrive;
-    } else if (errMag < 0) {
-      brakeForce = Math.min(1, -errMag / 8) * maxBrake;
+  const cfg = model.config;
+  const buckets: Array<{
+    startSpeed: number;
+    duration: number;
+    controls: number[][];
+  }> = [
+    // Duration tuned per-bucket: enough time for control differences to
+    // produce DISTINGUISHABLE endpoints (so the planner has real choices)
+    // but not so long that the planner can't react to nearby gates.
+    // At v=0 the chassis needs ~1.5 s to accelerate to a speed where turn
+    // dynamics differentiate. At v=28 brake-into-corner trajectories need
+    // ~0.8 s to develop (5.5 m/s² brake decel × 0.8 s = 4.4 m/s of speed
+    // change, enough to discriminate plans).
+    { startSpeed: 0,  duration: 1.5,  controls: lowSpeedV2Controls(cfg) },
+    { startSpeed: 10, duration: 0.8,  controls: midSpeedV2Controls(cfg) },
+    { startSpeed: 20, duration: 0.8,  controls: highSpeedV2Controls(cfg) },
+    { startSpeed: 28, duration: 0.8,  controls: topSpeedV2Controls(cfg) },
+  ];
+  const all: import('kinocat/primitives').MotionPrimitive[] = [];
+  let id = 0;
+  for (const b of buckets) {
+    const lib = characterizeVehicle({
+      forwardSim: inner,
+      controlSets: b.controls,
+      duration: b.duration,
+      substeps: 6,
+      startSpeeds: [b.startSpeed],
+    });
+    for (const p of lib.primitives) {
+      all.push({ ...p, id: id++ });
     }
-    return inner(s, [steer, driveForce, brakeForce], dt);
-  };
-  return characterizeVehicle({
-    forwardSim: adapted,
-    controlSets: raceControlSets(RACE_AGENT),
-    duration: 0.55,
-    substeps: 6,
-    startSpeeds: RACE_START_SPEEDS,
-  });
+  }
+  return new MotionPrimitiveLibrary(all, RACE_START_SPEEDS);
+}
+
+type CfgLike = import('kinocat/agent').LearnableVehicleConfig;
+
+/** v=0 controls. From rest, controls only differentiate based on how the
+ *  chassis accelerates over the 1.5 s primitive — straight vs turning,
+ *  full vs partial throttle, reverse. */
+function lowSpeedV2Controls(cfg: CfgLike): number[][] {
+  const drv = cfg.maxDriveForce;
+  const brk = cfg.maxBrakeForce;
+  const st = cfg.maxSteerAngle;
+  return [
+    [0, drv, 0],                  // 0: full-throttle straight
+    [0, 0.5 * drv, 0],            // 1: half-throttle straight
+    [+st * 0.5, drv, 0],          // 2: half-left + full throttle
+    [-st * 0.5, drv, 0],          // 3: half-right + full throttle
+    [+st, 0.7 * drv, 0],          // 4: full-left + ¾ throttle
+    [-st, 0.7 * drv, 0],          // 5: full-right + ¾ throttle
+    [0, -0.4 * drv, 0],           // 6: reverse
+    [0, 0, brk * 0.5],            // 7: brake (no-op at v=0; valid for grid coherence)
+  ];
+}
+
+/** v=10 controls. Mid-range: tight turns become physically possible;
+ *  brake becomes meaningful; trail-brake variants for cornering. */
+function midSpeedV2Controls(cfg: CfgLike): number[][] {
+  const drv = cfg.maxDriveForce;
+  const brk = cfg.maxBrakeForce;
+  const st = cfg.maxSteerAngle;
+  return [
+    [0, drv, 0],                  // 0: accelerate
+    [0, 0.5 * drv, 0],            // 1: maintain
+    [0, 0, 0],                    // 2: coast
+    [0, 0, 0.4 * brk],            // 3: brake gently
+    [0, 0, brk],                  // 4: brake hard
+    [+st * 0.5, 0.5 * drv, 0],    // 5: moderate-left at speed
+    [-st * 0.5, 0.5 * drv, 0],    // 6: moderate-right at speed
+    [+st, 0.2 * drv, 0],          // 7: tight-left, low throttle
+    [-st, 0.2 * drv, 0],          // 8: tight-right, low throttle
+    [+st * 0.5, 0, 0.3 * brk],    // 9: trail-brake left
+    [-st * 0.5, 0, 0.3 * brk],    // 10: trail-brake right
+  ];
+}
+
+/** v=20 controls. High-speed regime where friction circle starts to
+ *  bite on tight turns. The widest action spread comes from BRAKE-INTO-
+ *  CORNER trajectories that drop speed to a turn-friendly regime within
+ *  the primitive. */
+function highSpeedV2Controls(cfg: CfgLike): number[][] {
+  const drv = cfg.maxDriveForce;
+  const brk = cfg.maxBrakeForce;
+  const st = cfg.maxSteerAngle;
+  return [
+    [0, drv, 0],                  // accelerate (still possible at 20)
+    [0, 0.4 * drv, 0],            // maintain
+    [0, 0, 0],                    // coast
+    [0, 0, 0.4 * brk],            // brake light
+    [0, 0, brk],                  // brake hard
+    [+st * 0.3, 0.4 * drv, 0],    // gentle-right + power
+    [-st * 0.3, 0.4 * drv, 0],
+    [+st * 0.5, 0, 0.3 * brk],    // brake + moderate-right
+    [-st * 0.5, 0, 0.3 * brk],
+    [+st * 0.8, 0, 0.6 * brk],    // hard brake + sharp-right (decel-into-corner)
+    [-st * 0.8, 0, 0.6 * brk],
+    [+st, 0, brk],                // full lock + hard brake (extreme racing entry)
+    [-st, 0, brk],
+  ];
+}
+
+/** v=28 controls (top speed). Friction circle limits gentle-radius
+ *  turns to a tight band; meaningful spread comes from BRAKE-INTO-CORNER
+ *  trajectories (decelerating to a regime where wider turns become
+ *  feasible). Includes hard-brake-with-steer combinations that
+ *  effectively transition the chassis to mid-speed by the end of the
+ *  primitive. */
+function topSpeedV2Controls(cfg: CfgLike): number[][] {
+  const drv = cfg.maxDriveForce;
+  const brk = cfg.maxBrakeForce;
+  const st = cfg.maxSteerAngle;
+  return [
+    [0, 0.4 * drv, 0],            // accelerate-cruise (small accel)
+    [0, 0, 0],                    // coast straight
+    [0, 0, 0.3 * brk],            // light brake straight
+    [0, 0, 0.7 * brk],            // mid brake straight
+    [0, 0, brk],                  // hard brake straight
+    [+st * 0.15, 0, 0],           // gentle right coast
+    [-st * 0.15, 0, 0],           // gentle left coast
+    [+st * 0.3, 0, 0.5 * brk],    // moderate right + brake (decel through turn)
+    [-st * 0.3, 0, 0.5 * brk],    // moderate left + brake
+    [+st * 0.5, 0, brk],          // sharp right + hard brake (race-line entry)
+    [-st * 0.5, 0, brk],          // sharp left + hard brake
+    [+st, 0, brk],                // full lock + hard brake (extreme entry)
+    [-st, 0, brk],
+  ];
 }
 
 // ---------------------------------------------------------------------------
