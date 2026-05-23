@@ -59,6 +59,12 @@ const DEFAULT_ENV_OPTIONS: VehicleEnvOptions = {
   goalHeadingTol: Infinity,
   sweepSegmentCheck: false,
   analyticExpansion: { everyN: 6, step: 0.6 },
+  // No-op on worlds that don't expose `clearanceAt` / `buildGoalLowerBound`
+  // (the gating checks live in `VehicleEnvironment`). `InMemoryNavWorld`
+  // now implements both, so the carchase demo and other obstacle-rich
+  // scenes pick them up automatically.
+  clearanceBroadphase: true,
+  gridHeuristic: {},
 };
 
 const DEFAULT_TIME_OPTIONS: Omit<TimeAwareOptions, 'obstacles' | 'affordances'> = {

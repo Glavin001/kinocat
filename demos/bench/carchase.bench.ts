@@ -109,9 +109,11 @@ const CONFIGS: Array<{ name: string; opts: VehicleEnvOptions }> = [
   { name: 'all', opts: ALL },
 ];
 
-function freshWorld(): InMemoryNavWorld {
-  return new InMemoryNavWorld(COURSE.polygons, COURSE.obstacles);
-}
+// Match production: the worker builds the NavWorld ONCE at init and reuses it
+// across all replans (so the coarse-heuristic / clearance grids amortise
+// across plans). Allocating a fresh world per bench iteration would charge
+// the one-time grid-build cost to every measurement.
+const WORLD = new InMemoryNavWorld(COURSE.polygons, COURSE.obstacles);
 
 function runOne(
   scn: Scenario,
@@ -121,7 +123,7 @@ function runOne(
   return planVehicleOnce({
     start: scn.start,
     goal: scn.goal,
-    world: freshWorld(),
+    world: WORLD,
     agent: CARCHASE_AGENT,
     lib: CARCHASE_LIB,
     movingObstacles: scn.obstacles,
