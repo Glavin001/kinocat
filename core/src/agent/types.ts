@@ -2,13 +2,24 @@ import type { Pt } from '../internal/geom';
 
 /** Vehicle search state. Planning plane is world XZ; Y is derived from
  *  polygon containment and is NOT part of the search state. `speed` is signed
- *  (negative = reverse). `t` is absolute time (used from M4 on). */
+ *  (negative = reverse). `t` is absolute time (used from M4 on).
+ *
+ *  `yawRate` (rad/s about world +Y, planning-frame sign) and `lateralVelocity`
+ *  (m/s along chassis +right) are OPTIONAL: legacy producers (kinematic sim,
+ *  scenarios, older recorded data) omit them and consumers should default to
+ *  0. The v2 learned dynamics model and the Rapier adapter populate them so
+ *  the planner can carry yaw / slip continuity across primitives — the missing
+ *  Markov state in the original 4-D `(x, z, heading, speed)` formulation. */
 export interface VehicleState {
   x: number;
   z: number;
   heading: number;
   speed: number;
   t: number;
+  /** rad/s about world +Y. Defaults to 0 when absent. */
+  yawRate?: number;
+  /** m/s along chassis +right (slip indicator). Defaults to 0 when absent. */
+  lateralVelocity?: number;
 }
 
 /** Humanoid search state — no inertial `speed` dimension (M7). */

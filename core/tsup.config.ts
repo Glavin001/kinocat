@@ -11,6 +11,7 @@ const entry = {
   'environment/index': 'src/environment/index.ts',
   'predict/index': 'src/predict/index.ts',
   'execute/index': 'src/execute/index.ts',
+  'learning/index': 'src/learning/index.ts',
   'adapters/navcat/index': 'src/adapters/navcat/index.ts',
   'adapters/rapier/index': 'src/adapters/rapier/index.ts',
   'adapters/three/index': 'src/adapters/three/index.ts',

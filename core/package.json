@@ -41,6 +41,10 @@
       "types": "./dist/execute/index.d.ts",
       "default": "./dist/execute/index.js"
     },
+    "./learning": {
+      "types": "./dist/learning/index.d.ts",
+      "default": "./dist/learning/index.js"
+    },
     "./adapters/navcat": {
       "types": "./dist/adapters/navcat/index.d.ts",
       "default": "./dist/adapters/navcat/index.js"

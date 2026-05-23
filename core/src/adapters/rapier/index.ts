@@ -17,6 +17,7 @@ export type { RapierBodyLike, RapierWorldLike, RapierVec3Like, RapierQuatLike } 
 export {
   ensureRapier,
   createRaycastVehicle,
+  deriveLearnableConfig,
   planToAckermannControls,
   createBoxCollider,
   createGroundCollider,
@@ -33,6 +34,14 @@ export type {
   HeightfieldColliderOptions,
   HeightSampler,
 } from './raycast-vehicle';
+
+export { createHeadlessTrialHarness } from './headless-trial';
+export type {
+  HeadlessTrialHarness,
+  HeadlessTrialOptions,
+  TrialSpec,
+  TrialOutcome,
+} from './headless-trial';
 
 export interface RapierForwardSimOptions {
   world: RapierWorldLike;
