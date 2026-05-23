@@ -333,6 +333,15 @@ export default function Parking() {
       // past the cusp and it never executes the gear change cleanly.
       segments: [] as VehicleState[][],
       activeSegIdx: 0,
+      // Pose + wall-clock time the chassis was in when the active segment
+      // began. We use these to gate the "segment done, advance" check on
+      // actual displacement / elapsed time, so a corrective plan whose
+      // first segment endpoint happens to be within the arriveTol of the
+      // current chassis pose isn't instantly skipped before pure-pursuit
+      // has a chance to drive it.
+      segStartX: 0,
+      segStartZ: 0,
+      segStartWall: 0,
       planStartWall: performance.now(),
       goal: null as VehicleState | null,
       lastExpansions: 0,
@@ -356,6 +365,9 @@ export default function Parking() {
         ai.segments = splitAtGearCusps(res.path);
         ai.activeSegIdx = 0;
         ai.planStartWall = performance.now();
+        ai.segStartX = state.x;
+        ai.segStartZ = state.z;
+        ai.segStartWall = performance.now();
         if (showPathRef.current) replacePathLine(res.path);
       } else if (ai.plan === null) {
         // Replan failed and we had nothing — leave it null so the brake
@@ -441,7 +453,14 @@ export default function Parking() {
       );
       const dHead = Math.abs(angleDiff(state.heading, scenario.goal.heading));
       // Already parked — let the brake-on-no-plan branch hold us still.
-      if (dGoal < 0.6 && dHead < 0.25 && Math.abs(state.speed) < 0.4) return;
+      // Treat as parked once the chassis is comfortably inside the goal
+      // tolerance window AND nearly stopped. The heading slack (~10°) is
+      // wider than the planner's goalHeadingTol (~8°) because pure-pursuit
+      // on a Rapier raycast vehicle can't reliably trim heading below
+      // that under tight-radius corrective shimmies — replanning more
+      // doesn't help, it just busies the loop and the user sees the path
+      // line flicker.
+      if (dGoal < 0.6 && dHead < 0.18 && Math.abs(state.speed) < 0.4) return;
       replan(FIRST_PLAN_DEADLINE_MS);
     }, REPLAN_POLL_MS);
 
@@ -472,11 +491,25 @@ export default function Parking() {
         // final goal pose), not the whole plan. If the chassis is close
         // enough to it AND nearly stopped, advance to the next segment
         // — that performs the gear-change handoff cleanly.
+        //
+        // CRITICAL: also require either that the chassis has actually
+        // moved >= 0.25 m from where the segment began OR that ≥ 1.2 s
+        // of wall-clock has elapsed. Without this gate, a short
+        // corrective segment whose endpoint is already within arriveTol
+        // of the current pose advances on its first tick — before
+        // pure-pursuit can fire any throttle — and the chassis sits
+        // still while plan→null→replan→short-segment→… loops.
         const segEnd = seg[seg.length - 1]!;
         const dEnd = Math.hypot(state.x - segEnd.x, state.z - segEnd.z);
         const isFinalSeg = ai.activeSegIdx === ai.segments.length - 1;
         const arriveTol = isFinalSeg ? 0.25 : 0.4;
-        if (dEnd < arriveTol && Math.abs(state.speed) < 0.3) {
+        const segMoved = Math.hypot(
+          state.x - ai.segStartX,
+          state.z - ai.segStartZ,
+        );
+        const segElapsed = (now - ai.segStartWall) / 1000;
+        const segHadAChance = segMoved >= 0.25 || segElapsed >= 1.2;
+        if (segHadAChance && dEnd < arriveTol && Math.abs(state.speed) < 0.3) {
           if (isFinalSeg) {
             // Whole plan executed — clear it. The poll loop will check
             // goal proximity and either stop or replan.
@@ -486,6 +519,9 @@ export default function Parking() {
           } else {
             ai.activeSegIdx++;
             ai.planStartWall = now;
+            ai.segStartX = state.x;
+            ai.segStartZ = state.z;
+            ai.segStartWall = now;
             carHandle.applyControls({ steer: 0, throttle: 0, brake: 1 });
           }
         } else {

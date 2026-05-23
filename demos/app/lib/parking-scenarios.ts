@@ -306,13 +306,13 @@ function reversePerp(): ParkingScenario {
 }
 
 function parallel(): ParkingScenario {
-  // Two cars parked parallel to curb at z = 0, with an 8.0 m gap
-  // between their inner edges. Ego must squeeze in parallel to the curb
-  // (heading = 0) between them. 8.0 m / 5.1 m ego ≈ 1.57× — a real-
-  // world "comfortable" parallel park ratio. With the planner running
-  // a 0.35 m clearance margin, the maneuver has ~0.5 m of breathing
-  // room from each parked car at every point along the curve.
-  const gap = 8.0;
+  // Two cars parked parallel to curb at z = 0, with an 8.6 m gap
+  // between their inner edges. Ego length is 5.1 m → ratio ≈ 1.69×,
+  // closer to "really roomy" than "tight" parallel park. The wider
+  // gap absorbs residual heading misalignment from pure-pursuit on
+  // the tight Reeds-Shepp arcs — without it, even a 5° tilt at the
+  // end of the maneuver visibly clips one of the parked cars.
+  const gap = 8.6;
   const aheadX = gap / 2 + PARKED_HX;
   const behindX = -gap / 2 - PARKED_HX;
   const parkedCars: ParkedCar[] = [
