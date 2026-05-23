@@ -226,6 +226,7 @@ export default function RacePrimitives() {
   const [v2Model, setV2Model] = useState<LearnedVehicleModel | null>(null);
   const [v2Meta, setV2Meta] = useState<PersistedV2Model['meta'] | null>(null);
   const [useV2, setUseV2] = useState(false);
+  const v2Active = useV2 && v2Model !== null;
 
   const sceneRef = useRef<{
     cleanup: () => void;
@@ -260,12 +261,16 @@ export default function RacePrimitives() {
     if (!mount) return;
     let disposed = false;
     let cleanup: (() => void) | null = null;
+    // Clear stale online-learner UI state from a previous race (the v2
+    // scene won't emit onLearner so any prior snapshot would otherwise
+    // linger).
+    setLearner(null);
     (async () => {
       try {
         await ensureRapier();
         if (disposed) return;
-        const learnedLibraryOverride = (useV2 && v2Model)
-          ? buildLearnedRaceLibraryV2(v2Model)
+        const learnedLibraryOverride = v2Active
+          ? buildLearnedRaceLibraryV2(v2Model!)
           : undefined;
         const setup = await setupScene(mount, params, {
           onMetrics: (km, lm) => setMetrics({ kinematic: km, learned: lm }),
@@ -429,6 +434,7 @@ export default function RacePrimitives() {
         winner={winner}
         params={params}
         error={error}
+        v2Active={v2Active}
         onLearn={runInlineLearn}
         onStart={startRace}
         onStop={stopRace}
@@ -451,7 +457,7 @@ export default function RacePrimitives() {
           rollbackActive={learner?.rollbackActive ?? false}
           bestLapNumber={learner?.bestLapNumber ?? 0}
         />
-        {(phase === 'racing' || phase === 'finished') && learner && (
+        {(phase === 'racing' || phase === 'finished') && learner && !v2Active && (
           <LearnerPanel snap={learner} />
         )}
         {phase === 'learning' && (
@@ -1364,6 +1370,7 @@ function TopBar({
   winner,
   params,
   error,
+  v2Active,
   onLearn,
   onStart,
   onStop,
@@ -1381,12 +1388,22 @@ function TopBar({
   winner: 'kinematic' | 'learned' | 'tie' | null;
   params: LearnedVehicleParams | null;
   error: string | null;
+  /** True when the learned car is driving with the offline-trained v2
+   *  library — online refitting is disabled in that mode, so the status
+   *  text changes accordingly. */
+  v2Active: boolean;
   onLearn: () => void;
   onStart: () => void;
   onStop: () => void;
   onReset: () => void;
   onClearCache: () => void;
 }) {
+  const subtitle = v2Active
+    ? 'kinematic (control) vs offline-trained v2 model · online refit disabled while v2 is active'
+    : 'kinematic (control) vs online-learning · both start with the same library, learned car refits 5 coefficients from race data each lap';
+  const racingStatus = v2Active
+    ? 'racing… (learned car using v2 library — offline-trained, no online refit)'
+    : 'racing… (the learned car refits every lap)';
   return (
     <div
       style={{
@@ -1399,10 +1416,7 @@ function TopBar({
       }}
     >
       <div style={{ color: '#7fd6ff', fontWeight: 700 }}>race the primitives</div>
-      <div style={{ opacity: 0.65 }}>
-        kinematic (control) vs online-learning · both start with the same
-        library, learned car refits 5 coefficients from race data each lap
-      </div>
+      <div style={{ opacity: 0.65 }}>{subtitle}</div>
       <div style={{ flex: 1 }} />
       {phase === 'loading' && <Status>loading…</Status>}
       {phase === 'learning' && (
@@ -1412,7 +1426,7 @@ function TopBar({
       )}
       {phase === 'ready' && params && (
         <>
-          <Status>ready</Status>
+          <Status>ready{v2Active ? ' · v2 active' : ''}</Status>
           <Btn onClick={onStart}>start race</Btn>
           <Btn onClick={onLearn} secondary>pre-train</Btn>
           <Btn onClick={onReset} secondary>reset</Btn>
@@ -1421,13 +1435,13 @@ function TopBar({
       )}
       {phase === 'racing' && (
         <>
-          <Status>racing… (the learned car refits every lap)</Status>
+          <Status>{racingStatus}</Status>
           <Btn onClick={onStop}>stop</Btn>
         </>
       )}
       {phase === 'finished' && (
         <>
-          <Status>stopped</Status>
+          <Status>stopped{v2Active ? ' · v2 active' : ''}</Status>
           <Btn onClick={onStart}>race again</Btn>
           <Btn onClick={onReset} secondary>reset</Btn>
         </>
