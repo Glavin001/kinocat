@@ -382,23 +382,35 @@ export default function Parking() {
     };
     window.addEventListener('keydown', onKeyDown);
 
-    // Periodic correction.
+    // Parking is a committed maneuver — the first plan is given a long
+    // budget on purpose so it can find a quality multi-shunt path; once
+    // it's committed, follow it through. A periodic replan that
+    // re-targets every 600 ms (the old behaviour here) actively breaks
+    // tight maneuvers, because at a cusp / near the goal the planner can
+    // legitimately return a *different* shorter plan from the current
+    // chassis pose — pure-pursuit then whips between the two and the
+    // car ends up wedged against a parked car.
+    //
+    // Instead, only replan when the controller has nothing to chase:
+    //   - no plan exists yet, or
+    //   - the existing plan has been executed past its last sample but
+    //     the chassis hasn't actually reached the goal.
+    // tick() (below) sets `ai.plan = null` once the plan is exhausted,
+    // so the periodic poll just needs to look for that null and refresh.
+    const REPLAN_POLL_MS = 600;
     const replanTimer = window.setInterval(() => {
       if (pausedRef.current) return;
+      if (ai.plan !== null) return;
       const state = carHandle.readState(performance.now());
       const dGoal = Math.hypot(
         state.x - scenario.goal.x,
         state.z - scenario.goal.z,
       );
       const dHead = Math.abs(angleDiff(state.heading, scenario.goal.heading));
-      // Already at the goal — stop replanning, the brake-when-no-plan
-      // branch in tick() will hold the car still.
-      if (dGoal < 0.5 && dHead < 0.2 && Math.abs(state.speed) < 0.3) {
-        ai.plan = null;
-        return;
-      }
-      replan(REPLAN_DEADLINE_MS);
-    }, REPLAN_INTERVAL_MS);
+      // Already parked — let the brake-on-no-plan branch hold us still.
+      if (dGoal < 0.6 && dHead < 0.25 && Math.abs(state.speed) < 0.4) return;
+      replan(FIRST_PLAN_DEADLINE_MS);
+    }, REPLAN_POLL_MS);
 
     const onResize = () => {
       const w = window.innerWidth;
@@ -428,18 +440,26 @@ export default function Parking() {
           carHandle.applyControls(
             planToAckermannControls(state, live, {
               wheelBase: 2 * WHEEL_BASE,
-              lookaheadMin: 1.2,
-              lookaheadGain: 0.5,
-              lookaheadMax: 4,
-              maxLateralAccel: 4,
-              maxAccel: 3,
-              maxDecel: 6,
+              // Tight lookahead — parking maneuvers hinge on staying on
+              // the exact curve through the cusps; a long lookahead cuts
+              // the inside of every turn and clips parked cars during
+              // execution.
+              lookaheadMin: 0.6,
+              lookaheadGain: 0.35,
+              lookaheadMax: 2.0,
+              maxLateralAccel: 3,
+              maxAccel: 2,
+              maxDecel: 5,
               cruiseSpeed: PARKING_AGENT.maxSpeed,
-              goalTolerance: 0.4,
+              goalTolerance: 0.25,
               minTurnRadius: PARKING_AGENT.minTurnRadius,
             }),
           );
         } else {
+          // Plan executed past its last sample — clear it so the replan
+          // poll can re-evaluate from the current pose, and brake in the
+          // meantime so the chassis doesn't coast into anything.
+          ai.plan = null;
           carHandle.applyControls({ steer: 0, throttle: 0, brake: 1 });
         }
       } else {
