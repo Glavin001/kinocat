@@ -50,8 +50,16 @@ export type {
 } from './vehicle-model';
 export {
   DEFAULT_LEARNED_PARAMS_V2,
+  PARAMS_V2_LO,
+  PARAMS_V2_HI,
+  PARAMS_V2_ORDER,
+  paramsV2ToVec,
+  paramsV2FromVec,
   parametricForwardV2,
   learnedForwardSimV2,
   predictWithUncertainty,
   buildParametricOnlyModel,
+  buildMLPInput,
+  MLP_INPUT_DIM,
+  MLP_OUTPUT_DIM,
 } from './vehicle-model';
