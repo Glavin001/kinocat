@@ -145,6 +145,12 @@ const groups: { heading: string; demos: Demo[] }[] = [
         desc: 'A time trial. Two identical Rapier vehicles start on the same line and race the same waypoint loop (tight high-speed slalom + hard 90° turn into a stop). The ONLY difference: one planner uses the kinematic-derived primitive library, the other uses the library learned in /learnprimitives. The kinematic car overshoots the slalom (no understeer in its model) and brakes too late into the corner; the learned car threads the gates and stops on the mark. Split-viewport render with per-car lap times, tracking error, and lap counter — the gap closure is visible and measurable. If no learned library is cached, click "learn now" to fit one in ~10s.',
         tag: '3D · interactive · before-after',
       },
+      {
+        href: '/primitive-explorer',
+        title: 'Primitive / action-space explorer — see what each planner can actually do',
+        desc: 'A diagnostic tool for the /raceprimitives racing libraries. Side-by-side fan plots of the kinematic and v2-learned primitive libraries at each start-speed bucket. Below: an overlay view connecting kinematic↔v2 endpoint predictions per control so you can see exactly which controls the two models disagree about. Plus resolution diagnostics — primitive count, max angular gap, reachable-area hull — to verify the action space is dense enough. The honest answer to "why does the v2 car drive a different racing line?"',
+        tag: '2D · diagnostic',
+      },
     ],
   },
   {

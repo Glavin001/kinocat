@@ -667,6 +667,7 @@ const TESTED_DEMOS = new Set([
   'raceprimitives', // 'raceprimitives demo' — side-by-side kinematic vs learned library race
   'ramp', // 'ramp + affordance demo' — drivable heightfield ramp + planner-only BallisticJump
   'primitives', // 'primitives demo' — buildPrimitiveFan
+  'primitive-explorer', // 'primitive-explorer demo' — kinematic-vs-v2 action-space diagnostics (tested in primitive-diagnostics.test.ts)
   'reverse', // 'reverse demo' — planReverse
   'swarm', // 'swarm demo' — buildSwarm
   'world3d', // 'world3d demo' — planWorld3d
