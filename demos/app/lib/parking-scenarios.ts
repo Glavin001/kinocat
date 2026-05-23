@@ -127,14 +127,18 @@ function pose(x: number, z: number, heading: number): VehicleState {
 
 export const PARKING_AGENT: VehicleAgent = defaultVehicleAgent({
   minTurnRadius: 3.5,
-  maxSpeed: 4,
-  maxReverseSpeed: 3,
+  // Cap at 2 m/s. Pure-pursuit drift on a Rapier raycast vehicle scales
+  // roughly with speed; at 3-4 m/s the chassis cuts the inside of a
+  // tight Reeds-Shepp arc by 20-30 cm and clips a parked car, even
+  // though the plan itself was collision-free.
+  maxSpeed: 2,
+  maxReverseSpeed: 1.5,
   // The default footprint (2.55 × 1.15) already encloses the Rapier
   // chassis with a 0.15 m baseline buffer; the demo additionally passes
-  // `footprintInflate: 0.15` to the planner for an extra 0.15 m around
-  // parked cars during execution.
-  reverseCostMultiplier: 1.1,
-  directionChangePenalty: 0.2,
+  // `footprintInflate: 0.25` to the planner so the planned curve stays
+  // ~0.4 m off any parked-car edge, leaving execution room.
+  reverseCostMultiplier: 1.05,
+  directionChangePenalty: 0.15,
 });
 
 export function buildParkingPrimitives(
@@ -147,22 +151,25 @@ export function buildParkingPrimitives(
   // that a parallel-park shunt resolves into a handful of edges.
   return characterizeVehicle({
     forwardSim: kinematicForwardSim(agent),
+    // Top speed 2 m/s anywhere in the library — matches PARKING_AGENT.maxSpeed
+    // so the planner can't request a faster primitive than pure-pursuit can
+    // physically track on the Rapier chassis.
     controlSets: [
-      [0, 3],
       [0, 2],
-      [kHalf, 2],
-      [-kHalf, 2],
-      [k, 1.5],
-      [-k, 1.5],
-      [0, -2],
-      [kHalf, -1.5],
-      [-kHalf, -1.5],
-      [k, -1.2],
-      [-k, -1.2],
+      [0, 1.2],
+      [kHalf, 1.5],
+      [-kHalf, 1.5],
+      [k, 1.0],
+      [-k, 1.0],
+      [0, -1.5],
+      [kHalf, -1.0],
+      [-kHalf, -1.0],
+      [k, -0.8],
+      [-k, -0.8],
     ],
-    duration: 0.4,
+    duration: 0.5,
     substeps: 6,
-    startSpeeds: [-1.5, 0, 1.5],
+    startSpeeds: [-1.0, 0, 1.0],
   });
 }
 
@@ -202,7 +209,11 @@ function forwardPullin(): ParkingScenario {
   // with one empty stall at x = 0. Stall spacing 2.7 m centre-to-centre
   // gives ~0.7 m lateral clearance between cars (tight). Ego approaches
   // from the south along the +z axis.
-  const stallSpacing = 2.7;
+  // Stall-to-stall spacing along the row. 3.0 m centre-to-centre gives
+  // the ego (2.3 m wide) ~0.7 m of lateral clearance on each side once
+  // it's nosed into the empty stall — tight but enough to absorb the
+  // 0.25 m planning inflation plus pure-pursuit drift.
+  const stallSpacing = 3.0;
   const parkedCars: ParkedCar[] = [];
   for (const i of [-2, -1, 1, 2]) {
     parkedCars.push({
@@ -240,7 +251,11 @@ function reversePerp(): ParkingScenario {
   // along z = 6 facing north; opposing curb wall at z = -1. Ego enters
   // from the west driving east; to park nose-north in the empty stall
   // it must drive past and reverse in.
-  const stallSpacing = 2.7;
+  // Stall-to-stall spacing along the row. 3.0 m centre-to-centre gives
+  // the ego (2.3 m wide) ~0.7 m of lateral clearance on each side once
+  // it's nosed into the empty stall — tight but enough to absorb the
+  // 0.25 m planning inflation plus pure-pursuit drift.
+  const stallSpacing = 3.0;
   const parkedCars: ParkedCar[] = [];
   for (const i of [-2, -1, 1, 2]) {
     parkedCars.push({
@@ -259,6 +274,11 @@ function reversePerp(): ParkingScenario {
     hz: PARKED_HZ,
     heading: Math.PI / 2,
   };
+  // Drivable aisle: parked-car row front at z = 3.6, south curb front
+  // at z = -2.1, so the aisle is ~5.7 m wide. Wide enough for the
+  // planner to find a maneuver, but the spawn east of the empty stall
+  // (below) means a forward 90° turn into the stall would overshoot —
+  // a back-in is the natural solution.
   const walls: ParkingWall[] = [
     { id: 'south-curb', x: 0, z: -2.5, hx: 24, hz: 0.4 },
     { id: 'north-back', x: 0, z: 9.4, hx: 24, hz: 0.4 },
@@ -275,7 +295,12 @@ function reversePerp(): ParkingScenario {
     parkedCars,
     walls,
     targetStall,
-    spawn: pose(-15, 1.4, 0),
+    // Spawn EAST of the empty stall, heading east, in the middle of the
+    // aisle. A forward arc into the stall from here would require the
+    // car to circle back round — the natural plan is a reverse-S back
+    // into the stall, which is exactly the maneuver this scenario is
+    // here to demonstrate.
+    spawn: pose(8, 1.5, 0),
     goal: pose(0, 6, Math.PI / 2),
   };
 }
@@ -387,15 +412,18 @@ export function planParking(req: ParkingPlanRequest): PlanResult<VehicleState> {
     envOptions: {
       posCell: 0.3,
       headingBuckets: 36,
-      goalRadius: 0.4,
-      goalHeadingTol: 0.18,
+      goalRadius: 0.35,
+      goalHeadingTol: 0.15,
       sweepSegmentCheck: true,
-      // 0.15 m planning clearance on top of the default 0.15 m baseline
-      // gives ~0.3 m total margin from the Rapier chassis edge to any
-      // parked-car / curb edge — tight on purpose (this is the demo's
-      // whole point) but enough that pure-pursuit drift during execution
-      // doesn't scrape a fender.
-      footprintInflate: 0.15,
+      // 0.25 m planning clearance on top of the default 0.15 m baseline
+      // gives ~0.4 m total margin from the Rapier chassis edge to any
+      // parked-car / curb edge. The previous 0.15 m wasn't enough cushion
+      // for pure-pursuit drift during execution — the chassis clipped a
+      // parked car on the entry curve. 0.25 m also widens the planner's
+      // notion of "blocked" past the size of a single physical-arc
+      // forward sweep through reverse-perp's narrow aisle, forcing it
+      // to find a proper back-in maneuver instead of cutting the corner.
+      footprintInflate: 0.25,
       analyticExpansion: { everyN: 3, step: 0.15 },
     },
     deadlineMs: req.deadlineMs ?? PARKING_PLAN_BUDGET_MS,
