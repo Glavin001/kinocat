@@ -301,7 +301,14 @@ export default function Parking() {
     }
 
     const ai = {
+      // The FULL plan as returned by the planner — kept for the path
+      // overlay so the user sees the whole intended maneuver.
       plan: null as VehicleState[] | null,
+      // The plan split at every gear cusp (forward↔reverse). Pure-pursuit
+      // tracks one segment at a time, otherwise its lookahead reaches
+      // past the cusp and it never executes the gear change cleanly.
+      segments: [] as VehicleState[][],
+      activeSegIdx: 0,
       planStartWall: performance.now(),
       goal: null as VehicleState | null,
       lastExpansions: 0,
@@ -322,13 +329,15 @@ export default function Parking() {
       ai.lastExpansions = res.stats.expansions;
       if (res.found && res.path.length > 1) {
         ai.plan = res.path;
+        ai.segments = splitAtGearCusps(res.path);
+        ai.activeSegIdx = 0;
         ai.planStartWall = performance.now();
         if (showPathRef.current) replacePathLine(res.path);
       } else if (ai.plan === null) {
-        // Only clobber the previous plan if we had nothing — a periodic
-        // replan that fails (e.g. the car briefly clips an obstacle and
-        // the start pose is rejected) shouldn't strand the controller.
+        // Replan failed and we had nothing — leave it null so the brake
+        // branch holds the car still.
         ai.plan = null;
+        ai.segments = [];
       }
     }
 
@@ -433,34 +442,48 @@ export default function Parking() {
       const now = performance.now();
       const state = carHandle.readState(now);
 
-      if (ai.plan && ai.plan.length > 1) {
-        const elapsed = (now - ai.planStartWall) / 1000;
-        const live = trimPlan(ai.plan, elapsed);
-        if (live.length >= 2) {
+      const seg = ai.segments[ai.activeSegIdx];
+      if (seg && seg.length > 1) {
+        // Track the END of the current segment (the cusp pose or the
+        // final goal pose), not the whole plan. If the chassis is close
+        // enough to it AND nearly stopped, advance to the next segment
+        // — that performs the gear-change handoff cleanly.
+        const segEnd = seg[seg.length - 1]!;
+        const dEnd = Math.hypot(state.x - segEnd.x, state.z - segEnd.z);
+        const isFinalSeg = ai.activeSegIdx === ai.segments.length - 1;
+        const arriveTol = isFinalSeg ? 0.25 : 0.4;
+        if (dEnd < arriveTol && Math.abs(state.speed) < 0.3) {
+          if (isFinalSeg) {
+            // Whole plan executed — clear it. The poll loop will check
+            // goal proximity and either stop or replan.
+            ai.plan = null;
+            ai.segments = [];
+            carHandle.applyControls({ steer: 0, throttle: 0, brake: 1 });
+          } else {
+            ai.activeSegIdx++;
+            ai.planStartWall = now;
+            carHandle.applyControls({ steer: 0, throttle: 0, brake: 1 });
+          }
+        } else {
           carHandle.applyControls(
-            planToAckermannControls(state, live, {
+            planToAckermannControls(state, seg, {
               wheelBase: 2 * WHEEL_BASE,
-              // Tight lookahead — parking maneuvers hinge on staying on
-              // the exact curve through the cusps; a long lookahead cuts
-              // the inside of every turn and clips parked cars during
-              // execution.
-              lookaheadMin: 0.6,
-              lookaheadGain: 0.35,
-              lookaheadMax: 2.0,
-              maxLateralAccel: 3,
-              maxAccel: 2,
-              maxDecel: 5,
+              // Tight lookahead — at parking speeds the chassis needs
+              // to stay on the exact RS arc; a long lookahead cuts the
+              // inside and clips a fender. lookaheadMax stays well
+              // BELOW any reasonable segment length so it never reaches
+              // past the segment's end pose.
+              lookaheadMin: 0.5,
+              lookaheadGain: 0.3,
+              lookaheadMax: 1.5,
+              maxLateralAccel: 2.5,
+              maxAccel: 1.5,
+              maxDecel: 4,
               cruiseSpeed: PARKING_AGENT.maxSpeed,
-              goalTolerance: 0.25,
+              goalTolerance: arriveTol,
               minTurnRadius: PARKING_AGENT.minTurnRadius,
             }),
           );
-        } else {
-          // Plan executed past its last sample — clear it so the replan
-          // poll can re-evaluate from the current pose, and brake in the
-          // meantime so the chassis doesn't coast into anything.
-          ai.plan = null;
-          carHandle.applyControls({ steer: 0, throttle: 0, brake: 1 });
         }
       } else {
         carHandle.applyControls({ steer: 0, throttle: 0, brake: 1 });
@@ -625,6 +648,34 @@ function angleDiff(a: number, b: number): number {
   while (d > Math.PI) d -= 2 * Math.PI;
   while (d < -Math.PI) d += 2 * Math.PI;
   return d;
+}
+
+/** Split a plan into monotonic-gear segments: each segment has either
+ *  all non-negative speeds (forward) or all non-positive speeds (reverse).
+ *  The boundary state (the cusp) appears as the last sample of one
+ *  segment AND the first sample of the next so pure-pursuit on the new
+ *  segment has a valid starting frame. */
+function splitAtGearCusps(plan: VehicleState[]): VehicleState[][] {
+  if (plan.length < 2) return [plan];
+  const out: VehicleState[][] = [];
+  let cur: VehicleState[] = [plan[0]!];
+  let curSign = 0;
+  for (let i = 1; i < plan.length; i++) {
+    const s = plan[i]!;
+    const sgn = s.speed > 1e-3 ? 1 : s.speed < -1e-3 ? -1 : 0;
+    if (sgn !== 0 && curSign !== 0 && sgn !== curSign) {
+      // Gear flip — close out the current segment INCLUDING the cusp
+      // pose, then start a new one from the cusp pose.
+      cur.push(s);
+      out.push(cur);
+      cur = [s];
+    } else {
+      cur.push(s);
+    }
+    if (sgn !== 0) curSign = sgn;
+  }
+  if (cur.length >= 2) out.push(cur);
+  return out;
 }
 
 function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
