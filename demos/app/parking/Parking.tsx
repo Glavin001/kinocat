@@ -61,6 +61,9 @@ export default function Parking() {
   const [ready, setReady] = useState(false);
   const [hud, setHud] = useState('');
   const [status, setStatus] = useState('');
+  // Two extra lines that only render when debug overlay is on.
+  const [debugSeg, setDebugSeg] = useState('');
+  const [debugCmd, setDebugCmd] = useState('');
 
   const scenarioRef = useRef(scenarioId);
   const pausedRef = useRef(paused);
@@ -346,6 +349,12 @@ export default function Parking() {
       goal: null as VehicleState | null,
       lastExpansions: 0,
       lastBudgetMs: 0,
+      // Last command we applied + tracker diagnostics, for the debug HUD.
+      lastSteer: 0,
+      lastThrottle: 0,
+      lastBrake: 0,
+      lastGear: 0 as -1 | 0 | 1,
+      lastCrossTrackErr: 0,
     };
 
     function replan(deadlineMs: number) {
@@ -515,6 +524,10 @@ export default function Parking() {
             // goal proximity and either stop or replan.
             ai.plan = null;
             ai.segments = [];
+            ai.lastSteer = 0;
+            ai.lastThrottle = 0;
+            ai.lastBrake = 1;
+            ai.lastGear = 0;
             carHandle.applyControls({ steer: 0, throttle: 0, brake: 1 });
           } else {
             ai.activeSegIdx++;
@@ -522,30 +535,54 @@ export default function Parking() {
             ai.segStartX = state.x;
             ai.segStartZ = state.z;
             ai.segStartWall = now;
+            ai.lastSteer = 0;
+            ai.lastThrottle = 0;
+            ai.lastBrake = 1;
+            ai.lastGear = 0;
             carHandle.applyControls({ steer: 0, throttle: 0, brake: 1 });
           }
         } else {
-          carHandle.applyControls(
-            planToAckermannControls(state, seg, {
-              wheelBase: 2 * WHEEL_BASE,
-              // Tight lookahead — at parking speeds the chassis needs
-              // to stay on the exact RS arc; a long lookahead cuts the
-              // inside and clips a fender. lookaheadMax stays well
-              // BELOW any reasonable segment length so it never reaches
-              // past the segment's end pose.
-              lookaheadMin: 0.5,
-              lookaheadGain: 0.3,
-              lookaheadMax: 1.5,
-              maxLateralAccel: 2.5,
-              maxAccel: 1.5,
-              maxDecel: 4,
-              cruiseSpeed: PARKING_AGENT.maxSpeed,
-              goalTolerance: arriveTol,
-              minTurnRadius: PARKING_AGENT.minTurnRadius,
-            }),
-          );
+          const cmd = planToAckermannControls(state, seg, {
+            wheelBase: 2 * WHEEL_BASE,
+            // Tight lookahead — at parking speeds the chassis needs to
+            // stay on the exact RS arc; a long lookahead cuts the inside
+            // and clips a fender. lookaheadMax stays well BELOW any
+            // reasonable segment length so it never reaches past the
+            // segment's end pose.
+            lookaheadMin: 0.5,
+            lookaheadGain: 0.3,
+            lookaheadMax: 1.5,
+            maxLateralAccel: 2.5,
+            maxAccel: 1.5,
+            maxDecel: 4,
+            cruiseSpeed: PARKING_AGENT.maxSpeed,
+            goalTolerance: arriveTol,
+            minTurnRadius: PARKING_AGENT.minTurnRadius,
+          });
+          carHandle.applyControls(cmd);
+          ai.lastSteer = cmd.steer;
+          ai.lastThrottle = cmd.throttle;
+          ai.lastBrake = cmd.brake;
+          // Pure-pursuit picks gear from the ahead-on-path speed; the
+          // segments are pure-gear by construction so the segment's
+          // *second* state speed is a stable indicator of intent.
+          const segAhead = seg[1]?.speed ?? 0;
+          ai.lastGear = segAhead > 1e-3 ? 1 : segAhead < -1e-3 ? -1 : 0;
+          // Cross-track error: distance from chassis to the nearest
+          // path sample. A large value means the chassis has wandered
+          // off the planned curve.
+          let bestD = Infinity;
+          for (const p of seg) {
+            const d = Math.hypot(state.x - p.x, state.z - p.z);
+            if (d < bestD) bestD = d;
+          }
+          ai.lastCrossTrackErr = bestD;
         }
       } else {
+        ai.lastSteer = 0;
+        ai.lastThrottle = 0;
+        ai.lastBrake = 1;
+        ai.lastGear = 0;
         carHandle.applyControls({ steer: 0, throttle: 0, brake: 1 });
       }
 
@@ -584,14 +621,27 @@ export default function Parking() {
           after.x - scenario.goal.x,
           after.z - scenario.goal.z,
         );
+        const headErr = (angleDiff(after.heading, scenario.goal.heading) * 180) / Math.PI;
         setHud(
-          `v=${Math.abs(after.speed).toFixed(2)} m/s · goal=${distToGoal.toFixed(2)} m`,
+          `v=${Math.abs(after.speed).toFixed(2)} m/s · goal=${distToGoal.toFixed(2)} m · Δθ=${headErr.toFixed(0)}°`,
         );
         setStatus(
           ai.plan
             ? `plan=${ai.plan.length} exp=${ai.lastExpansions} budget=${ai.lastBudgetMs.toFixed(0)}ms`
             : `no plan (exp=${ai.lastExpansions} budget=${ai.lastBudgetMs.toFixed(0)}ms)`,
         );
+        if (showDebugRef.current) {
+          const segs = ai.segments.length;
+          const gearLabel = ai.lastGear > 0 ? 'fwd' : ai.lastGear < 0 ? 'rev' : '—';
+          setDebugSeg(
+            segs > 0
+              ? `seg ${ai.activeSegIdx + 1}/${segs} · ${gearLabel} · xte=${ai.lastCrossTrackErr.toFixed(2)}m`
+              : 'no segments',
+          );
+          setDebugCmd(
+            `steer=${(ai.lastSteer * 180 / Math.PI).toFixed(0)}° · thr=${ai.lastThrottle.toFixed(2)} · brk=${ai.lastBrake.toFixed(2)}`,
+          );
+        }
       }
 
       renderer.render(scene, camera);
@@ -648,9 +698,17 @@ export default function Parking() {
         </div>
         <div>{hud}</div>
         <div style={{ opacity: 0.8 }}>{status}</div>
+        {showDebug && debugSeg && (
+          <div style={{ opacity: 0.75, color: '#ffc466' }}>{debugSeg}</div>
+        )}
+        {showDebug && debugCmd && (
+          <div style={{ opacity: 0.75, color: '#ffc466' }}>{debugCmd}</div>
+        )}
         <div style={{ opacity: 0.6, marginTop: 6, fontSize: 11 }}>
           Sub-meter discretisation + footprintInflate clearance margin so the
-          planner threads gaps a default car-chase plan would clip.
+          planner threads gaps a default car-chase plan would clip. Toggle
+          [d] footprint to also see the planner&apos;s clearance ring around
+          parked cars and the live control commands.
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 8 }}>
           {PARKING_SCENARIOS.map((id) => (
@@ -711,29 +769,39 @@ function angleDiff(a: number, b: number): number {
   return d;
 }
 
-/** Split a plan into monotonic-gear segments: each segment has either
- *  all non-negative speeds (forward) or all non-positive speeds (reverse).
- *  The boundary state (the cusp) appears as the last sample of one
- *  segment AND the first sample of the next so pure-pursuit on the new
- *  segment has a valid starting frame. */
+/** Split a plan into monotonic-gear segments: each segment is purely
+ *  forward OR purely reverse (no mixed gears). The cusp itself is
+ *  represented as the boundary BETWEEN segments — seg1 ends with the
+ *  last forward state, seg2 starts with the first reverse state. The
+ *  two positions are adjacent on the path (one primitive substep apart),
+ *  so the geometric handoff is seamless.
+ *
+ *  An earlier version of this function shared the cusp pose between the
+ *  two segments. That put a reverse-speed state at the END of the
+ *  forward segment, so pure-pursuit's `nearestIndex + 1` lookup near
+ *  the end of the segment found the wrong-sign speed there and flipped
+ *  gear mid-segment. The chassis would brake, oscillate, and overshoot;
+ *  by the time my advance check fired, the chassis was metres past the
+ *  cusp and pure-pursuit on the reverse segment couldn't recover.
+ *  Keeping segments pure avoids that. */
 function splitAtGearCusps(plan: VehicleState[]): VehicleState[][] {
   if (plan.length < 2) return [plan];
   const out: VehicleState[][] = [];
   let cur: VehicleState[] = [plan[0]!];
-  let curSign = 0;
   for (let i = 1; i < plan.length; i++) {
     const s = plan[i]!;
-    const sgn = s.speed > 1e-3 ? 1 : s.speed < -1e-3 ? -1 : 0;
-    if (sgn !== 0 && curSign !== 0 && sgn !== curSign) {
-      // Gear flip — close out the current segment INCLUDING the cusp
-      // pose, then start a new one from the cusp pose.
-      cur.push(s);
-      out.push(cur);
+    const prev = cur[cur.length - 1]!;
+    const flipped =
+      (prev.speed > 1e-3 && s.speed < -1e-3) ||
+      (prev.speed < -1e-3 && s.speed > 1e-3);
+    if (flipped) {
+      // Close current segment WITHOUT the new state. New segment starts
+      // at the new state.
+      if (cur.length >= 2) out.push(cur);
       cur = [s];
     } else {
       cur.push(s);
     }
-    if (sgn !== 0) curSign = sgn;
   }
   if (cur.length >= 2) out.push(cur);
   return out;
