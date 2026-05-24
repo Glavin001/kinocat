@@ -946,6 +946,10 @@ export interface ManeuverTrainingOptions {
   daggerLapsPerRound?: number;
   daggerMaxSimTime?: number;
   daggerWindowSec?: number;
+  /** Phase 3.5 hard-example bundle: trials exported from `/sim-to-real`'s
+   *  miner pool. Added to the store before the first round so they
+   *  participate in every parametric + residual fit. */
+  minedTrials?: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[];
 }
 
 const DEFAULT_SPEED_SCHEDULE = [0, 4, 8, 12, 16, 20, 24, 28];
@@ -977,6 +981,11 @@ export async function runManeuverTraining(
   // the dataset is uniformly maneuver-sourced.)
   const harness = pipeline.harness;
   const store = createTrialStore<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>();
+  // Seed the store with externally-supplied trials (e.g. the
+  // sim-to-real hard-example pool) so they're available from round 0.
+  if (opts.minedTrials && opts.minedTrials.length > 0) {
+    for (const t of opts.minedTrials) store.add(t);
+  }
   let finalDiag: ModelDiagnostics = { openLoopDivergence: [], perStateRms: [], coverage: [], baselines: {} };
   let trialIdx = 0;
   const daggerStartRound = opts.daggerStartRound ?? Infinity;

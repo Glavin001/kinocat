@@ -6,7 +6,7 @@
 // `PersistedV2Model` payload the demos load on first visit) +
 // `demos/public/models/v2-default.manifest.json` (provenance sidecar).
 
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -61,6 +61,7 @@ async function main(): Promise<void> {
       ticks: { type: 'string' },
       out: { type: 'string' },
       dagger: { type: 'string' },
+      'import-mined': { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -101,6 +102,18 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
     process.stdout.write(`  · DAgger mode: race-collect starting round ${daggerStartRound + 1}\n`);
   }
 
+  // Phase 3.5: import sim-to-real-mined trials before round 0 so the
+  // residual MLP sees the hard regimes from the first fit.
+  let minedTrials = undefined;
+  if (values['import-mined']) {
+    const arg = String(values['import-mined']);
+    const minedPath = isAbsolute(arg) ? arg : resolve(repoRoot, arg);
+    const raw = readFileSync(minedPath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    minedTrials = parsed.trials ?? [];
+    process.stdout.write(`  · Imported ${minedTrials.length} mined trial${minedTrials.length === 1 ? '' : 's'} from ${minedPath}\n`);
+  }
+
   const result = await runManeuverTraining({
     rounds,
     trialsPerRound,
@@ -108,6 +121,7 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
     sampleEveryNTicks,
     seed,
     daggerStartRound,
+    minedTrials,
     onEvent: (e: TrainingEvent) => {
       switch (e.type) {
         case 'round-start':
