@@ -146,6 +146,12 @@ const groups: { heading: string; demos: Demo[] }[] = [
         tag: '3D · interactive · before-after',
       },
       {
+        href: '/model-lab',
+        title: 'Model Lab — train and inspect the v2 dynamics model',
+        desc: 'First-class observability for the v2 learned vehicle model. Train (with live loss + per-round evolution), then visually inspect: action-space fan plots with Rapier ground-truth dots and ensemble uncertainty halos; coverage heatmap of held-out error by (speed × steer); trial rollout playback comparing Rapier vs v2 vs parametric-only vs kinematic; per-component RMS (heading / speed / yawRate / lateral velocity); and a scenario playground for "what would the model do here?" with optional on-demand Rapier ground truth.',
+        tag: '2D · training · diagnostic',
+      },
+      {
         href: '/primitive-explorer',
         title: 'Primitive / action-space explorer — see what each planner can actually do',
         desc: 'A diagnostic tool for the /raceprimitives racing libraries. Side-by-side fan plots of the kinematic and v2-learned primitive libraries at each start-speed bucket. Below: an overlay view connecting kinematic↔v2 endpoint predictions per control so you can see exactly which controls the two models disagree about. Plus resolution diagnostics — primitive count, max angular gap, reachable-area hull — to verify the action space is dense enough. The honest answer to "why does the v2 car drive a different racing line?"',

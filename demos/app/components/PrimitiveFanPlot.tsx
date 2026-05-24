@@ -11,6 +11,22 @@
 import { useEffect, useMemo, useRef } from 'react';
 import type { MotionPrimitive } from 'kinocat/primitives';
 
+export interface FanPlotGroundTruth {
+  /** Index of the primitive this GT corresponds to. */
+  index: number;
+  /** End-state offset measured in Rapier (start-local frame). */
+  dx: number;
+  dz: number;
+}
+
+export interface FanPlotUncertainty {
+  /** Index of the primitive this uncertainty applies to. */
+  index: number;
+  /** Radius (in meters) representing 1-sigma position spread across the
+   *  ensemble. Rendered as a translucent halo around the predicted endpoint. */
+  radiusM: number;
+}
+
 export interface PrimitiveFanPlotProps {
   primitives: ReadonlyArray<MotionPrimitive>;
   /** Color for forward primitives (and their endpoint dots). */
@@ -39,6 +55,13 @@ export interface PrimitiveFanPlotProps {
    *  fixed extent so multiple plots can share identical axes for visual
    *  comparison. Otherwise auto-fits from the primitive sweeps. */
   fixedExtent?: { xMin: number; xMax: number; zMin: number; zMax: number };
+  /** Ground-truth Rapier endpoints rendered as white-ish dots with
+   *  arrows from the predicted endpoint → ground truth (= per-control
+   *  open-loop error visualized). */
+  groundTruth?: ReadonlyArray<FanPlotGroundTruth>;
+  /** Ensemble uncertainty halos — translucent rings around each
+   *  predicted endpoint sized by per-primitive 1-sigma spread. */
+  uncertainty?: ReadonlyArray<FanPlotUncertainty>;
 }
 
 const DEFAULT_PALETTE = {
@@ -66,6 +89,8 @@ export function PrimitiveFanPlot({
   aspectRatio = 4 / 3,
   palette,
   fixedExtent,
+  groundTruth,
+  uncertainty,
 }: PrimitiveFanPlotProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dimsRef = useRef<{ cw: number; ch: number }>({ cw: 760, ch: 460 });
@@ -196,6 +221,57 @@ export function PrimitiveFanPlot({
     }
     if (hasHighlight && highlightIndex! < primitives.length) {
       drawOne(primitives[highlightIndex!]!, false);
+    }
+
+    // Uncertainty halos — drawn UNDER the GT arrows so the arrows read
+    // on top. A halo larger than the GT arrow length signals the model
+    // is honest about how wrong it might be (or that the ensemble
+    // hasn't seen this region).
+    if (uncertainty && uncertainty.length > 0) {
+      for (const u of uncertainty) {
+        const p = primitives[u.index];
+        if (!p) continue;
+        const [ex, ey] = px(p.end.dx, p.end.dz);
+        const rPx = u.radiusM * scale;
+        if (rPx < 0.5) continue;
+        ctx.fillStyle = withAlpha(forwardColor, 0.10);
+        ctx.beginPath();
+        ctx.arc(ex, ey, rPx, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = withAlpha(forwardColor, 0.35);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(ex, ey, rPx, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+
+    // Ground-truth dots + error arrows (predicted -> actual).
+    if (groundTruth && groundTruth.length > 0) {
+      ctx.lineWidth = 1.25;
+      for (const g of groundTruth) {
+        const p = primitives[g.index];
+        if (!p) continue;
+        const [px0, py0] = px(p.end.dx, p.end.dz);
+        const [gx, gy] = px(g.dx, g.dz);
+        // Arrow shaft.
+        ctx.strokeStyle = '#ffd070';
+        ctx.beginPath();
+        ctx.moveTo(px0, py0);
+        ctx.lineTo(gx, gy);
+        ctx.stroke();
+        // GT dot.
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(gx, gy, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+        // Subtle outline so it pops against the colored prediction dot.
+        ctx.strokeStyle = '#ffd070';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(gx, gy, 3.5, 0, Math.PI * 2);
+        ctx.stroke();
+      }
     }
 
     // Origin marker

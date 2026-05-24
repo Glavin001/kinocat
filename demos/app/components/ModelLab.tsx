@@ -179,6 +179,18 @@ export function ModelLab(props: ModelLabProps) {
       {showResults && (
         <ResultsView roundHistory={roundHistory} loadedMeta={props.loadedMeta ?? undefined} />
       )}
+
+      <div style={{
+        marginTop: 8, padding: '8px 10px',
+        background: 'rgba(85, 220, 255, 0.08)',
+        border: '1px solid rgba(85, 220, 255, 0.25)',
+        borderRadius: 4, fontSize: 11, lineHeight: 1.5,
+      }}>
+        Looking for a deeper view? Open the dedicated{' '}
+        <a href="/model-lab" style={{ color: '#55dcff', fontWeight: 700 }}>Model Lab dashboard</a>{' '}
+        for rollout playback, ground-truth fan plots, coverage heatmap, and
+        the scenario playground.
+      </div>
     </>
   );
 

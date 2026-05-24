@@ -67,9 +67,9 @@ export const DEFAULT_VEHICLE_OPTS = {
 export type TrainingEvent =
   | { type: 'round-start'; round: number; trialsBeforeRound: number }
   | { type: 'trial-batch'; round: number; collected: number; discarded: number }
-  | { type: 'fit-progress'; round: number; phase: 'parametric'; event: FitProgressEvent }
+  | { type: 'fit-progress'; round: number; phase: 'parametric' | 'residual'; event: FitProgressEvent }
   | { type: 'evaluation'; round: number; diagnostics: ModelDiagnostics }
-  | { type: 'round-end'; round: number; trainedModel: LearnedVehicleModel }
+  | { type: 'round-end'; round: number; trainedModel: LearnedVehicleModel; params: LearnedVehicleParamsV2; diagnostics: ModelDiagnostics; trialsAfter: number }
   | { type: 'done'; totalTrials: number; finalModel: LearnedVehicleModel; finalDiagnostics: ModelDiagnostics };
 
 // ---------------------------------------------------------------------------
@@ -250,11 +250,23 @@ function evaluate(
   // the headline open-loop divergence reflects what the planner will
   // actually see at race time. When the ensemble is empty (no residual
   // trained yet), this falls back to parametric-only.
+  const wrap = (a: number): number => {
+    let d = a;
+    while (d > Math.PI) d -= 2 * Math.PI;
+    while (d < -Math.PI) d += 2 * Math.PI;
+    return d;
+  };
   return evaluateModel<VehicleState, WheeledControls, LearnableVehicleConfig>({
     trials: heldOut,
     horizons,
     controlsToVec,
     extractMetricFields: (s) => ({ x: s.x, z: s.z, heading: s.heading, speed: s.speed }),
+    perStateRmsFields: [
+      { name: 'heading', sqError: (p, a) => wrap(p.heading - a.heading) ** 2 },
+      { name: 'speed', sqError: (p, a) => (p.speed - a.speed) ** 2 },
+      { name: 'yawRate', sqError: (p, a) => ((p.yawRate ?? 0) - (a.yawRate ?? 0)) ** 2 },
+      { name: 'lateralVelocity', sqError: (p, a) => ((p.lateralVelocity ?? 0) - (a.lateralVelocity ?? 0)) ** 2 },
+    ],
     model: { make: () => learnedForwardSimV2(model) },
     baselines: {
       kinematic: { make: () => composedSim(kinematicForwardSim(agent), wheeledToLegacy) },
@@ -319,11 +331,27 @@ export interface RunOfflineTrainingOptions {
   seed?: number;
   onEvent?: (e: TrainingEvent) => void;
   vehicleOptions?: typeof DEFAULT_VEHICLE_OPTS;
+  /** When true, the harness is RETURNED to the caller (not disposed)
+   *  so downstream UI (scenario playground) can keep running Rapier
+   *  trials against the same vehicle config. Caller MUST dispose. */
+  keepHarness?: boolean;
+}
+
+export interface RunOfflineTrainingResult {
+  model: LearnedVehicleModel;
+  trials: TrialStore<VehicleState, WheeledControls, LearnableVehicleConfig>;
+  finalDiagnostics: ModelDiagnostics;
+  /** Only populated when `keepHarness: true`. Caller owns disposal. */
+  harness?: HeadlessTrialHarness;
+  /** The vehicle config the trials were collected against. */
+  config: LearnableVehicleConfig;
+  /** Sample interval in seconds = sampleEveryNTicks / 60. */
+  sampleDt: number;
 }
 
 export async function runOfflineTraining(
   opts: RunOfflineTrainingOptions = {},
-): Promise<{ model: LearnedVehicleModel; trials: TrialStore<VehicleState, WheeledControls, LearnableVehicleConfig>; finalDiagnostics: ModelDiagnostics }> {
+): Promise<RunOfflineTrainingResult> {
   const rounds = opts.rounds ?? 3;
   const trialsPerActive = opts.trialsPerActiveRound ?? 48;
   const ticks = opts.trialTicks ?? 120;
@@ -467,12 +495,12 @@ export async function runOfflineTraining(
         // interval = sampleEveryN / 60 seconds.
         fitSubstepsPerSample: 6,
         onProgress: (e) => {
-          // Reuse the fit-progress event channel so the existing UI can
-          // see the MLP loss curve drop.
+          // Tagged as 'residual' so UI can distinguish parametric-fit
+          // curve from MLP-fit curve when rendering.
           opts.onEvent?.({
             type: 'fit-progress',
             round,
-            phase: 'parametric', // (UI reuses the same chart)
+            phase: 'residual',
             event: { iter: e.epoch, loss: e.trainLoss, perComponent: undefined },
           });
         },
@@ -491,11 +519,25 @@ export async function runOfflineTraining(
     // Populate coverage with bin keys we'll use for active exploration in the next round.
     finalDiag = withCellBinning(finalDiag, store);
     opts.onEvent?.({ type: 'evaluation', round, diagnostics: finalDiag });
-    opts.onEvent?.({ type: 'round-end', round, trainedModel: model });
+    opts.onEvent?.({
+      type: 'round-end',
+      round,
+      trainedModel: model,
+      params: model.params,
+      diagnostics: finalDiag,
+      trialsAfter: store.size(),
+    });
   }
-  harness.dispose();
+  if (!opts.keepHarness) harness.dispose();
   opts.onEvent?.({ type: 'done', totalTrials: store.size(), finalModel: model, finalDiagnostics: finalDiag });
-  return { model, trials: store, finalDiagnostics: finalDiag };
+  return {
+    model,
+    trials: store,
+    finalDiagnostics: finalDiag,
+    harness: opts.keepHarness ? harness : undefined,
+    config,
+    sampleDt: sampleEveryN / 60,
+  };
 }
 
 function wrapAngleResidual(a: number): number {
@@ -545,3 +587,44 @@ function withCellBinning(
 
 // Re-export for the demo UI.
 export { PARAMS_V2_ORDER };
+
+/** Build a standalone Rapier harness for the Model Lab's scenario
+ *  playground. Mirrors the vehicle config used by `runOfflineTraining`
+ *  so trajectories are directly comparable. Caller owns disposal. */
+export async function createScenarioHarness(): Promise<{
+  harness: HeadlessTrialHarness;
+  config: LearnableVehicleConfig;
+}> {
+  const harness = await createHeadlessTrialHarness({
+    vehicleOptions: DEFAULT_VEHICLE_OPTS,
+    groundBounds: { x0: -500, x1: 500, z0: -500, z1: 500 },
+  });
+  const config = deriveLearnableConfig({
+    id: 'driver', position: { x: 0, z: 0 }, heading: 0, ...DEFAULT_VEHICLE_OPTS,
+  });
+  return { harness, config };
+}
+
+/** Roll a forward sim through a controls trace and return the predicted
+ *  state at every recorded sample boundary. Useful for the RolloutPlayer
+ *  to show the model's open-loop prediction next to the Rapier truth. */
+export function rolloutForwardSim(
+  sim: import('kinocat/primitives').ForwardSim<VehicleState>,
+  initialState: VehicleState,
+  controlsTrace: ReadonlyArray<WheeledControls>,
+  dt: number,
+  sampleEveryNTicks: number,
+): { states: VehicleState[]; times: number[] } {
+  const states: VehicleState[] = [{ ...initialState }];
+  const times: number[] = [0];
+  let s: VehicleState = { ...initialState };
+  for (let i = 0; i < controlsTrace.length; i++) {
+    const c = controlsTrace[i]!;
+    s = sim(s, [c.steer, c.driveForce, c.brakeForce], dt);
+    if ((i + 1) % sampleEveryNTicks === 0) {
+      states.push({ ...s });
+      times.push((i + 1) * dt);
+    }
+  }
+  return { states, times };
+}
