@@ -49,7 +49,7 @@ import {
 // (`demos/test/carchase-scenarios.test.ts`) so they run in a parallel
 // vitest worker — adding them here pushed total wall time past the 60 s
 // birpc RPC timeout in CI.
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 
 // These assert the *exact* configuration the demos ship with always finds a
 // plan within its expansion budget — so a "no plan" regression fails CI.
@@ -138,8 +138,8 @@ describe('navmesh demo runs over a real navcat navmesh', () => {
     expect(world.polygonAt(36, 12)).not.toBeNull(); // platform
     const r = planNavmesh(
       world,
-      { x: 4, z: 12, heading: 0, speed: 0, t: 0 } as VehicleState,
-      { x: 36, z: 12, heading: 0, speed: 0, t: 0 } as VehicleState,
+      { x: 4, z: 12, heading: 0, speed: 0, t: 0 } as CarKinematicState,
+      { x: 36, z: 12, heading: 0, speed: 0, t: 0 } as CarKinematicState,
     );
     expect(r.found).toBe(true);
     expect(r.stats.expansions).toBeLessThan(DEMO_MAX_EXPANSIONS);

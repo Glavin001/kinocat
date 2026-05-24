@@ -24,7 +24,7 @@ import { defaultVehicleAgent, kinematicForwardSim, learnedForwardSimV2 } from 'k
 import type {
   LearnedVehicleParams,
   VehicleAgent,
-  VehicleState,
+  CarKinematicState,
 } from 'kinocat/agent';
 import {
   characterizeVehicle,
@@ -57,7 +57,7 @@ export const RACE_PALETTE = {
  *  `reachedGoalRegion`), so the planner is free to choose whatever speed
  *  is most efficient for the trajectory. Flow-through behaviour is
  *  achieved by the lookahead in `pickNextWaypoint`, not by goal speed. */
-function pose(x: number, z: number, heading: number): VehicleState {
+function pose(x: number, z: number, heading: number): CarKinematicState {
   return { x, z, heading, speed: 0, t: 0 };
 }
 
@@ -69,8 +69,8 @@ export function buildRaceCourse(): {
   bounds: typeof RACE_BOUNDS;
   polygons: NavPolygon[];
   obstacles: Array<[number, number][]>;
-  waypoints: VehicleState[];
-  spawn: VehicleState;
+  waypoints: CarKinematicState[];
+  spawn: CarKinematicState;
 } {
   const b = RACE_BOUNDS;
   const polygons: NavPolygon[] = [
@@ -95,7 +95,7 @@ export function buildRaceCourse(): {
   // "take it at 12 m/s", real chassis can't, the kinematic car overshoots
   // and has to recover. The learned planner predicts the understeer and
   // plans entry-speed accordingly.
-  const waypoints: VehicleState[] = [
+  const waypoints: CarKinematicState[] = [
     pose(-35, 0, 0),    // 0: accel into slalom
     pose(-22, 8, 0),    // 1: slalom L
     pose(-12, -8, 0),   // 2: slalom R  (8m gates, ±8m throw)
@@ -396,8 +396,8 @@ export const RACE_ARRIVE_RADIUS = 2.5;
 export const RACE_PLANNER_GATE_RADIUS = 1.8;
 
 export interface RacePlanRequest {
-  state: VehicleState;
-  goal: VehicleState;
+  state: CarKinematicState;
+  goal: CarKinematicState;
   lib: MotionPrimitiveLibrary;
   world?: NavWorld;
   polygons: NavPolygon[];
@@ -406,7 +406,7 @@ export interface RacePlanRequest {
   maxExpansions?: number;
 }
 
-export function planRace(req: RacePlanRequest): PlanResult<VehicleState> {
+export function planRace(req: RacePlanRequest): PlanResult<CarKinematicState> {
   const world = req.world ?? new InMemoryNavWorld(req.polygons, req.obstacles);
   return planVehicleOnce({
     start: req.state,
@@ -420,9 +420,9 @@ export function planRace(req: RacePlanRequest): PlanResult<VehicleState> {
 }
 
 export interface RaceMultiGoalRequest {
-  state: VehicleState;
+  state: CarKinematicState;
   /** Ordered sequence of gates the chassis must pass through. */
-  gates: VehicleState[];
+  gates: CarKinematicState[];
   lib: MotionPrimitiveLibrary;
   world?: NavWorld;
   polygons: NavPolygon[];
@@ -441,7 +441,7 @@ export interface RaceMultiGoalRequest {
  *  Same time-cost as `planRace`; same goal radius. The only constraint
  *  is "pass within `gateRadius` of each gate in order" — no heading,
  *  no speed, exactly what the user asked for. */
-export function planRaceMultiGoal(req: RaceMultiGoalRequest): PlanResult<VehicleState> {
+export function planRaceMultiGoal(req: RaceMultiGoalRequest): PlanResult<CarKinematicState> {
   const world = req.world ?? new InMemoryNavWorld(req.polygons, req.obstacles);
   return planVehicleMultiGoal({
     start: req.state,
@@ -474,8 +474,8 @@ export function planRaceMultiGoal(req: RaceMultiGoalRequest): PlanResult<Vehicle
  *  planned (so the caller can fall back gracefully if a later segment
  *  fails). */
 export function planThroughWaypoints(args: {
-  state: VehicleState;
-  waypoints: VehicleState[];
+  state: CarKinematicState;
+  waypoints: CarKinematicState[];
   fromIdx: number;
   count: number;
   lib: MotionPrimitiveLibrary;
@@ -483,7 +483,7 @@ export function planThroughWaypoints(args: {
   obstacles: Array<[number, number][]>;
   world?: NavWorld;
   totalBudgetMs?: number;
-}): { path: VehicleState[]; segments: number } {
+}): { path: CarKinematicState[]; segments: number } {
   const {
     state,
     waypoints,
@@ -497,8 +497,8 @@ export function planThroughWaypoints(args: {
   const navWorld = world ?? new InMemoryNavWorld(polygons, obstacles);
   const totalBudget = args.totalBudgetMs ?? RACE_REPLAN_BUDGET_MS;
   const perSegment = Math.max(40, totalBudget / Math.max(1, count));
-  const path: VehicleState[] = [];
-  let from: VehicleState = { ...state, t: 0 };
+  const path: CarKinematicState[] = [];
+  let from: CarKinematicState = { ...state, t: 0 };
   let tOffset = 0;
   let segments = 0;
   for (let i = 0; i < count; i++) {
@@ -530,7 +530,7 @@ export function planThroughWaypoints(args: {
 // Waypoint AI — pick the next waypoint, advance when reached.
 
 export interface WaypointPick {
-  goal: VehicleState;
+  goal: CarKinematicState;
   nextIndex: number;
   /** Did we advance to a new waypoint on this tick? */
   advanced: boolean;
@@ -549,8 +549,8 @@ export interface WaypointPick {
  *  Both cars MUST consume the same output of this function so the
  *  comparison stays fair — only the motion-primitive library varies. */
 export function pickNextWaypoint(
-  state: VehicleState,
-  waypoints: VehicleState[],
+  state: CarKinematicState,
+  waypoints: CarKinematicState[],
   loopIndex: number,
   arriveRadius = RACE_ARRIVE_RADIUS,
 ): WaypointPick {
@@ -646,10 +646,10 @@ export function emptyMetrics(): RaceMetrics {
 // Headless snapshot for the test runner.
 
 export interface RaceSnapshot {
-  spawn: VehicleState;
-  goal: VehicleState;
-  kinematicResult: PlanResult<VehicleState>;
-  learnedResult: PlanResult<VehicleState>;
+  spawn: CarKinematicState;
+  goal: CarKinematicState;
+  kinematicResult: PlanResult<CarKinematicState>;
+  learnedResult: PlanResult<CarKinematicState>;
 }
 
 /** Tiny smoke check that BOTH libraries can plan from spawn → first

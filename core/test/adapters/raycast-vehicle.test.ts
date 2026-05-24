@@ -13,7 +13,7 @@ import {
   planToAckermannControls,
   type CarHandle,
 } from '../../src/adapters/rapier/raycast-vehicle';
-import type { VehicleState } from '../../src/agent/types';
+import type { CarKinematicState } from '../../src/agent/types';
 
 let RAPIER_OK = false;
 let RAPIER: Awaited<ReturnType<typeof ensureRapier>> | null = null;
@@ -213,8 +213,8 @@ describe('planToAckermannControls', () => {
   };
 
   it('issues forward throttle and ~zero steer for a straight path ahead', () => {
-    const state: VehicleState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
-    const path: VehicleState[] = [
+    const state: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
+    const path: CarKinematicState[] = [
       { x: 0, z: 0, heading: 0, speed: 8, t: 0 },
       { x: 10, z: 0, heading: 0, speed: 8, t: 1.25 },
       { x: 20, z: 0, heading: 0, speed: 8, t: 2.5 },
@@ -227,8 +227,8 @@ describe('planToAckermannControls', () => {
   });
 
   it('brakes when the lookahead is inside the goal tolerance', () => {
-    const state: VehicleState = { x: 10, z: 0, heading: 0, speed: 6, t: 0 };
-    const path: VehicleState[] = [
+    const state: CarKinematicState = { x: 10, z: 0, heading: 0, speed: 6, t: 0 };
+    const path: CarKinematicState[] = [
       { x: 9, z: 0, heading: 0, speed: 6, t: 0 },
       { x: 10, z: 0, heading: 0, speed: 0, t: 0.2 },
     ];

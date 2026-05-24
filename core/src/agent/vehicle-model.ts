@@ -15,7 +15,7 @@
 // effect of training across diverse configs improves identifiability of the
 // invariant physics, not just future-proofing.
 
-import type { VehicleState } from './types';
+import type { CarKinematicState } from './types';
 import type { ForwardSim } from '../primitives/types';
 import { wrapAngle } from '../internal/math';
 import {
@@ -200,7 +200,7 @@ export function paramsV2FromVec(v: ReadonlyArray<number>): LearnedVehicleParamsV
 /**
  * Extended parametric forward model. Stateless / deterministic / pure.
  *
- * `controls = [steer, driveForce, brakeForce]` per `WheeledControls` encoding.
+ * `controls = [steer, driveForce, brakeForce]` per `WheeledCarControls` encoding.
  * `config` carries the vehicle's physical parameters (mass, wheelbase, etc.)
  * so the model is config-aware.
  *
@@ -214,8 +214,8 @@ export function paramsV2FromVec(v: ReadonlyArray<number>): LearnedVehicleParamsV
 export function parametricForwardV2(
   params: LearnedVehicleParamsV2,
   config: LearnableVehicleConfig,
-): ForwardSim<VehicleState> {
-  return (s: VehicleState, controls: number[], dt: number): VehicleState => {
+): ForwardSim<CarKinematicState> {
+  return (s: CarKinematicState, controls: number[], dt: number): CarKinematicState => {
     const c = decodeWheeled(controls);
     const v = s.speed;
     const vy = s.lateralVelocity ?? 0;
@@ -325,7 +325,7 @@ export interface LearnedVehicleModel {
 }
 
 export interface PredictionWithUncertainty {
-  next: VehicleState;
+  next: CarKinematicState;
   /** Standard deviation across the ensemble per output dimension
    *  (x, z, heading, speed, yawRate, lateralVelocity). Length 6. */
   std: number[];
@@ -346,14 +346,14 @@ export function buildParametricOnlyModel(
   };
 }
 
-/** Drop-in `ForwardSim<VehicleState>` for `characterizeVehicle` and the
+/** Drop-in `ForwardSim<CarKinematicState>` for `characterizeVehicle` and the
  *  IGHA* planner. */
-export function learnedForwardSimV2(model: LearnedVehicleModel): ForwardSim<VehicleState> {
+export function learnedForwardSimV2(model: LearnedVehicleModel): ForwardSim<CarKinematicState> {
   const paraSim = parametricForwardV2(model.params, model.config);
   if (model.residualEnsemble.length === 0) {
     return paraSim;
   }
-  return (s: VehicleState, controls: number[], dt: number): VehicleState => {
+  return (s: CarKinematicState, controls: number[], dt: number): CarKinematicState => {
     const base = paraSim(s, controls, dt);
     // Build MLP input: [state6, controls3, config13] = 22-dim default.
     const input = buildMLPInput(s, controls, model.config);
@@ -368,7 +368,7 @@ export function learnedForwardSimV2(model: LearnedVehicleModel): ForwardSim<Vehi
  *  monitor to flag OOD operation. */
 export function predictWithUncertainty(
   model: LearnedVehicleModel,
-  s: VehicleState,
+  s: CarKinematicState,
   controls: number[],
   dt: number,
 ): PredictionWithUncertainty {
@@ -405,7 +405,7 @@ const STATE_SCALES = [20, 20, Math.PI, 20, 4, 6]; // (x, z, heading, speed, yawR
 const CONTROL_SCALES = [1, 4000, 2000];
 
 export function buildMLPInput(
-  s: VehicleState,
+  s: CarKinematicState,
   controls: ReadonlyArray<number>,
   config: LearnableVehicleConfig,
 ): number[] {
@@ -442,10 +442,10 @@ function ensembleMean(ensemble: MLP[], input: ReadonlyArray<number>): Float64Arr
  *  residual is interpreted as a per-state-component additive correction;
  *  `dtScale` rescales it from the residual's reference dt to the current dt. */
 function applyResidual(
-  base: VehicleState,
+  base: CarKinematicState,
   residual: Float64Array | ReadonlyArray<number>,
   dtScale: number,
-): VehicleState {
+): CarKinematicState {
   return {
     x: base.x + (residual[0] ?? 0) * dtScale,
     z: base.z + (residual[1] ?? 0) * dtScale,

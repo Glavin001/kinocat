@@ -22,13 +22,6 @@ export interface CarKinematicState {
   lateralVelocity?: number;
 }
 
-/**
- * @deprecated Use `CarKinematicState`. Retained as a structural alias so
- * existing imports keep compiling. The new name disambiguates from
- * `AircraftState` and any future non-car vehicle state.
- */
-export type VehicleState = CarKinematicState;
-
 /** Humanoid search state — no inertial `speed` dimension (M7). */
 export interface HumanoidState {
   x: number;
@@ -37,7 +30,7 @@ export interface HumanoidState {
   t: number;
 }
 
-/** Aircraft search state. Unlike VehicleState, altitude `y` is part of the
+/** Aircraft search state. Unlike CarKinematicState, altitude `y` is part of the
  *  searched state — a genuinely 3D plan, not an XZ plan with derived height.
  *  `heading` is the XZ-plane bearing (yaw), `pitch` the flight-path angle
  *  (climb positive), `roll` the bank angle around the forward axis (lets the
@@ -54,7 +47,7 @@ export interface AircraftState {
   t: number;
 }
 
-export type AgentState = VehicleState | HumanoidState | AircraftState;
+export type AgentState = CarKinematicState | HumanoidState | AircraftState;
 
 export interface VehicleAgent {
   kind: 'vehicle';

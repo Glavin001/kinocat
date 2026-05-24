@@ -4,7 +4,7 @@ import { navWorldFromTriangleMesh } from '../src/adapters/navcat/index';
 import { VehicleEnvironment } from '../src/environment/vehicle-environment';
 import { defaultVehicleAgent, kinematicForwardSim } from '../src/agent/vehicle';
 import { characterizeVehicle } from '../src/primitives/characterize';
-import type { VehicleState } from '../src/agent/types';
+import type { CarKinematicState } from '../src/agent/types';
 
 // Opt 1 (spec §10.2): on a real navcat world `footprintClear` is the
 // bottleneck — several findNearestPoly + raycast calls per sweep sample.
@@ -59,8 +59,8 @@ try {
   built = null;
 }
 
-const start: VehicleState = { x: 4, z: 20, heading: 0, speed: 0, t: 0 };
-const goal: VehicleState = { x: 56, z: 20, heading: 0, speed: 0, t: 0 };
+const start: CarKinematicState = { x: 4, z: 20, heading: 0, speed: 0, t: 0 };
+const goal: CarKinematicState = { x: 56, z: 20, heading: 0, speed: 0, t: 0 };
 
 function run(clearanceBroadphase: boolean): void {
   if (!built) return;

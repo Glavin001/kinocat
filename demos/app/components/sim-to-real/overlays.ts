@@ -8,18 +8,18 @@
 // so allocating fresh BufferGeometries every frame is a non-starter.
 
 import * as THREE from 'three';
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import { createCarMeshHelper, syncCarMesh } from 'kinocat/adapters/three';
 import type { WheelTelemetry } from 'kinocat/adapters/rapier';
 import { speedToColor } from '../../lib/sim-to-real-scene';
 
 // ---------------------------------------------------------------------------
 // GhostCar — semi-transparent car mesh posed each frame to a predicted
-// VehicleState. One per model.
+// CarKinematicState. One per model.
 
 export interface GhostCar {
   group: THREE.Group;
-  setPose(s: VehicleState): void;
+  setPose(s: CarKinematicState): void;
   setVisible(v: boolean): void;
   dispose(scene: THREE.Scene): void;
 }
@@ -58,7 +58,7 @@ export function createGhostCar(color: number, opacity = 0.45): GhostCar {
 
 export interface TrailRibbon {
   line: THREE.Line;
-  push(s: VehicleState): void;
+  push(s: CarKinematicState): void;
   reset(): void;
   setVisible(v: boolean): void;
   dispose(scene: THREE.Scene): void;
@@ -78,7 +78,7 @@ export function createTrailRibbon(
   const mat = new THREE.LineBasicMaterial({ vertexColors: true });
   const line = new THREE.Line(geom, mat);
   let count = 0;
-  function push(s: VehicleState) {
+  function push(s: CarKinematicState) {
     let idx = count;
     if (idx >= capacity) {
       // Shift left by 1: drop oldest sample. Cheap enough at 2k.
@@ -123,7 +123,7 @@ export function createTrailRibbon(
 
 export interface FuturePolyline {
   line: THREE.Line;
-  setPath(states: ReadonlyArray<VehicleState>): void;
+  setPath(states: ReadonlyArray<CarKinematicState>): void;
   setVisible(v: boolean): void;
   dispose(scene: THREE.Scene): void;
 }
@@ -138,7 +138,7 @@ export function createFuturePolyline(color: number, y = 0.2): FuturePolyline {
     opacity: 0.9,
   });
   const line = new THREE.Line(geom, mat);
-  function setPath(states: ReadonlyArray<VehicleState>) {
+  function setPath(states: ReadonlyArray<CarKinematicState>) {
     const pts = states.map((s) => new THREE.Vector3(s.x, y, s.z));
     geom.setFromPoints(pts);
     (line as THREE.Line).computeLineDistances();

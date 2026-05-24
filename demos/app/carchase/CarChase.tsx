@@ -10,7 +10,7 @@ import {
   constantVelocity,
 } from 'kinocat/predict';
 import type { Predict, MovingObstacle } from 'kinocat/predict';
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import type { ObstacleDescriptor, WorkerPlanResponse } from 'kinocat/worker';
 import {
   CARCHASE_AGENT,
@@ -38,7 +38,7 @@ import {
 } from './rapierVehicle';
 import { stepRaycastVehicle } from 'kinocat/adapters/rapier';
 import { updateChaseCamera } from 'kinocat/adapters/three';
-import { trimPlan as trimPlanCore } from 'kinocat/vehicle/car';
+import { trimPlan } from 'kinocat/vehicle/car';
 import {
   createBuildingHelper,
   createJumpArcHelper,
@@ -61,10 +61,10 @@ interface CopAI {
   id: string;
   color: number;
   car: CarHandle;
-  plan: VehicleState[] | null;
+  plan: CarKinematicState[] | null;
   planStartWall: number;
   mode: CopTacticalMode;
-  goal: VehicleState | null;
+  goal: CarKinematicState | null;
   lastReplanWall: number;
   lastExpansions: number;
   lastBudgetMs: number;
@@ -92,10 +92,10 @@ interface CopAI {
 
 interface RobberAI {
   car: CarHandle;
-  plan: VehicleState[] | null;
+  plan: CarKinematicState[] | null;
   planStartWall: number;
   loopIndex: number;
-  goal: VehicleState | null;
+  goal: CarKinematicState | null;
   lastReplanWall: number;
   lastExpansions: number;
   lastBudgetMs: number;
@@ -417,7 +417,7 @@ export default function CarChase() {
     const copPathLines: (THREE.Line | null)[] = cops.map(() => null);
     function replacePathLine(
       old: THREE.Line | null,
-      path: VehicleState[],
+      path: CarKinematicState[],
       color: number,
     ): THREE.Line {
       if (old) {
@@ -521,7 +521,7 @@ export default function CarChase() {
 
     /** Reset a single car in-place: fix rotation to upright, nudge back
      *  slightly along the heading to clear whatever it's stuck on. */
-    function resetCarInPlace(target: UnstickTarget & { plan: VehicleState[] | null }) {
+    function resetCarInPlace(target: UnstickTarget & { plan: CarKinematicState[] | null }) {
       const state = target.car.readState(performance.now());
       // Nudge 3 m backward along heading to clear the obstacle.
       const nudge = 3;
@@ -559,7 +559,7 @@ export default function CarChase() {
 
     function applyPlanResult(
       npcId: string,
-      resp: { found: boolean; path: VehicleState[]; stats: { expansions: number } },
+      resp: { found: boolean; path: CarKinematicState[]; stats: { expansions: number } },
       budgetMs: number,
     ) {
       if (npcId === 'robber') {
@@ -609,8 +609,8 @@ export default function CarChase() {
 
     function prepareRobberReplan(now: number): {
       npcId: string;
-      start: VehicleState;
-      goal: VehicleState;
+      start: CarKinematicState;
+      goal: CarKinematicState;
       obstacles: ObstacleDescriptor[];
     } | null {
       if (playerDrivingRef.current) return null;
@@ -644,15 +644,15 @@ export default function CarChase() {
 
     function prepareCopReplan(co: CopAI, copIndex: number, now: number): {
       npcId: string;
-      start: VehicleState;
-      goal: VehicleState;
+      start: CarKinematicState;
+      goal: CarKinematicState;
       obstacles: ObstacleDescriptor[];
     } {
       const robberState = robber.car.readState(now);
       const copState = co.car.readState(now);
       const mode = selectTacticalMode(robberState, copState, copIndex);
-      const robberPredict: Predict<VehicleState> = (t) => {
-        const p = registry.predictNPC('robber')(t) as VehicleState | null;
+      const robberPredict: Predict<CarKinematicState> = (t) => {
+        const p = registry.predictNPC('robber')(t) as CarKinematicState | null;
         return p ?? predictRobberFromState(robberState, 8)(t);
       };
       const goal = tacticalGoal(robberState, robberPredict, copState, mode, course.buildings, course);
@@ -913,7 +913,7 @@ export default function CarChase() {
         const dx = robberStateAfter.x - copStatesAfter[i]!.x;
         const dz = robberStateAfter.z - copStatesAfter[i]!.z;
         // Vertical separation comes from the physics body translation, NOT
-        // from VehicleState (which is the XZ planning plane). A cop directly
+        // from CarKinematicState (which is the XZ planning plane). A cop directly
         // below a mid-air robber should NOT count as touching.
         const copY = cops[i]!.car.chassis.translation().y;
         const dy = robberY - copY;
@@ -1216,10 +1216,6 @@ export default function CarChase() {
 
 /** Drop path samples already passed; resample t-origin so pure-pursuit picks
  *  a fresh lookahead. */
-function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
-  return trimPlanCore(plan, elapsed);
-}
-
 /** Anything that holds a car handle plus the stuck-detector bookkeeping.
  *  Both RobberAI and CopAI satisfy this — the helper doesn't care which.
  *  Mutates `lastMovedWall` / `unstickUntilWall` on the passed-in object. */
@@ -1242,7 +1238,7 @@ interface UnstickTarget {
  *  each other don't both reverse the same way and re-wedge. */
 function maybeUnstick(
   target: UnstickTarget,
-  state: VehicleState,
+  state: CarKinematicState,
   now: number,
 ): boolean {
   // Active burst — keep applying reverse controls until it elapses.
@@ -1283,7 +1279,7 @@ function maybeUnstick(
  *  Nudges the car backward along its heading to clear the obstacle.
  *  Falls back to spawnPose only when the car is off-world. */
 function maybeAutoReset(
-  target: UnstickTarget & { plan: VehicleState[] | null },
+  target: UnstickTarget & { plan: CarKinematicState[] | null },
   spawnPose: { x: number; z: number; heading: number },
   now: number,
 ): boolean {

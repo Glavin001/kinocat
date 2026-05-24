@@ -12,7 +12,7 @@ import {
   learnedForwardSim,
   kinematicForwardSim,
 } from 'kinocat/agent';
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import { MotionPrimitiveLibrary } from 'kinocat/primitives';
 import { CARCHASE_AGENT } from '../app/lib/carchase-scenarios';
 import {
@@ -39,9 +39,9 @@ it('rapier availability is a boolean (logs skip status in CI)', () => {
 });
 
 describe('learnedForwardSim contract', () => {
-  it('produces VehicleState with wrapped heading and finite fields', () => {
+  it('produces CarKinematicState with wrapped heading and finite fields', () => {
     const sim = learnedForwardSim(DEFAULT_LEARNED_PARAMS, CARCHASE_AGENT);
-    let s: VehicleState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
+    let s: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
     for (let k = 0; k < 200; k++) {
       s = sim(s, [1 / CARCHASE_AGENT.minTurnRadius, 12], 0.05);
       expect(Number.isFinite(s.x)).toBe(true);
@@ -55,7 +55,7 @@ describe('learnedForwardSim contract', () => {
   it('respects the agent speed and curvature limits at saturation', () => {
     const sim = learnedForwardSim(DEFAULT_LEARNED_PARAMS, CARCHASE_AGENT);
     // Way-too-big target speed and curvature; the sim should clamp them.
-    let s: VehicleState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
+    let s: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
     for (let k = 0; k < 200; k++) {
       s = sim(s, [10, 1000], 0.05);
     }
@@ -171,7 +171,7 @@ describe.skipIf(!RAPIER_OK)('autonomous sweep + fit', () => {
       let kinErr = 0;
       let n = 0;
       for (const tr of data.trials) {
-        let s: VehicleState = { x: 0, z: 0, heading: 0, speed: tr.startSpeed, t: 0 };
+        let s: CarKinematicState = { x: 0, z: 0, heading: 0, speed: tr.startSpeed, t: 0 };
         for (let i = 1; i < tr.samples.length; i++) {
           const a = tr.samples[i - 1]!;
           const b = tr.samples[i]!;

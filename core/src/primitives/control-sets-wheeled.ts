@@ -10,10 +10,10 @@
 // segments; a tighter max steer angle clamps to its bound).
 //
 // Used by `characterizeVehicle` to build a `MotionPrimitiveLibrary` against
-// any `ForwardSim<VehicleState>` that accepts this control vector.
+// any `ForwardSim<CarKinematicState>` that accepts this control vector.
 
 import type { LearnableVehicleConfig } from '../agent/vehicle-config';
-import { encodeWheeled, type WheeledControls } from '../agent/controls';
+import { encodeWheeled, type WheeledCarControls } from '../agent/controls';
 
 export interface WheeledControlTierOptions {
   config: LearnableVehicleConfig;
@@ -30,7 +30,7 @@ export function coarseWheeledControls(opts: WheeledControlTierOptions): number[]
   const driveF = (opts.fullDriveFraction ?? 0.9) * config.maxDriveForce;
   const halfSteer = 0.5 * config.maxSteerAngle;
   const brakeF = (opts.fullBrakeFraction ?? 0.8) * config.maxBrakeForce;
-  const actions: WheeledControls[] = [
+  const actions: WheeledCarControls[] = [
     // Cruise straight, full throttle.
     { steer: 0, driveForce: driveF, brakeForce: 0 },
     // Gentle left / right at moderate throttle.
@@ -61,7 +61,7 @@ export function fineWheeledControls(opts: WheeledControlTierOptions): number[][]
     { drive: 0, brake: 0 }, // coast
     { drive: 0, brake: brakeF },
   ];
-  const actions: WheeledControls[] = [];
+  const actions: WheeledCarControls[] = [];
   // Take a sparser steer set for full-throttle to avoid silly extreme-grip
   // combinations and keep the fine tier at ~15-18 actions.
   for (const eff of efforts) {

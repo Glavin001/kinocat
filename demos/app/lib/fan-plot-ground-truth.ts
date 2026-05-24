@@ -15,7 +15,7 @@
 
 import type {
   LearnedVehicleModel,
-  VehicleState,
+  CarKinematicState,
   LearnableVehicleConfig,
 } from 'kinocat/agent';
 import { predictWithUncertainty } from 'kinocat/agent';
@@ -129,7 +129,7 @@ export function computeUncertaintyHalos(opts: ComputeUncertaintyOpts): Uncertain
   for (let i = 0; i < opts.primitives.length; i++) {
     const p = opts.primitives[i]!;
     if (Math.abs(p.startSpeed - opts.startSpeed) > 0.5) continue;
-    const state: VehicleState = {
+    const state: CarKinematicState = {
       x: 0, z: 0, heading: 0,
       speed: p.startSpeed, t: 0,
       yawRate: 0, lateralVelocity: 0,

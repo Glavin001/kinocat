@@ -8,9 +8,9 @@ import {
   asObstacle,
 } from '../../src/predict/factories';
 import { kinematicForwardSim, defaultVehicleAgent } from '../../src/agent/vehicle';
-import type { VehicleState } from '../../src/agent/types';
+import type { CarKinematicState } from '../../src/agent/types';
 
-const base: VehicleState = { x: 0, z: 0, heading: 0, speed: 4, t: 0 };
+const base: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 4, t: 0 };
 
 describe('predict factories', () => {
   it('constantVelocity extrapolates along heading and clamps the horizon', () => {
@@ -23,7 +23,7 @@ describe('predict factories', () => {
   });
 
   it('constantAcceleration matches the kinematic equations', () => {
-    const s: VehicleState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
+    const s: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
     const p = constantAcceleration(s, { ax: 2, az: 0 });
     const at2 = p(2)!;
     expect(at2.x).toBeCloseTo(4, 9); // 0.5*2*2^2
@@ -40,7 +40,7 @@ describe('predict factories', () => {
   });
 
   it('fromObservations re-reads current state each query', () => {
-    let cur: VehicleState = { x: 0, z: 0, heading: 0, speed: 2, t: 0 };
+    let cur: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 2, t: 0 };
     const p = fromObservations(() => cur, { horizon: 10 });
     expect(p(1)!.x).toBeCloseTo(2, 9);
     cur = { x: 10, z: 0, heading: Math.PI / 2, speed: 3, t: 1 };

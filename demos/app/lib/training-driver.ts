@@ -7,8 +7,8 @@
 // This is the use-case-specific consumer that wires the agnostic core
 // pieces together for the /raceprimitives demo.
 
-import type { WheeledControls } from 'kinocat/agent';
-import type { VehicleState, LearnableVehicleConfig, LearnedVehicleParamsV2 } from 'kinocat/agent';
+import type { WheeledCarControls } from 'kinocat/agent';
+import type { CarKinematicState, LearnableVehicleConfig, LearnedVehicleParamsV2 } from 'kinocat/agent';
 import {
   DEFAULT_LEARNED_PARAMS_V2,
   parametricForwardV2,
@@ -182,8 +182,8 @@ async function collectTrialBatch(
   ticks: number,
   sampleEveryNTicks: number,
   startId: number,
-): Promise<{ collected: Trial<VehicleState, WheeledControls, LearnableVehicleConfig>[]; discarded: number }> {
-  const collected: Trial<VehicleState, WheeledControls, LearnableVehicleConfig>[] = [];
+): Promise<{ collected: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[]; discarded: number }> {
+  const collected: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[] = [];
   let discarded = 0;
   let idx = startId;
   for (const c of cells) {
@@ -207,7 +207,7 @@ async function collectTrialBatch(
 // ---------------------------------------------------------------------------
 // Loss + evaluation
 
-function stateDeltaForFit(pred: VehicleState, act: VehicleState): number {
+function stateDeltaForFit(pred: CarKinematicState, act: CarKinematicState): number {
   const dx = pred.x - act.x;
   const dz = pred.z - act.z;
   let dh = pred.heading - act.heading;
@@ -217,12 +217,12 @@ function stateDeltaForFit(pred: VehicleState, act: VehicleState): number {
   return dx * dx + dz * dz + 5 * dh * dh + ds * ds;
 }
 
-function controlsToVec(c: WheeledControls): number[] {
+function controlsToVec(c: WheeledCarControls): number[] {
   return [c.steer, c.driveForce, c.brakeForce];
 }
 
 function evaluate(
-  store: TrialStore<VehicleState, WheeledControls, LearnableVehicleConfig>,
+  store: TrialStore<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>,
   model: LearnedVehicleModel,
 ): ModelDiagnostics {
   // Last 25% of trials are held-out evaluation set.
@@ -234,15 +234,15 @@ function evaluate(
   }
   const horizons = [0.5, 1.0, 1.6];
   const agent = defaultVehicleAgent();
-  const wheeledToLegacy = (c: WheeledControls): number[] => {
+  const wheeledToLegacy = (c: WheeledCarControls): number[] => {
     const k = Math.sin(c.steer) / (2 * DEFAULT_VEHICLE_OPTS.wheelBase);
     const targetSpeed = c.driveForce > 0 ? 10 : (c.brakeForce > 0 ? 0 : 5);
     return [k, targetSpeed];
   };
   const composedSim = (
-    inner: ForwardSim<VehicleState>,
-    encode: (c: WheeledControls) => number[],
-  ): ForwardSim<VehicleState> => (s, controls, dt) => inner(s, encode({
+    inner: ForwardSim<CarKinematicState>,
+    encode: (c: WheeledCarControls) => number[],
+  ): ForwardSim<CarKinematicState> => (s, controls, dt) => inner(s, encode({
     steer: controls[0] ?? 0, driveForce: controls[1] ?? 0, brakeForce: controls[2] ?? 0,
   }), dt);
 
@@ -256,7 +256,7 @@ function evaluate(
     while (d < -Math.PI) d += 2 * Math.PI;
     return d;
   };
-  return evaluateModel<VehicleState, WheeledControls, LearnableVehicleConfig>({
+  return evaluateModel<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
     trials: heldOut,
     horizons,
     controlsToVec,
@@ -339,7 +339,7 @@ export interface RunOfflineTrainingOptions {
 
 export interface RunOfflineTrainingResult {
   model: LearnedVehicleModel;
-  trials: TrialStore<VehicleState, WheeledControls, LearnableVehicleConfig>;
+  trials: TrialStore<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>;
   finalDiagnostics: ModelDiagnostics;
   /** Only populated when `keepHarness: true`. Caller owns disposal. */
   harness?: HeadlessTrialHarness;
@@ -367,7 +367,7 @@ export async function runOfflineTraining(
   const config = deriveLearnableConfig({
     id: 'driver', position: { x: 0, z: 0 }, heading: 0, ...veh,
   });
-  const store = createTrialStore<VehicleState, WheeledControls, LearnableVehicleConfig>();
+  const store = createTrialStore<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>();
   let model = buildParametricOnlyModel(DEFAULT_LEARNED_PARAMS_V2, config);
   let trialIdx = 0;
 
@@ -432,7 +432,7 @@ export async function runOfflineTraining(
       driveDeadzone: 80,
       rollingResistance: 0.05,
     };
-    const fit = runParametricFit<LearnedVehicleParamsV2, VehicleState, WheeledControls, LearnableVehicleConfig>({
+    const fit = runParametricFit<LearnedVehicleParamsV2, CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
       init: model.params,
       encode: paramsV2ToVec,
       decode: paramsV2FromVec,
@@ -470,7 +470,7 @@ export async function runOfflineTraining(
     const isFinalRound = round === rounds - 1;
     if (isFinalRound && store.size() >= 16) {
       const baselineSim = parametricForwardV2(model.params, config);
-      const residualFit = runResidualMLPFit<VehicleState, WheeledControls, LearnableVehicleConfig>({
+      const residualFit = runResidualMLPFit<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
         trials: store.all(),
         makeBaselineSim: () => baselineSim,
         encodeInput: (s, ctrl, cfg) => buildMLPInput(s, ctrl, cfg),
@@ -552,7 +552,7 @@ function wrapAngleResidual(a: number): number {
  *  doesn't know about our binning scheme; we attach it here. */
 function withCellBinning(
   diag: ModelDiagnostics,
-  store: TrialStore<VehicleState, WheeledControls, LearnableVehicleConfig>,
+  store: TrialStore<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>,
 ): ModelDiagnostics {
   // Rebuild a coverage list keyed by (speed, steer) bin from the held-out
   // trials' initial state + first control.
@@ -609,15 +609,15 @@ export async function createScenarioHarness(): Promise<{
  *  state at every recorded sample boundary. Useful for the RolloutPlayer
  *  to show the model's open-loop prediction next to the Rapier truth. */
 export function rolloutForwardSim(
-  sim: import('kinocat/primitives').ForwardSim<VehicleState>,
-  initialState: VehicleState,
-  controlsTrace: ReadonlyArray<WheeledControls>,
+  sim: import('kinocat/primitives').ForwardSim<CarKinematicState>,
+  initialState: CarKinematicState,
+  controlsTrace: ReadonlyArray<WheeledCarControls>,
   dt: number,
   sampleEveryNTicks: number,
-): { states: VehicleState[]; times: number[] } {
-  const states: VehicleState[] = [{ ...initialState }];
+): { states: CarKinematicState[]; times: number[] } {
+  const states: CarKinematicState[] = [{ ...initialState }];
   const times: number[] = [0];
-  let s: VehicleState = { ...initialState };
+  let s: CarKinematicState = { ...initialState };
   for (let i = 0; i < controlsTrace.length; i++) {
     const c = controlsTrace[i]!;
     s = sim(s, [c.steer, c.driveForce, c.brakeForce], dt);

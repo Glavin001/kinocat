@@ -11,7 +11,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import RAPIER from '@dimforge/rapier3d-compat';
 import { InMemoryNavWorld } from 'kinocat/environment';
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import {
   ensureRapier,
   createRaycastVehicle,
@@ -33,7 +33,7 @@ import {
   createRapierDebugRenderer,
   updateChaseCamera,
 } from 'kinocat/adapters/three';
-import { trimPlan as trimPlanCore } from 'kinocat/vehicle/car';
+import { trimPlan } from 'kinocat/vehicle/car';
 import {
   RAMP_AGENT,
   RAMP_BOUNDS,
@@ -254,7 +254,7 @@ export default function RampDemo() {
     scene.add(carMesh.group);
 
     const ai = {
-      plan: null as VehicleState[] | null,
+      plan: null as CarKinematicState[] | null,
       planStartWall: performance.now(),
       goal: course.goal,
       lastExpansions: 0,
@@ -263,7 +263,7 @@ export default function RampDemo() {
     };
 
     let pathLine: THREE.Line | null = null;
-    function replacePathLine(path: VehicleState[]): void {
+    function replacePathLine(path: CarKinematicState[]): void {
       if (pathLine) {
         scene.remove(pathLine);
         pathLine.geometry.dispose();
@@ -552,10 +552,6 @@ export default function RampDemo() {
       </div>
     </div>
   );
-}
-
-function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
-  return trimPlanCore(plan, elapsed);
 }
 
 function ToggleButton({

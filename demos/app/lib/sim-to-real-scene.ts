@@ -4,8 +4,8 @@
 // pure parts can be unit-tested without Three.js or Rapier.
 //
 // Three primitives:
-//   1. `rolloutOpenLoop`: drive a `ForwardSim<VehicleState>` through a
-//      controls trace at fixed `dt`. Returns one VehicleState per tick
+//   1. `rolloutOpenLoop`: drive a `ForwardSim<CarKinematicState>` through a
+//      controls trace at fixed `dt`. Returns one CarKinematicState per tick
 //      (inclusive of t=0). Used by Playback mode: feed the trial's
 //      `controlsTrace` and you get the model's predicted timeline.
 //   2. `projectFuture`: take the current state + a HELD constant control
@@ -15,7 +15,7 @@
 //      pose+heading+speed gaps; reports rolling RMS over the last
 //      `windowSec` seconds. Used by the HUD.
 
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import type { ForwardSim } from 'kinocat/primitives';
 
 // ---------------------------------------------------------------------------
@@ -31,12 +31,12 @@ import type { ForwardSim } from 'kinocat/primitives';
  *    helper just chains it. Yaw-rate / lateral velocity propagation is
  *    whatever the sim returns. */
 export function rolloutOpenLoop(
-  initial: VehicleState,
+  initial: CarKinematicState,
   controlsTrace: ReadonlyArray<ReadonlyArray<number>>,
   dt: number,
-  forwardSim: ForwardSim<VehicleState>,
-): VehicleState[] {
-  const out: VehicleState[] = [initial];
+  forwardSim: ForwardSim<CarKinematicState>,
+): CarKinematicState[] {
+  const out: CarKinematicState[] = [initial];
   let s = initial;
   for (let i = 0; i < controlsTrace.length; i++) {
     const c = controlsTrace[i]!;
@@ -61,11 +61,11 @@ export interface FutureProjectionOpts {
 /** Roll the sim forward with a constant control vector for `horizonSec`
  *  seconds. Returns the full sampled path (initial state included). */
 export function projectFuture(
-  initial: VehicleState,
+  initial: CarKinematicState,
   controls: ReadonlyArray<number>,
-  forwardSim: ForwardSim<VehicleState>,
+  forwardSim: ForwardSim<CarKinematicState>,
   opts: FutureProjectionOpts,
-): VehicleState[] {
+): CarKinematicState[] {
   const dt = opts.stepDt ?? 1 / 60;
   const steps = Math.max(1, Math.round(opts.horizonSec / dt));
   const trace = Array.from({ length: steps }, () => controls);
@@ -106,7 +106,7 @@ export function wrapPi(a: number): number {
  *  state at the SAME time t. The two should be aligned: index-i in
  *  Playback, or the prediction-at-T compared to the actual-at-T in
  *  Free Drive. */
-export function poseGap(real: VehicleState, pred: VehicleState): GapSample {
+export function poseGap(real: CarKinematicState, pred: CarKinematicState): GapSample {
   const dx = pred.x - real.x;
   const dz = pred.z - real.z;
   return {
@@ -165,19 +165,19 @@ export interface ScheduledPrediction {
   /** World time the prediction is supposed to be matched at. */
   matchAt: number;
   /** Predicted state at matchAt. */
-  pred: VehicleState;
+  pred: CarKinematicState;
 }
 
 export class FuturePredictionTracker {
   private pending: ScheduledPrediction[] = [];
   /** Add a prediction (current time + horizon = matchAt). */
-  schedule(pred: VehicleState, currentTime: number, horizonSec: number): void {
+  schedule(pred: CarKinematicState, currentTime: number, horizonSec: number): void {
     this.pending.push({ matchAt: currentTime + horizonSec, pred });
   }
   /** Match every pending prediction whose matchAt is <= realState.t.
    *  Emits a GapSample for each, in chronological order, and removes
    *  them from the queue. */
-  drainMatured(realState: VehicleState): GapSample[] {
+  drainMatured(realState: CarKinematicState): GapSample[] {
     const out: GapSample[] = [];
     while (this.pending.length > 0 && this.pending[0]!.matchAt <= realState.t) {
       const { pred } = this.pending.shift()!;

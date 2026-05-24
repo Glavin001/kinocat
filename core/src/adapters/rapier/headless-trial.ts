@@ -4,7 +4,7 @@
 // requested initial kinematic state (forward speed, lateral velocity, yaw
 // rate), settles the suspension briefly, then drives the vehicle through a
 // caller-supplied native-controls trace at the fixed physics tick (1/60s).
-// Samples the resulting `VehicleState` at a requested rate and returns them.
+// Samples the resulting `CarKinematicState` at a requested rate and returns them.
 //
 // Used by the offline-training pipeline to collect ground-truth dynamics
 // trials at arbitrary initial conditions (including ones the running planner
@@ -14,8 +14,8 @@
 // can run multiple in parallel (see `headless-trial-worker.ts`).
 
 import RAPIER from '@dimforge/rapier3d-compat';
-import type { VehicleState } from '../../agent/types';
-import type { WheeledControls } from '../../agent/controls';
+import type { CarKinematicState } from '../../agent/types';
+import type { WheeledCarControls } from '../../agent/controls';
 import {
   type LearnableVehicleConfig,
   DEFAULT_LEARNABLE_CONFIG,
@@ -34,7 +34,7 @@ export interface TrialSpec {
   /** Initial kinematic state. */
   kin: { forwardSpeed: number; lateralVelocity?: number; yawRate?: number };
   /** Native-controls trace, one entry per physics tick (PHYSICS_DT seconds). */
-  controlsTrace: WheeledControls[];
+  controlsTrace: WheeledCarControls[];
   /** How many ticks per recorded sample (e.g., 6 = record every 6 ticks). */
   sampleEveryNTicks: number;
   /** Optional id to attach to the result for downstream bookkeeping. */
@@ -50,7 +50,7 @@ export interface HeadlessTrialResult {
   spec: TrialSpec;
   /** Recorded samples in world frame (NOT trial-local). Length =
    *  floor(controlsTrace.length / sampleEveryNTicks) + 1 (start + samples). */
-  samples: VehicleState[];
+  samples: CarKinematicState[];
   /** The vehicle config the chassis was created with. */
   config: LearnableVehicleConfig;
   /** Physics dt the trial was run at (always 1/60 in this implementation). */
@@ -117,7 +117,7 @@ export async function createHeadlessTrialHarness(
   );
   const spinLim = opts.spinThreshold ?? 10;
 
-  function step(c: WheeledControls): void {
+  function step(c: WheeledCarControls): void {
     car.applyWheeledControls(c);
     world.timestep = PHYSICS_DT;
     car.vehicle.updateVehicle(PHYSICS_DT);
@@ -145,7 +145,7 @@ export async function createHeadlessTrialHarness(
     ) {
       car.teleportFull(spec.pose, spec.kin);
     }
-    const samples: VehicleState[] = [];
+    const samples: CarKinematicState[] = [];
     const startTime = 0;
     samples.push({ ...car.readState(startTime) });
     let lateSpinTicks = 0;

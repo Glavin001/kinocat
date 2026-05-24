@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { purePursuit } from '../../src/execute/pure-pursuit';
 import type { PurePursuitConfig, PlanPath } from '../../src/execute/types';
-import type { VehicleState } from '../../src/agent/types';
+import type { CarKinematicState } from '../../src/agent/types';
 import { wrapAngle } from '../../src/internal/math';
 
 const cfg: PurePursuitConfig = {
@@ -17,7 +17,7 @@ const cfg: PurePursuitConfig = {
 };
 
 /** Closed-loop unicycle sim (perfect speed tracking) for tracking tests. */
-function simulate(start: VehicleState, path: PlanPath, steps: number, dt = 0.05) {
+function simulate(start: CarKinematicState, path: PlanPath, steps: number, dt = 0.05) {
   let s = { ...start };
   let maxCross = 0;
   for (let k = 0; k < steps; k++) {
@@ -43,7 +43,7 @@ describe('purePursuit', () => {
     for (let x = 0; x <= 24; x += 2) {
       path.push({ x, z: 0, heading: 0, speed: 6, t: x / 6 });
     }
-    const start: VehicleState = { x: 0, z: 2, heading: 0, speed: 0, t: 0 };
+    const start: CarKinematicState = { x: 0, z: 2, heading: 0, speed: 0, t: 0 };
     const { final } = simulate(start, path, 600);
     expect(Math.hypot(final.x - 24, final.z - 0)).toBeLessThan(0.6);
     expect(Math.abs(final.z)).toBeLessThan(0.2); // converged onto the line
@@ -55,7 +55,7 @@ describe('purePursuit', () => {
       { x: 0, z: 0, heading: 0, speed: 6, t: 0 },
       { x: 0.1, z: 50, heading: Math.PI / 2, speed: 6, t: 10 },
     ];
-    const cur: VehicleState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
+    const cur: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
     const cmd = purePursuit(cur, path, longCfg);
     const kappa = Math.abs(cmd.steering);
     expect(kappa).toBeGreaterThan(0.1);
@@ -69,7 +69,7 @@ describe('purePursuit', () => {
     for (let x = 0; x >= -12; x -= 2) {
       path.push({ x, z: 0, heading: 0, speed: -4, t: -x / 4 });
     }
-    const start: VehicleState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
+    const start: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
     const cmd0 = purePursuit(start, path, cfg);
     expect(cmd0.targetSpeed).toBeLessThan(0);
     const { final } = simulate(start, path, 600);
@@ -81,7 +81,7 @@ describe('purePursuit', () => {
       { x: 0, z: 0, heading: 0, speed: 6, t: 0 },
       { x: 10, z: 1, heading: 0, speed: 6, t: 1.7 },
     ];
-    const cur: VehicleState = { x: 1, z: 0.2, heading: 0.1, speed: 3, t: 0.2 };
+    const cur: CarKinematicState = { x: 1, z: 0.2, heading: 0.1, speed: 3, t: 0.2 };
     expect(purePursuit(cur, path, cfg)).toEqual(purePursuit(cur, path, cfg));
   });
 
@@ -90,7 +90,7 @@ describe('purePursuit', () => {
       { x: 0, z: 0, heading: 0, speed: 4, t: 0 },
       { x: 5, z: 0, heading: 0, speed: 0, t: 1.25 },
     ];
-    const atGoal: VehicleState = { x: 4.9, z: 0, heading: 0, speed: 1, t: 1.2 };
+    const atGoal: CarKinematicState = { x: 4.9, z: 0, heading: 0, speed: 1, t: 1.2 };
     const cmd = purePursuit(atGoal, path, cfg);
     expect(cmd.atGoal).toBe(true);
     expect(cmd.brake).toBe(1);

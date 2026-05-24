@@ -22,8 +22,8 @@ import type { ReactNode } from 'react';
 import type {
   LearnedVehicleModel,
   LearnedVehicleParamsV2,
-  VehicleState,
-  WheeledControls,
+  CarKinematicState,
+  WheeledCarControls,
   LearnableVehicleConfig,
 } from 'kinocat/agent';
 import type {
@@ -77,7 +77,7 @@ export const DEFAULT_TRAINING_SETTINGS: TrainingSettings = {
 export interface ModelLabState {
   model: LearnedVehicleModel | null;
   meta: PersistedV2Model['meta'] | null;
-  trialStore: TrialStore<VehicleState, WheeledControls, LearnableVehicleConfig> | null;
+  trialStore: TrialStore<CarKinematicState, WheeledCarControls, LearnableVehicleConfig> | null;
   harness: HeadlessTrialHarness | null;
   config: LearnableVehicleConfig | null;
   sampleDt: number;

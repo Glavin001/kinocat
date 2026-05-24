@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { ReplanState, planPoseAt } from '../../src/execute/replan';
 import type { PlanPath } from '../../src/execute/types';
-import type { VehicleState } from '../../src/agent/types';
+import type { CarKinematicState } from '../../src/agent/types';
 
 const path: PlanPath = [
   { x: 0, z: 0, heading: 0, speed: 4, t: 0 },
@@ -35,21 +35,21 @@ describe('ReplanState', () => {
   it('does not replan immediately after setPlan when on-track', () => {
     const rs = new ReplanState(trigger);
     rs.setPlan(path, 1000);
-    const onTrack: VehicleState = { x: 4, z: 0, heading: 0, speed: 4, t: 1 };
+    const onTrack: CarKinematicState = { x: 4, z: 0, heading: 0, speed: 4, t: 1 };
     expect(rs.shouldReplan(onTrack, 1100)).toBe(false);
   });
 
   it('replans on periodic refresh', () => {
     const rs = new ReplanState(trigger);
     rs.setPlan(path, 1000);
-    const onTrack: VehicleState = { x: 4, z: 0, heading: 0, speed: 4, t: 1 };
+    const onTrack: CarKinematicState = { x: 4, z: 0, heading: 0, speed: 4, t: 1 };
     expect(rs.shouldReplan(onTrack, 1600)).toBe(true); // 600ms > 500ms
   });
 
   it('replans on divergence beyond threshold', () => {
     const rs = new ReplanState(trigger);
     rs.setPlan(path, 1000);
-    const off: VehicleState = { x: 4, z: 5, heading: 0, speed: 4, t: 1 };
+    const off: CarKinematicState = { x: 4, z: 5, heading: 0, speed: 4, t: 1 };
     expect(rs.divergence(off)).toBeCloseTo(5, 9);
     expect(rs.shouldReplan(off, 1100)).toBe(true);
   });
@@ -58,7 +58,7 @@ describe('ReplanState', () => {
     const rs = new ReplanState(trigger);
     rs.setPlan(path, 1000);
     rs.markDirty('tile-rebuild');
-    const onTrack: VehicleState = { x: 4, z: 0, heading: 0, speed: 4, t: 1 };
+    const onTrack: CarKinematicState = { x: 4, z: 0, heading: 0, speed: 4, t: 1 };
     expect(rs.shouldReplan(onTrack, 1100)).toBe(true);
     rs.setPlan(path, 1100); // setPlan clears the dirty flag
     expect(rs.shouldReplan(onTrack, 1150)).toBe(false);
@@ -76,7 +76,7 @@ describe('ReplanState plan-switch hysteresis (anti-oscillation)', () => {
     { x: 0, z: 0, heading: 0, speed: 4, t: 0 },
     { x: 8, z: -1, heading: 0, speed: 4, t: 2 },
   ];
-  const onTrack: VehicleState = { x: 4, z: 0, heading: 0, speed: 4, t: 1 };
+  const onTrack: CarKinematicState = { x: 4, z: 0, heading: 0, speed: 4, t: 1 };
 
   it('adopts the first plan unconditionally', () => {
     const rs = new ReplanState(trigger);
@@ -106,7 +106,7 @@ describe('ReplanState plan-switch hysteresis (anti-oscillation)', () => {
   it('always adopts when diverged or dirty (current plan invalid)', () => {
     const rs = new ReplanState(trigger);
     rs.setPlan(path, 1000, 10);
-    const off: VehicleState = { x: 4, z: 9, heading: 0, speed: 4, t: 1 };
+    const off: CarKinematicState = { x: 4, z: 9, heading: 0, speed: 4, t: 1 };
     rs.shouldReplan(off, 1100); // reason = divergence
     expect(rs.consider(altPath, 10, 1100)).toBe(true); // equal cost but adopt
     rs.setPlan(path, 1200, 10);

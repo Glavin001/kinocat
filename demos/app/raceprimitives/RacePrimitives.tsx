@@ -11,7 +11,7 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
-import type { LearnedVehicleParams, VehicleState } from 'kinocat/agent';
+import type { LearnedVehicleParams, CarKinematicState } from 'kinocat/agent';
 import { DEFAULT_LEARNED_PARAMS } from 'kinocat/agent';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import { MotionPrimitiveLibrary } from 'kinocat/primitives';
@@ -23,7 +23,7 @@ import {
   stepRaycastVehicle,
   type CarHandle,
 } from 'kinocat/adapters/rapier';
-import { trimPlan as trimPlanCore } from 'kinocat/vehicle/car';
+import { trimPlan } from 'kinocat/vehicle/car';
 import {
   createCarMeshHelper,
   syncCarMesh,
@@ -130,17 +130,17 @@ interface CarRuntime {
   trailLine: THREE.Line;
   trailPts: THREE.Vector3[];
   ai: {
-    plan: VehicleState[] | null;
+    plan: CarKinematicState[] | null;
     planStartWall: number;
     loopIndex: number;
-    goal: VehicleState | null;
+    goal: CarKinematicState | null;
     /** Predicted end state of the plan's first primitive (t = 0.55s ahead)
      *  recorded at plan-install time. When wall-time reaches the predicted
      *  time, we compare predicted vs actual to get the per-primitive
      *  prediction error — the honest measure of dynamics-model accuracy
      *  (unlike the position-vs-elapsed-time metric which rewards
      *  confidence over correctness on long straights). */
-    predictedEnd: { state: VehicleState; dueWall: number } | null;
+    predictedEnd: { state: CarKinematicState; dueWall: number } | null;
   };
   lib: MotionPrimitiveLibrary;
   metrics: RaceMetrics;
@@ -981,7 +981,7 @@ async function setupScene(
     // debug-report export can include it; multi-goal A* solves ONE search
     // over (chassis × gate-index) joint state space, with 2 gates fitting
     // the 120 ms per-car budget on this course.
-    const gates: VehicleState[] = [];
+    const gates: CarKinematicState[] = [];
     for (let i = 0; i < PLAN_LOOKAHEAD_COUNT; i++) {
       const idx = (car.ai.loopIndex + i) % course.waypoints.length;
       gates.push({ ...course.waypoints[idx]!, t: 0 });
@@ -1045,7 +1045,7 @@ async function setupScene(
         car.pathLine.geometry.dispose();
         (car.pathLine.material as THREE.Material).dispose();
       }
-      const pts = res.path.map((p: VehicleState) => new THREE.Vector3(p.x, 0.4, p.z));
+      const pts = res.path.map((p: CarKinematicState) => new THREE.Vector3(p.x, 0.4, p.z));
       car.pathLine = new THREE.Line(
         new THREE.BufferGeometry().setFromPoints(pts),
         new THREE.LineBasicMaterial({
@@ -1468,15 +1468,11 @@ function paramsEqual(a: LearnedVehicleParams, b: LearnedVehicleParams): boolean 
   );
 }
 
-function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
-  return trimPlanCore(plan, elapsed);
-}
-
 /** Smoothly move a perspective camera into a chase position behind a
- *  VehicleState. The chassis y is unknown to the planner (Y is derived in
+ *  CarKinematicState. The chassis y is unknown to the planner (Y is derived in
  *  kinocat); for the cam we place it ~10m above so the wheels and the
  *  upcoming course are both visible. */
-function updateChaseCamera(cam: THREE.PerspectiveCamera, s: VehicleState): void {
+function updateChaseCamera(cam: THREE.PerspectiveCamera, s: CarKinematicState): void {
   const c = Math.cos(s.heading);
   const sn = Math.sin(s.heading);
   // 14m behind + 7m above the chassis, looking ~6m ahead.
@@ -1485,7 +1481,7 @@ function updateChaseCamera(cam: THREE.PerspectiveCamera, s: VehicleState): void 
   cam.lookAt(s.x + 6 * c, 1.2, s.z + 6 * sn);
 }
 
-function planAtTime(plan: VehicleState[], t: number): VehicleState | null {
+function planAtTime(plan: CarKinematicState[], t: number): CarKinematicState | null {
   if (plan.length === 0) return null;
   if (t <= plan[0]!.t) return plan[0]!;
   for (let i = 1; i < plan.length; i++) {

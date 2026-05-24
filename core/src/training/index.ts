@@ -2,7 +2,7 @@
 //
 // The car-specific training pipeline (currently in
 // `demos/app/lib/training-driver.ts`) already operates on generic types
-// `<VehicleState, WheeledControls, LearnableVehicleConfig>`. This module
+// `<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>`. This module
 // just formalizes the contract so future vehicle pipelines (airplane,
 // hovercraft, ...) plug into the same orchestrator without each one
 // re-implementing the round / trial-collect / fit-parametric / fit-residual

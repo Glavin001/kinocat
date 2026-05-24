@@ -16,8 +16,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type {
   LearnedVehicleModel,
   LearnableVehicleConfig,
-  VehicleState,
-  WheeledControls,
+  CarKinematicState,
+  WheeledCarControls,
 } from 'kinocat/agent';
 import type { MotionPrimitive } from 'kinocat/primitives';
 import type { Trial } from 'kinocat/learning';
@@ -54,8 +54,8 @@ function DashboardInner() {
     : null;
 
   const [selectedSpeed, setSelectedSpeed] = useState<number>(RACE_START_SPEEDS[2]!);
-  const [selectedTrial, setSelectedTrial] = useState<Trial<VehicleState, WheeledControls, LearnableVehicleConfig> | null>(null);
-  const [extraTrack, setExtraTrack] = useState<{ name: string; color: string; states: VehicleState[]; times: number[] } | null>(null);
+  const [selectedTrial, setSelectedTrial] = useState<Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig> | null>(null);
+  const [extraTrack, setExtraTrack] = useState<{ name: string; color: string; states: CarKinematicState[]; times: number[] } | null>(null);
 
   // Sync selectedTrial to the store contents when trials load.
   useEffect(() => {

@@ -8,7 +8,7 @@
 // to gate i that pays off at gate i+1 or i+2 — the racing-line problem.
 // One global search frees the planner to make those trade-offs.
 
-import type { VehicleAgent, VehicleState } from '../agent/types';
+import type { VehicleAgent, CarKinematicState } from '../agent/types';
 import type { MotionPrimitiveLibrary } from '../primitives/library';
 import type { MovingObstacle } from '../predict/types';
 import type { AffordanceRegistry } from '../predict/affordance-registry';
@@ -32,11 +32,11 @@ import type { PlanResult, PlannerOptions } from './types';
 import { makeCounters } from './perf';
 
 export interface PlanVehicleMultiGoalRequest {
-  start: VehicleState;
+  start: CarKinematicState;
   /** Ordered list of gates the chassis must pass through. Each is treated
    *  as a position to be reached within `gateRadius` — heading and speed
    *  at the gate are not constrained. */
-  gates: VehicleState[];
+  gates: CarKinematicState[];
   world: NavWorld;
   agent: VehicleAgent;
   lib: MotionPrimitiveLibrary;
@@ -76,7 +76,7 @@ const DEFAULT_GATE_RADIUS = 4;
  *  each gate position in order; heading and speed are free. */
 export function planVehicleMultiGoal(
   req: PlanVehicleMultiGoalRequest,
-): PlanResult<VehicleState> {
+): PlanResult<CarKinematicState> {
   if (req.gates.length === 0) {
     return {
       found: false,
@@ -114,7 +114,7 @@ export function planVehicleMultiGoal(
 
   const gateRadius = req.gateRadius ?? DEFAULT_GATE_RADIUS;
   const gateRadiusSq = gateRadius * gateRadius;
-  const multiEnv = new MultiGoalEnvironment<VehicleState>(timeEnv, {
+  const multiEnv = new MultiGoalEnvironment<CarKinematicState>(timeEnv, {
     gates: req.gates,
     reachedGate: (s, g) => {
       const dx = s.x - g.x;
@@ -129,7 +129,7 @@ export function planVehicleMultiGoal(
   const startState = multiGoalStart(req.start);
   const goalState = multiGoalTerminal(req.gates);
 
-  const result = plan<MultiGoalState<VehicleState>>(
+  const result = plan<MultiGoalState<CarKinematicState>>(
     {
       start: startState,
       goal: goalState,
@@ -143,7 +143,7 @@ export function planVehicleMultiGoal(
   );
 
   // Unwrap the multi-goal state → vehicle state for the planner's standard
-  // PlanResult<VehicleState> contract.
+  // PlanResult<CarKinematicState> contract.
   return {
     found: result.found,
     cost: result.cost,

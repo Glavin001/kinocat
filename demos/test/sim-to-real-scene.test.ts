@@ -1,7 +1,7 @@
 // Unit tests for the pure /sim-to-real helpers. No Rapier / Three needed.
 
 import { describe, it, expect } from 'vitest';
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import type { ForwardSim } from 'kinocat/primitives';
 import {
   rolloutOpenLoop,
@@ -14,14 +14,14 @@ import {
 } from '../app/lib/sim-to-real-scene';
 
 // A trivial constant-velocity forward sim along +x at `controls[0]` m/s.
-const linearSim: ForwardSim<VehicleState> = (s, c, dt) => ({
+const linearSim: ForwardSim<CarKinematicState> = (s, c, dt) => ({
   ...s,
   x: s.x + (c[0] ?? 0) * dt,
   t: s.t + dt,
   speed: c[0] ?? 0,
 });
 
-const s0: VehicleState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
+const s0: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
 
 describe('rolloutOpenLoop', () => {
   it('returns initial state + one sample per applied control', () => {
@@ -56,8 +56,8 @@ describe('wrapPi / poseGap', () => {
   });
 
   it('poseGap reports pos/heading/speed deltas with heading wrapped', () => {
-    const real: VehicleState = { x: 1, z: 2, heading: 0.1, speed: 5, t: 0 };
-    const pred: VehicleState = { x: 4, z: 6, heading: Math.PI + 0.2, speed: 7, t: 0 };
+    const real: CarKinematicState = { x: 1, z: 2, heading: 0.1, speed: 5, t: 0 };
+    const pred: CarKinematicState = { x: 4, z: 6, heading: Math.PI + 0.2, speed: 7, t: 0 };
     const g = poseGap(real, pred);
     expect(g.posErr).toBeCloseTo(5, 6);
     expect(Math.abs(g.headingErr)).toBeLessThanOrEqual(Math.PI);
@@ -91,12 +91,12 @@ describe('GapAccumulator', () => {
 describe('FuturePredictionTracker', () => {
   it('drains predictions whose matchAt has been reached', () => {
     const tr = new FuturePredictionTracker();
-    const make = (x: number): VehicleState => ({ x, z: 0, heading: 0, speed: 0, t: 0 });
+    const make = (x: number): CarKinematicState => ({ x, z: 0, heading: 0, speed: 0, t: 0 });
     tr.schedule(make(1), 0, 0.5);
     tr.schedule(make(2), 0, 1.0);
     tr.schedule(make(3), 0, 1.5);
     expect(tr.size()).toBe(3);
-    const real: VehicleState = { x: 5, z: 0, heading: 0, speed: 0, t: 0.6 };
+    const real: CarKinematicState = { x: 5, z: 0, heading: 0, speed: 0, t: 0.6 };
     const matured = tr.drainMatured(real);
     expect(matured).toHaveLength(1);
     expect(matured[0]!.posErr).toBeCloseTo(4, 6); // predicted x=1 vs real x=5

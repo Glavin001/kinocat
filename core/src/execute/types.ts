@@ -1,4 +1,4 @@
-import type { VehicleState } from '../agent/types';
+import type { CarKinematicState } from '../agent/types';
 
 export interface PurePursuitConfig {
   /** Minimum lookahead distance (world units). */
@@ -50,4 +50,4 @@ export interface ReplanTrigger {
 
 export type ReplanReason = 'no-plan' | 'dirty' | 'divergence' | 'periodic' | 'none';
 
-export type PlanPath = VehicleState[];
+export type PlanPath = CarKinematicState[];

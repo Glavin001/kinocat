@@ -9,7 +9,7 @@ import {
   AffordanceRegistry,
   createJumpAffordance,
 } from '../../src/predict/affordance-registry';
-import type { VehicleAgent, VehicleState } from '../../src/agent/types';
+import type { VehicleAgent, CarKinematicState } from '../../src/agent/types';
 
 function rect(id: number, x0: number, z0: number, x1: number, z1: number): NavPolygon {
   return { id, y: 0, ring: [[x0, z0], [x1, z0], [x1, z1], [x0, z1]] };
@@ -42,8 +42,8 @@ describe('lazy affordance edges', () => {
     rect(1, 0, -6, 14, 6),
     rect(2, 22, -6, 40, 6),
   ]);
-  const start: VehicleState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
-  const goal: VehicleState = { x: 34, z: 0, heading: 0, speed: 0, t: 0 };
+  const start: CarKinematicState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
+  const goal: CarKinematicState = { x: 34, z: 0, heading: 0, speed: 0, t: 0 };
 
   function makeEnv(reg?: AffordanceRegistry) {
     const base = new VehicleEnvironment(world, agent, lib, {
@@ -106,8 +106,8 @@ describe('shortcut vs misdirect affordances (emergent rejection)', () => {
   // Open corridor: a normal drive plan exists, so the planner can choose to
   // ignore an affordance entirely based on cost.
   const world = new InMemoryNavWorld([rect(1, 0, -10, 60, 10)]);
-  const start: VehicleState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
-  const goal: VehicleState = { x: 56, z: 0, heading: 0, speed: 0, t: 0 };
+  const start: CarKinematicState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
+  const goal: CarKinematicState = { x: 56, z: 0, heading: 0, speed: 0, t: 0 };
   const makeEnv = (reg?: AffordanceRegistry) =>
     new TimeAwareEnvironment(
       new VehicleEnvironment(world, agent, lib, {

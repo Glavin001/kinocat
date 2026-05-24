@@ -5,7 +5,7 @@
 // characterization.
 
 import type { ForwardSim } from '../../primitives/types';
-import type { VehicleState } from '../../agent/types';
+import type { CarKinematicState } from '../../agent/types';
 import { wrapAngle } from '../../internal/math';
 import type { RapierBodyLike, RapierQuatLike, RapierWorldLike } from './types';
 
@@ -74,10 +74,10 @@ function yawFromQuat(q: RapierQuatLike): number {
  */
 export function rapierForwardSim(
   opts: RapierForwardSimOptions,
-): ForwardSim<VehicleState> {
+): ForwardSim<CarKinematicState> {
   const y = opts.groundY ?? 0;
   const { world, body } = opts;
-  return (s: VehicleState, controls: number[], dt: number): VehicleState => {
+  return (s: CarKinematicState, controls: number[], dt: number): CarKinematicState => {
     const curvature = controls[0] ?? 0;
     const speed = controls[1] ?? 0;
     body.setTranslation({ x: s.x, y, z: s.z }, true);

@@ -3,7 +3,7 @@
 // driving/airborne/landing modes. Whatever physics does is just the start
 // state of the next plan; replanning is the universal correction.
 
-import type { VehicleState } from '../agent/types';
+import type { CarKinematicState } from '../agent/types';
 import type { PlanPath, PurePursuitConfig, TrackingCommand } from './types';
 import { clamp, dist } from '../internal/math';
 
@@ -43,7 +43,7 @@ function lookaheadPoint(
 
 /** Compute the tracking command for `current` following `path`. Pure. */
 export function purePursuit(
-  current: VehicleState,
+  current: CarKinematicState,
   path: PlanPath,
   config: PurePursuitConfig,
 ): TrackingCommand {

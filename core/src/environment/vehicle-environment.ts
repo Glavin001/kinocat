@@ -1,6 +1,6 @@
 import type { Environment, EdgeRef, Node } from './types';
 import type { NavWorld } from './nav-world';
-import type { VehicleAgent, VehicleState } from '../agent/types';
+import type { VehicleAgent, CarKinematicState } from '../agent/types';
 import type { MotionPrimitiveLibrary } from '../primitives/library';
 import { makeNode } from '../planner/node';
 import { pack3 } from '../planner/resolution';
@@ -78,7 +78,7 @@ export interface AnalyticEdgeData {
   samples: [number, number][];
 }
 
-export class VehicleEnvironment implements Environment<VehicleState> {
+export class VehicleEnvironment implements Environment<CarKinematicState> {
   readonly levels: number;
   private readonly posCell: number;
   private readonly headingBuckets: number;
@@ -162,10 +162,10 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   }
 
   createNode(
-    state: VehicleState,
-    parent: Node<VehicleState> | null,
+    state: CarKinematicState,
+    parent: Node<CarKinematicState> | null,
     edge: EdgeRef | null,
-  ): Node<VehicleState> {
+  ): Node<CarKinematicState> {
     const ix = Math.round(state.x / this.posCell);
     const iz = Math.round(state.z / this.posCell);
     const ih = this.headingBucket(state.heading);
@@ -178,7 +178,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     return makeNode(state, parent, edge, index, `${ix},${iz},${ih},${isp},${it}`);
   }
 
-  private sweepClear(node: VehicleState, primSweep: ReadonlyArray<{ x: number; z: number; heading: number }>): boolean {
+  private sweepClear(node: CarKinematicState, primSweep: ReadonlyArray<{ x: number; z: number; heading: number }>): boolean {
     const c = Math.cos(node.heading);
     const s = Math.sin(node.heading);
     let px = node.x;
@@ -226,20 +226,20 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     return true;
   }
 
-  succ(node: Node<VehicleState>, goal: Node<VehicleState>): Node<VehicleState>[] {
+  succ(node: Node<CarKinematicState>, goal: Node<CarKinematicState>): Node<CarKinematicState>[] {
     const st = node.state;
     const c = Math.cos(st.heading);
     const s = Math.sin(st.heading);
     const parentReverse =
       node.edge && (node.edge.data as DriveEdgeData | undefined)?.reverse === true;
-    const out: Node<VehicleState>[] = [];
+    const out: Node<CarKinematicState>[] = [];
 
     for (const prim of this.lib.lookup(st.speed)) {
       if (!this.sweepClear(st, prim.sweep)) continue;
 
       const ex = st.x + prim.end.dx * c - prim.end.dz * s;
       const ez = st.z + prim.end.dx * s + prim.end.dz * c;
-      const next: VehicleState = {
+      const next: CarKinematicState = {
         x: ex,
         z: ez,
         heading: wrapAngle(st.heading + prim.end.dHeading),
@@ -277,9 +277,9 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   /** Reeds-Shepp shot from `node` to the goal; a single goal-reaching
    *  successor if the swept footprint is collision-free, else null. */
   private tryAnalyticShot(
-    node: Node<VehicleState>,
-    goal: Node<VehicleState>,
-  ): Node<VehicleState> | null {
+    node: Node<CarKinematicState>,
+    goal: Node<CarKinematicState>,
+  ): Node<CarKinematicState> | null {
     const a = node.state;
     const b = goal.state;
     const path = reedsSheppShortestPath(
@@ -330,7 +330,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
       prevReverse = rev;
     }
 
-    const next: VehicleState = {
+    const next: CarKinematicState = {
       x: b.x,
       z: b.z,
       heading: b.heading,
@@ -349,7 +349,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     return n;
   }
 
-  heuristic(from: VehicleState, to: VehicleState): number {
+  heuristic(from: CarKinematicState, to: CarKinematicState): number {
     this.rec.counters.heuristicCalls++;
     const euclid = dist(from.x, from.z, to.x, to.z);
     let tRS: number;
@@ -402,7 +402,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     return tRS;
   }
 
-  private poseClear(s: VehicleState): boolean {
+  private poseClear(s: CarKinematicState): boolean {
     this.rec.counters.collisionChecks++;
     const ok = this.world.footprintClear(
       placeFootprint(this.agent.footprint, s.x, s.z, s.heading),
@@ -411,7 +411,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     return ok;
   }
 
-  checkValidity(_start: VehicleState, goal: VehicleState): [boolean, boolean] {
+  checkValidity(_start: CarKinematicState, goal: CarKinematicState): [boolean, boolean] {
     // Always accept the start. In a chase / contact-rich physics simulation
     // the chassis can spend frames slightly clipping a wall or another car,
     // even though it is on the verge of breaking free. Refusing to plan
@@ -424,7 +424,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     return [true, this.poseClear(goal)];
   }
 
-  reachedGoalRegion(node: Node<VehicleState>, goal: Node<VehicleState>): boolean {
+  reachedGoalRegion(node: Node<CarKinematicState>, goal: Node<CarKinematicState>): boolean {
     const a = node.state;
     const b = goal.state;
     if (dist(a.x, a.z, b.x, b.z) > this.goalRadius) return false;

@@ -22,7 +22,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import RAPIER from '@dimforge/rapier3d-compat';
 import type {
   LearnedVehicleModel,
-  VehicleState,
+  CarKinematicState,
 } from 'kinocat/agent';
 import type { ForwardSim } from 'kinocat/primitives';
 import {
@@ -225,14 +225,14 @@ export default function SimToRealScope() {
     const ENGINE_FORCE_N = v2Model.config.maxDriveForce;
     const BRAKE_FORCE_N = v2Model.config.maxBrakeForce;
 
-    const sims: Record<GhostKind['id'], ForwardSim<VehicleState>> = {
+    const sims: Record<GhostKind['id'], ForwardSim<CarKinematicState>> = {
       'v2-full': learnedForwardSimV2(v2Model),
       'parametric': parametricForwardV2(paramModel.params, paramModel.config),
       'kinematic': kinematicForwardSim(RACE_AGENT),
     };
 
     // Control-vector encoding differs per forward sim:
-    //   - v2-full and parametric take WheeledControls native form:
+    //   - v2-full and parametric take WheeledCarControls native form:
     //       [steer_rad, driveForce_N, brakeForce_N]
     //   - kinematic takes [curvature_1/m, target_speed_m_s] (see
     //     core/src/agent/vehicle.ts).
@@ -339,7 +339,7 @@ export default function SimToRealScope() {
         /** Last instantaneous gap sample (for HUD). */
         last: GapSample;
         /** Predicted state from the OPEN-LOOP playback rollout (Playback). */
-        playbackTrace: VehicleState[] | null;
+        playbackTrace: CarKinematicState[] | null;
         playbackIdx: number;
         /** Sim-time the ghost was last re-anchored to the real chassis. */
         lastAnchorT: number;
@@ -415,7 +415,7 @@ export default function SimToRealScope() {
     window.addEventListener('keyup', onKeyUp);
 
     // ---- click-to-goal (plan-execute) --------------------------------
-    let planActive: VehicleState[] | null = null;
+    let planActive: CarKinematicState[] | null = null;
     const navWorld = new InMemoryNavWorld(
       [{
         id: 0,
@@ -456,7 +456,7 @@ export default function SimToRealScope() {
         // Also stamp ghost waypoints from the plan into each model's
         // open-loop trace so we can overlay model-predicted execution.
         const dt = result.path[1]!.t - result.path[0]!.t;
-        const initial: VehicleState = { ...s, t: 0 };
+        const initial: CarKinematicState = { ...s, t: 0 };
         // The plan's controls aren't directly exported per-step here;
         // we approximate by sampling pure-pursuit deltas. For Gap B
         // analysis the plan itself is the reference, so the ghosts roll
@@ -596,7 +596,7 @@ export default function SimToRealScope() {
       car.applyControls(appliedControls);
       stepRaycastVehicle(world, [car], { dt: PHYSICS_DT, substeps: VEHICLE_SUBSTEPS });
       const subDt = PHYSICS_DT / VEHICLE_SUBSTEPS;
-      const realAfter: VehicleState = { ...car.readState(0), t: simTime + PHYSICS_DT };
+      const realAfter: CarKinematicState = { ...car.readState(0), t: simTime + PHYSICS_DT };
       simTime += PHYSICS_DT;
       syncCarMesh(realCarMesh.group, realAfter);
       realTrail.push(realAfter);
@@ -627,7 +627,7 @@ export default function SimToRealScope() {
               ent.playbackTrace[ent.playbackTrace.length - 1]!.z - realBefore.z,
             ) > 50);
         if (needsAnchor) {
-          const seed: VehicleState = { ...realBefore, t: simTime - PHYSICS_DT };
+          const seed: CarKinematicState = { ...realBefore, t: simTime - PHYSICS_DT };
           ent.playbackTrace = [seed];
           ent.lastAnchorT = simTime;
         }
@@ -637,7 +637,7 @@ export default function SimToRealScope() {
         for (let i = 0; i < innerSteps; i++) {
           s = sim(s, cv, modelDt);
         }
-        const predicted: VehicleState = { ...s, t: simTime };
+        const predicted: CarKinematicState = { ...s, t: simTime };
         ent.playbackTrace!.push(predicted);
         if (ent.playbackTrace!.length > 4096) ent.playbackTrace!.shift();
         ent.car.setPose(predicted);
@@ -791,14 +791,14 @@ export default function SimToRealScope() {
 
 function buildHudSnapshot(
   mode: SimToRealMode,
-  real: VehicleState,
+  real: CarKinematicState,
   ghosts: Map<string, {
     kind: GhostKind;
     last: GapSample;
     gap: GapAccumulator;
   }>,
   maxGripPct: number,
-  planActive: VehicleState[] | null,
+  planActive: CarKinematicState[] | null,
 ): HUDSnapshot {
   const ghostEntries = [...ghosts.values()].map((g) => ({
     label: g.kind.label,

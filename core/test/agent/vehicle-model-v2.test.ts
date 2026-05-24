@@ -14,7 +14,7 @@ import {
   predictWithUncertainty,
 } from 'kinocat/agent';
 import { DEFAULT_LEARNABLE_CONFIG } from 'kinocat/agent';
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 
 const cfg = DEFAULT_LEARNABLE_CONFIG;
 
@@ -24,10 +24,10 @@ function rollFor(
   brakeForce: number,
   ticks: number,
   startSpeed = 8,
-  initial?: Partial<VehicleState>,
-): VehicleState {
+  initial?: Partial<CarKinematicState>,
+): CarKinematicState {
   const sim = parametricForwardV2(DEFAULT_LEARNED_PARAMS_V2, cfg);
-  let s: VehicleState = {
+  let s: CarKinematicState = {
     x: 0, z: 0, heading: 0, speed: startSpeed,
     yawRate: 0, lateralVelocity: 0, t: 0,
     ...initial,
@@ -45,7 +45,7 @@ describe('parametricForwardV2 — structural invariants', () => {
     // commanded curvature, then measure long + lat (centripetal) accel.
     // Cap: gripScale * frictionSlip * G * frictionCircleSlack.
     const sim = parametricForwardV2(DEFAULT_LEARNED_PARAMS_V2, cfg);
-    let s: VehicleState = {
+    let s: CarKinematicState = {
       x: 0, z: 0, heading: 0, speed: 10, yawRate: 0, lateralVelocity: 0, t: 0,
     };
     const dt = 1 / 60;
@@ -79,7 +79,7 @@ describe('parametricForwardV2 — structural invariants', () => {
 
   it('dt-consistent: two half-dt steps approximately equal one full-dt step', () => {
     const sim = parametricForwardV2(DEFAULT_LEARNED_PARAMS_V2, cfg);
-    const start: VehicleState = {
+    const start: CarKinematicState = {
       x: 0, z: 0, heading: 0, speed: 6, yawRate: 0, lateralVelocity: 0, t: 0,
     };
     const dt = 0.1;
@@ -114,7 +114,7 @@ describe('learnedForwardSimV2 + predictWithUncertainty', () => {
     const model = buildParametricOnlyModel();
     const wrapped = learnedForwardSimV2(model);
     const direct = parametricForwardV2(model.params, model.config);
-    const start: VehicleState = {
+    const start: CarKinematicState = {
       x: 1, z: 2, heading: 0.3, speed: 5, yawRate: 0.1, lateralVelocity: -0.2, t: 0,
     };
     const ctrl = [0.05, 800, 100];

@@ -27,7 +27,7 @@ import {
   paramsV2FromVec,
   DEFAULT_LEARNABLE_CONFIG,
   type LearnableVehicleConfig,
-  type VehicleState,
+  type CarKinematicState,
   type LearnedVehicleParamsV2,
   defaultVehicleAgent,
   learnedForwardSim,
@@ -36,7 +36,7 @@ import {
 } from 'kinocat/agent';
 import { createTrialStore, runParametricFit, evaluateModel } from 'kinocat/learning';
 import type { Trial } from 'kinocat/learning';
-import type { WheeledControls } from 'kinocat/agent';
+import type { WheeledCarControls } from 'kinocat/agent';
 import type { ForwardSim } from 'kinocat/primitives';
 
 let RAPIER_OK = false;
@@ -59,11 +59,11 @@ const VEHICLE_OPTS = {
   driveTrain: 'rwd' as const,
 };
 
-interface MyTrial extends Trial<VehicleState, WheeledControls, LearnableVehicleConfig> {}
+interface MyTrial extends Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig> {}
 
 async function collectTrials(opts: {
   speeds: number[];
-  controls: WheeledControls[];
+  controls: WheeledCarControls[];
   ticks: number;
   sampleEveryNTicks: number;
 }): Promise<MyTrial[]> {
@@ -102,7 +102,7 @@ async function collectTrials(opts: {
   return trials;
 }
 
-function stateDeltaForFit(pred: VehicleState, act: VehicleState): number {
+function stateDeltaForFit(pred: CarKinematicState, act: CarKinematicState): number {
   const dx = pred.x - act.x;
   const dz = pred.z - act.z;
   let dh = pred.heading - act.heading;
@@ -112,7 +112,7 @@ function stateDeltaForFit(pred: VehicleState, act: VehicleState): number {
   return dx * dx + dz * dz + 5 * dh * dh + ds * ds;
 }
 
-function controlsToVec(c: WheeledControls): number[] {
+function controlsToVec(c: WheeledCarControls): number[] {
   return [c.steer, c.driveForce, c.brakeForce];
 }
 
@@ -122,7 +122,7 @@ describe.skipIf(!RAPIER_OK)('v2 learned vehicle model beats legacy baseline on o
     const speeds = [0, 5, 10];
     const fullDrive = VEHICLE_OPTS.engineForce * 0.8;
     const halfSteer = VEHICLE_OPTS.maxSteerAngle * 0.5;
-    const controls: WheeledControls[] = [
+    const controls: WheeledCarControls[] = [
       { steer: 0, driveForce: fullDrive, brakeForce: 0 },           // cruise
       { steer: +halfSteer, driveForce: fullDrive, brakeForce: 0 },  // gentle right turn
       { steer: -halfSteer, driveForce: fullDrive, brakeForce: 0 },  // gentle left turn
@@ -134,7 +134,7 @@ describe.skipIf(!RAPIER_OK)('v2 learned vehicle model beats legacy baseline on o
     expect(trainTrials.length).toBeGreaterThan(5);
 
     // Fit v2 parametric.
-    const fit = runParametricFit<LearnedVehicleParamsV2, VehicleState, WheeledControls, LearnableVehicleConfig>({
+    const fit = runParametricFit<LearnedVehicleParamsV2, CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
       init: DEFAULT_LEARNED_PARAMS_V2,
       encode: paramsV2ToVec,
       decode: paramsV2FromVec,
@@ -147,7 +147,7 @@ describe.skipIf(!RAPIER_OK)('v2 learned vehicle model beats legacy baseline on o
     expect(fit.history.length).toBeGreaterThan(2);
 
     // Collect a small held-out trial set with different controls.
-    const heldOutControls: WheeledControls[] = [
+    const heldOutControls: WheeledCarControls[] = [
       { steer: +VEHICLE_OPTS.maxSteerAngle * 0.3, driveForce: fullDrive * 0.6, brakeForce: 0 },
       { steer: -VEHICLE_OPTS.maxSteerAngle * 0.7, driveForce: fullDrive * 0.4, brakeForce: 0 },
       { steer: 0, driveForce: fullDrive * 0.3, brakeForce: VEHICLE_OPTS.brakeForce * 0.3 },
@@ -164,14 +164,14 @@ describe.skipIf(!RAPIER_OK)('v2 learned vehicle model beats legacy baseline on o
     // representation for an apples-to-apples baseline. Use bicycle-model:
     // curvature = sin(steer) / (2*wheelBase), targetSpeed ≈ predicted steady-state
     // (set to current speed + a heuristic).
-    function wheeledToLegacyVec(c: WheeledControls): number[] {
+    function wheeledToLegacyVec(c: WheeledCarControls): number[] {
       const k = Math.sin(c.steer) / (2 * VEHICLE_OPTS.wheelBase);
       // Use ~10 m/s if drive force is on, 0 if brake-only.
       const targetSpeed = c.driveForce > 0 ? 10 : (c.brakeForce > 0 ? 0 : 5);
       return [k, targetSpeed];
     }
 
-    const diag = evaluateModel<VehicleState, WheeledControls, LearnableVehicleConfig>({
+    const diag = evaluateModel<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
       trials: heldOut,
       horizons,
       controlsToVec,
@@ -198,16 +198,16 @@ describe.skipIf(!RAPIER_OK)('v2 learned vehicle model beats legacy baseline on o
   });
 });
 
-// Wrap a `ForwardSim<VehicleState>` that consumes a different control encoding
+// Wrap a `ForwardSim<CarKinematicState>` that consumes a different control encoding
 // in a compatible signature for evaluateModel (which always passes the
 // trial's wheeled-controls-encoded number[]).
 function composedSim(
-  inner: ForwardSim<VehicleState>,
-  encode: (c: WheeledControls) => number[],
-): ForwardSim<VehicleState> {
+  inner: ForwardSim<CarKinematicState>,
+  encode: (c: WheeledCarControls) => number[],
+): ForwardSim<CarKinematicState> {
   return (s, controls, dt) => {
-    // Decode opaque wheeled vector → WheeledControls → re-encode for inner.
-    const wc: WheeledControls = {
+    // Decode opaque wheeled vector → WheeledCarControls → re-encode for inner.
+    const wc: WheeledCarControls = {
       steer: controls[0] ?? 0,
       driveForce: controls[1] ?? 0,
       brakeForce: controls[2] ?? 0,

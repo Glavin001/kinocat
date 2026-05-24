@@ -1,10 +1,10 @@
 import type { ForwardSim, LocalPose, MotionPrimitive } from './types';
 import { MotionPrimitiveLibrary } from './library';
-import type { VehicleState } from '../agent/types';
+import type { CarKinematicState } from '../agent/types';
 import { wrapAngle } from '../internal/math';
 
 export interface CharacterizeVehicleOptions {
-  forwardSim: ForwardSim<VehicleState>;
+  forwardSim: ForwardSim<CarKinematicState>;
   /** Opaque control vectors to sweep (one primitive per control × speed). */
   controlSets: number[][];
   /** Wall-clock duration of each primitive (seconds). */
@@ -31,7 +31,7 @@ export function characterizeVehicle(
 
   for (const startSpeed of startSpeeds) {
     for (const controls of controlSets) {
-      let s: VehicleState = { x: 0, z: 0, heading: 0, speed: startSpeed, t: 0 };
+      let s: CarKinematicState = { x: 0, z: 0, heading: 0, speed: startSpeed, t: 0 };
       const sweep: LocalPose[] = [{ x: 0, z: 0, heading: 0 }];
       for (let k = 0; k < substeps; k++) {
         s = forwardSim(s, controls, dt);

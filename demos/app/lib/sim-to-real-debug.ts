@@ -16,7 +16,7 @@
 // plain objects, no clone of incoming states (the caller is expected to
 // pass already-frozen snapshots — see SimToRealScope).
 
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import type { WheelTelemetry } from 'kinocat/adapters/rapier';
 
 export interface DebugFrame {
@@ -29,10 +29,10 @@ export interface DebugFrame {
    *  [steer-norm-or-radians, driveForce N, brakeForce N]. */
   ctrlVec: [number, number, number];
   /** Rapier-real chassis state after the physics step. */
-  real: VehicleState;
+  real: CarKinematicState;
   /** Per-model predicted state at the SAME sim-time. Keys are the
    *  ghost ids ('v2-full' / 'parametric' / 'kinematic'). */
-  ghosts: Record<string, VehicleState>;
+  ghosts: Record<string, CarKinematicState>;
   /** Per-model gap snapshot (signed deltas, raw — no wrap). */
   gaps: Record<string, { posErr: number; headingErr: number; speedErr: number }>;
   /** Per-wheel telemetry from the last Rapier sub-step. */
@@ -205,7 +205,7 @@ export function toJSON(
 ): string {
   const round = (x: number, n = 4): number =>
     Number.isFinite(x) ? Number(x.toFixed(n)) : x;
-  const rs = (s: VehicleState) => ({
+  const rs = (s: CarKinematicState) => ({
     x: round(s.x), z: round(s.z),
     heading: round(s.heading), speed: round(s.speed),
     yawRate: round(s.yawRate ?? 0), lateralVelocity: round(s.lateralVelocity ?? 0),

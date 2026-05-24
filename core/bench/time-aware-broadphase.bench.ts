@@ -8,7 +8,7 @@ import { defaultVehicleAgent, kinematicForwardSim } from '../src/agent/vehicle';
 import { characterizeVehicle } from '../src/primitives/characterize';
 import { asObstacle } from '../src/predict/factories';
 import { PlanRegistry } from '../src/predict/plan-registry';
-import type { VehicleState, AgentState } from '../src/agent/types';
+import type { CarKinematicState, AgentState } from '../src/agent/types';
 
 // Moving-obstacle broadphase for the real-time MULTI-AGENT case: every NPC
 // treats the others' published plans as obstacles via
@@ -61,8 +61,8 @@ const obstacles = Array.from({ length: 12 }, (_, n) =>
   asObstacle(registry.predictNPC(`npc${n}`), 1.7),
 );
 
-const start: VehicleState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
-const goal: VehicleState = { x: 40, z: 0, heading: 0, speed: 0, t: 0 };
+const start: CarKinematicState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
+const goal: CarKinematicState = { x: 40, z: 0, heading: 0, speed: 0, t: 0 };
 
 function run(broadphase: TimeAwareOptions['broadphase']): void {
   const world = new InMemoryNavWorld([

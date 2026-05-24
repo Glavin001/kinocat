@@ -27,7 +27,7 @@ import {
   createJumpAffordance,
 } from 'kinocat/predict';
 import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
-import type { VehicleAgent, VehicleState } from 'kinocat/agent';
+import type { VehicleAgent, CarKinematicState } from 'kinocat/agent';
 import { characterizeVehicle, MotionPrimitiveLibrary } from 'kinocat/primitives';
 
 export const OBS_BOUNDS = { x0: -60, x1: 60, z0: -40, z1: 40 } as const;
@@ -101,7 +101,7 @@ export interface ObstacleCourse {
   jumps: RampJumpSpec[];
   boosts: ObsBoostSpec[];
   driftGates: ObsGateSpec[];
-  waypoints: VehicleState[];
+  waypoints: CarKinematicState[];
 }
 
 function box(x: number, z: number, hx: number, hz: number): [number, number][] {
@@ -198,7 +198,7 @@ export function buildObstacleCourse(
   // Waypoint loop tracing the full course — through the boost pad on the
   // west side, between the buildings, over the ramp, around the goal box,
   // back. Picked so each waypoint is in the open and the next is reachable.
-  const waypoints: VehicleState[] = [
+  const waypoints: CarKinematicState[] = [
     pose(-45, -25, 0),
     pose(-15, -25, Math.PI / 4),
     pose(10, -5, 0),     // approach the ramp
@@ -223,7 +223,7 @@ export function buildObstacleCourse(
   };
 }
 
-function pose(x: number, z: number, heading: number): VehicleState {
+function pose(x: number, z: number, heading: number): CarKinematicState {
   return { x, z, heading, speed: 0, t: 0 };
 }
 
@@ -320,8 +320,8 @@ export const OBS_MAX_EXPANSIONS = 20000;
 export const OBS_TEST_MAX_EXPANSIONS = 60000;
 
 export interface ObsPlanRequest {
-  state: VehicleState;
-  goal: VehicleState;
+  state: CarKinematicState;
+  goal: CarKinematicState;
   course: ObstacleCourse;
   world?: NavWorld;
   deadlineMs?: number;
@@ -330,7 +330,7 @@ export interface ObsPlanRequest {
 
 export function planObstacleCourse(
   req: ObsPlanRequest,
-): PlanResult<VehicleState> {
+): PlanResult<CarKinematicState> {
   const world =
     req.world ?? new InMemoryNavWorld(req.course.polygons, req.course.obstacles);
   return planVehicleOnce({
@@ -349,14 +349,14 @@ export function planObstacleCourse(
 // Waypoint AI — pick the next waypoint, nudge it clear, plan to it.
 
 export interface ObsWaypointPick {
-  goal: VehicleState;
+  goal: CarKinematicState;
   nextIndex: number;
 }
 
 /** Advance to the next waypoint once within `arriveRadius`; nudge the chosen
  *  pose clear of obstacles using the shared core helper. */
 export function obsPickWaypoint(
-  state: VehicleState,
+  state: CarKinematicState,
   course: ObstacleCourse,
   loopIndex: number,
   world: NavWorld,
@@ -375,12 +375,12 @@ export function obsPickWaypoint(
 
 export interface ObstacleCourseSnapshot {
   course: ObstacleCourse;
-  start: VehicleState;
-  goal: VehicleState;
-  result: PlanResult<VehicleState>;
+  start: CarKinematicState;
+  goal: CarKinematicState;
+  result: PlanResult<CarKinematicState>;
 }
 
-const SPAWN: VehicleState = { x: -50, z: -25, heading: 0, speed: 0, t: 0 };
+const SPAWN: CarKinematicState = { x: -50, z: -25, heading: 0, speed: 0, t: 0 };
 
 export function buildObstacleCourseSnapshot(
   blocks: ObsBlocks = OBS_BLOCKS_ALL,
@@ -399,6 +399,6 @@ export function buildObstacleCourseSnapshot(
   return { course, start: SPAWN, goal: pick.goal, result };
 }
 
-export function obsSpawn(): VehicleState {
+export function obsSpawn(): CarKinematicState {
   return { ...SPAWN };
 }

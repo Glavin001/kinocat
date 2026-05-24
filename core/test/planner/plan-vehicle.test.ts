@@ -6,7 +6,7 @@ import { TimeAwareEnvironment } from '../../src/environment/time-aware';
 import { InMemoryNavWorld, type NavPolygon } from '../../src/environment/nav-world';
 import { characterizeVehicle } from '../../src/primitives/characterize';
 import { defaultVehicleAgent, kinematicForwardSim } from '../../src/agent/vehicle';
-import type { VehicleAgent, VehicleState } from '../../src/agent/types';
+import type { VehicleAgent, CarKinematicState } from '../../src/agent/types';
 
 function rect(id: number, x0: number, z0: number, x1: number, z1: number): NavPolygon {
   return { id, y: 0, ring: [[x0, z0], [x1, z0], [x1, z1], [x0, z1]] };
@@ -46,8 +46,8 @@ describe('planVehicleOnce', () => {
 
   it('finds a plan on a clear field (matches manual env stack)', () => {
     const world = new InMemoryNavWorld([floor], []);
-    const start: VehicleState = { x: -20, z: 0, heading: 0, speed: 0, t: 0 };
-    const goal: VehicleState = { x: 20, z: 0, heading: 0, speed: 0, t: 0 };
+    const start: CarKinematicState = { x: -20, z: 0, heading: 0, speed: 0, t: 0 };
+    const goal: CarKinematicState = { x: 20, z: 0, heading: 0, speed: 0, t: 0 };
 
     const sugar = planVehicleOnce({
       start,
@@ -96,8 +96,8 @@ describe('planVehicleOnce', () => {
 
   it('respects an explicit envOptions override', () => {
     const world = new InMemoryNavWorld([floor], []);
-    const start: VehicleState = { x: -20, z: 0, heading: 0, speed: 0, t: 0 };
-    const goal: VehicleState = { x: 20, z: 0, heading: 0, speed: 0, t: 0 };
+    const start: CarKinematicState = { x: -20, z: 0, heading: 0, speed: 0, t: 0 };
+    const goal: CarKinematicState = { x: 20, z: 0, heading: 0, speed: 0, t: 0 };
     // A very tight goal radius — the trivial straight-shot only matches at
     // the goal pose, so analytic Reeds-Shepp shot is the dominant path.
     const r = planVehicleOnce({

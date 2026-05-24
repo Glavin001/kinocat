@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import type { CSSProperties } from 'react';
 
 interface Demo {
   href: string;
@@ -7,14 +8,19 @@ interface Demo {
   tag: string;
 }
 
-const groups: { heading: string; demos: Demo[] }[] = [
+interface DemoGroup {
+  heading: string;
+  demos: Demo[];
+}
+
+const GROUPS: DemoGroup[] = [
   {
     heading: 'Flagship',
     demos: [
       {
         href: '/carchase',
         title: 'Car-chase — Rapier raycast vehicles + multi-AI pursuit',
-        desc: 'A cops-and-robbers stunt arena driven by Rapier.js DynamicRayCastVehicleControllers: three police cars pursue an AI evader through a downtown grid, an alley shortcut, a ramped jump gap, drift slalom, and boost pads. Each cop replans against the robber\'s published plan (PlanRegistry) and reads its siblings to fan out instead of stacking; the robber takes affordances (BoostPad / BallisticJump) opportunistically. Press T to take over the robber yourself — the cops re-target the human-driven chassis with no code change. Real Rapier raycast suspension + kinocat IGHA* on Reeds-Shepp curves.',
+        desc: "A cops-and-robbers stunt arena driven by Rapier.js DynamicRayCastVehicleControllers: three police cars pursue an AI evader through a downtown grid, an alley shortcut, a ramped jump gap, drift slalom, and boost pads. Each cop replans against the robber's published plan (PlanRegistry) and reads its siblings to fan out instead of stacking; the robber takes affordances (BoostPad / BallisticJump) opportunistically. Press T to take over the robber yourself — the cops re-target the human-driven chassis with no code change. Real Rapier raycast suspension + kinocat IGHA* on Reeds-Shepp curves.",
         tag: '3D · interactive · rapier · multi-agent',
       },
       {
@@ -50,7 +56,7 @@ const groups: { heading: string; demos: Demo[] }[] = [
     ],
   },
   {
-    heading: 'Algorithms & curves',
+    heading: 'Algorithms, curves & agent types',
     demos: [
       {
         href: '/curves',
@@ -75,6 +81,12 @@ const groups: { heading: string; demos: Demo[] }[] = [
         title: 'Reverse maneuvers',
         desc: 'A corridor with the goal behind: the only feasible plan reverses. No special-case logic — it falls out of the search.',
         tag: '2D · kinodynamic',
+      },
+      {
+        href: '/humanoid',
+        title: 'Humanoid vs. vehicle',
+        desc: 'The omnidirectional humanoid threads a tight L-corridor a turn-radius-constrained vehicle cannot — same IGHA* core.',
+        tag: '2D · humanoid',
       },
     ],
   },
@@ -102,7 +114,7 @@ const groups: { heading: string; demos: Demo[] }[] = [
     ],
   },
   {
-    heading: 'Spatial / navmesh (3D)',
+    heading: '3D navmesh & flight',
     demos: [
       {
         href: '/world3d',
@@ -131,7 +143,7 @@ const groups: { heading: string; demos: Demo[] }[] = [
     ],
   },
   {
-    heading: 'Tools',
+    heading: 'Learning & diagnostics',
     demos: [
       {
         href: '/learnprimitives',
@@ -154,7 +166,7 @@ const groups: { heading: string; demos: Demo[] }[] = [
       {
         href: '/sim-to-real',
         title: 'Sim-to-Real Scope — model prediction vs Rapier reality in 3D',
-        desc: 'A dedicated 3D scope that overlays the v2 model\'s open-loop prediction (and parametric-only + kinematic baselines) on top of the live Rapier raycast-vehicle controller, in the same world, at the same time. Three modes: Playback (replay a control trace through both Rapier and each model), Free Drive (WASD; ghosts predict 1s ahead from the current state+controls), and Plan & Execute (click a goal; pure-pursuit drives the plan while the HUD reports plan-vs-actual error). Ghost cars, speed-colored trail ribbons, future polylines, an ensemble uncertainty cloud, live error arrows from real → ghost, and per-wheel friction-circle disks at the contact points. Isolates the two gaps that matter: pure dynamics (model.forward vs Rapier.step on identical controls) and end-to-end execution (planner output vs pure-pursuit-driven chassis).',
+        desc: "A dedicated 3D scope that overlays the v2 model's open-loop prediction (and parametric-only + kinematic baselines) on top of the live Rapier raycast-vehicle controller, in the same world, at the same time. Three modes: Playback (replay a control trace through both Rapier and each model), Free Drive (WASD; ghosts predict 1s ahead from the current state+controls), and Plan & Execute (click a goal; pure-pursuit drives the plan while the HUD reports plan-vs-actual error). Ghost cars, speed-colored trail ribbons, future polylines, an ensemble uncertainty cloud, live error arrows from real → ghost, and per-wheel friction-circle disks at the contact points. Isolates the two gaps that matter: pure dynamics (model.forward vs Rapier.step on identical controls) and end-to-end execution (planner output vs pure-pursuit-driven chassis).",
         tag: '3D · diagnostic · sim-to-real',
       },
       {
@@ -165,99 +177,91 @@ const groups: { heading: string; demos: Demo[] }[] = [
       },
     ],
   },
-  {
-    heading: 'Humanoid',
-    demos: [
-      {
-        href: '/humanoid',
-        title: 'Humanoid vs. vehicle',
-        desc: 'The omnidirectional humanoid threads a tight L-corridor a turn-radius-constrained vehicle cannot — same IGHA* core.',
-        tag: '2D · humanoid',
-      },
-    ],
-  },
 ];
+
+const styles: Record<string, CSSProperties> = {
+  main: {
+    color: '#cdd3de',
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    maxWidth: 820,
+    margin: '0 auto',
+    padding: 'clamp(16px, 5vw, 32px)',
+  },
+  title: { fontSize: 22, marginBottom: 4 },
+  intro: { opacity: 0.75, marginTop: 0 },
+  groupHeading: {
+    fontSize: 14,
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+    opacity: 0.6,
+    marginTop: 28,
+    marginBottom: 6,
+  },
+  list: { listStyle: 'none', padding: 0, margin: 0 },
+  card: {
+    border: '1px solid #2a2f3a',
+    borderRadius: 10,
+    padding: 16,
+    margin: '10px 0',
+    background: '#12151c',
+  },
+  cardHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    gap: 12,
+    flexWrap: 'wrap',
+  },
+  cardLink: { color: '#7fd6ff', fontSize: 17, textDecoration: 'none' },
+  cardTag: {
+    fontSize: 11,
+    opacity: 0.6,
+    border: '1px solid #2a2f3a',
+    borderRadius: 999,
+    padding: '2px 8px',
+  },
+  cardDesc: { opacity: 0.75, margin: '6px 0 0' },
+};
+
+function DemoCard({ demo }: { demo: Demo }) {
+  return (
+    <li style={styles.card}>
+      <div style={styles.cardHeader}>
+        <Link href={demo.href} style={styles.cardLink}>
+          {demo.title} →
+        </Link>
+        <span style={styles.cardTag}>{demo.tag}</span>
+      </div>
+      <p style={styles.cardDesc}>{demo.desc}</p>
+    </li>
+  );
+}
+
+function DemoSection({ group }: { group: DemoGroup }) {
+  return (
+    <section>
+      <h2 style={styles.groupHeading}>{group.heading}</h2>
+      <ul style={styles.list}>
+        {group.demos.map((d) => (
+          <DemoCard key={d.href} demo={d} />
+        ))}
+      </ul>
+    </section>
+  );
+}
 
 export default function Home() {
   return (
-    <main
-      style={{
-        color: '#cdd3de',
-        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-        maxWidth: 820,
-        margin: '0 auto',
-        padding: 'clamp(16px, 5vw, 32px)',
-      }}
-    >
-      <h1 style={{ fontSize: 22, marginBottom: 4 }}>kinocat demos</h1>
-      <p style={{ opacity: 0.75, marginTop: 0 }}>
+    <main style={styles.main}>
+      <h1 style={styles.title}>kinocat demos</h1>
+      <p style={styles.intro}>
         Time-extended kinodynamic planning (IGHA*) running entirely in the
         browser via the <code>kinocat</code> package — curves, motion
         primitives, anytime search, time-aware &amp; multi-agent planning,
         affordances, navmesh integration, and humanoid agents.
       </p>
-      {groups.map((g) => (
-        <section key={g.heading}>
-          <h2
-            style={{
-              fontSize: 14,
-              textTransform: 'uppercase',
-              letterSpacing: 1,
-              opacity: 0.6,
-              marginTop: 28,
-              marginBottom: 6,
-            }}
-          >
-            {g.heading}
-          </h2>
-          <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
-            {g.demos.map((d) => (
-              <li
-                key={d.href}
-                style={{
-                  border: '1px solid #2a2f3a',
-                  borderRadius: 10,
-                  padding: 16,
-                  margin: '10px 0',
-                  background: '#12151c',
-                }}
-              >
-                <div
-                  style={{
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'baseline',
-                    gap: 12,
-                    flexWrap: 'wrap',
-                  }}
-                >
-                  <Link
-                    href={d.href}
-                    style={{
-                      color: '#7fd6ff',
-                      fontSize: 17,
-                      textDecoration: 'none',
-                    }}
-                  >
-                    {d.title} →
-                  </Link>
-                  <span
-                    style={{
-                      fontSize: 11,
-                      opacity: 0.6,
-                      border: '1px solid #2a2f3a',
-                      borderRadius: 999,
-                      padding: '2px 8px',
-                    }}
-                  >
-                    {d.tag}
-                  </span>
-                </div>
-                <p style={{ opacity: 0.75, margin: '6px 0 0' }}>{d.desc}</p>
-              </li>
-            ))}
-          </ul>
-        </section>
+      {GROUPS.map((group) => (
+        <DemoSection key={group.heading} group={group} />
       ))}
     </main>
   );

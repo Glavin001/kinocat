@@ -9,7 +9,7 @@ import {
 } from 'navcat/three';
 import { purePursuit, ReplanState } from 'kinocat/execute';
 import { kinematicForwardSim } from 'kinocat/agent';
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import { buildNavmesh, planNavmesh, DEMO_AGENT as agent } from '../lib/scenarios';
 
 const sim = kinematicForwardSim(agent);
@@ -28,7 +28,7 @@ const PP = {
 export default function NavMeshView() {
   const mountRef = useRef<HTMLDivElement>(null);
   const [info, setInfo] = useState('building navmesh…');
-  const goalRef = useRef<VehicleState>({ x: 36, z: 12, heading: 0, speed: 0, t: 0 });
+  const goalRef = useRef<CarKinematicState>({ x: 36, z: 12, heading: 0, speed: 0, t: 0 });
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -89,7 +89,7 @@ export default function NavMeshView() {
     };
 
     let pathLine: THREE.Line | null = null;
-    const drawPath = (path: VehicleState[]) => {
+    const drawPath = (path: CarKinematicState[]) => {
       if (pathLine) {
         scene.remove(pathLine);
         pathLine.geometry.dispose();
@@ -104,7 +104,7 @@ export default function NavMeshView() {
       scene.add(pathLine);
     };
 
-    let state: VehicleState = { x: 4, z: 12, heading: 0, speed: 0, t: 0 };
+    let state: CarKinematicState = { x: 4, z: 12, heading: 0, speed: 0, t: 0 };
     const replan = new ReplanState({
       divergenceThresholdMeters: 2.5,
       refreshIntervalMs: 1800,
@@ -127,7 +127,7 @@ export default function NavMeshView() {
       }
     };
 
-    const place = (m: THREE.Mesh, s: VehicleState) =>
+    const place = (m: THREE.Mesh, s: CarKinematicState) =>
       m.position.set(s.x, surfaceY(s.x, s.z) + 0.6, s.z);
     place(startMarker, state);
     place(goalMarker, goalRef.current);
@@ -142,7 +142,7 @@ export default function NavMeshView() {
       ray.setFromCamera(ndc, camera);
       const hit = ray.intersectObject(navHelper.object, true)[0];
       if (!hit) return;
-      const g: VehicleState = {
+      const g: CarKinematicState = {
         x: hit.point.x,
         z: hit.point.z,
         heading: 0,

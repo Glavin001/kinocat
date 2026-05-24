@@ -13,8 +13,8 @@ import { useCallback, useMemo, useState } from 'react';
 import type {
   LearnedVehicleModel,
   LearnableVehicleConfig,
-  VehicleState,
-  WheeledControls,
+  CarKinematicState,
+  WheeledCarControls,
 } from 'kinocat/agent';
 import { learnedForwardSimV2 } from 'kinocat/agent';
 import type { Trial } from 'kinocat/learning';
@@ -49,8 +49,8 @@ export interface ScenarioPlaygroundProps {
   /** Push a synthesized trial up so the parent can hand it to
    *  `RolloutPlayer.trial`. */
   onScenarioReady: (
-    trial: Trial<VehicleState, WheeledControls, LearnableVehicleConfig> | null,
-    extra?: { name: string; color: string; states: VehicleState[]; times: number[] } | null,
+    trial: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig> | null,
+    extra?: { name: string; color: string; states: CarKinematicState[]; times: number[] } | null,
   ) => void;
 }
 
@@ -74,23 +74,23 @@ function buildSyntheticTrial(
   inputs: ScenarioInputs,
   model: LearnedVehicleModel,
   config: LearnableVehicleConfig,
-): Trial<VehicleState, WheeledControls, LearnableVehicleConfig> {
+): Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig> {
   // Build a "fake" trial whose `samples` are the model's own prediction
   // so RolloutPlayer treats the model as ground truth visually. The
   // Rapier overlay (extra track) is what the user then compares
   // against — the more they diverge, the worse the model's prediction
   // for that scenario.
   const ticks = Math.max(1, Math.round(inputs.durationSec / PHYSICS_DT));
-  const controls: WheeledControls[] = Array.from({ length: ticks }, () => ({
+  const controls: WheeledCarControls[] = Array.from({ length: ticks }, () => ({
     steer: inputs.steer, driveForce: inputs.driveForce, brakeForce: inputs.brakeForce,
   }));
   const sim = learnedForwardSimV2(model);
   const sampleStride = 6;
-  let s: VehicleState = {
+  let s: CarKinematicState = {
     x: 0, z: 0, heading: 0, speed: inputs.startSpeed, t: 0,
     yawRate: 0, lateralVelocity: 0,
   };
-  const samples: { t: number; state: VehicleState }[] = [{ t: 0, state: s }];
+  const samples: { t: number; state: CarKinematicState }[] = [{ t: 0, state: s }];
   for (let i = 0; i < ticks; i++) {
     const c = controls[i]!;
     s = sim(s, [c.steer, c.driveForce, c.brakeForce], PHYSICS_DT);
@@ -112,7 +112,7 @@ function buildSyntheticTrial(
 function runRapierScenario(
   harness: HeadlessTrialHarness,
   inputs: ScenarioInputs,
-): { states: VehicleState[]; times: number[] } | null {
+): { states: CarKinematicState[]; times: number[] } | null {
   const ticks = Math.max(1, Math.round(inputs.durationSec / PHYSICS_DT));
   const trace = Array.from({ length: ticks }, () => ({
     steer: inputs.steer, driveForce: inputs.driveForce, brakeForce: inputs.brakeForce,

@@ -10,8 +10,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   LearnedVehicleModel,
   LearnableVehicleConfig,
-  VehicleState,
-  WheeledControls,
+  CarKinematicState,
+  WheeledCarControls,
 } from 'kinocat/agent';
 import {
   defaultVehicleAgent,
@@ -21,14 +21,14 @@ import {
 } from 'kinocat/agent';
 import type { Trial } from 'kinocat/learning';
 
-export interface RolloutTrial extends Trial<VehicleState, WheeledControls, LearnableVehicleConfig> {}
+export interface RolloutTrial extends Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig> {}
 
 export interface RolloutPlayerProps {
   trial: RolloutTrial | null;
   model: LearnedVehicleModel | null;
   /** Optional second rollout the user can attach (e.g. for the scenario
    *  playground's "Run in Rapier" capture). */
-  extraTrack?: { name: string; color: string; states: VehicleState[]; times: number[] } | null;
+  extraTrack?: { name: string; color: string; states: CarKinematicState[]; times: number[] } | null;
   /** Trial picker UI. */
   trials: ReadonlyArray<RolloutTrial>;
   onSelectTrial?: (t: RolloutTrial) => void;
@@ -38,7 +38,7 @@ type Track = {
   name: string;
   color: string;
   /** State at each sample boundary. */
-  states: VehicleState[];
+  states: CarKinematicState[];
   /** Time (sec) at each sample boundary. */
   times: number[];
 };
@@ -57,12 +57,12 @@ function buildTracks(
     times: trial.samples.map((s) => s.t),
   });
   if (model) {
-    const ctrlVec = (c: WheeledControls) => [c.steer, c.driveForce, c.brakeForce];
+    const ctrlVec = (c: WheeledCarControls) => [c.steer, c.driveForce, c.brakeForce];
     const v2Sim = learnedForwardSimV2(model);
     const paramSim = parametricForwardV2(model.params, model.config);
-    const v2States: VehicleState[] = [trial.initialState];
+    const v2States: CarKinematicState[] = [trial.initialState];
     const v2Times: number[] = [0];
-    const paramStates: VehicleState[] = [trial.initialState];
+    const paramStates: CarKinematicState[] = [trial.initialState];
     const paramTimes: number[] = [0];
     let sV = trial.initialState;
     let sP = trial.initialState;
@@ -87,12 +87,12 @@ function buildTracks(
   // Kinematic baseline — adapter approximates the legacy [curvature, targetSpeed].
   const agent = defaultVehicleAgent();
   const kinSim = kinematicForwardSim(agent);
-  const wheeledToLegacy = (c: WheeledControls): number[] => {
+  const wheeledToLegacy = (c: WheeledCarControls): number[] => {
     const k = Math.sin(c.steer) / (2 * 1.6); // wheelBase default
     const targetSpeed = c.driveForce > 0 ? 10 : (c.brakeForce > 0 ? 0 : 5);
     return [k, targetSpeed];
   };
-  const kinStates: VehicleState[] = [trial.initialState];
+  const kinStates: CarKinematicState[] = [trial.initialState];
   const kinTimes: number[] = [0];
   let sK = trial.initialState;
   for (let i = 0; i < trial.controlsTrace.length; i++) {
@@ -196,7 +196,7 @@ export function RolloutPlayer({ trial, model, trials, onSelectTrial, extraTrack 
 
       // World extent — union over all tracks' visible portions.
       let xMin = Infinity, xMax = -Infinity, zMin = Infinity, zMax = -Infinity;
-      const localXform = (s: VehicleState) => {
+      const localXform = (s: CarKinematicState) => {
         // Center around the trial's spawn — the harness teleports to
         // (0,0) heading 0, but the recorded samples are in world frame.
         // Trial samples already start near (0,0).
@@ -219,7 +219,7 @@ export function RolloutPlayer({ trial, model, trials, onSelectTrial, extraTrack 
       const scale = Math.min(w / xR, h / zR);
       const ox = w / 2 - ((xMin + xMax) / 2) * scale;
       const oy = h / 2 - ((zMin + zMax) / 2) * scale;
-      const px = (s: VehicleState): [number, number] => [ox + localXform(s).x * scale, oy + localXform(s).z * scale];
+      const px = (s: CarKinematicState): [number, number] => [ox + localXform(s).x * scale, oy + localXform(s).z * scale];
 
       // Grid
       ctx.strokeStyle = '#1a2030';

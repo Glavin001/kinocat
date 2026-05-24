@@ -6,7 +6,7 @@ import {
   clampWheeled,
 } from 'kinocat/agent';
 
-describe('WheeledControls — encode/decode round-trip', () => {
+describe('WheeledCarControls — encode/decode round-trip', () => {
   it('round-trips identity', () => {
     const c = { steer: 0.3, driveForce: 2000, brakeForce: 500 };
     const vec = encodeWheeled(c);

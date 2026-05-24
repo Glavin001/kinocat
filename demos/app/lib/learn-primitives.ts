@@ -16,7 +16,7 @@
 // test.ts` (headless). No browser-only APIs anywhere in this module.
 
 import RAPIER from '@dimforge/rapier3d-compat';
-import type { VehicleAgent, VehicleState, LearnedVehicleParams } from 'kinocat/agent';
+import type { VehicleAgent, CarKinematicState, LearnedVehicleParams } from 'kinocat/agent';
 import {
   DEFAULT_LEARNED_PARAMS,
   kinematicForwardSim,
@@ -396,7 +396,7 @@ function rolloutAndLoss(
   // matches the resolution of the open-loop trial (33 physics ticks across
   // 6 samples ≈ 5-6 ticks per sample window).
   for (const tr of data.trials) {
-    let s: VehicleState = {
+    let s: CarKinematicState = {
       x: 0,
       z: 0,
       heading: 0,
@@ -636,10 +636,10 @@ export function buildLearnedLibrary(
  *  (curvature, targetSpeed) pair the pure-pursuit tracker produced for this
  *  tick — the same form the parametric model accepts. */
 export interface TransitionSample {
-  state: VehicleState;
+  state: CarKinematicState;
   controls: [number, number];
   dt: number;
-  next: VehicleState;
+  next: CarKinematicState;
 }
 
 function transitionLoss(
@@ -731,7 +731,7 @@ export function summariseKinematicGap(data: SweepData): DiscrepancySummary {
   const errors: number[] = [];
   const speedErrors: number[] = [];
   for (const tr of data.trials) {
-    let s: VehicleState = {
+    let s: CarKinematicState = {
       x: 0,
       z: 0,
       heading: 0,

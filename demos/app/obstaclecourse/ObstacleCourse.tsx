@@ -19,7 +19,7 @@ import {
   combineHeightSamplers,
 } from 'kinocat/environment';
 import type { HeightSampler } from 'kinocat/environment';
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import {
   ensureRapier,
   createRaycastVehicle,
@@ -47,7 +47,7 @@ import {
   createRapierDebugRenderer,
   updateChaseCamera,
 } from 'kinocat/adapters/three';
-import { trimPlan as trimPlanCore } from 'kinocat/vehicle/car';
+import { trimPlan } from 'kinocat/vehicle/car';
 import {
   OBS_AGENT,
   OBS_BOUNDS,
@@ -304,10 +304,10 @@ export default function ObstacleCourse() {
     scene.add(carMesh.group);
 
     const ai = {
-      plan: null as VehicleState[] | null,
+      plan: null as CarKinematicState[] | null,
       planStartWall: performance.now(),
       loopIndex: 0,
-      goal: null as VehicleState | null,
+      goal: null as CarKinematicState | null,
       lastExpansions: 0,
       lastBudgetMs: 0,
     };
@@ -316,7 +316,7 @@ export default function ObstacleCourse() {
     scene.add(goalMarker);
 
     let pathLine: THREE.Line | null = null;
-    function replacePathLine(path: VehicleState[]): void {
+    function replacePathLine(path: CarKinematicState[]): void {
       if (pathLine) {
         scene.remove(pathLine);
         pathLine.geometry.dispose();
@@ -598,10 +598,6 @@ export default function ObstacleCourse() {
       </div>
     </div>
   );
-}
-
-function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
-  return trimPlanCore(plan, elapsed);
 }
 
 function ToggleButton({

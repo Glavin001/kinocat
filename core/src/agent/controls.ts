@@ -23,13 +23,6 @@ export interface WheeledCarControls {
   brakeForce: number;
 }
 
-/**
- * @deprecated Use `WheeledCarControls`. Retained as a structural alias so
- * existing imports keep compiling. The new name disambiguates from
- * non-wheeled vehicle controls (airplane throttle/elevator/aileron, etc.).
- */
-export type WheeledControls = WheeledCarControls;
-
 /** Dimensionality of the encoded controls vector. */
 export const WHEELED_CONTROL_DIM = 3;
 

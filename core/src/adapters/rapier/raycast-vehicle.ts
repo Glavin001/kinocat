@@ -14,8 +14,8 @@
 // fully overridable via `RaycastVehicleOptions`.
 
 import RAPIER from '@dimforge/rapier3d-compat';
-import type { VehicleState } from '../../agent/types';
-import type { WheeledControls } from '../../agent/controls';
+import type { CarKinematicState } from '../../agent/types';
+import type { WheeledCarControls } from '../../agent/controls';
 import type {
   LearnableVehicleConfig,
   DrivenWheels,
@@ -42,7 +42,7 @@ export interface CarHandle {
   chassis: RAPIER.RigidBody;
   vehicle: RAPIER.DynamicRayCastVehicleController;
   /** Read the chassis pose/speed back as a planner-shaped state. */
-  readState(now: number): VehicleState;
+  readState(now: number): CarKinematicState;
   /** Drive the raycast vehicle for the upcoming physics tick. Caller is
    *  responsible for calling `vehicle.updateVehicle(dt)` then `world.step()`. */
   applyControls(c: { steer: number; throttle: number; brake: number }): void;
@@ -51,7 +51,7 @@ export interface CarHandle {
    *  brake force (N). Used by the v2 learned model + IGHA* planner whose
    *  action space is `[steer, driveForce, brakeForce]` — no pure-pursuit /
    *  speed-PID layer in between. */
-  applyWheeledControls(c: WheeledControls): void;
+  applyWheeledControls(c: WheeledCarControls): void;
   /** Hard reset to a pose (e.g. on /R). */
   teleport(pose: { x: number; z: number; heading: number }): void;
   /** Like {@link teleport} but with a forward speed (m/s) imparted along the
@@ -262,7 +262,7 @@ export function createRaycastVehicle(
     vehicle.setWheelSideFrictionStiffness(i, D.sideFrictionStiffness);
   }
 
-  function readState(now: number): VehicleState {
+  function readState(now: number): CarKinematicState {
     const t = chassis.translation();
     const q = chassis.rotation();
     const lin = chassis.linvel();
@@ -302,7 +302,7 @@ export function createRaycastVehicle(
     for (let i = 0; i < 4; i++) vehicle.setWheelBrake(i, brakeForce);
   }
 
-  function applyWheeledControls(c: WheeledControls) {
+  function applyWheeledControls(c: WheeledCarControls) {
     // Same sign-flip convention as `planToAckermannControls`: kinocat
     // +curvature rotates +X toward +Z; Rapier yaw rotates +X toward -Z.
     // The `steer` field here is in the kinocat planning-frame sense;
@@ -434,8 +434,8 @@ export interface AckermannCommand {
 /** Convert a kinocat plan tail to (steer, throttle, brake) for Rapier.
  *  `state` is the current chassis state read back from physics. */
 export function planToAckermannControls(
-  state: VehicleState,
-  path: VehicleState[],
+  state: CarKinematicState,
+  path: CarKinematicState[],
   cfg: AckermannConfig,
 ): AckermannCommand {
   const cmd = purePursuit(state, path, cfg);

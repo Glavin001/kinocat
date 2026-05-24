@@ -32,7 +32,7 @@ interface XZHeading {
 /** Walk `goal` toward `near` in fixed `step` increments until the agent's
  *  rotated footprint at `(goal.x, goal.z, goal.heading)` is accepted by
  *  `world.footprintClear`. Generic over any state shape extending
- *  `{ x, z, heading }` so it works for `VehicleState` and other planner
+ *  `{ x, z, heading }` so it works for `CarKinematicState` and other planner
  *  states; non-position fields are preserved.
  *
  *  Returns the original `goal` immediately if it is already clear. Falls
