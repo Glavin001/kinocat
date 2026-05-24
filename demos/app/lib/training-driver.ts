@@ -938,6 +938,14 @@ export interface ManeuverTrainingOptions {
    *  `[0, 4, 8, 12, 16, 20, 24, 28]`. */
   startSpeedSchedule?: number[];
   onEvent?: (e: TrainingEvent) => void;
+  /** Phase 3 DAgger mode: starting at round `daggerStartRound`, race the
+   *  currently-trained v2 model against the track for `daggerLapsPerRound`
+   *  laps and mix the collected closed-loop trials into the next round's
+   *  training set. Disabled by default. */
+  daggerStartRound?: number;
+  daggerLapsPerRound?: number;
+  daggerMaxSimTime?: number;
+  daggerWindowSec?: number;
 }
 
 const DEFAULT_SPEED_SCHEDULE = [0, 4, 8, 12, 16, 20, 24, 28];
@@ -971,6 +979,11 @@ export async function runManeuverTraining(
   const store = createTrialStore<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>();
   let finalDiag: ModelDiagnostics = { openLoopDivergence: [], perStateRms: [], coverage: [], baselines: {} };
   let trialIdx = 0;
+  const daggerStartRound = opts.daggerStartRound ?? Infinity;
+  const daggerLapsPerRound = opts.daggerLapsPerRound ?? 2;
+  const daggerMaxSimTime = opts.daggerMaxSimTime ?? 120;
+  const daggerWindowSec = opts.daggerWindowSec ?? 1.0;
+
   for (let round = 0; round < rounds; round++) {
     opts.onEvent?.({ type: 'round-start', round, trialsBeforeRound: store.size() });
     const bundle = buildDefaultManeuverBundle({
@@ -987,6 +1000,30 @@ export async function runManeuverTraining(
     trialIdx += bundle.length;
     for (const t of collected) store.add(t);
     opts.onEvent?.({ type: 'trial-batch', round, collected: collected.length, discarded });
+    // Phase 3 DAgger: race the current v2 model on the actual track and
+    // append the recorded (state, controls, next_state) trials. Lifted
+    // behind a feature flag so the existing maneuver-only pipeline
+    // remains the default — DAgger needs a halfway-decent starting model.
+    if (round >= daggerStartRound) {
+      const { collectFromRaceScenario } = await import('./race-scenario-collect');
+      const { buildLearnedRaceLibraryV2 } = await import('./race-primitives-scenarios');
+      const lib = buildLearnedRaceLibraryV2(pipeline.currentLearnedModel());
+      const race = await collectFromRaceScenario({
+        lib,
+        targetLaps: daggerLapsPerRound,
+        maxSimTime: daggerMaxSimTime,
+        windowSec: daggerWindowSec,
+        sampleEveryNTicks: sampleEveryN,
+        scenarioId: `dagger-round${round}`,
+      });
+      for (const t of race.trials) store.add(t);
+      opts.onEvent?.({
+        type: 'trial-batch',
+        round,
+        collected: race.trials.length,
+        discarded: 0,
+      });
+    }
     const ctx = { round, store };
     const params = await pipeline.fitParametric(ctx, (event) =>
       opts.onEvent?.({ type: 'fit-progress', round, phase: 'parametric', event }),

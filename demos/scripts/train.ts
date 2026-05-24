@@ -60,6 +60,7 @@ async function main(): Promise<void> {
       trials: { type: 'string' },
       ticks: { type: 'string' },
       out: { type: 'string' },
+      dagger: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -95,12 +96,18 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
   const t0 = Date.now();
   let lastRoundT = t0;
 
+  const daggerStartRound = values.dagger !== undefined ? Number(values.dagger) : undefined;
+  if (daggerStartRound !== undefined) {
+    process.stdout.write(`  · DAgger mode: race-collect starting round ${daggerStartRound + 1}\n`);
+  }
+
   const result = await runManeuverTraining({
     rounds,
     trialsPerRound,
     trialTicks,
     sampleEveryNTicks,
     seed,
+    daggerStartRound,
     onEvent: (e: TrainingEvent) => {
       switch (e.type) {
         case 'round-start':
