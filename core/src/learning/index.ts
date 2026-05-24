@@ -9,11 +9,17 @@ export type {
   TrialSample,
   TrialStore,
   SerializedTrials,
+  TrialSplit,
+  SplitPolicy,
 } from './trial-store';
 export {
   createTrialStore,
   serializeTrials,
   deserializeTrials,
+  assignSplit,
+  trialSplitKey,
+  hashString,
+  DEFAULT_SPLIT_POLICY,
 } from './trial-store';
 
 export type {

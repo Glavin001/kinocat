@@ -22,3 +22,12 @@ jobs:
       - run: pnpm --filter kinocat build
       - run: pnpm size
       - run: pnpm typecheck
+      # Phase 0 / Phase 1 of the training-dataset plan: the maneuver-based
+      # training pipeline must run end-to-end and emit a v2 model artifact.
+      # Catches refactors that silently break the pipeline.
+      - run: pnpm run train:quick
+      # Phase 3 acceptance surface: the headless race scenario completes
+      # for the baselines. Lap-time bounds are asserted in
+      # `demos/test/headless-race.test.ts`; this run additionally
+      # confirms the CLI shape works against the freshly-trained model.
+      - run: pnpm run race:quick

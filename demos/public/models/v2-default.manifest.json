@@ -1,0 +1,131 @@
+{
+  "version": 1,
+  "profile": "default",
+  "seed": 42,
+  "rounds": 3,
+  "trialsPerRound": 120,
+  "trialTicks": 120,
+  "sampleEveryNTicks": 6,
+  "totalTrials": 360,
+  "sampleDt": 0.1,
+  "vehicleOptions": {
+    "chassisHalf": {
+      "x": 2.4,
+      "y": 0.5,
+      "z": 1
+    },
+    "chassisDensity": 60,
+    "wheelBase": 1.6,
+    "wheelTrack": 0.85,
+    "wheelRadius": 0.35,
+    "engineForce": 4000,
+    "brakeForce": 2000,
+    "maxSteerAngle": 0.6,
+    "driveTrain": "rwd"
+  },
+  "git": "e821fbb",
+  "diagnostics": {
+    "openLoopDivergence": [
+      {
+        "tSec": 0.5,
+        "posRms": 0.36255004302213856,
+        "headingRms": 0.09623531410176203,
+        "speedRms": 0.8492874908627341
+      },
+      {
+        "tSec": 1,
+        "posRms": 0.8588917043973553,
+        "headingRms": 0.2733476441957064,
+        "speedRms": 1.4456516451419572
+      },
+      {
+        "tSec": 1.6,
+        "posRms": 1.8490476176378379,
+        "headingRms": 0.31329196696732076,
+        "speedRms": 1.0525352190572432
+      }
+    ],
+    "perStateRms": [
+      {
+        "name": "heading",
+        "rms": 0.2867961277142043
+      },
+      {
+        "name": "speed",
+        "rms": 1.2633440518184962
+      },
+      {
+        "name": "yawRate",
+        "rms": 0.3322376889309749
+      },
+      {
+        "name": "lateralVelocity",
+        "rms": 0.8005991729778339
+      }
+    ],
+    "baselines": {
+      "kinematic": [
+        {
+          "tSec": 0.5,
+          "posRms": 4.761204549660451,
+          "headingRms": 0.1626826942843889,
+          "speedRms": 9.05442889385807
+        },
+        {
+          "tSec": 1,
+          "posRms": 8.535080356223201,
+          "headingRms": 0.49585526736990204,
+          "speedRms": 9.850724781368513
+        },
+        {
+          "tSec": 1.6,
+          "posRms": 13.84147179507178,
+          "headingRms": 0.6619208442295019,
+          "speedRms": 10.645215085286875
+        }
+      ],
+      "legacyV1": [
+        {
+          "tSec": 0.5,
+          "posRms": 2.4723283602124573,
+          "headingRms": 0.1596202335142409,
+          "speedRms": 7.6567681073720815
+        },
+        {
+          "tSec": 1,
+          "posRms": 6.928359603887361,
+          "headingRms": 0.4862614830875423,
+          "speedRms": 10.944599452443242
+        },
+        {
+          "tSec": 1.6,
+          "posRms": 13.02085419566934,
+          "headingRms": 0.5933467043408033,
+          "speedRms": 10.79977467811535
+        }
+      ],
+      "parametricOnly": [
+        {
+          "tSec": 0.5,
+          "posRms": 2.417958216851704,
+          "headingRms": 0.1283133060832094,
+          "speedRms": 7.156984607797867
+        },
+        {
+          "tSec": 1,
+          "posRms": 6.3752669194753775,
+          "headingRms": 0.43677610425652275,
+          "speedRms": 9.600525452529592
+        },
+        {
+          "tSec": 1.6,
+          "posRms": 11.259390732941103,
+          "headingRms": 0.5974748170214836,
+          "speedRms": 8.321698671753344
+        }
+      ]
+    }
+  },
+  "runtimeMs": 177553,
+  "createdAt": 1779605061640
+}

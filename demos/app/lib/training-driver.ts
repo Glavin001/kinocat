@@ -37,6 +37,7 @@ import {
   type FitProgressEvent,
   proposeNextBatch,
   type ExplorationCell,
+  assignSplit,
 } from 'kinocat/learning';
 import {
   createHeadlessTrialHarness,
@@ -44,6 +45,12 @@ import {
   type TrialSpec,
   type HeadlessTrialHarness,
 } from 'kinocat/adapters/rapier';
+import {
+  defaultManeuverBundle,
+  type ManeuverLimits,
+  type ManeuverSpec,
+} from 'kinocat/vehicle/car';
+import { buildControlsTrace } from 'kinocat/training';
 import type { ForwardSim } from 'kinocat/primitives';
 import type {
   TrainingPipeline,
@@ -750,4 +757,199 @@ export function rolloutForwardSim(
     }
   }
   return { states, times };
+}
+
+// ===========================================================================
+// Maneuver-based trial collection (Phase 1 of the training-dataset plan).
+//
+// Drop-in replacement for `collectTrialBatch`: takes a `ManeuverSpec[]`
+// (each producing a time-varying controls trace) and returns trials whose
+// `controlsTrace` came from the maneuver factories — OU random walks,
+// transition probes, panic / identification maneuvers, …
+//
+// Each emitted trial is tagged with `maneuverId` + `maneuverParams` so the
+// hash-based split policy + coverage meter index them consistently. The
+// initial state for every maneuver is the zero-velocity origin, matching
+// the existing harness; Phase 2's `state-conditioner` work will diversify
+// initial conditions on top of this.
+
+export interface ManeuverTrialOptions {
+  ticks: number;
+  sampleEveryNTicks: number;
+  /** Initial forward speed (m/s). Defaults to 0. */
+  startSpeed?: number;
+}
+
+function carManeuverLimits(): ManeuverLimits {
+  return {
+    maxSteerAngle: DEFAULT_VEHICLE_OPTS.maxSteerAngle,
+    maxDriveForce: DEFAULT_VEHICLE_OPTS.engineForce,
+    maxBrakeForce: DEFAULT_VEHICLE_OPTS.brakeForce,
+  };
+}
+
+/** Build the default maneuver bundle sized for one training round. */
+export function buildDefaultManeuverBundle(args: {
+  count: number;
+  seed?: number;
+}): ManeuverSpec[] {
+  return defaultManeuverBundle({
+    limits: carManeuverLimits(),
+    count: args.count,
+    seed: args.seed,
+  });
+}
+
+/** Collect a batch of trials by running each spec's driver through the
+ *  headless trial harness (no real body needed — drivers in the default
+ *  bundle are state-independent so the trace pre-rolls correctly). */
+export async function collectManeuverBatch(
+  harness: HeadlessTrialHarness,
+  specs: ManeuverSpec[],
+  opts: ManeuverTrialOptions,
+  startId: number,
+  startSpeedSchedule?: number[],
+): Promise<{
+  collected: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[];
+  discarded: number;
+}> {
+  const collected: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[] = [];
+  let discarded = 0;
+  let id = startId;
+  const limits = carManeuverLimits();
+  const dt = 1 / 60;
+  const speeds = startSpeedSchedule && startSpeedSchedule.length > 0
+    ? startSpeedSchedule
+    : [opts.startSpeed ?? 0];
+  for (const spec of specs) {
+    const driver = spec.build(limits, 0);
+    const trace = buildControlsTrace(driver, {
+      state: { x: 0, z: 0, heading: 0, speed: 0, t: 0 } as CarKinematicState,
+      dt,
+      steps: opts.ticks,
+    });
+    // Rotate through the start-speed schedule so the maneuvers are
+    // exercised across the full speed envelope.
+    const startSpeed = speeds[id % speeds.length]!;
+    const trialSpec: TrialSpec = {
+      pose: { x: 0, z: 0, heading: 0 },
+      kin: { forwardSpeed: startSpeed },
+      controlsTrace: trace,
+      sampleEveryNTicks: opts.sampleEveryNTicks,
+      id: `m-${id}`,
+    };
+    id++;
+    const result = harness.runTrial(trialSpec);
+    if (!result.ok) { discarded++; continue; }
+    const t = result.trial;
+    const trial: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig> = {
+      id: t.id,
+      initialState: t.samples[0]!,
+      controlsTrace: trialSpec.controlsTrace,
+      dt: t.dt,
+      samples: t.samples.map((s, i) => ({ t: i * opts.sampleEveryNTicks * t.dt, state: s })),
+      config: t.config,
+      configKey: 'rwd-default',
+      maneuverId: spec.id,
+      maneuverParams: { ...spec.params, startSpeed },
+    };
+    trial.split = assignSplit(trial);
+    collected.push(trial);
+  }
+  return { collected, discarded };
+}
+
+// ---------------------------------------------------------------------------
+// Maneuver-based training driver — entry point used by `pnpm run train`.
+
+export interface ManeuverTrainingOptions {
+  /** Total trials per round. Default 200. */
+  trialsPerRound?: number;
+  rounds?: number;
+  trialTicks?: number;
+  sampleEveryNTicks?: number;
+  seed?: number;
+  vehicleOptions?: typeof DEFAULT_VEHICLE_OPTS;
+  /** Forward-speed schedule cycled across maneuvers. Default
+   *  `[0, 4, 8, 12, 16, 20, 24, 28]`. */
+  startSpeedSchedule?: number[];
+  onEvent?: (e: TrainingEvent) => void;
+}
+
+const DEFAULT_SPEED_SCHEDULE = [0, 4, 8, 12, 16, 20, 24, 28];
+
+/** Orchestrate maneuver-based offline training. Same pipeline shape as
+ *  `runOfflineTraining` but the trial sourcing is the Phase 1 maneuver
+ *  library instead of the constant-hold grid. */
+export async function runManeuverTraining(
+  opts: ManeuverTrainingOptions = {},
+): Promise<RunOfflineTrainingResult> {
+  const trialsPerRound = opts.trialsPerRound ?? 200;
+  const rounds = opts.rounds ?? 3;
+  const ticks = opts.trialTicks ?? 120;
+  const sampleEveryN = opts.sampleEveryNTicks ?? 6;
+  const seed = opts.seed ?? 42;
+  const veh = opts.vehicleOptions ?? DEFAULT_VEHICLE_OPTS;
+  const startSpeedSchedule = opts.startSpeedSchedule ?? DEFAULT_SPEED_SCHEDULE;
+
+  // Reuse the same pipeline class as `runOfflineTraining` so the fit /
+  // evaluation logic is shared, but override trial collection with the
+  // maneuver-based collector.
+  const pipeline = await CarV2TrainingPipeline.create({
+    rounds, trialsPerActiveRound: trialsPerRound, trialTicks: ticks,
+    sampleEveryNTicks: sampleEveryN, seed, vehicleOptions: veh,
+  });
+  // Replace cell-based trial sourcing with maneuver-based on every round.
+  // (Round 0 in the default pipeline uses the seed grid; rounds 1+ use
+  // active exploration. We replace BOTH with fresh maneuver bundles so
+  // the dataset is uniformly maneuver-sourced.)
+  const harness = pipeline.harness;
+  const store = createTrialStore<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>();
+  let finalDiag: ModelDiagnostics = { openLoopDivergence: [], perStateRms: [], coverage: [], baselines: {} };
+  let trialIdx = 0;
+  for (let round = 0; round < rounds; round++) {
+    opts.onEvent?.({ type: 'round-start', round, trialsBeforeRound: store.size() });
+    const bundle = buildDefaultManeuverBundle({
+      count: trialsPerRound,
+      seed: seed + round * 17,
+    });
+    const { collected, discarded } = await collectManeuverBatch(
+      harness,
+      bundle,
+      { ticks, sampleEveryNTicks: sampleEveryN },
+      trialIdx,
+      startSpeedSchedule,
+    );
+    trialIdx += bundle.length;
+    for (const t of collected) store.add(t);
+    opts.onEvent?.({ type: 'trial-batch', round, collected: collected.length, discarded });
+    const ctx = { round, store };
+    const params = await pipeline.fitParametric(ctx, (event) =>
+      opts.onEvent?.({ type: 'fit-progress', round, phase: 'parametric', event }),
+    );
+    await pipeline.fitResidual(ctx, params, (event) =>
+      opts.onEvent?.({ type: 'fit-progress', round, phase: 'residual', event }),
+    );
+    const trained = { params, forwardSim: learnedForwardSimV2(pipeline.currentLearnedModel()) };
+    finalDiag = pipeline.evaluate(ctx, trained);
+    opts.onEvent?.({ type: 'evaluation', round, diagnostics: finalDiag });
+    opts.onEvent?.({
+      type: 'round-end',
+      round,
+      trainedModel: pipeline.currentLearnedModel(),
+      params: pipeline.currentLearnedModel().params,
+      diagnostics: finalDiag,
+      trialsAfter: store.size(),
+    });
+  }
+  const finalModel = pipeline.currentLearnedModel();
+  pipeline.dispose();
+  opts.onEvent?.({ type: 'done', totalTrials: store.size(), finalModel, finalDiagnostics: finalDiag });
+  return {
+    model: finalModel,
+    trials: store,
+    finalDiagnostics: finalDiag,
+    config: pipeline.config,
+    sampleDt: pipeline.sampleDt,
+  };
 }
