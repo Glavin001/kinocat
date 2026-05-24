@@ -80,9 +80,34 @@ export function purePursuit(
   const vGoal = Math.sqrt(
     2 * config.maxDecel * Math.max(distToGoal - config.goalTolerance, 0),
   );
+
+  // Optional path-speed cap: when the upstream planner attached a
+  // speed-profile-smoothed plan, the per-sample `speed` already encodes
+  // curvature- and brake-distance-aware targets. Take the min of the
+  // planned speeds in a forward window so the controller actually
+  // consumes that information (without this, the smoother has no effect).
+  let vPath = Infinity;
+  if (config.respectPathSpeed) {
+    let acc = 0;
+    const window = config.lookaheadMax;
+    for (let i = ni; i < path.length - 1 && acc <= window; i++) {
+      const s2 = Math.abs(path[i]!.speed);
+      if (s2 < vPath) vPath = s2;
+      acc += dist(path[i]!.x, path[i]!.z, path[i + 1]!.x, path[i + 1]!.z);
+    }
+    const last = Math.abs(path[path.length - 1]!.speed);
+    if (last < vPath) vPath = last;
+    if (!Number.isFinite(vPath)) vPath = Infinity;
+  }
+
   const speedMag = atGoal
     ? 0
-    : Math.min(config.cruiseSpeed, vCurve, Math.max(vGoal, config.lookaheadMin));
+    : Math.min(
+        config.cruiseSpeed,
+        vCurve,
+        vPath,
+        Math.max(vGoal, config.lookaheadMin),
+      );
   const targetSpeed = gear * speedMag;
 
   let throttle = 0;

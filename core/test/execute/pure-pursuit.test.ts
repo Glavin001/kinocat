@@ -85,6 +85,25 @@ describe('purePursuit', () => {
     expect(purePursuit(cur, path, cfg)).toEqual(purePursuit(cur, path, cfg));
   });
 
+  it('respects path speed when respectPathSpeed is enabled', () => {
+    // Straight path with a slow zone in the forward window. Without the
+    // option, the controller targets cruise; with it, the target should
+    // drop to the slow zone's planned speed.
+    const path: PlanPath = [
+      { x: 0, z: 0, heading: 0, speed: 6, t: 0 },
+      { x: 2, z: 0, heading: 0, speed: 6, t: 0.3 },
+      { x: 4, z: 0, heading: 0, speed: 2, t: 0.9 }, // slow zone
+      { x: 6, z: 0, heading: 0, speed: 2, t: 1.5 },
+      { x: 8, z: 0, heading: 0, speed: 6, t: 2.0 },
+    ];
+    const cur: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 6, t: 0 };
+    const without = purePursuit(cur, path, { ...cfg, respectPathSpeed: false });
+    const withCap = purePursuit(cur, path, { ...cfg, respectPathSpeed: true });
+    expect(Math.abs(without.targetSpeed)).toBeGreaterThan(Math.abs(withCap.targetSpeed));
+    // The cap should be the slow-zone speed (2 m/s).
+    expect(Math.abs(withCap.targetSpeed)).toBeCloseTo(2, 5);
+  });
+
   it('brakes at the goal', () => {
     const path: PlanPath = [
       { x: 0, z: 0, heading: 0, speed: 4, t: 0 },

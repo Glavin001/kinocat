@@ -108,6 +108,11 @@ const PURE_PURSUIT_CONFIG = {
   cruiseSpeed: RACE_AGENT.maxSpeed,
   goalTolerance: 2,
   minTurnRadius: RACE_AGENT.minTurnRadius,
+  // Consume the speed-profile-smoothed `speed` on every plan sample so
+  // the friction-circle pass actually influences throttle/brake. Without
+  // this the smoother has no effect and the controller would still
+  // arrive hot at corner entries.
+  respectPathSpeed: true,
 };
 
 // ---------------------------------------------------------------------------

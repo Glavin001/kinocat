@@ -17,6 +17,15 @@ export interface PurePursuitConfig {
   goalTolerance: number;
   /** Optional min turning radius to clamp commanded curvature. */
   minTurnRadius?: number;
+  /**
+   * When true, the tracker also caps target speed by the minimum planned
+   * `speed` over a forward window of the path (default ~lookaheadMax
+   * worth of arc-length). This is how the controller actually consumes
+   * a friction-circle / speed-profile smoother's output — without this
+   * the curvature-aware `vCurve` is the only forward-looking term and
+   * the smoothed profile is ignored. Default false (legacy behaviour).
+   */
+  respectPathSpeed?: boolean;
 }
 
 export interface TrackingCommand {
