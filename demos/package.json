@@ -15,7 +15,9 @@
     "train:sweep": "tsx scripts/train.ts --profile=sweep",
     "train:overnight": "tsx scripts/train.ts --profile=overnight",
     "race": "tsx scripts/race.ts",
-    "race:quick": "tsx scripts/race.ts --quick --no-parametric --ledger=docs/race-results"
+    "race:quick": "tsx scripts/race.ts --quick --no-parametric --ledger=docs/race-results",
+    "ablation": "tsx scripts/ablation.ts",
+    "ablation:quick": "tsx scripts/ablation.ts --laps=3 --max-sim=180"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.14.0",

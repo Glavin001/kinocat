@@ -126,8 +126,70 @@ const PURE_PURSUIT_CONFIG = {
   // Consume the speed-profile-smoothed `speed` on every plan sample so
   // the friction-circle pass actually influences throttle/brake. Without
   // this the smoother has no effect and the controller would still
-  // arrive hot at corner entries.
+  // arrive hot at corner entries. (Tuning override below toggles this.)
   respectPathSpeed: true,
+};
+
+// ---------------------------------------------------------------------------
+// Feature flags — for ablation studies.
+//
+// Every "best-in-class" planner improvement landed on this branch is gated
+// behind a flag here. The default is ALL ON (everything we've measured to
+// help). The headless-race CLI (`pnpm run race --tuning=...`) and a new
+// `pnpm run ablation` script flip these to isolate the contribution of
+// each improvement. Without this discipline, accidental regressions hide
+// behind the aggregate "lap time went up by 2s" signal.
+//
+// Naming: a feature ON is "improvement enabled". Setting to its disabled
+// value reverts to the legacy behaviour from before the improvement
+// landed. `LEGACY_TUNING` is the all-off baseline; `DEFAULT_TUNING` is
+// the all-on current state.
+
+export interface RaceTuning {
+  /** Plan-stitching commit window (ms). 0 = replan from live chassis state. */
+  commitWindowMs: number;
+  /** Trajectory-consistency hysteresis weight passed to the planner
+   *  (s/m of deviation from the previously-committed plan). 0 disables. */
+  consistencyWeight: number;
+  /** Friction-circle forward/backward speed-profile post-pass on the plan. */
+  enableSpeedProfile: boolean;
+  /** Geometric trajectory smoother — dense (~0.4m) C¹-continuous polyline. */
+  enableTrajectorySmoother: boolean;
+  /** Pure-pursuit folds the smoothed plan's per-sample speeds into the
+   *  target-speed clamp (the smoother has no effect without this). */
+  respectPathSpeed: boolean;
+  /** Event-driven replan triggers in addition to the fixed cadence. */
+  enableAdaptiveReplan: boolean;
+  /** Trigger an extra replan on waypoint advance (subset of adaptive). */
+  enableWaypointAdvanceReplan: boolean;
+  /** Reeds-Shepp heuristic lookup table inside `VehicleEnvironment`
+   *  (faster heuristic evaluation; admissible). */
+  enableHeuristicTable: boolean;
+}
+
+/** All features enabled — current best-in-class state of the branch. */
+export const DEFAULT_TUNING: RaceTuning = {
+  commitWindowMs: COMMIT_WINDOW_MS,
+  consistencyWeight: 0.08,
+  enableSpeedProfile: true,
+  enableTrajectorySmoother: true,
+  respectPathSpeed: true,
+  enableAdaptiveReplan: true,
+  enableWaypointAdvanceReplan: true,
+  enableHeuristicTable: true,
+};
+
+/** All improvements disabled — reverts to the pre-improvement baseline.
+ *  Useful as the reference point in ablation studies. */
+export const LEGACY_TUNING: RaceTuning = {
+  commitWindowMs: 0,
+  consistencyWeight: 0,
+  enableSpeedProfile: false,
+  enableTrajectorySmoother: false,
+  respectPathSpeed: false,
+  enableAdaptiveReplan: false,
+  enableWaypointAdvanceReplan: false,
+  enableHeuristicTable: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -208,6 +270,11 @@ export interface RaceScenarioOptions {
   stallTimeoutMs?: number;
   /** Optional spawn offset along z per car (default: spread cars 3m apart). */
   spawnSpacingZ?: number;
+  /** Feature-flag bundle controlling every best-in-class improvement
+   *  layered onto the planner+controller. Defaults to `DEFAULT_TUNING`
+   *  (everything ON). Used by ablation tooling and the CLI to A/B test
+   *  individual improvements. */
+  tuning?: Partial<RaceTuning>;
 }
 
 export interface RaceScenario {
@@ -287,6 +354,11 @@ export async function createRaceScenario(
   const offTrackRecovery = opts.offTrackRecovery ?? 'spawn';
   const stallTimeoutMs = opts.stallTimeoutMs ?? STALL_TIMEOUT_MS;
   const spacing = opts.spawnSpacingZ ?? 3;
+  const tuning: RaceTuning = { ...DEFAULT_TUNING, ...(opts.tuning ?? {}) };
+  const trackerConfig = {
+    ...PURE_PURSUIT_CONFIG,
+    respectPathSpeed: tuning.respectPathSpeed,
+  };
 
   const cars: CarInternal[] = opts.entries.map((entry, i) => {
     // One world per car (matches web demo's split-viewport setup; cars
@@ -373,10 +445,10 @@ export async function createRaceScenario(
     // from the current state — guaranteeing the controller can keep
     // following the existing plan through the commit window without
     // discontinuity. First replan (no plan yet) starts from `now`.
-    const commitWindowSec = COMMIT_WINDOW_MS / 1000;
+    const commitWindowSec = tuning.commitWindowMs / 1000;
     let planStartSimTime = simTime;
     let startState: CarKinematicState;
-    if (c.plan && c.plan.length > 1) {
+    if (commitWindowSec > 0 && c.plan && c.plan.length > 1) {
       const elapsed = simTime - c.planStartSimTime + commitWindowSec;
       const sampled = samplePlanAt(c.plan, elapsed);
       if (sampled) {
@@ -422,7 +494,7 @@ export async function createRaceScenario(
     // executed (relative to the new search's start time) so reference
     // geometry is only about the future, not the past.
     let referencePath: ReadonlyArray<{ x: number; z: number }> | undefined;
-    {
+    if (tuning.consistencyWeight > 0) {
       const refPlan = c.pendingPlan ?? c.plan;
       const refStart = c.pendingPlan ? c.pendingPlanStartSimTime : c.planStartSimTime;
       if (refPlan && refPlan.length > 1) {
@@ -444,46 +516,50 @@ export async function createRaceScenario(
       deadlineMs: RACE_REPLAN_BUDGET_MS,
       gateRadius: RACE_PLANNER_GATE_RADIUS,
       referencePath,
-      referenceWeight: 0.08,
+      referenceWeight: tuning.consistencyWeight,
+      disableHeuristicTable: !tuning.enableHeuristicTable,
     });
     const replanMs = performance.now() - tStart;
     c.diagnostics.lastReplanMs = replanMs;
     c.diagnostics.lastReplanFound = res.found && res.path.length > 1;
     c.diagnostics.totalReplans += 1;
     if (c.diagnostics.lastReplanFound) {
-      // Two-stage post-process pipeline (Apollo / Autoware shape):
+      // Two-stage post-process pipeline (Apollo / Autoware shape), each
+      // stage individually toggleable for ablation:
       //  (a) Geometric trajectory smoother — turns the sparse, sharp-
       //      seamed motion-primitive polyline into a dense (~0.4m
       //      spacing), C¹-continuous reference. Without this the
       //      prediction/visualisation/lookahead all sample on a
-      //      piecewise-linear interpolation of primitive endpoints,
-      //      which is exactly what produced the "sharp lines" in the
-      //      predicted plan.
+      //      piecewise-linear interpolation of primitive endpoints.
       //  (b) Friction-circle speed-profile pass — assigns a
-      //      curvature- and brake-distance-aware speed at every dense
-      //      sample. Now operates on much denser samples so curvature
-      //      estimates are accurate.
-      const geomSmoothed = smoothTrajectory(res.path, {
-        sampleSpacing: 0.4,
-        iterations: 20,
-        dataWeight: 0.5,
-        smoothWeight: 0.3,
-        anchorEndpoints: true,
-      });
-      const smoothed = smoothSpeedProfile(geomSmoothed, {
-        aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel,
-        aLonMaxAccel: PURE_PURSUIT_CONFIG.maxAccel,
-        aLonMaxDecel: PURE_PURSUIT_CONFIG.maxDecel,
-        maxSpeed: PURE_PURSUIT_CONFIG.cruiseSpeed,
-        minSpeed: 0.5,
-        honorEntrySpeed: true,
-      });
+      //      curvature- and brake-distance-aware speed at every sample.
+      let smoothed = res.path;
+      if (tuning.enableTrajectorySmoother) {
+        smoothed = smoothTrajectory(smoothed, {
+          sampleSpacing: 0.4,
+          iterations: 20,
+          dataWeight: 0.5,
+          smoothWeight: 0.3,
+          anchorEndpoints: true,
+        });
+      }
+      if (tuning.enableSpeedProfile) {
+        smoothed = smoothSpeedProfile(smoothed, {
+          aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel,
+          aLonMaxAccel: PURE_PURSUIT_CONFIG.maxAccel,
+          aLonMaxDecel: PURE_PURSUIT_CONFIG.maxDecel,
+          maxSpeed: PURE_PURSUIT_CONFIG.cruiseSpeed,
+          minSpeed: 0.5,
+          honorEntrySpeed: true,
+        });
+      }
       c.diagnostics.successfulReplans += 1;
       c.diagnostics.consecutiveFailedReplans = 0;
-      if (c.plan && c.plan.length > 1) {
+      if (commitWindowSec > 0 && c.plan && c.plan.length > 1) {
         // Promote later — keep the current plan active through the
         // commit window. `stepOne` will swap when simTime crosses
-        // pendingPlanStartSimTime.
+        // pendingPlanStartSimTime. Skipped when commit window is 0 so
+        // the legacy "replace immediately" behaviour is preserved.
         c.pendingPlan = smoothed;
         c.pendingPlanStartSimTime = planStartSimTime;
       } else {
@@ -548,6 +624,7 @@ export async function createRaceScenario(
    *  consecutive failures (back off — keep retrying until something
    *  takes). */
   function shouldEarlyReplan(c: CarInternal, state: CarKinematicState): boolean {
+    if (!tuning.enableAdaptiveReplan) return false;
     if (c.holdingForSync || c.finished) return false;
     const sinceLastMs = (simTime - c.lastReplanSimTime) * 1000;
     if (sinceLastMs < MIN_TIME_BETWEEN_REPLANS_MS) return false;
@@ -598,9 +675,11 @@ export async function createRaceScenario(
         // MIN_TIME_BETWEEN_REPLANS rate-limit) instead of waiting up to
         // ~300 ms of cadence — otherwise the controller can chase a plan
         // whose first gate the car has already passed.
-        const sinceLastMs = (simTime - c.lastReplanSimTime) * 1000;
-        if (sinceLastMs >= MIN_TIME_BETWEEN_REPLANS_MS) {
-          replanCar(c);
+        if (tuning.enableWaypointAdvanceReplan) {
+          const sinceLastMs = (simTime - c.lastReplanSimTime) * 1000;
+          if (sinceLastMs >= MIN_TIME_BETWEEN_REPLANS_MS) {
+            replanCar(c);
+          }
         }
         if (c.waypointsCleared % course.waypoints.length === 0) {
           const lapEnd = c.raceTime;
@@ -636,7 +715,7 @@ export async function createRaceScenario(
       const elapsed = simTime - c.planStartSimTime;
       const live = trimPlan(c.plan, elapsed);
       if (live.length >= 2) {
-        const trk = purePursuit(stateBefore, live, PURE_PURSUIT_CONFIG);
+        const trk = purePursuit(stateBefore, live, trackerConfig);
         const steer = -Math.atan(trk.steering * (2 * WHEEL_BASE));
         const cmd = wheeledFromNormalized(
           { steer, throttle: trk.throttle, brake: trk.brake },

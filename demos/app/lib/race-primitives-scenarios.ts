@@ -441,6 +441,10 @@ export interface RaceMultiGoalRequest {
   referencePath?: ReadonlyArray<{ x: number; z: number }>;
   /** Weight per metre of deviation. Default 0.1 (s/m). */
   referenceWeight?: number;
+  /** Opt out of the Reeds-Shepp heuristic lookup table (which is enabled
+   *  by default in `planVehicleMultiGoal`). Used by ablation harnesses
+   *  to measure the cache's contribution. */
+  disableHeuristicTable?: boolean;
 }
 
 /** Single A* through an ordered SEQUENCE of gates. Unlike `planRace`
@@ -453,6 +457,20 @@ export interface RaceMultiGoalRequest {
  *  no speed, exactly what the user asked for. */
 export function planRaceMultiGoal(req: RaceMultiGoalRequest): PlanResult<CarKinematicState> {
   const world = req.world ?? new InMemoryNavWorld(req.polygons, req.obstacles);
+  // Build envOptions only when we have a non-default flag to set. The
+  // planner merges this with its own defaults — leaving the others
+  // (posCell, headingBuckets, analyticExpansion, heuristicTable) alone.
+  const envOptions: import('kinocat/environment').VehicleEnvOptions = {};
+  let usedEnvOptions = false;
+  if (req.referencePath && req.referencePath.length >= 2) {
+    envOptions.referencePath = req.referencePath;
+    envOptions.referenceWeight = req.referenceWeight;
+    usedEnvOptions = true;
+  }
+  if (req.disableHeuristicTable) {
+    envOptions.heuristicTable = false;
+    usedEnvOptions = true;
+  }
   return planVehicleMultiGoal({
     start: req.state,
     gates: req.gates,
@@ -464,13 +482,7 @@ export function planRaceMultiGoal(req: RaceMultiGoalRequest): PlanResult<CarKine
     // (chassis pose × gate index).
     maxExpansions: req.maxExpansions ?? RACE_MAX_EXPANSIONS * 2,
     gateRadius: req.gateRadius,
-    envOptions:
-      req.referencePath && req.referencePath.length >= 2
-        ? {
-            referencePath: req.referencePath,
-            referenceWeight: req.referenceWeight,
-          }
-        : undefined,
+    envOptions: usedEnvOptions ? envOptions : undefined,
   });
 }
 

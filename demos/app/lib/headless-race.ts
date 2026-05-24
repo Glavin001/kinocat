@@ -16,6 +16,7 @@ import {
   createRaceScenario,
   type RaceEntry,
   type RaceLap,
+  type RaceTuning,
 } from './race-scenario';
 import {
   buildLearnedRaceLibraryV2,
@@ -27,7 +28,8 @@ import {
   type LearnedVehicleModel,
 } from 'kinocat/agent';
 
-export type { RaceEntry, RaceLap } from './race-scenario';
+export type { RaceEntry, RaceLap, RaceTuning } from './race-scenario';
+export { DEFAULT_TUNING, LEGACY_TUNING } from './race-scenario';
 
 export interface RaceResult {
   name: string;
@@ -36,12 +38,20 @@ export interface RaceResult {
   best: number;
   /** Mean lap duration (s) or NaN. */
   avg: number;
+  /** Sample standard deviation of lap durations (s) or NaN. */
+  stddev: number;
   /** Total sim time consumed (s). */
   totalSimTime: number;
   /** Did the car complete `targetLaps` within the time budget? */
   finished: boolean;
   /** How many times the chassis left the arena / rolled. */
   offTrackEvents: number;
+  /** RMS prediction error at primitive boundary (m). The honest
+   *  "how accurate is the model the planner uses" metric. */
+  predErrorRms: number;
+  /** Total successful + failed replans (planner-quality proxy). */
+  totalReplans: number;
+  successfulReplans: number;
 }
 
 export interface RunRaceOptions {
@@ -57,6 +67,8 @@ export interface RunRaceOptions {
    *  status update string (for the CLI progress bar). */
   onProgress?: (msg: string) => void;
   progressEverySec?: number;
+  /** Per-feature toggles for ablation studies. Defaults to all-on. */
+  tuning?: Partial<RaceTuning>;
 }
 
 /** Race every entry against each other in independent Rapier worlds
@@ -73,6 +85,7 @@ export async function runHeadlessRace(
     targetLaps,
     syncHold: opts.syncHold ?? false,
     offTrackRecovery: 'spawn',
+    tuning: opts.tuning,
   });
   let nextProgressAt = progressEvery;
   while (scenario.simTime() < maxSimTime) {
@@ -93,14 +106,24 @@ export async function runHeadlessRace(
     const durations = c.laps.map((l) => l.duration);
     const best = durations.length > 0 ? Math.min(...durations) : NaN;
     const avg = durations.length > 0 ? durations.reduce((a, b) => a + b, 0) / durations.length : NaN;
+    let stddev = NaN;
+    if (durations.length >= 2 && Number.isFinite(avg)) {
+      const variance =
+        durations.reduce((s, d) => s + (d - avg) * (d - avg), 0) / (durations.length - 1);
+      stddev = Math.sqrt(variance);
+    }
     return {
       name: c.name,
       laps: c.laps,
       best,
       avg,
+      stddev,
       totalSimTime: finalSimTime,
       finished: c.laps.length >= targetLaps,
       offTrackEvents: c.offTrackEvents,
+      predErrorRms: c.diagnostics.predErrorRms,
+      totalReplans: c.diagnostics.totalReplans,
+      successfulReplans: c.diagnostics.successfulReplans,
     };
   });
 }
