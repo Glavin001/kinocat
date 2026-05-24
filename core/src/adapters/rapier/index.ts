@@ -36,6 +36,11 @@ export type {
   WheelTelemetry,
 } from './raycast-vehicle';
 
+export { stepRaycastVehicle } from './step';
+export type { StepRaycastVehicleOptions } from './step';
+export { RapierCarBody } from './car-body';
+export type { RapierCarBodyOptions } from './car-body';
+
 export { createHeadlessTrialHarness } from './headless-trial';
 export type {
   HeadlessTrialHarness,

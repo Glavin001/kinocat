@@ -36,6 +36,9 @@ import {
   spawnCar,
   type CarHandle,
 } from './rapierVehicle';
+import { stepRaycastVehicle } from 'kinocat/adapters/rapier';
+import { updateChaseCamera } from 'kinocat/adapters/three';
+import { trimPlan as trimPlanCore } from 'kinocat/vehicle/car';
 import {
   createBuildingHelper,
   createJumpArcHelper,
@@ -884,14 +887,11 @@ export default function CarChase() {
       // next one). Sub-step both together so suspension stays stable.
       // EXCLUDE_DYNAMIC keeps wheel rays from hitting other cars' chassis
       // colliders — without it cars ride up on each other when close.
-      const subDt = PHYSICS_DT / VEHICLE_SUBSTEPS;
-      world.timestep = subDt;
-      const wheelFilter = RAPIER.QueryFilterFlags.EXCLUDE_DYNAMIC;
-      for (let s = 0; s < VEHICLE_SUBSTEPS; s++) {
-        robber.car.vehicle.updateVehicle(subDt, wheelFilter);
-        for (const co of cops) co.car.vehicle.updateVehicle(subDt, wheelFilter);
-        world.step();
-      }
+      stepRaycastVehicle(
+        world,
+        [robber.car as unknown as Parameters<typeof stepRaycastVehicle>[1][number], ...cops.map((c) => c.car as unknown as Parameters<typeof stepRaycastVehicle>[1][number])],
+        { dt: PHYSICS_DT, substeps: VEHICLE_SUBSTEPS },
+      );
 
       // Re-read post-step states for rendering + capture detection.
       const robberStateAfter = robber.car.readState(now);
@@ -1011,16 +1011,11 @@ export default function CarChase() {
 
       // Chase camera tracks the robber from behind.
       if (chaseRef.current) {
-        const c = Math.cos(robberStateAfter.heading);
-        const s = Math.sin(robberStateAfter.heading);
-        const cam = new THREE.Vector3(
-          robberStateAfter.x - 14 * c,
-          7,
-          robberStateAfter.z - 14 * s,
+        updateChaseCamera(
+          camera,
+          { x: robberStateAfter.x, z: robberStateAfter.z, heading: robberStateAfter.heading },
+          { orbit },
         );
-        camera.position.lerp(cam, 0.12);
-        orbit.target.set(robberStateAfter.x, 1.5, robberStateAfter.z);
-        orbit.update();
       }
 
       // HUD throttle (~10 Hz to avoid React thrash).
@@ -1222,9 +1217,7 @@ export default function CarChase() {
 /** Drop path samples already passed; resample t-origin so pure-pursuit picks
  *  a fresh lookahead. */
 function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
-  let i = 0;
-  while (i < plan.length - 1 && plan[i + 1]!.t <= elapsed) i++;
-  return plan.slice(i);
+  return trimPlanCore(plan, elapsed);
 }
 
 /** Anything that holds a car handle plus the stuck-detector bookkeeping.

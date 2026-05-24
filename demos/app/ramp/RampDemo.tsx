@@ -17,6 +17,7 @@ import {
   createRaycastVehicle,
   createHeightfieldCollider,
   planToAckermannControls,
+  stepRaycastVehicle,
   type RaycastVehicleOptions,
 } from 'kinocat/adapters/rapier';
 import {
@@ -30,7 +31,9 @@ import {
   createHeightfieldMeshHelper,
   createRampChevronsHelper,
   createRapierDebugRenderer,
+  updateChaseCamera,
 } from 'kinocat/adapters/three';
+import { trimPlan as trimPlanCore } from 'kinocat/vehicle/car';
 import {
   RAMP_AGENT,
   RAMP_BOUNDS,
@@ -398,13 +401,7 @@ export default function RampDemo() {
         car.applyControls({ steer: 0, throttle: 0, brake: 0 });
       }
 
-      const subDt = PHYSICS_DT / VEHICLE_SUBSTEPS;
-      world.timestep = subDt;
-      const wheelFilter = RAPIER.QueryFilterFlags.EXCLUDE_DYNAMIC;
-      for (let s = 0; s < VEHICLE_SUBSTEPS; s++) {
-        car.vehicle.updateVehicle(subDt, wheelFilter);
-        world.step();
-      }
+      stepRaycastVehicle(world, [car], { dt: PHYSICS_DT, substeps: VEHICLE_SUBSTEPS });
 
       const after = car.readState(now);
       // syncCarMesh only updates X, Z, yaw. For the ramp demo we MUST also
@@ -429,16 +426,7 @@ export default function RampDemo() {
       }
 
       if (chaseRef.current) {
-        const cc = Math.cos(after.heading);
-        const ss = Math.sin(after.heading);
-        const cam = new THREE.Vector3(
-          after.x - 14 * cc,
-          7,
-          after.z - 14 * ss,
-        );
-        camera.position.lerp(cam, 0.12);
-        orbit.target.set(after.x, 1.5, after.z);
-        orbit.update();
+        updateChaseCamera(camera, { x: after.x, z: after.z, heading: after.heading }, { orbit });
       }
 
       if (now - lastHudWall > 100) {
@@ -567,9 +555,7 @@ export default function RampDemo() {
 }
 
 function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
-  let i = 0;
-  while (i < plan.length - 1 && plan[i + 1]!.t <= elapsed) i++;
-  return plan.slice(i);
+  return trimPlanCore(plan, elapsed);
 }
 
 function ToggleButton({

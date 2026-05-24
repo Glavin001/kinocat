@@ -14,7 +14,7 @@
 // Rapier adapter, an alternate physics adapter, a closed-form simulator) can
 // accept these and translate them to its own wheel inputs.
 
-export interface WheeledControls {
+export interface WheeledCarControls {
   /** Front-wheel steer angle in radians. */
   steer: number;
   /** Signed engine force in Newtons (negative = reverse). */
@@ -23,14 +23,21 @@ export interface WheeledControls {
   brakeForce: number;
 }
 
+/**
+ * @deprecated Use `WheeledCarControls`. Retained as a structural alias so
+ * existing imports keep compiling. The new name disambiguates from
+ * non-wheeled vehicle controls (airplane throttle/elevator/aileron, etc.).
+ */
+export type WheeledControls = WheeledCarControls;
+
 /** Dimensionality of the encoded controls vector. */
 export const WHEELED_CONTROL_DIM = 3;
 
-export function encodeWheeled(c: WheeledControls): number[] {
+export function encodeWheeled(c: WheeledCarControls): number[] {
   return [c.steer, c.driveForce, c.brakeForce];
 }
 
-export function decodeWheeled(v: ReadonlyArray<number>): WheeledControls {
+export function decodeWheeled(v: ReadonlyArray<number>): WheeledCarControls {
   return {
     steer: v[0] ?? 0,
     driveForce: v[1] ?? 0,
@@ -38,15 +45,15 @@ export function decodeWheeled(v: ReadonlyArray<number>): WheeledControls {
   };
 }
 
-/** Clamp a `WheeledControls` against an agent's physical limits. */
+/** Clamp a `WheeledCarControls` against an agent's physical limits. */
 export function clampWheeled(
-  c: WheeledControls,
+  c: WheeledCarControls,
   limits: {
     maxSteerAngle: number;
     maxDriveForce: number;
     maxBrakeForce: number;
   },
-): WheeledControls {
+): WheeledCarControls {
   const s = Math.max(-limits.maxSteerAngle, Math.min(limits.maxSteerAngle, c.steer));
   const d = Math.max(-limits.maxDriveForce, Math.min(limits.maxDriveForce, c.driveForce));
   const b = Math.max(0, Math.min(limits.maxBrakeForce, c.brakeForce));

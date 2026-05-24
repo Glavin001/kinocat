@@ -16,6 +16,9 @@ import * as THREE from 'three';
 import type { VehicleState } from '../../agent/types';
 import type { HeightSampler, RampSpec } from '../../environment/ramp';
 
+export { updateChaseCamera } from './chase-camera';
+export type { ChaseCameraTarget, ChaseCameraOpts } from './chase-camera';
+
 export interface PlanarPoint {
   x: number;
   z: number;

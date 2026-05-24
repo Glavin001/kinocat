@@ -20,8 +20,10 @@ import {
   createRaycastVehicle,
   createGroundCollider,
   ensureRapier,
+  stepRaycastVehicle,
   type CarHandle,
 } from 'kinocat/adapters/rapier';
+import { trimPlan as trimPlanCore } from 'kinocat/vehicle/car';
 import {
   createCarMeshHelper,
   syncCarMesh,
@@ -918,9 +920,7 @@ async function setupScene(
   for (const car of [kinematic, learned]) {
     for (let i = 0; i < 30; i++) {
       car.car.applyControls({ steer: 0, throttle: 0, brake: 0 });
-      car.world.timestep = PHYSICS_DT;
-      car.car.vehicle.updateVehicle(PHYSICS_DT);
-      car.world.step();
+      stepRaycastVehicle(car.world, [car.car], { dt: PHYSICS_DT, substeps: 1 });
     }
     car.car.teleport({
       x: course.spawn.x,
@@ -1153,13 +1153,7 @@ async function setupScene(
     }
 
     // ---- Sub-stepped physics.
-    const subDt = dt / VEHICLE_SUBSTEPS;
-    car.world.timestep = subDt;
-    const filter = RAPIER.QueryFilterFlags.EXCLUDE_DYNAMIC;
-    for (let s = 0; s < VEHICLE_SUBSTEPS; s++) {
-      car.car.vehicle.updateVehicle(subDt, filter);
-      car.world.step();
-    }
+    stepRaycastVehicle(car.world, [car.car], { dt, substeps: VEHICLE_SUBSTEPS });
     const after = car.car.readState(now);
 
     // ---- Online learning: append transition (only while actually driving;
@@ -1475,9 +1469,7 @@ function paramsEqual(a: LearnedVehicleParams, b: LearnedVehicleParams): boolean 
 }
 
 function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
-  let i = 0;
-  while (i < plan.length - 1 && plan[i + 1]!.t <= elapsed) i++;
-  return plan.slice(i);
+  return trimPlanCore(plan, elapsed);
 }
 
 /** Smoothly move a perspective camera into a chase position behind a

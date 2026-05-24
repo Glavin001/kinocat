@@ -39,9 +39,14 @@ import {
   createGroundCollider,
   createRaycastVehicle,
   planToAckermannControls,
+  stepRaycastVehicle,
   type CarHandle,
   type WheelTelemetry,
 } from 'kinocat/adapters/rapier';
+import {
+  encodeForParametricV2,
+  encodeForKinematic,
+} from 'kinocat/vehicle/car';
 import {
   createCarMeshHelper,
   syncCarMesh,
@@ -245,16 +250,24 @@ export default function SimToRealScope() {
     // We therefore negate `steer` here when encoding for the ghost
     // sims; otherwise the chassis turns left, every ghost predicts
     // right, and the user notices instantly (they did).
+    // Control encoders. The steer-sign-flip rule (Rapier raycast frame ->
+    // kinocat planning frame) lives once, in `kinocat/vehicle/car`'s
+    // `encodeForParametricV2`. Demos no longer reinvent it inline.
     const encodeForSim: Record<GhostKind['id'], (steer: number, throttle: number, brake: number) => number[]> = {
-      'v2-full': (steer, throttle, brake) => [-steer, throttle * ENGINE_FORCE_N, brake * BRAKE_FORCE_N],
-      'parametric': (steer, throttle, brake) => [-steer, throttle * ENGINE_FORCE_N, brake * BRAKE_FORCE_N],
-      'kinematic': (steer, throttle, brake) => {
-        // Kinematic model: curvature in the same kinocat sign as the
-        // wheeled-controls steer (positive = +heading rotation).
-        const curvature = Math.sin(-steer) / Math.max(0.5, 2 * RACE_AGENT.minTurnRadius);
-        const target = (throttle - brake) * RACE_AGENT.maxSpeed;
-        return [curvature, target];
-      },
+      'v2-full': (steer, throttle, brake) =>
+        encodeForParametricV2({ steer, driveForce: throttle * ENGINE_FORCE_N, brakeForce: brake * BRAKE_FORCE_N }),
+      'parametric': (steer, throttle, brake) =>
+        encodeForParametricV2({ steer, driveForce: throttle * ENGINE_FORCE_N, brakeForce: brake * BRAKE_FORCE_N }),
+      'kinematic': (steer, throttle, brake) =>
+        encodeForKinematic(
+          { steer, driveForce: 0, brakeForce: 0 },
+          {
+            wheelBase: Math.max(0.5, 2 * RACE_AGENT.minTurnRadius),
+            maxSpeed: RACE_AGENT.maxSpeed,
+            throttle,
+            brake,
+          },
+        ),
     };
 
     // ---- Three.js scene -----------------------------------------------
@@ -581,13 +594,8 @@ export default function SimToRealScope() {
 
       // ---- step Rapier ----
       car.applyControls(appliedControls);
+      stepRaycastVehicle(world, [car], { dt: PHYSICS_DT, substeps: VEHICLE_SUBSTEPS });
       const subDt = PHYSICS_DT / VEHICLE_SUBSTEPS;
-      world.timestep = subDt;
-      const wheelFilter = RAPIER.QueryFilterFlags.EXCLUDE_DYNAMIC;
-      for (let s = 0; s < VEHICLE_SUBSTEPS; s++) {
-        car.vehicle.updateVehicle(subDt, wheelFilter);
-        world.step();
-      }
       const realAfter: VehicleState = { ...car.readState(0), t: simTime + PHYSICS_DT };
       simTime += PHYSICS_DT;
       syncCarMesh(realCarMesh.group, realAfter);

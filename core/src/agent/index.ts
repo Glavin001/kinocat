@@ -1,5 +1,6 @@
 // kinocat/agent — vehicle / humanoid agent metadata + default forward models.
 export type {
+  CarKinematicState,
   VehicleState,
   HumanoidState,
   AircraftState,
@@ -20,7 +21,7 @@ export { defaultHumanoidAgent } from './humanoid';
 export { defaultAircraftAgent, aircraftForwardSim } from './aircraft';
 
 // Generic wheeled-vehicle action shape + clamp helpers.
-export type { WheeledControls } from './controls';
+export type { WheeledCarControls, WheeledControls } from './controls';
 export {
   WHEELED_CONTROL_DIM,
   encodeWheeled,

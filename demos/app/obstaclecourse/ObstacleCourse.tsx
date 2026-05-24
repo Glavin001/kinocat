@@ -27,6 +27,7 @@ import {
   createBoxCollider,
   createHeightfieldCollider,
   planToAckermannControls,
+  stepRaycastVehicle,
 } from 'kinocat/adapters/rapier';
 import {
   createGroundPlaneHelper,
@@ -44,7 +45,9 @@ import {
   createRampChevronsHelper,
   createJumpArcHelper,
   createRapierDebugRenderer,
+  updateChaseCamera,
 } from 'kinocat/adapters/three';
+import { trimPlan as trimPlanCore } from 'kinocat/vehicle/car';
 import {
   OBS_AGENT,
   OBS_BOUNDS,
@@ -450,13 +453,7 @@ export default function ObstacleCourse() {
 
       // Physics: vehicle update before world step, sub-stepped (Rapier
       // raycast-vehicle is twitchy at 60 Hz on its own).
-      const subDt = PHYSICS_DT / VEHICLE_SUBSTEPS;
-      world.timestep = subDt;
-      const wheelFilter = RAPIER.QueryFilterFlags.EXCLUDE_DYNAMIC;
-      for (let s = 0; s < VEHICLE_SUBSTEPS; s++) {
-        car.vehicle.updateVehicle(subDt, wheelFilter);
-        world.step();
-      }
+      stepRaycastVehicle(world, [car], { dt: PHYSICS_DT, substeps: VEHICLE_SUBSTEPS });
 
       const after = car.readState(now);
       syncCarMesh(carMesh.group, after);
@@ -474,16 +471,7 @@ export default function ObstacleCourse() {
       if (ai.goal) goalMarker.position.set(ai.goal.x, 2, ai.goal.z);
 
       if (chaseRef.current) {
-        const c = Math.cos(after.heading);
-        const s = Math.sin(after.heading);
-        const cam = new THREE.Vector3(
-          after.x - 14 * c,
-          7,
-          after.z - 14 * s,
-        );
-        camera.position.lerp(cam, 0.12);
-        orbit.target.set(after.x, 1.5, after.z);
-        orbit.update();
+        updateChaseCamera(camera, { x: after.x, z: after.z, heading: after.heading }, { orbit });
       }
 
       if (now - lastHudWall > 100) {
@@ -613,9 +601,7 @@ export default function ObstacleCourse() {
 }
 
 function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
-  let i = 0;
-  while (i < plan.length - 1 && plan[i + 1]!.t <= elapsed) i++;
-  return plan.slice(i);
+  return trimPlanCore(plan, elapsed);
 }
 
 function ToggleButton({

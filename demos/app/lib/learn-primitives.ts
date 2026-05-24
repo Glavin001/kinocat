@@ -30,6 +30,7 @@ import {
   createRaycastVehicle,
   createGroundCollider,
   ensureRapier,
+  stepRaycastVehicle,
   type CarHandle,
   type RaycastVehicleOptions,
 } from 'kinocat/adapters/rapier';
@@ -168,9 +169,7 @@ export async function createSweepWorld(agent: VehicleAgent = CARCHASE_AGENT): Pr
   // at rest length before the first trial begins driving.
   for (let i = 0; i < 30; i++) {
     car.applyControls({ steer: 0, throttle: 0, brake: 0 });
-    world.timestep = PHYSICS_DT;
-    car.vehicle.updateVehicle(PHYSICS_DT);
-    world.step();
+    stepRaycastVehicle(world, [car], { dt: PHYSICS_DT, substeps: 1 });
   }
   return {
     rapier,
@@ -219,9 +218,7 @@ const SPEED_TOL = 0.25;     // m/s — "close enough" to target start speed
 
 function physicsStep(sw: SweepWorld, cmd: { steer: number; throttle: number; brake: number }): void {
   sw.car.applyControls(cmd);
-  sw.world.timestep = PHYSICS_DT;
-  sw.car.vehicle.updateVehicle(PHYSICS_DT);
-  sw.world.step();
+  stepRaycastVehicle(sw.world, [sw.car], { dt: PHYSICS_DT, substeps: 1 });
 }
 
 /** Brake to a near-stop using ONLY the brake input. No teleport. */
@@ -293,9 +290,7 @@ export function runTrial(
     const state = car.readState(0);
     const cmd = controlsToWheelCommand(state.speed, controls[0], controls[1], wheelBase);
     car.applyControls(cmd);
-    world.timestep = PHYSICS_DT;
-    car.vehicle.updateVehicle(PHYSICS_DT);
-    world.step();
+    stepRaycastVehicle(world, [car], { dt: PHYSICS_DT, substeps: 1 });
     if (sampleTicks.has(tick)) {
       const s = car.readState(0);
       const [lx, lz] = rotate(s.x - origin.x, s.z - origin.z, c0, s0);

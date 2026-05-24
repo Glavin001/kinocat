@@ -45,6 +45,26 @@
       "types": "./dist/learning/index.d.ts",
       "default": "./dist/learning/index.js"
     },
+    "./scene": {
+      "types": "./dist/scene/index.d.ts",
+      "default": "./dist/scene/index.js"
+    },
+    "./diagnostics": {
+      "types": "./dist/diagnostics/index.d.ts",
+      "default": "./dist/diagnostics/index.js"
+    },
+    "./training": {
+      "types": "./dist/training/index.d.ts",
+      "default": "./dist/training/index.js"
+    },
+    "./vehicle/car": {
+      "types": "./dist/vehicle/car/index.d.ts",
+      "default": "./dist/vehicle/car/index.js"
+    },
+    "./vehicle/airplane": {
+      "types": "./dist/vehicle/airplane/index.d.ts",
+      "default": "./dist/vehicle/airplane/index.js"
+    },
     "./adapters/navcat": {
       "types": "./dist/adapters/navcat/index.d.ts",
       "default": "./dist/adapters/navcat/index.js"
