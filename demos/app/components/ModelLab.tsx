@@ -15,7 +15,7 @@ import { useMemo, useRef, useState } from 'react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, BarChart, Bar, ResponsiveContainer,
 } from 'recharts';
-import { runOfflineTraining, type TrainingEvent } from '../lib/training-driver';
+import { runManeuverTraining, type TrainingEvent } from '../lib/training-driver';
 import { useIsMobile } from '../lib/use-is-mobile';
 import type { LearnedVehicleModel } from 'kinocat/agent';
 import type { ModelDiagnostics, FitProgressEvent } from 'kinocat/learning';
@@ -116,8 +116,12 @@ export function ModelLab(props: ModelLabProps) {
             break;
         }
       };
-      const result = await runOfflineTraining({
-        rounds, trialsPerActiveRound: trialsPerRound, trialTicks,
+      // Use the same maneuver-based trial sourcing the `pnpm run train`
+      // CLI uses, so a model trained in the browser is structurally the
+      // same as one trained at the command line — same fit + same trial
+      // distribution.
+      const result = await runManeuverTraining({
+        rounds, trialsPerRound, trialTicks,
         sampleEveryNTicks: 6, seed, onEvent,
       });
       if (cancelRef.current.cancelled) {
