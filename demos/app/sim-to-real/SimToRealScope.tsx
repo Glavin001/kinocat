@@ -23,6 +23,7 @@ import RAPIER from '@dimforge/rapier3d-compat';
 import type {
   LearnedVehicleModel,
   CarKinematicState,
+  WheeledCarControls,
 } from 'kinocat/agent';
 import type { ForwardSim } from 'kinocat/primitives';
 import {
@@ -67,14 +68,9 @@ import {
   FuturePredictionTracker,
   type GapSample,
 } from '../lib/sim-to-real-scene';
-import {
-  DebugRecorder,
-  aggregateStats,
-  toJSON,
-  toMarkdown,
-  type DebugMeta,
-  type DebugFrame,
-} from '../lib/sim-to-real-debug';
+import { DebugRecorder, type RecorderMeta } from 'kinocat/diagnostics';
+import { carRecorderFormatters } from 'kinocat/vehicle/car';
+import type { GhostStepResult } from 'kinocat/scene';
 import {
   createGhostCar,
   createTrailRibbon,
@@ -378,7 +374,11 @@ export default function SimToRealScope() {
     scene.add(friction.group);
 
     // Rolling debug recorder. 600 frames @ ~60 Hz = 10 s of history.
-    const recorder = new DebugRecorder(600);
+    // Generic kinocat/diagnostics ring buffer + car-domain formatters.
+    const recorder = new DebugRecorder<CarKinematicState, WheeledCarControls>({
+      capacity: 600,
+      formatters: carRecorderFormatters,
+    });
 
     // Plan-execute overlay (cyan polyline). Built on demand.
     const planMat = new THREE.LineBasicMaterial({ color: 0x00ffff, transparent: true, opacity: 0.95 });
@@ -497,9 +497,7 @@ export default function SimToRealScope() {
     resetFnRef.current = resetAll;
 
     exportFnRef.current = (fmt: 'json' | 'md') => {
-      const frames = recorder.frames();
-      const stats = aggregateStats(frames);
-      const meta: DebugMeta = {
+      const meta: RecorderMeta = {
         mode: modeRef.current,
         matchSubsteps: matchSubstepsRef.current,
         physicsDt: PHYSICS_DT,
@@ -509,7 +507,7 @@ export default function SimToRealScope() {
         brakeForceN: BRAKE_FORCE_N,
         hasPersistedV2: persistedModel !== null,
       };
-      return fmt === 'md' ? toMarkdown(meta, frames, stats) : toJSON(meta, frames, stats);
+      return fmt === 'md' ? recorder.toMarkdown(meta) : recorder.toJSON(meta);
     };
     // Also expose on window for headless debugging via CDP.
     (window as unknown as { __simToRealExport?: (f: 'json' | 'md') => string }).__simToRealExport =
@@ -692,28 +690,38 @@ export default function SimToRealScope() {
       friction.setVisible(showFrictionRef.current);
 
       // ---- debug capture ----
-      // ctrlVec recorded in the v2/parametric (wheeled) encoding —
-      // the kinematic ghost uses a different encoding (see encodeForSim).
+      // The recorder consumes `WheeledCarControls` (the v2/parametric
+      // wheeled encoding). The kinematic ghost uses a different encoding
+      // internally (see encodeForSim) but for the captured controls we
+      // use the wheeled form, which is what the planner ultimately emits.
       const recCtrl = encodeForSim['v2-full'](appliedControls.steer, appliedControls.throttle, appliedControls.brake);
-      const frame: DebugFrame = {
-        t: simTime,
-        applied: { ...appliedControls },
-        ctrlVec: [recCtrl[0]!, recCtrl[1]!, recCtrl[2]!],
-        real: { ...realAfter },
-        ghosts: {},
-        gaps: {},
-        wheels: wheels.map((w) => ({ ...w, contactPoint: w.contactPoint ? { ...w.contactPoint } : null })),
+      const wheeled: WheeledCarControls = {
+        steer: recCtrl[0]!,
+        driveForce: recCtrl[1]!,
+        brakeForce: recCtrl[2]!,
       };
+      const ghostStates: GhostStepResult<CarKinematicState>[] = [];
       for (const ent of ghosts.values()) {
         const last = ent.playbackTrace![ent.playbackTrace!.length - 1]!;
-        frame.ghosts[ent.kind.id] = { ...last };
-        frame.gaps[ent.kind.id] = {
-          posErr: ent.last.posErr,
-          headingErr: ent.last.headingErr,
-          speedErr: ent.last.speedErr,
-        };
+        ghostStates.push({ name: ent.kind.id, state: { ...last } });
       }
-      recorder.push(frame);
+      recorder.attachExtras({
+        appliedRaw: { ...appliedControls },
+        wheels: wheels.map((w) => ({
+          inContact: w.inContact,
+          contactPoint: w.contactPoint ? { ...w.contactPoint } : null,
+          forwardImpulse: w.forwardImpulse,
+          sideImpulse: w.sideImpulse,
+          suspensionForce: w.suspensionForce,
+          frictionSlip: w.frictionSlip,
+        })),
+      });
+      recorder.capture({
+        simTime,
+        real: { ...realAfter },
+        controls: wheeled,
+        ghosts: ghostStates,
+      });
 
       // ---- chase-cam follow when orbit is idle? Leave manual. ----
 

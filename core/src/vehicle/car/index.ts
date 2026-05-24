@@ -27,3 +27,4 @@ export {
   PlaybackPatternCarDriver,
   type PlaybackPatternSegment,
 } from './drivers';
+export { carRecorderFormatters } from './recorder-formatters';

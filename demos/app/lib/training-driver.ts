@@ -45,6 +45,11 @@ import {
   type HeadlessTrialHarness,
 } from 'kinocat/adapters/rapier';
 import type { ForwardSim } from 'kinocat/primitives';
+import type {
+  TrainingPipeline,
+  TrainingContext,
+  TrainedModel,
+} from 'kinocat/training';
 
 // ---------------------------------------------------------------------------
 // Defaults — match the race-primitives chassis tuning.
@@ -349,129 +354,214 @@ export interface RunOfflineTrainingResult {
   sampleDt: number;
 }
 
-export async function runOfflineTraining(
-  opts: RunOfflineTrainingOptions = {},
-): Promise<RunOfflineTrainingResult> {
-  const rounds = opts.rounds ?? 3;
-  const trialsPerActive = opts.trialsPerActiveRound ?? 48;
-  const ticks = opts.trialTicks ?? 120;
-  const sampleEveryN = opts.sampleEveryNTicks ?? 6;
-  const veh = opts.vehicleOptions ?? DEFAULT_VEHICLE_OPTS;
-  const seedTrials = opts.seedTrials ?? [...buildSeedGrid(), ...extremeProbes()];
-  const seed = opts.seed ?? 42;
+/** Per-parameter regularization scales used by the parametric fit.
+ *  Hand-tuned to keep weakly-constrained coefficients near the default
+ *  prior while still letting strong evidence move them. */
+const REG_SCALES: LearnedVehicleParamsV2 = {
+  engineScale: 0.10,
+  reverseEffScale: 0.15,
+  brakeScale: 0.30,
+  accelTau: 0.10,
+  gripScale: 0.15,
+  frictionCircleSlack: 0.10,
+  steerRatio: 0.15,
+  understeerOffThrottle: 0.005,
+  understeerPowerOn: 0.005,
+  yawRateTau: 0.08,
+  lateralDamping: 2.5,
+  lateralFromSteer: 0.30,
+  slipDrag: 0.30,
+  loadTransferCoeff: 0.02,
+  driveDeadzone: 80,
+  rollingResistance: 0.05,
+};
 
-  const harness = await createHeadlessTrialHarness({
-    vehicleOptions: veh,
-    groundBounds: { x0: -500, x1: 500, z0: -500, z1: 500 },
-  });
-  const config = deriveLearnableConfig({
-    id: 'driver', position: { x: 0, z: 0 }, heading: 0, ...veh,
-  });
-  const store = createTrialStore<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>();
-  let model = buildParametricOnlyModel(DEFAULT_LEARNED_PARAMS_V2, config);
-  let trialIdx = 0;
+/** Concrete car-v2 implementation of the generic `TrainingPipeline`
+ *  contract. The same class is consumed by:
+ *
+ *  - the demo's `runOfflineTraining` function (preserves the existing
+ *    demo-shape event stream + return shape for backward compatibility),
+ *  - the core's `runOfflineTraining` orchestrator (proves an alternative
+ *    vehicle pipeline could plug in identically; covered by the
+ *    equivalence test).
+ *
+ *  Carries its own Rapier harness, trial store config, and round-by-
+ *  round mutable state (current model, last diagnostics for the
+ *  active explorer's cell-error map). */
+export class CarV2TrainingPipeline
+  implements TrainingPipeline<CarKinematicState, WheeledCarControls, LearnedVehicleParamsV2, LearnableVehicleConfig>
+{
+  readonly name = 'car-v2';
+  readonly harness: HeadlessTrialHarness;
+  readonly config: LearnableVehicleConfig;
+  readonly sampleDt: number;
 
-  // Seedable RNG for active exploration jitter.
-  let rngState = seed | 0;
-  const rng = (): number => {
-    rngState = (rngState + 0x6d2b79f5) | 0;
-    let t = rngState;
+  private readonly seedTrials: CellSpec[];
+  private readonly trialsPerActive: number;
+  private readonly ticks: number;
+  private readonly sampleEveryN: number;
+  private readonly rounds: number;
+  private readonly seed: number;
+  private readonly onParametricProgress?: (round: number, e: FitProgressEvent) => void;
+  private readonly onResidualProgress?: (round: number, e: FitProgressEvent) => void;
+
+  private model: LearnedVehicleModel;
+  private lastDiag: ModelDiagnostics = { openLoopDivergence: [], perStateRms: [], coverage: [], baselines: {} };
+  private trialIdx = 0;
+  private rngState: number;
+
+  private constructor(args: {
+    harness: HeadlessTrialHarness;
+    config: LearnableVehicleConfig;
+    seedTrials: CellSpec[];
+    trialsPerActive: number;
+    ticks: number;
+    sampleEveryN: number;
+    rounds: number;
+    seed: number;
+    initialModel: LearnedVehicleModel;
+    onParametricProgress?: (round: number, e: FitProgressEvent) => void;
+    onResidualProgress?: (round: number, e: FitProgressEvent) => void;
+  }) {
+    this.harness = args.harness;
+    this.config = args.config;
+    this.seedTrials = args.seedTrials;
+    this.trialsPerActive = args.trialsPerActive;
+    this.ticks = args.ticks;
+    this.sampleEveryN = args.sampleEveryN;
+    this.rounds = args.rounds;
+    this.seed = args.seed;
+    this.sampleDt = args.sampleEveryN / 60;
+    this.model = args.initialModel;
+    this.rngState = args.seed | 0;
+    this.onParametricProgress = args.onParametricProgress;
+    this.onResidualProgress = args.onResidualProgress;
+  }
+
+  static async create(opts: {
+    rounds?: number;
+    trialsPerActiveRound?: number;
+    trialTicks?: number;
+    sampleEveryNTicks?: number;
+    seed?: number;
+    seedTrials?: CellSpec[];
+    vehicleOptions?: typeof DEFAULT_VEHICLE_OPTS;
+    onParametricProgress?: (round: number, e: FitProgressEvent) => void;
+    onResidualProgress?: (round: number, e: FitProgressEvent) => void;
+  } = {}): Promise<CarV2TrainingPipeline> {
+    const veh = opts.vehicleOptions ?? DEFAULT_VEHICLE_OPTS;
+    const harness = await createHeadlessTrialHarness({
+      vehicleOptions: veh,
+      groundBounds: { x0: -500, x1: 500, z0: -500, z1: 500 },
+    });
+    const config = deriveLearnableConfig({
+      id: 'driver', position: { x: 0, z: 0 }, heading: 0, ...veh,
+    });
+    return new CarV2TrainingPipeline({
+      harness,
+      config,
+      seedTrials: opts.seedTrials ?? [...buildSeedGrid(), ...extremeProbes()],
+      trialsPerActive: opts.trialsPerActiveRound ?? 48,
+      ticks: opts.trialTicks ?? 120,
+      sampleEveryN: opts.sampleEveryNTicks ?? 6,
+      rounds: opts.rounds ?? 3,
+      seed: opts.seed ?? 42,
+      initialModel: buildParametricOnlyModel(DEFAULT_LEARNED_PARAMS_V2, config),
+      onParametricProgress: opts.onParametricProgress,
+      onResidualProgress: opts.onResidualProgress,
+    });
+  }
+
+  totalRounds(): number {
+    return this.rounds;
+  }
+
+  /** Current learned model (parametric coefficients + optional residual
+   *  ensemble + reference dt). Mutates round-by-round. */
+  currentLearnedModel(): LearnedVehicleModel {
+    return this.model;
+  }
+
+  dispose(): void {
+    this.harness.dispose();
+  }
+
+  private rng = (): number => {
+    this.rngState = (this.rngState + 0x6d2b79f5) | 0;
+    let t = this.rngState;
     t = Math.imul(t ^ (t >>> 15), t | 1);
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 
-  let finalDiag: ModelDiagnostics = { openLoopDivergence: [], perStateRms: [], coverage: [], baselines: {} };
-  for (let round = 0; round < rounds; round++) {
-    opts.onEvent?.({ type: 'round-start', round, trialsBeforeRound: store.size() });
-    // Round 0 uses seed grid; subsequent rounds use active exploration.
-    let cells: CellSpec[];
-    if (round === 0) {
-      cells = seedTrials;
-    } else {
-      // Build cell-error map from coverage diagnostics of previous evaluation.
-      const cellErrors = new Map<string, { error: number; count: number }>();
-      for (const c of finalDiag.coverage) {
-        cellErrors.set(c.binId, { error: c.errorRms, count: c.count });
-      }
-      const explorationCells = buildExplorationCells(cellErrors, rng);
-      const proposed = proposeNextBatch({
-        cells: explorationCells, budget: trialsPerActive, seed: seed + round,
-        alwaysInclude: extremeProbes(),
-      });
-      cells = proposed.map((p) => p.spec);
+  /** Round 0 → seed grid; rounds > 0 → active exploration sampled from
+   *  the previous round's per-cell error map. */
+  private nextCells(round: number): CellSpec[] {
+    if (round === 0) return this.seedTrials;
+    const cellErrors = new Map<string, { error: number; count: number }>();
+    for (const c of this.lastDiag.coverage) {
+      cellErrors.set(c.binId, { error: c.errorRms, count: c.count });
     }
-    const { collected, discarded } = await collectTrialBatch(harness, cells, ticks, sampleEveryN, trialIdx);
-    trialIdx += cells.length;
-    for (const t of collected) store.add(t);
-    opts.onEvent?.({ type: 'trial-batch', round, collected: collected.length, discarded });
+    const explorationCells = buildExplorationCells(cellErrors, this.rng);
+    const proposed = proposeNextBatch({
+      cells: explorationCells, budget: this.trialsPerActive, seed: this.seed + round,
+      alwaysInclude: extremeProbes(),
+    });
+    return proposed.map((p) => p.spec);
+  }
 
-    // Fit on accumulated trials.
-    // Per-parameter regularization scales: how far each coefficient can
-    // drift from the default prior before the regularization penalty
-    // grows significantly. Larger scale = looser. Tighter scales pull
-    // weakly-constrained coefficients (the ones that pin to bounds when
-    // unregularized) toward physically-grounded defaults. Hand-tuned to
-    // the parameter magnitudes — see PARAM_NAMES ordering in vehicle-
-    // model.ts (paramsV2ToVec).
-    const REG_SCALES: LearnedVehicleParamsV2 = {
-      engineScale: 0.10,
-      reverseEffScale: 0.15,
-      brakeScale: 0.30,
-      accelTau: 0.10,
-      gripScale: 0.15,
-      frictionCircleSlack: 0.10,
-      steerRatio: 0.15,
-      understeerOffThrottle: 0.005,
-      understeerPowerOn: 0.005,
-      yawRateTau: 0.08,
-      lateralDamping: 2.5,
-      lateralFromSteer: 0.30,
-      slipDrag: 0.30,
-      loadTransferCoeff: 0.02,
-      driveDeadzone: 80,
-      rollingResistance: 0.05,
-    };
+  async collectTrials(
+    ctx: TrainingContext<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>,
+  ): Promise<{ collected: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[]; discarded: number }> {
+    const cells = this.nextCells(ctx.round);
+    const result = await collectTrialBatch(this.harness, cells, this.ticks, this.sampleEveryN, this.trialIdx);
+    this.trialIdx += cells.length;
+    return result;
+  }
+
+  async fitParametric(
+    ctx: TrainingContext<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>,
+    onProgress?: (e: FitProgressEvent) => void,
+  ): Promise<LearnedVehicleParamsV2> {
     const fit = runParametricFit<LearnedVehicleParamsV2, CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
-      init: model.params,
+      init: this.model.params,
       encode: paramsV2ToVec,
       decode: paramsV2FromVec,
       makeSim: (p, cfg) => parametricForwardV2(p, cfg),
       stateDelta: stateDeltaForFit,
-      trials: store.all(),
+      trials: ctx.store.all(),
       controlsToVec,
-      maxIter: round === 0 ? 200 : 120,
-      onProgress: (e) => opts.onEvent?.({ type: 'fit-progress', round, phase: 'parametric', event: e }),
-      // Pull toward DEFAULT_LEARNED_PARAMS_V2 to prevent the fit from
-      // pinning coefficients to bounds. 0.05 strength × ~4000 samples ≈
-      // 200 reg per param-diff — meaningful next to a typical data loss
-      // around ~15k while still letting data move the fit when it has
-      // strong evidence.
+      maxIter: ctx.round === 0 ? 200 : 120,
+      onProgress: (e) => {
+        onProgress?.(e);
+        this.onParametricProgress?.(ctx.round, e);
+      },
+      // Regularize toward DEFAULT_LEARNED_PARAMS_V2 to keep weakly-
+      // constrained coefficients from pinning to bounds.
       regularization: {
         strength: 0.05,
         priorVec: paramsV2ToVec(DEFAULT_LEARNED_PARAMS_V2),
         scales: paramsV2ToVec(REG_SCALES),
       },
     });
-    model = { ...model, params: fit.params };
+    this.model = { ...this.model, params: fit.params };
+    return fit.params;
+  }
 
-    // Residual MLP fit. The parametric model alone cannot represent
-    // Rapier's full nonlinear behavior (engine torque falloff at speed,
-    // tire slip, suspension load transfer, etc) — so several coefficients
-    // tended to pin to bounds when the parametric fit ran solo. The
-    // residual MLP ensemble learns the per-tick correction the parametric
-    // can't, dropping open-loop prediction error substantially without
-    // forcing the parametric into unphysical regions.
-    //
-    // Only fit residual after enough rounds of trial data have built up,
-    // and only on the final round (the parametric needs to be at its
-    // final fit before residual training — fitting residual against an
-    // intermediate parametric would baked-in stale corrections).
-    const isFinalRound = round === rounds - 1;
-    if (isFinalRound && store.size() >= 16) {
-      const baselineSim = parametricForwardV2(model.params, config);
+  async fitResidual(
+    ctx: TrainingContext<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>,
+    params: LearnedVehicleParamsV2,
+    onProgress?: (e: FitProgressEvent) => void,
+  ): Promise<TrainedModel<CarKinematicState, LearnedVehicleParamsV2>> {
+    // Only fit residual on the final round, and only if we have enough
+    // trials. The parametric needs to be at its final fit BEFORE residual
+    // training — fitting residual against an intermediate parametric
+    // bakes stale corrections in.
+    const isFinalRound = ctx.round === this.rounds - 1;
+    if (isFinalRound && ctx.store.size() >= 16) {
+      const baselineSim = parametricForwardV2(params, this.config);
       const residualFit = runResidualMLPFit<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
-        trials: store.all(),
+        trials: ctx.store.all(),
         makeBaselineSim: () => baselineSim,
         encodeInput: (s, ctrl, cfg) => buildMLPInput(s, ctrl, cfg),
         encodeResidual: (actual, baseline) => [
@@ -490,53 +580,86 @@ export async function runOfflineTraining(
         batchSize: 64,
         learningRate: 1e-3,
         valSplit: 0.2,
-        // Reference dt for the per-sample residual. Samples are recorded
-        // every `sampleEveryN` physics ticks @ 60 Hz, so each sample
-        // interval = sampleEveryN / 60 seconds.
         fitSubstepsPerSample: 6,
         onProgress: (e) => {
-          // Tagged as 'residual' so UI can distinguish parametric-fit
-          // curve from MLP-fit curve when rendering.
-          opts.onEvent?.({
-            type: 'fit-progress',
-            round,
-            phase: 'residual',
-            event: { iter: e.epoch, loss: e.trainLoss, perComponent: undefined },
-          });
+          const ev: FitProgressEvent = { iter: e.epoch, loss: e.trainLoss, perComponent: undefined };
+          onProgress?.(ev);
+          this.onResidualProgress?.(ctx.round, ev);
         },
       });
-      model = {
-        ...model,
+      this.model = {
+        ...this.model,
+        params,
         residualEnsemble: residualFit.ensemble,
-        // Each sample interval = (sampleEveryN ticks) / 60 Hz seconds.
-        // Default sampleEveryN = 6 → 0.1s reference dt.
-        residualReferenceDt: sampleEveryN / 60,
+        residualReferenceDt: this.sampleEveryN / 60,
       };
+    } else {
+      this.model = { ...this.model, params };
     }
+    return {
+      params: this.model.params,
+      forwardSim: learnedForwardSimV2(this.model),
+    };
+  }
 
-    // Evaluate.
-    finalDiag = evaluate(store, model);
-    // Populate coverage with bin keys we'll use for active exploration in the next round.
-    finalDiag = withCellBinning(finalDiag, store);
+  evaluate(
+    ctx: TrainingContext<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>,
+    _trained: TrainedModel<CarKinematicState, LearnedVehicleParamsV2>,
+  ): ModelDiagnostics {
+    let diag = evaluate(ctx.store, this.model);
+    diag = withCellBinning(diag, ctx.store);
+    this.lastDiag = diag;
+    return diag;
+  }
+}
+
+export async function runOfflineTraining(
+  opts: RunOfflineTrainingOptions = {},
+): Promise<RunOfflineTrainingResult> {
+  const pipeline = await CarV2TrainingPipeline.create({
+    rounds: opts.rounds,
+    trialsPerActiveRound: opts.trialsPerActiveRound,
+    trialTicks: opts.trialTicks,
+    sampleEveryNTicks: opts.sampleEveryNTicks,
+    seed: opts.seed,
+    seedTrials: opts.seedTrials,
+    vehicleOptions: opts.vehicleOptions,
+  });
+  const store = createTrialStore<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>();
+  let finalDiag: ModelDiagnostics = { openLoopDivergence: [], perStateRms: [], coverage: [], baselines: {} };
+  for (let round = 0; round < pipeline.totalRounds(); round++) {
+    opts.onEvent?.({ type: 'round-start', round, trialsBeforeRound: store.size() });
+    const ctx: TrainingContext<CarKinematicState, WheeledCarControls, LearnableVehicleConfig> = { round, store };
+    const { collected, discarded } = await pipeline.collectTrials(ctx);
+    for (const t of collected) store.add(t);
+    opts.onEvent?.({ type: 'trial-batch', round, collected: collected.length, discarded });
+    const params = await pipeline.fitParametric(ctx, (event) =>
+      opts.onEvent?.({ type: 'fit-progress', round, phase: 'parametric', event }),
+    );
+    const trained = await pipeline.fitResidual(ctx, params, (event) =>
+      opts.onEvent?.({ type: 'fit-progress', round, phase: 'residual', event }),
+    );
+    finalDiag = pipeline.evaluate(ctx, trained);
     opts.onEvent?.({ type: 'evaluation', round, diagnostics: finalDiag });
     opts.onEvent?.({
       type: 'round-end',
       round,
-      trainedModel: model,
-      params: model.params,
+      trainedModel: pipeline.currentLearnedModel(),
+      params: pipeline.currentLearnedModel().params,
       diagnostics: finalDiag,
       trialsAfter: store.size(),
     });
   }
-  if (!opts.keepHarness) harness.dispose();
-  opts.onEvent?.({ type: 'done', totalTrials: store.size(), finalModel: model, finalDiagnostics: finalDiag });
+  const finalModel = pipeline.currentLearnedModel();
+  if (!opts.keepHarness) pipeline.dispose();
+  opts.onEvent?.({ type: 'done', totalTrials: store.size(), finalModel, finalDiagnostics: finalDiag });
   return {
-    model,
+    model: finalModel,
     trials: store,
     finalDiagnostics: finalDiag,
-    harness: opts.keepHarness ? harness : undefined,
-    config,
-    sampleDt: sampleEveryN / 60,
+    harness: opts.keepHarness ? pipeline.harness : undefined,
+    config: pipeline.config,
+    sampleDt: pipeline.sampleDt,
   };
 }
 
