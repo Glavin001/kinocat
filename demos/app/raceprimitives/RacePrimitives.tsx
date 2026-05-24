@@ -78,41 +78,39 @@ import {
 } from '../lib/debug-report';
 import type { LearnedVehicleModel } from 'kinocat/agent';
 
-const PHYSICS_DT = 1 / 60;
-const VEHICLE_SUBSTEPS = 4;
-// Force constants matching `LEARN_VEHICLE_TUNING`. Used to convert legacy
-// normalized `{throttle, brake}` to the canonical `WheeledCarControls`
-// action shape every vehicle source now emits.
-const ENGINE_FORCE_N = 4000;
-const BRAKE_FORCE_N = 2000;
+// SINGLE SOURCE OF TRUTH: all race-simulation tunables live in
+// `../lib/race-scenario.ts`. Importing them here (rather than redeclaring
+// inline) guarantees the React demo + the headless CLI cannot drift on
+// physics dt, replan cadence, pure-pursuit gain, steer-angle formula,
+// engine/brake forces, etc. If you need to change any value, change it
+// in `race-scenario.ts` and BOTH consumers update automatically.
+//
+// Behavioral note: until the React tick loop also routes through
+// `createRaceScenario` (planned follow-up), this file still has its own
+// `replan` + `stepCar` implementations that read these constants. They
+// mirror `race-scenario.ts` line-for-line so behavior is identical.
+import {
+  PHYSICS_DT,
+  VEHICLE_SUBSTEPS,
+  REPLAN_INTERVAL_MS,
+  WHEEL_BASE,
+  ENGINE_FORCE_N,
+  BRAKE_FORCE_N,
+  TRACKER_MAX_LATERAL_ACCEL as SCENARIO_TRACKER_MAX_LATERAL_ACCEL,
+  PLAN_LOOKAHEAD_COUNT as SCENARIO_PLAN_LOOKAHEAD_COUNT,
+} from '../lib/race-scenario';
 
-// Per-chassis force tuning; arithmetic + chassis-side steer-sign flip
-// live in `kinocat/vehicle/car`'s `wheeledFromNormalized`.
 const RACE_FORCE_TUNING: CarForceTuning = {
   engineForceN: ENGINE_FORCE_N,
   brakeForceN: BRAKE_FORCE_N,
 };
 const toWheeled = (cmd: { steer: number; throttle: number; brake: number }) =>
   wheeledFromNormalized(cmd, RACE_FORCE_TUNING);
-// 300ms tick (~3.3 Hz). Both cars plan in the SAME tick callback so they
-// always plan at the same wall-time with the same per-car budget — fair
-// by construction. CPU = 2 × RACE_REPLAN_BUDGET_MS (120) / 300 = 80%
-// (was 120% with the old 500ms × 300 budget, which was over-saturated
-// and animation visibly choked).
-const REPLAN_INTERVAL_MS = 300;
-const WHEEL_BASE = 1.6;
-// Real tire grip on dry asphalt is ~9-10 m/s² (~1g). 12 keeps the cars
-// physically plausible — pure-pursuit won't follow a plan that demands more
-// than this, so a kinematic plan saying "take this turn at 16 m/s" gets
-// clipped to ~7 m/s by the tracker. The LEARNED planner knows about this
-// and plans entry speeds the tracker WON'T need to clip, so its trajectory
-// executes cleanly. With the previous TRACKER_MAX_LATERAL_ACCEL=25 the
-// tracker would let the car attempt impossible turns and slide off-map.
-const TRACKER_MAX_LATERAL_ACCEL = 12;
-// Multi-goal A* lookahead: number of consecutive gates the planner sees
-// per replan. Module-scope so the debug-report export can include it
-// alongside other planner-config snapshots.
-const PLAN_LOOKAHEAD_COUNT = 2;
+// Re-export the scenario-shared constants under the names the rest of this
+// file uses. Real tire grip on dry asphalt is ~9-10 m/s² (~1g); the value
+// in race-scenario.ts (12) keeps the cars physically plausible.
+const TRACKER_MAX_LATERAL_ACCEL = SCENARIO_TRACKER_MAX_LATERAL_ACCEL;
+const PLAN_LOOKAHEAD_COUNT = SCENARIO_PLAN_LOOKAHEAD_COUNT;
 // Online-learning buffer cap. ~60Hz × ~30s/lap = 1800 samples/lap; 4000
 // covers ~2 laps of real driving, refit converges in well under a second.
 const ONLINE_SAMPLE_CAP = 4000;
