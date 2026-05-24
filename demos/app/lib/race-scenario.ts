@@ -38,7 +38,7 @@ import {
   type CarKinematicState,
   type WheeledCarControls,
 } from 'kinocat/vehicle/car';
-import { purePursuit, smoothSpeedProfile } from 'kinocat/execute';
+import { purePursuit, smoothSpeedProfile, smoothTrajectory } from 'kinocat/execute';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavWorld } from 'kinocat/environment';
 import type { MotionPrimitiveLibrary } from 'kinocat/primitives';
@@ -436,12 +436,26 @@ export async function createRaceScenario(
     c.diagnostics.lastReplanFound = res.found && res.path.length > 1;
     c.diagnostics.totalReplans += 1;
     if (c.diagnostics.lastReplanFound) {
-      // Friction-circle-aware speed-profile post-pass. The primitive A*
-      // emits a sequence of per-primitive endpoint speeds; we replace
-      // them with a curvature-respecting forward/backward smoothed
-      // profile, killing "hot-into-the-corner" overshoot. Path geometry
-      // (x, z, heading) is preserved; only speeds and `t` change.
-      const smoothed = smoothSpeedProfile(res.path, {
+      // Two-stage post-process pipeline (Apollo / Autoware shape):
+      //  (a) Geometric trajectory smoother — turns the sparse, sharp-
+      //      seamed motion-primitive polyline into a dense (~0.4m
+      //      spacing), C¹-continuous reference. Without this the
+      //      prediction/visualisation/lookahead all sample on a
+      //      piecewise-linear interpolation of primitive endpoints,
+      //      which is exactly what produced the "sharp lines" in the
+      //      predicted plan.
+      //  (b) Friction-circle speed-profile pass — assigns a
+      //      curvature- and brake-distance-aware speed at every dense
+      //      sample. Now operates on much denser samples so curvature
+      //      estimates are accurate.
+      const geomSmoothed = smoothTrajectory(res.path, {
+        sampleSpacing: 0.4,
+        iterations: 20,
+        dataWeight: 0.5,
+        smoothWeight: 0.3,
+        anchorEndpoints: true,
+      });
+      const smoothed = smoothSpeedProfile(geomSmoothed, {
         aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel,
         aLonMaxAccel: PURE_PURSUIT_CONFIG.maxAccel,
         aLonMaxDecel: PURE_PURSUIT_CONFIG.maxDecel,

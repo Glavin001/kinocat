@@ -9,3 +9,4 @@ export type {
 export { purePursuit } from './pure-pursuit';
 export { ReplanState, planPoseAt } from './replan';
 export { smoothSpeedProfile, type SpeedProfileOptions } from './speed-profile';
+export { smoothTrajectory, type TrajectorySmoothOptions } from './trajectory-smoother';
