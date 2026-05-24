@@ -1030,14 +1030,24 @@ async function setupScene(
     car.idealLine.geometry.dispose();
     car.idealLine.geometry = new THREE.BufferGeometry().setFromPoints(pts);
     car.idealLine.computeLineDistances();
-    // Plan polyline (if a plan is available).
+    // Plan polyline (if a plan is available). Trim the segment we've
+    // already executed, then prepend the chassis position so the line
+    // starts exactly where the car is and follows ONLY the unexecuted
+    // future. With the commit-window stitch the plan's first sample
+    // may be the predicted future state (not the live chassis) — the
+    // prepended chassis point bridges that small gap so the rendered
+    // line is "from where I am, along what I plan to do" rather than
+    // including a stale tail or a phantom future-start segment.
     if (status.plan && status.plan.length >= 2) {
       if (car.pathLine) {
         car.scene.remove(car.pathLine);
         car.pathLine.geometry.dispose();
         (car.pathLine.material as THREE.Material).dispose();
       }
-      const pl = status.plan.map((p) => new THREE.Vector3(p.x, 0.4, p.z));
+      const elapsed = Math.max(0, scenario.simTime() - status.planStartSimTime);
+      const tail = trimPlan(status.plan, elapsed);
+      const pl: THREE.Vector3[] = [new THREE.Vector3(after.x, 0.4, after.z)];
+      for (const p of tail) pl.push(new THREE.Vector3(p.x, 0.4, p.z));
       car.pathLine = new THREE.Line(
         new THREE.BufferGeometry().setFromPoints(pl),
         new THREE.LineBasicMaterial({ color: car.pathColor, transparent: true, opacity: 0.85 }),
