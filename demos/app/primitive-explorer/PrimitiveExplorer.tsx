@@ -24,7 +24,7 @@ import {
 const KINEMATIC_CSS = '#ff8aa0';
 const LEARNED_CSS = '#55dcff';
 const GATE_CSS = '#ffd070';
-import { loadV2Model, type PersistedV2Model } from '../lib/v2-model-persistence';
+import { loadV2Model, loadV2ModelFromUrl, type PersistedV2Model } from '../lib/v2-model-persistence';
 import { diagnoseLibrary, type LibraryDiagnostics } from '../lib/primitive-diagnostics';
 import { PrimitiveFanPlot } from '../components/PrimitiveFanPlot';
 import { PrimitiveOverlayPlot } from '../components/PrimitiveOverlayPlot';
@@ -39,11 +39,23 @@ export default function PrimitiveExplorer() {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
 
   useEffect(() => {
-    const v2 = loadV2Model();
-    if (v2) {
-      setV2Model(v2.model);
-      setV2Meta(v2.meta);
+    let cancelled = false;
+    const cached = loadV2Model();
+    if (cached) {
+      setV2Model(cached.model);
+      setV2Meta(cached.meta);
+      return;
     }
+    // No cached model — fall back to the preloaded artifact the
+    // `pnpm run train` CLI ships with the project.
+    void loadV2ModelFromUrl().then((res) => {
+      if (cancelled || !res) return;
+      setV2Model(res.model);
+      setV2Meta(res.meta);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const kinematicLib = useMemo(() => buildKinematicLibrary(), []);

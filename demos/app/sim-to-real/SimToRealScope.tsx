@@ -61,7 +61,7 @@ import {
   RACE_BOUNDS,
   buildLearnedRaceLibraryV2,
 } from '../lib/race-primitives-scenarios';
-import { loadV2Model } from '../lib/v2-model-persistence';
+import { loadV2Model, loadV2ModelFromUrl } from '../lib/v2-model-persistence';
 import {
   projectFuture,
   poseGap,
@@ -179,9 +179,18 @@ export default function SimToRealScope() {
     (async () => {
       await ensureRapier();
       if (cancelled) return;
-      const cached = loadV2Model();
-      setHasModel(cached !== null);
-      cleanup = setupScene(mount, cached?.model ?? null);
+      // Prefer localStorage (user's own trained / imported model); fall
+      // back to the preloaded `/models/v2-default.json` artifact the
+      // `pnpm run train` CLI shipped with the project so a fresh visitor
+      // sees the v2 ghost without retraining.
+      let resolved = loadV2Model();
+      if (!resolved) {
+        const preloaded = await loadV2ModelFromUrl();
+        if (cancelled) return;
+        resolved = preloaded;
+      }
+      setHasModel(resolved !== null);
+      cleanup = setupScene(mount, resolved?.model ?? null);
       setReady(true);
     })();
     return () => {

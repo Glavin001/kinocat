@@ -65,6 +65,7 @@ import { ModelLab } from '../components/ModelLab';
 import { useIsMobile } from '../lib/use-is-mobile';
 import {
   loadV2Model,
+  loadV2ModelFromUrl,
   saveV2Model,
   clearV2Model,
   buildV2ModelDownloadUrl,
@@ -265,6 +266,10 @@ export default function RacePrimitives() {
   const [v2Model, setV2Model] = useState<LearnedVehicleModel | null>(null);
   const [v2Meta, setV2Meta] = useState<PersistedV2Model['meta'] | null>(null);
   const [useV2, setUseV2State] = useState(false);
+  // True iff `/models/v2-default.json` is reachable (the preloaded
+  // artifact `pnpm run train` writes). Drives the "Reset to default"
+  // button in Model Lab.
+  const [hasPreloadedDefault, setHasPreloadedDefault] = useState(false);
   // Persist the toggle so the user doesn't have to re-enable v2 on every
   // page reload after they've trained a model.
   const setUseV2 = (v: boolean) => {
@@ -292,20 +297,49 @@ export default function RacePrimitives() {
     const p = loadLearnedParams();
     setParams(p ?? DEFAULT_LEARNED_PARAMS);
     setPhase('ready');
-    // Also try to load a previously-trained v2 model so the user can
-    // immediately toggle "use v2" without retraining each visit.
-    const v2 = loadV2Model();
-    if (v2) {
-      setV2Model(v2.model);
-      setV2Meta(v2.meta);
+    // Try the localStorage cache first — if the user trained or imported
+    // a model in a previous session it stays sticky.
+    const cached = loadV2Model();
+    let cancelled = false;
+    if (cached) {
+      setV2Model(cached.model);
+      setV2Meta(cached.meta);
     }
+    // Always probe the preloaded artifact in the background — both so
+    // we can light up the "Reset to default" button, and so a fresh
+    // visitor (no cache) gets the CLI-trained model without waiting on
+    // an inline retrain. Preloaded never overrides a cached model
+    // (otherwise the user's training would be silently discarded on
+    // reload).
+    void loadV2ModelFromUrl().then((res) => {
+      if (cancelled) return;
+      if (!res) return;
+      setHasPreloadedDefault(true);
+      if (!cached) {
+        setV2Model(res.model);
+        setV2Meta(res.meta);
+      }
+    });
     if (typeof window !== 'undefined') {
       try {
         const v = window.localStorage.getItem('kinocat:v2-toggle:v1');
         if (v === '1') setUseV2State(true);
       } catch { /* ignore */ }
     }
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  // Reset action wired into the Model Lab "Reset to default" button.
+  // Discards any cached model + reloads the preloaded artifact.
+  async function resetToPreloadedDefault(): Promise<void> {
+    const res = await loadV2ModelFromUrl();
+    if (!res) return;
+    clearV2Model();
+    setV2Model(res.model);
+    setV2Meta(res.meta);
+  }
 
   // Mount the Three.js + Rapier scene as soon as initial params are decided.
   // Also re-mounts when the v2 toggle changes (rebuilds the learned car's
@@ -580,6 +614,8 @@ export default function RacePrimitives() {
           useV2={useV2}
           onToggleUseV2={setUseV2}
           hasV2Model={v2Model !== null}
+          onResetToDefault={resetToPreloadedDefault}
+          hasPreloadedDefault={hasPreloadedDefault}
         />
       </div>
     </div>

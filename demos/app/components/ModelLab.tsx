@@ -27,6 +27,14 @@ export interface ModelLabProps {
   onClearLoaded?: () => void;
   /** Optional download trigger when the user has a trained or loaded model. */
   onExport?: () => void;
+  /** Reset back to the preloaded `/models/v2-default.json` artifact (the
+   *  model the `pnpm run train` CLI shipped with the project). Optional —
+   *  when absent, the button is hidden. */
+  onResetToDefault?: () => void;
+  /** True iff a preloaded default artifact is known to be available
+   *  (the page tried to fetch it on mount and got a 200). Drives the
+   *  reset button's enabled state. */
+  hasPreloadedDefault?: boolean;
   /** Whether the v2 library is currently driving the learned car. */
   useV2: boolean;
   onToggleUseV2: (v: boolean) => void;
@@ -158,6 +166,15 @@ export function ModelLab(props: ModelLabProps) {
           )}
           {props.hasV2Model && props.onClearLoaded && (
             <button onClick={props.onClearLoaded} style={ghostBtnStyle}>Clear cached</button>
+          )}
+          {props.onResetToDefault && props.hasPreloadedDefault && (
+            <button
+              onClick={props.onResetToDefault}
+              style={ghostBtnStyle}
+              title="Reload the v2 model the `pnpm run train` CLI shipped with this project"
+            >
+              Reset to default
+            </button>
           )}
         </Row>
       </Section>
