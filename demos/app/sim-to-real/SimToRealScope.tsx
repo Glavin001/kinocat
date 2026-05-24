@@ -47,6 +47,7 @@ import {
 import {
   encodeForParametricV2,
   encodeForKinematic,
+  wheeledFromNormalized,
 } from 'kinocat/vehicle/car';
 import {
   createCarMeshHelper,
@@ -590,8 +591,15 @@ export default function SimToRealScope() {
         }
       }
 
-      // ---- step Rapier ----
-      car.applyControls(appliedControls);
+      // Canonical action shape: WheeledCarControls. Steer-sign flip + force
+      // scaling come from `wheeledFromNormalized` so the chassis input
+      // matches the headless learner and every other demo bit-for-bit.
+      car.applyWheeledControls(
+        wheeledFromNormalized(appliedControls, {
+          engineForceN: ENGINE_FORCE_N,
+          brakeForceN: BRAKE_FORCE_N,
+        }),
+      );
       stepRaycastVehicle(world, [car], { dt: PHYSICS_DT, substeps: VEHICLE_SUBSTEPS });
       const subDt = PHYSICS_DT / VEHICLE_SUBSTEPS;
       const realAfter: CarKinematicState = { ...car.readState(0), t: simTime + PHYSICS_DT };

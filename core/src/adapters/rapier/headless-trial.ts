@@ -16,6 +16,7 @@
 import RAPIER from '@dimforge/rapier3d-compat';
 import type { CarKinematicState } from '../../agent/types';
 import type { WheeledCarControls } from '../../agent/controls';
+import { ZERO_WHEELED } from '../../vehicle/car/wheeled';
 import {
   type LearnableVehicleConfig,
   DEFAULT_LEARNABLE_CONFIG,
@@ -104,7 +105,7 @@ export async function createHeadlessTrialHarness(
   });
   // Initial settle so the suspension is at rest length.
   for (let i = 0; i < 30; i++) {
-    car.applyControls({ steer: 0, throttle: 0, brake: 0 });
+    car.applyWheeledControls(ZERO_WHEELED);
     world.timestep = PHYSICS_DT;
     car.vehicle.updateVehicle(PHYSICS_DT);
     world.step();

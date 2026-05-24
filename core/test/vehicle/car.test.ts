@@ -15,6 +15,8 @@ import {
   keyboardAckermann,
   keysFromSet,
   trimPlan,
+  wheeledFromNormalized,
+  ZERO_WHEELED,
   type CarKinematicState,
 } from '../../src/vehicle/car';
 
@@ -170,7 +172,33 @@ describe('PlanFollowerCarDriver', () => {
     const c = d.sample({ x: 0, z: 0, heading: 0, speed: 0, t: 0 }, 0, 1 / 60);
     expect(c).toEqual({ steer: 0, driveForce: 0, brakeForce: 0 });
   });
+});
 
+describe('wheeledFromNormalized', () => {
+  const tuning = { engineForceN: 4000, brakeForceN: 2000 };
+  it('pre-negates steer (planner-frame -> Rapier-frame)', () => {
+    const out = wheeledFromNormalized({ steer: 0.3, throttle: 0, brake: 0 }, tuning);
+    expect(out.steer).toBeCloseTo(-0.3, 12);
+  });
+  it('scales throttle by engineForceN, supports reverse', () => {
+    expect(
+      wheeledFromNormalized({ steer: 0, throttle: 0.5, brake: 0 }, tuning).driveForce,
+    ).toBeCloseTo(2000, 12);
+    expect(
+      wheeledFromNormalized({ steer: 0, throttle: -1, brake: 0 }, tuning).driveForce,
+    ).toBeCloseTo(-4000, 12);
+  });
+  it('scales brake by brakeForceN', () => {
+    expect(
+      wheeledFromNormalized({ steer: 0, throttle: 0, brake: 0.5 }, tuning).brakeForce,
+    ).toBeCloseTo(1000, 12);
+  });
+  it('ZERO_WHEELED is the no-op input', () => {
+    expect(ZERO_WHEELED).toEqual({ steer: 0, driveForce: 0, brakeForce: 0 });
+  });
+});
+
+describe('PlanFollowerCarDriver (plan set)', () => {
   it('produces a finite command once a plan is set', () => {
     const d = new PlanFollowerCarDriver({
       config: {

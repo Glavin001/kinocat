@@ -68,7 +68,7 @@ describe.skipIf(!RAPIER_OK)('HeadlessTrialHarness vs RapierCarBody equivalence',
     });
     // Initial settle (30) + per-spec settle (9) = 39 ticks of zero controls.
     for (let i = 0; i < 30; i++) {
-      carB.applyControls({ steer: 0, throttle: 0, brake: 0 });
+      carB.applyWheeledControls({ steer: 0, driveForce: 0, brakeForce: 0 });
       worldB.timestep = 1 / 60;
       carB.vehicle.updateVehicle(1 / 60);
       worldB.step();

@@ -35,7 +35,7 @@ function makeCar() {
   });
   // Settle.
   for (let i = 0; i < 30; i++) {
-    car.applyControls({ steer: 0, throttle: 0, brake: 0 });
+    car.applyWheeledControls({ steer: 0, driveForce: 0, brakeForce: 0 });
     world.timestep = PHYSICS_DT;
     car.vehicle.updateVehicle(PHYSICS_DT);
     world.step();

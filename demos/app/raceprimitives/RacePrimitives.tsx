@@ -23,7 +23,11 @@ import {
   stepRaycastVehicle,
   type CarHandle,
 } from 'kinocat/adapters/rapier';
-import { trimPlan } from 'kinocat/vehicle/car';
+import {
+  trimPlan,
+  wheeledFromNormalized,
+  type CarForceTuning,
+} from 'kinocat/vehicle/car';
 import {
   createCarMeshHelper,
   syncCarMesh,
@@ -75,6 +79,20 @@ import type { LearnedVehicleModel } from 'kinocat/agent';
 
 const PHYSICS_DT = 1 / 60;
 const VEHICLE_SUBSTEPS = 4;
+// Force constants matching `LEARN_VEHICLE_TUNING`. Used to convert legacy
+// normalized `{throttle, brake}` to the canonical `WheeledCarControls`
+// action shape every vehicle source now emits.
+const ENGINE_FORCE_N = 4000;
+const BRAKE_FORCE_N = 2000;
+
+// Per-chassis force tuning; arithmetic + chassis-side steer-sign flip
+// live in `kinocat/vehicle/car`'s `wheeledFromNormalized`.
+const RACE_FORCE_TUNING: CarForceTuning = {
+  engineForceN: ENGINE_FORCE_N,
+  brakeForceN: BRAKE_FORCE_N,
+};
+const toWheeled = (cmd: { steer: number; throttle: number; brake: number }) =>
+  wheeledFromNormalized(cmd, RACE_FORCE_TUNING);
 // 300ms tick (~3.3 Hz). Both cars plan in the SAME tick callback so they
 // always plan at the same wall-time with the same per-car budget — fair
 // by construction. CPU = 2 × RACE_REPLAN_BUDGET_MS (120) / 300 = 80%
@@ -919,7 +937,7 @@ async function setupScene(
   // ---- Settle both vehicles ----
   for (const car of [kinematic, learned]) {
     for (let i = 0; i < 30; i++) {
-      car.car.applyControls({ steer: 0, throttle: 0, brake: 0 });
+      car.car.applyWheeledControls({ steer: 0, driveForce: 0, brakeForce: 0 });
       stepRaycastVehicle(car.world, [car.car], { dt: PHYSICS_DT, substeps: 1 });
     }
     car.car.teleport({
@@ -1108,7 +1126,7 @@ async function setupScene(
       // Brake firmly to a stop and hold. Sync hold should be brief — the
       // other car catches up within seconds — but firm braking ensures the
       // car doesn't drift through the next gate during the wait.
-      car.car.applyControls({ steer: 0, throttle: 0, brake: 1 });
+      car.car.applyWheeledControls(toWheeled({ steer: 0, throttle: 0, brake: 1 }));
       car.metrics.liveControls = { steer: 0, throttle: 0, brake: 1, targetSpeed: 0 };
     } else if (car.ai.plan && car.ai.plan.length > 1) {
       const elapsed = (now - car.ai.planStartWall) / 1000;
@@ -1129,7 +1147,7 @@ async function setupScene(
           minTurnRadius: RACE_AGENT.minTurnRadius,
         });
         const steer = -Math.atan(cmd.steering * (2 * WHEEL_BASE));
-        car.car.applyControls({ steer, throttle: cmd.throttle, brake: cmd.brake });
+        car.car.applyWheeledControls(toWheeled({ steer, throttle: cmd.throttle, brake: cmd.brake }));
         recordedControls = [cmd.steering, cmd.targetSpeed];
         car.metrics.liveControls = {
           steer: cmd.steering, throttle: cmd.throttle, brake: cmd.brake,
@@ -1140,13 +1158,13 @@ async function setupScene(
         car.lookaheadMarker.position.set(cmd.lookahead.x, 0.5, cmd.lookahead.z);
         car.lookaheadMarker.visible = true;
       } else {
-        car.car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
+        car.car.applyWheeledControls(toWheeled({ steer: 0, throttle: 0.2, brake: 0 }));
         recordedControls = [0, 5];
         car.metrics.liveControls = { steer: 0, throttle: 0.2, brake: 0, targetSpeed: 5 };
         car.lookaheadMarker.visible = false;
       }
     } else {
-      car.car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
+      car.car.applyWheeledControls(toWheeled({ steer: 0, throttle: 0.2, brake: 0 }));
       recordedControls = [0, 5];
       car.metrics.liveControls = { steer: 0, throttle: 0.2, brake: 0, targetSpeed: 5 };
       car.lookaheadMarker.visible = false;

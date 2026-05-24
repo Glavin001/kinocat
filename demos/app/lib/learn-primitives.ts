@@ -34,6 +34,11 @@ import {
   type CarHandle,
   type RaycastVehicleOptions,
 } from 'kinocat/adapters/rapier';
+import {
+  wheeledFromNormalized,
+  ZERO_WHEELED,
+  type CarForceTuning,
+} from 'kinocat/vehicle/car';
 import { CARCHASE_AGENT } from './carchase-scenarios';
 
 // ---------------------------------------------------------------------------
@@ -56,6 +61,14 @@ export const LEARN_VEHICLE_TUNING: Omit<RaycastVehicleOptions, 'id' | 'position'
   brakeForce: 2000,
   maxSteerAngle: 0.6,
   driveTrain: 'rwd',
+};
+
+// Per-chassis force tuning for the headless learner, consumed by the
+// shared `wheeledFromNormalized` helper so every action source (demos,
+// trial harness, model rollout) shares one arithmetic path.
+const LEARN_FORCE_TUNING: CarForceTuning = {
+  engineForceN: LEARN_VEHICLE_TUNING.engineForce!,
+  brakeForceN: LEARN_VEHICLE_TUNING.brakeForce!,
 };
 
 /** Primitive duration in seconds. Matches `carchase-scenarios.ts`. */
@@ -168,7 +181,7 @@ export async function createSweepWorld(agent: VehicleAgent = CARCHASE_AGENT): Pr
   // Settle the chassis on its suspension once at the start so the wheels are
   // at rest length before the first trial begins driving.
   for (let i = 0; i < 30; i++) {
-    car.applyControls({ steer: 0, throttle: 0, brake: 0 });
+    car.applyWheeledControls(ZERO_WHEELED);
     stepRaycastVehicle(world, [car], { dt: PHYSICS_DT, substeps: 1 });
   }
   return {
@@ -217,7 +230,9 @@ const MAX_RAMP_TICKS = 600; // up to 10s of simulated ramp-up
 const SPEED_TOL = 0.25;     // m/s — "close enough" to target start speed
 
 function physicsStep(sw: SweepWorld, cmd: { steer: number; throttle: number; brake: number }): void {
-  sw.car.applyControls(cmd);
+  // `wheeledFromNormalized` owns the steer-sign flip + force scaling so the
+  // headless learner and the live demos drive through identical arithmetic.
+  sw.car.applyWheeledControls(wheeledFromNormalized(cmd, LEARN_FORCE_TUNING));
   stepRaycastVehicle(sw.world, [sw.car], { dt: PHYSICS_DT, substeps: 1 });
 }
 
@@ -289,7 +304,7 @@ export function runTrial(
   for (let tick = 1; tick <= TICKS_PER_TRIAL; tick++) {
     const state = car.readState(0);
     const cmd = controlsToWheelCommand(state.speed, controls[0], controls[1], wheelBase);
-    car.applyControls(cmd);
+    car.applyWheeledControls(wheeledFromNormalized(cmd, LEARN_FORCE_TUNING));
     stepRaycastVehicle(world, [car], { dt: PHYSICS_DT, substeps: 1 });
     if (sampleTicks.has(tick)) {
       const s = car.readState(0);

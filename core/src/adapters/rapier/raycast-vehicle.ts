@@ -43,8 +43,21 @@ export interface CarHandle {
   vehicle: RAPIER.DynamicRayCastVehicleController;
   /** Read the chassis pose/speed back as a planner-shaped state. */
   readState(now: number): CarKinematicState;
-  /** Drive the raycast vehicle for the upcoming physics tick. Caller is
-   *  responsible for calling `vehicle.updateVehicle(dt)` then `world.step()`. */
+  /**
+   * Drive the raycast vehicle for the upcoming physics tick. Caller is
+   * responsible for calling `vehicle.updateVehicle(dt)` then `world.step()`.
+   *
+   * @deprecated Prefer {@link applyWheeledControls} so every control source
+   * (user keyboard, plan-follower, model rollout, headless trial) emits the
+   * same `WheeledCarControls` shape the v2 model is trained on.
+   * `applyControls` accepts normalized `{throttle, brake}` and skips the
+   * planner→Rapier steer-sign-flip, which leaks Rapier's frame convention
+   * into call sites. Migration is mechanical:
+   *   `applyControls({steer, throttle, brake})` ⇒
+   *   `applyWheeledControls({ steer: -steer, driveForce: throttle * engineForceN, brakeForce: brake * brakeForceN })`
+   * The `-steer` pre-negation preserves the exact chassis behavior across
+   * the API switch.
+   */
   applyControls(c: { steer: number; throttle: number; brake: number }): void;
   /** Drive the vehicle with NATIVE Rapier-form controls: actual steer angle
    *  (radians, will be clamped to maxSteerAngle), signed engine force (N),

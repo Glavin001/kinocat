@@ -97,13 +97,14 @@ describe.skipIf(!RAPIER_OK)('RapierCarBody + SceneController', () => {
       heading: 0,
     });
     for (let i = 0; i < 30; i++) {
-      car1.applyControls({ steer: 0, throttle: 0, brake: 0 });
-      car2.applyControls({ steer: 0, throttle: 0, brake: 0 });
+      car1.applyWheeledControls({ steer: 0, driveForce: 0, brakeForce: 0 });
+      car2.applyWheeledControls({ steer: 0, driveForce: 0, brakeForce: 0 });
       stepRaycastVehicle(world, [car1, car2], { dt: PHYSICS_DT, substeps: 4 });
     }
     for (let i = 0; i < 60; i++) {
-      car1.applyControls({ steer: 0, throttle: 1, brake: 0 });
-      car2.applyControls({ steer: 0, throttle: 0.5, brake: 0 });
+      // 4000 N == default engineForce × throttle=1; 2000 N == × throttle=0.5.
+      car1.applyWheeledControls({ steer: 0, driveForce: 4000, brakeForce: 0 });
+      car2.applyWheeledControls({ steer: 0, driveForce: 2000, brakeForce: 0 });
       stepRaycastVehicle(world, [car1, car2], { dt: PHYSICS_DT, substeps: 4 });
     }
     const x1 = car1.readState(0).x;

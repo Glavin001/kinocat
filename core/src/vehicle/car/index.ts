@@ -20,6 +20,12 @@ export {
   encodeWheeledRaw,
 } from './encoders';
 export {
+  wheeledFromNormalized,
+  ZERO_WHEELED,
+  type CarForceTuning,
+  type NormalizedCarCommand,
+} from './wheeled';
+export {
   KeyboardCarDriver,
   type KeyboardCarDriverOpts,
   PlanFollowerCarDriver,

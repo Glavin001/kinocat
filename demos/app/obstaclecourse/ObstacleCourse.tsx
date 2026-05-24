@@ -47,7 +47,12 @@ import {
   createRapierDebugRenderer,
   updateChaseCamera,
 } from 'kinocat/adapters/three';
-import { trimPlan } from 'kinocat/vehicle/car';
+import {
+  trimPlan,
+  wheeledFromNormalized,
+  ZERO_WHEELED,
+  type CarForceTuning,
+} from 'kinocat/vehicle/car';
 import {
   OBS_AGENT,
   OBS_BOUNDS,
@@ -65,6 +70,19 @@ const PHYSICS_DT = 1 / 60;
 const VEHICLE_SUBSTEPS = 4;
 const REPLAN_INTERVAL_MS = 120;
 const WHEEL_BASE = 1.6; // matches default in createRaycastVehicle
+// Force constants — match createRaycastVehicle defaults so the wheeled
+// control conversion below has the same physical effect as the legacy
+// `applyControls` normalized path.
+const ENGINE_FORCE_N = 4000;
+const BRAKE_FORCE_N = 2000;
+
+// Tuning consumed by the shared `wheeledFromNormalized` helper. Centralizing
+// the conversion in `kinocat/vehicle/car` keeps every demo, the headless
+// trial harness, and the offline training driver on the same arithmetic.
+const OBSTACLE_FORCE_TUNING: CarForceTuning = {
+  engineForceN: ENGINE_FORCE_N,
+  brakeForceN: BRAKE_FORCE_N,
+};
 
 // Gentle terrain so a flat-ground vehicle still copes. Bumps + bowls let us
 // see suspension behaviour without making the planner-vs-physics gap obvious.
@@ -422,33 +440,42 @@ export default function ObstacleCourse() {
           (keys.has('a') || keys.has('arrowleft') ? 1 : 0) -
           (keys.has('d') || keys.has('arrowright') ? 1 : 0);
         const brake = keys.has(' ') ? 1 : 0;
-        car.applyControls({ steer: steerIn * 0.55, throttle: accel, brake });
+        car.applyWheeledControls(
+          wheeledFromNormalized(
+            { steer: steerIn * 0.55, throttle: accel, brake },
+            OBSTACLE_FORCE_TUNING,
+          ),
+        );
       } else if (ai.plan && ai.plan.length > 1) {
         const elapsed = (now - ai.planStartWall) / 1000;
         const live = trimPlan(ai.plan, elapsed);
         if (live.length >= 2) {
-          car.applyControls(
-            planToAckermannControls(state, live, {
-              wheelBase: 2 * WHEEL_BASE,
-              lookaheadMin: 3,
-              lookaheadGain: 0.45,
-              lookaheadMax: 14,
-              maxLateralAccel: 8,
-              maxAccel: 6,
-              maxDecel: 8,
-              cruiseSpeed: OBS_AGENT.maxSpeed,
-              goalTolerance: 2,
-              minTurnRadius: OBS_AGENT.minTurnRadius,
-            }),
-          );
+          const cmd = planToAckermannControls(state, live, {
+            wheelBase: 2 * WHEEL_BASE,
+            lookaheadMin: 3,
+            lookaheadGain: 0.45,
+            lookaheadMax: 14,
+            maxLateralAccel: 8,
+            maxAccel: 6,
+            maxDecel: 8,
+            cruiseSpeed: OBS_AGENT.maxSpeed,
+            goalTolerance: 2,
+            minTurnRadius: OBS_AGENT.minTurnRadius,
+          });
+          car.applyWheeledControls(wheeledFromNormalized(cmd, OBSTACLE_FORCE_TUNING));
         } else {
-          car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
+          car.applyWheeledControls(
+            wheeledFromNormalized(
+              { steer: 0, throttle: 0.2, brake: 0 },
+              OBSTACLE_FORCE_TUNING,
+            ),
+          );
         }
       } else {
         // No plan yet — coast in neutral. Idling forward into the first plan
         // sounds harmless until a heightfield slope flips the car into a
         // wall; see bug-audit notes.
-        car.applyControls({ steer: 0, throttle: 0, brake: 0 });
+        car.applyWheeledControls(ZERO_WHEELED);
       }
 
       // Physics: vehicle update before world step, sub-stepped (Rapier

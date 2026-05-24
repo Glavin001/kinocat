@@ -33,7 +33,12 @@ import {
   createRapierDebugRenderer,
   updateChaseCamera,
 } from 'kinocat/adapters/three';
-import { trimPlan } from 'kinocat/vehicle/car';
+import {
+  trimPlan,
+  wheeledFromNormalized,
+  ZERO_WHEELED,
+  type CarForceTuning,
+} from 'kinocat/vehicle/car';
 import {
   RAMP_AGENT,
   RAMP_BOUNDS,
@@ -51,6 +56,9 @@ const WHEEL_BASE = 1.6;
 
 // Slightly more suspension travel than the obstacle-course tuning — the
 // ramp lip + landing benefit from a softer chassis.
+const ENGINE_FORCE_N = 4500;
+const BRAKE_FORCE_N = 2000;
+const MAX_STEER_RAD = 0.6;
 const RAMP_VEHICLE_TUNING: Omit<RaycastVehicleOptions, 'id' | 'position' | 'heading'> = {
   chassisHalf: { x: 2.4, y: 0.5, z: 1.0 },
   chassisDensity: 60,
@@ -59,10 +67,20 @@ const RAMP_VEHICLE_TUNING: Omit<RaycastVehicleOptions, 'id' | 'position' | 'head
   wheelRadius: 0.35,
   suspensionRestLength: 0.4,
   suspensionMaxTravel: 0.3,
-  engineForce: 4500,
-  brakeForce: 2000,
-  maxSteerAngle: 0.6,
+  engineForce: ENGINE_FORCE_N,
+  brakeForce: BRAKE_FORCE_N,
+  maxSteerAngle: MAX_STEER_RAD,
   driveTrain: 'rwd',
+};
+
+// Per-demo force-scale tuning consumed by the shared
+// `wheeledFromNormalized` helper. Single source of truth for the
+// normalized → WheeledCarControls conversion lives in
+// `kinocat/vehicle/car` — every demo points its constants at the same
+// helper so there is no copy-paste arithmetic at chassis call sites.
+const RAMP_FORCE_TUNING: CarForceTuning = {
+  engineForceN: ENGINE_FORCE_N,
+  brakeForceN: BRAKE_FORCE_N,
 };
 
 export default function RampDemo() {
@@ -375,30 +393,36 @@ export default function RampDemo() {
           (keys.has('a') || keys.has('arrowleft') ? 1 : 0) -
           (keys.has('d') || keys.has('arrowright') ? 1 : 0);
         const brake = keys.has(' ') ? 1 : 0;
-        car.applyControls({ steer: steerIn * 0.55, throttle: accel, brake });
+        car.applyWheeledControls(
+          wheeledFromNormalized(
+            { steer: steerIn * 0.55, throttle: accel, brake },
+            RAMP_FORCE_TUNING,
+          ),
+        );
       } else if (ai.plan && ai.plan.length > 1) {
         const elapsed = (now - ai.planStartWall) / 1000;
         const live = trimPlan(ai.plan, elapsed);
         if (live.length >= 2) {
-          car.applyControls(
-            planToAckermannControls(state, live, {
-              wheelBase: 2 * WHEEL_BASE,
-              lookaheadMin: 3,
-              lookaheadGain: 0.45,
-              lookaheadMax: 14,
-              maxLateralAccel: 8,
-              maxAccel: 6,
-              maxDecel: 8,
-              cruiseSpeed: RAMP_AGENT.maxSpeed,
-              goalTolerance: 2,
-              minTurnRadius: RAMP_AGENT.minTurnRadius,
-            }),
-          );
+          const cmd = planToAckermannControls(state, live, {
+            wheelBase: 2 * WHEEL_BASE,
+            lookaheadMin: 3,
+            lookaheadGain: 0.45,
+            lookaheadMax: 14,
+            maxLateralAccel: 8,
+            maxAccel: 6,
+            maxDecel: 8,
+            cruiseSpeed: RAMP_AGENT.maxSpeed,
+            goalTolerance: 2,
+            minTurnRadius: RAMP_AGENT.minTurnRadius,
+          });
+          car.applyWheeledControls(wheeledFromNormalized(cmd, RAMP_FORCE_TUNING));
         } else {
-          car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
+          car.applyWheeledControls(
+            wheeledFromNormalized({ steer: 0, throttle: 0.2, brake: 0 }, RAMP_FORCE_TUNING),
+          );
         }
       } else {
-        car.applyControls({ steer: 0, throttle: 0, brake: 0 });
+        car.applyWheeledControls(ZERO_WHEELED);
       }
 
       stepRaycastVehicle(world, [car], { dt: PHYSICS_DT, substeps: VEHICLE_SUBSTEPS });

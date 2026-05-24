@@ -46,7 +46,14 @@ function step(
   car: CarHandle,
   controls: { steer: number; throttle: number; brake: number },
 ): void {
-  car.applyControls(controls);
+  // Test helper: accepts normalized {steer (rad), throttle, brake} for
+  // readability; converts to the canonical WheeledCarControls shape
+  // (with chassis-side steer-flip pre-applied) for the chassis.
+  car.applyWheeledControls({
+    steer: -controls.steer,
+    driveForce: controls.throttle * 4000,
+    brakeForce: controls.brake * 2000,
+  });
   world.timestep = PHYSICS_DT;
   car.vehicle.updateVehicle(PHYSICS_DT);
   world.step();
