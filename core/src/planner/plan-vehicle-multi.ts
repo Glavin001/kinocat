@@ -61,6 +61,16 @@ const DEFAULT_ENV_OPTIONS: VehicleEnvOptions = {
   goalHeadingTol: Infinity,
   sweepSegmentCheck: false,
   analyticExpansion: { everyN: 6, step: 0.6 },
+  // Reeds-Shepp heuristic lookup table (Dolgov et al. Hybrid A*; spec
+  // §12.3). The RS shortest-path heuristic is the dominant per-successor
+  // cost in this environment; caching it by quantised source pose turns
+  // it into an O(1) lookup after the first touch of each cell. The
+  // built-in slack keeps the estimate admissible. For the multi-goal
+  // (per-leg) heuristic this saves the most — every leg re-uses the
+  // same per-cell RS distances. Defaults to the env's posCell /
+  // headingBuckets so the table is sized consistently with the search
+  // grid.
+  heuristicTable: {},
 };
 
 const DEFAULT_TIME_OPTIONS: Omit<TimeAwareOptions, 'obstacles' | 'affordances'> = {

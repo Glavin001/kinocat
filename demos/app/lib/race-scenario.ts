@@ -78,6 +78,21 @@ export const WHEEL_BASE = 1.6;
  * with the segment the controller is still executing.
  */
 export const COMMIT_WINDOW_MS = 200;
+/**
+ * Adaptive (event-driven) replan triggers — fired *in addition to* the
+ * fixed `REPLAN_INTERVAL_MS` cadence. Real AV stacks all do this: the
+ * cadence covers normal driving, the events cover the moments where the
+ * cadence-only loop visibly lags reality.
+ *
+ * `LATERAL_ERROR_REPLAN_M`: when the chassis drifts farther than this
+ * from the plan, the current plan is no longer the right reference and
+ * we should replan immediately rather than waiting up to 300 ms.
+ *
+ * `MIN_TIME_BETWEEN_REPLANS_MS`: rate-limit so a slipping chassis can't
+ * thrash the planner. Half the cadence is a reasonable floor.
+ */
+export const LATERAL_ERROR_REPLAN_M = 2.0;
+export const MIN_TIME_BETWEEN_REPLANS_MS = 150;
 
 const FORCE_TUNING: CarForceTuning = {
   engineForceN: ENGINE_FORCE_N,
@@ -493,6 +508,58 @@ export async function createRaceScenario(
     }
   }
 
+  /** Perpendicular distance from a point to the unexecuted future of the
+   *  current plan polyline. Returns Infinity if the plan is missing or
+   *  fully past. Used by the adaptive replan trigger to detect when the
+   *  chassis has drifted from the reference too far for the controller
+   *  alone to recover comfortably. */
+  function lateralFromPlan(c: CarInternal, x: number, z: number): number {
+    if (!c.plan || c.plan.length < 2) return Infinity;
+    const elapsed = Math.max(0, simTime - c.planStartSimTime);
+    const tail = trimPlan(c.plan, elapsed);
+    if (tail.length < 2) return Infinity;
+    let best = Infinity;
+    for (let i = 0; i < tail.length - 1; i++) {
+      const ax = tail[i]!.x;
+      const az = tail[i]!.z;
+      const bx = tail[i + 1]!.x;
+      const bz = tail[i + 1]!.z;
+      const dx = bx - ax;
+      const dz = bz - az;
+      const lenSq = dx * dx + dz * dz;
+      let u = 0;
+      if (lenSq > 1e-9) {
+        u = ((x - ax) * dx + (z - az) * dz) / lenSq;
+        if (u < 0) u = 0;
+        else if (u > 1) u = 1;
+      }
+      const px = ax + dx * u;
+      const pz = az + dz * u;
+      const d = Math.hypot(x - px, z - pz);
+      if (d < best) best = d;
+    }
+    return best;
+  }
+
+  /** Returns true if any adaptive trigger fires AND the rate-limit allows
+   *  it. The trigger set follows the Apollo / Autoware shape: lateral
+   *  divergence from the plan, mid-cadence waypoint advance (so the
+   *  planner can re-aim at the new horizon immediately), and
+   *  consecutive failures (back off — keep retrying until something
+   *  takes). */
+  function shouldEarlyReplan(c: CarInternal, state: CarKinematicState): boolean {
+    if (c.holdingForSync || c.finished) return false;
+    const sinceLastMs = (simTime - c.lastReplanSimTime) * 1000;
+    if (sinceLastMs < MIN_TIME_BETWEEN_REPLANS_MS) return false;
+    // Trigger: large lateral error from the plan.
+    const dLat = lateralFromPlan(c, state.x, state.z);
+    if (dLat > LATERAL_ERROR_REPLAN_M) return true;
+    // Trigger: consecutive failures — keep trying. Cadence already
+    // does this every 300ms but events let us retry earlier.
+    if (c.diagnostics.consecutiveFailedReplans >= 2) return true;
+    return false;
+  }
+
   function stepOne(c: CarInternal, dt: number): void {
     if (c.finished) {
       c.car.applyWheeledControls({ steer: 0, driveForce: 0, brakeForce: BRAKE_FORCE_N });
@@ -504,8 +571,12 @@ export async function createRaceScenario(
     // we decide whether to replan, so the next replan sees the most
     // recently-committed plan as its baseline.
     maybePromotePlan(c);
-    // Replan if the cadence elapsed.
-    if (simTime - c.lastReplanSimTime >= replanIntervalSec) {
+    // Replan if the fixed cadence elapsed OR an adaptive trigger fires
+    // (lateral divergence, consecutive planner failures, etc.). The
+    // trigger checks rate-limit themselves so a degenerate state can't
+    // thrash the planner.
+    const cadenceDue = simTime - c.lastReplanSimTime >= replanIntervalSec;
+    if (cadenceDue || shouldEarlyReplan(c, stateBefore)) {
       replanCar(c);
     }
     // Waypoint advance + lap detection (60Hz so lap times aren't quantized
@@ -522,6 +593,15 @@ export async function createRaceScenario(
         c.loopIndex = pick.nextIndex;
         const sectorTime = c.raceTime - c.lapStartSimTime;
         c.currentLapSectors.push(sectorTime);
+        // Adaptive trigger: a gate has just been cleared, so the planner's
+        // horizon has shifted. Re-plan immediately (subject to the
+        // MIN_TIME_BETWEEN_REPLANS rate-limit) instead of waiting up to
+        // ~300 ms of cadence — otherwise the controller can chase a plan
+        // whose first gate the car has already passed.
+        const sinceLastMs = (simTime - c.lastReplanSimTime) * 1000;
+        if (sinceLastMs >= MIN_TIME_BETWEEN_REPLANS_MS) {
+          replanCar(c);
+        }
         if (c.waypointsCleared % course.waypoints.length === 0) {
           const lapEnd = c.raceTime;
           const dur = lapEnd - c.lapStartSimTime;
