@@ -63,7 +63,17 @@ export interface LossDecomposition {
 
 export interface FitProgressEvent {
   iter: number;
+  /** Raw objective the optimizer minimizes. For the parametric fit this
+   *  is a SUM across all (trial, sample) pairs, so its absolute value
+   *  scales with the dataset size and is NOT directly comparable across
+   *  active-learning rounds. Prefer `lossNormalized` for display. */
   loss: number;
+  /** `loss / sampleCount` — per-sample mean. Comparable across rounds
+   *  even as the trial set grows. Populated by the async fitter when
+   *  the sample count is known. */
+  lossNormalized?: number;
+  /** Total `(trial, sample)` pairs the loss was summed over. */
+  sampleCount?: number;
   /** Optional per-component breakdown (averaged across samples). */
   perComponent?: LossDecomposition;
   /** Optional held-out (validation-split) loss. Populated by the residual
@@ -256,6 +266,93 @@ export function runParametricFit<P, S, C, Cfg>(
       },
     },
   );
+  return finalizeFit(opts, result, history);
+}
+
+// ---------------------------------------------------------------------------
+// Async, cooperatively-yielding variant for browser callers.
+//
+// The synchronous `runParametricFit` is fine for tests and Node, but in a
+// browser tab a 200-iteration Nelder-Mead over ~100 trials can monopolize
+// the main thread for tens of seconds and trigger "page unresponsive".
+// This variant yields to the event loop:
+//   - once every `yieldEveryNIter` simplex iterations (default 1),
+//   - and once every `yieldEveryNTrials` trials inside each loss eval
+//     (default 24), since a single loss eval is itself heavy.
+//
+// `cooperativeYield` defaults to a setTimeout(0) macrotask, which is the
+// most portable way to let the browser paint and process input. Pass a
+// faster `scheduler.yield()`-based yielder when targeting modern Chrome.
+
+export interface ParametricFitAsyncOptions<P, S, C, Cfg>
+  extends ParametricFitOptions<P, S, C, Cfg>
+{
+  /** Yield to the event loop every N Nelder-Mead iterations. Default 1. */
+  yieldEveryNIter?: number;
+  /** Yield to the event loop every N trials inside a single loss eval.
+   *  Default 24. Set to 0 to disable mid-loss-eval yielding. */
+  yieldEveryNTrials?: number;
+  /** How to yield. Default: `setTimeout(resolve, 0)`. */
+  cooperativeYield?: () => Promise<void>;
+}
+
+const defaultYield = (): Promise<void> =>
+  new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+export async function runParametricFitAsync<P, S, C, Cfg>(
+  opts: ParametricFitAsyncOptions<P, S, C, Cfg>,
+): Promise<ParametricFitResult<P>> {
+  const x0 = opts.encode(opts.init);
+  const history: FitProgressEvent[] = [];
+  const coop = opts.cooperativeYield ?? defaultYield;
+  const yieldEveryNIter = Math.max(1, opts.yieldEveryNIter ?? 1);
+  const yieldEveryNTrials = Math.max(0, opts.yieldEveryNTrials ?? 24);
+  const maxIter = opts.maxIter ?? 400;
+  // Precompute the total sample count so every progress event can
+  // expose a normalized per-sample loss. Each trial contributes
+  // (samples.length - 1) comparisons (the rollout starts at sample 1
+  // and predicts forward to each subsequent sample). Matches
+  // `rolloutAndScore`'s counting.
+  let sampleCount = 0;
+  for (const t of opts.trials) {
+    sampleCount += Math.max(0, t.samples.length - 1);
+  }
+  const sampleCountSafe = Math.max(1, sampleCount);
+  const loss = (v: ReadonlyArray<number>): Promise<number> =>
+    fullLossAsync(v, opts, coop, yieldEveryNTrials);
+  const result = await nelderMeadAsync(
+    x0,
+    loss,
+    {
+      maxIter,
+      tol: opts.tol ?? 1e-6,
+      step: opts.simplexStep ?? 0.1,
+      onIter: (iter, best, improved) => {
+        // Always notify so the UI can show "iter X / maxIter" even when
+        // late iterations aren't improving the loss. Only append to the
+        // returned history when the loss actually moved (keeps the
+        // serialized fit curve clean).
+        const e: FitProgressEvent = {
+          iter,
+          loss: best,
+          lossNormalized: best / sampleCountSafe,
+          sampleCount,
+        };
+        if (improved) history.push(e);
+        opts.onProgress?.(e);
+      },
+      yieldEveryNIter,
+      cooperativeYield: coop,
+    },
+  );
+  return finalizeFit(opts, result, history);
+}
+
+function finalizeFit<P, S, C, Cfg>(
+  opts: ParametricFitOptions<P, S, C, Cfg>,
+  result: { x: number[]; iters: number; best: number },
+  history: FitProgressEvent[],
+): ParametricFitResult<P> {
   const params = opts.decode(result.x);
   // Final decomposition (no regularization).
   let perComp: LossDecomposition | undefined;
@@ -298,4 +395,127 @@ export function runParametricFit<P, S, C, Cfg>(
     perComponent: perComp,
     history,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Async loss + Nelder-Mead helpers (used by `runParametricFitAsync`).
+
+async function fullLossAsync<P, S, C, Cfg>(
+  encoded: ReadonlyArray<number>,
+  opts: ParametricFitOptions<P, S, C, Cfg>,
+  coop: () => Promise<void>,
+  yieldEveryNTrials: number,
+): Promise<number> {
+  const params = opts.decode(encoded);
+  let total = 0;
+  let totalCount = 0;
+  let trialIdx = 0;
+  for (const trial of opts.trials) {
+    const sim = opts.makeSim(params, trial.config);
+    const r = rolloutAndScore(
+      sim,
+      trial,
+      opts.stateDelta,
+      opts.controlsToVec,
+      opts.fitSubstepsPerSample ?? 6,
+    );
+    total += r.loss;
+    totalCount += r.sampleCount;
+    trialIdx++;
+    if (yieldEveryNTrials > 0 && trialIdx % yieldEveryNTrials === 0) {
+      await coop();
+    }
+  }
+  const reg = opts.regularization;
+  if (reg && reg.strength > 0 && totalCount > 0) {
+    const scale = reg.strength * totalCount;
+    for (let i = 0; i < encoded.length; i++) {
+      const s = reg.scales[i] || 1;
+      const d = (encoded[i]! - (reg.priorVec[i] ?? 0)) / s;
+      total += scale * d * d;
+    }
+  }
+  return total;
+}
+
+async function nelderMeadAsync(
+  x0: number[],
+  loss: (v: number[]) => Promise<number>,
+  opts: {
+    maxIter: number;
+    tol: number;
+    step: number;
+    /** Fired every iteration; `improved=true` when the iter beat the
+     *  previous best (so callers can keep the official history clean
+     *  while still updating a live "iter X / Y" UI). */
+    onIter?: (iter: number, best: number, improved: boolean) => void;
+    yieldEveryNIter: number;
+    cooperativeYield: () => Promise<void>;
+  },
+): Promise<{ x: number[]; iters: number; best: number }> {
+  const n = x0.length;
+  const simplex: number[][] = [x0.slice()];
+  for (let i = 0; i < n; i++) {
+    const v = x0.slice();
+    v[i] = (v[i] ?? 0) * (1 + opts.step) + ((v[i] ?? 0) === 0 ? opts.step : 0);
+    simplex.push(v);
+  }
+  const scores: number[] = [];
+  for (const v of simplex) scores.push(await loss(v));
+  let bestEverScore = Math.min(...scores);
+  for (let iter = 0; iter < opts.maxIter; iter++) {
+    const order = scores
+      .map((s, i) => [s, i] as const)
+      .sort((a, b) => a[0] - b[0])
+      .map((p) => p[1]);
+    const sortedSim = order.map((i) => simplex[i]!);
+    const sortedScores = order.map((i) => scores[i]!);
+    for (let i = 0; i < simplex.length; i++) {
+      simplex[i] = sortedSim[i]!;
+      scores[i] = sortedScores[i]!;
+    }
+    const best = scores[0]!;
+    const worst = scores[n]!;
+    const improved = best < bestEverScore;
+    if (improved) bestEverScore = best;
+    opts.onIter?.(iter, best, improved);
+    if (worst - best < opts.tol) return { x: simplex[0]!, iters: iter, best };
+    const centroid = new Array(n).fill(0) as number[];
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) centroid[j]! += simplex[i]![j]!;
+    }
+    for (let j = 0; j < n; j++) centroid[j]! /= n;
+    const xr = centroid.map((c, j) => c + (c - simplex[n]![j]!));
+    const fr = await loss(xr);
+    if (fr < scores[n - 1]! && fr >= scores[0]!) {
+      simplex[n] = xr;
+      scores[n] = fr;
+    } else if (fr < scores[0]!) {
+      const xe = centroid.map((c, j) => c + 2 * (c - simplex[n]![j]!));
+      const fe = await loss(xe);
+      if (fe < fr) {
+        simplex[n] = xe;
+        scores[n] = fe;
+      } else {
+        simplex[n] = xr;
+        scores[n] = fr;
+      }
+    } else {
+      const xc = centroid.map((c, j) => c + 0.5 * (simplex[n]![j]! - c));
+      const fc = await loss(xc);
+      if (fc < scores[n]!) {
+        simplex[n] = xc;
+        scores[n] = fc;
+      } else {
+        for (let i = 1; i <= n; i++) {
+          simplex[i] = simplex[0]!.map((b, j) => b + 0.5 * (simplex[i]![j]! - b));
+          scores[i] = await loss(simplex[i]!);
+        }
+      }
+    }
+    if ((iter + 1) % opts.yieldEveryNIter === 0) {
+      await opts.cooperativeYield();
+    }
+  }
+  return { x: simplex[0]!, iters: opts.maxIter, best: scores[0]! };
 }

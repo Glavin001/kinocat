@@ -30,8 +30,8 @@ import {
   createTrialStore,
   type Trial,
   type TrialStore,
-  runParametricFit,
-  runResidualMLPFit,
+  runParametricFitAsync,
+  runResidualMLPFitAsync,
   evaluateModel,
   type ModelDiagnostics,
   type OpenLoopRow,
@@ -66,6 +66,27 @@ import type {
 } from 'kinocat/training';
 
 // ---------------------------------------------------------------------------
+// Cooperative yielding helper — used to keep the browser main thread
+// responsive during the long synchronous CPU work done by Rapier trial
+// collection, Nelder-Mead parametric fits, and SGD residual training.
+//
+// Prefers the modern `scheduler.yield()` (gives the browser a chance to
+// paint + handle input without the macrotask latency of setTimeout) and
+// falls back to a `MessageChannel`/`setTimeout(0)` macrotask otherwise.
+
+interface SchedulerLike { yield?: () => Promise<void> }
+
+const yieldToMainThread: () => Promise<void> = (() => {
+  if (typeof globalThis !== 'undefined') {
+    const sched = (globalThis as { scheduler?: SchedulerLike }).scheduler;
+    if (sched && typeof sched.yield === 'function') {
+      return () => sched.yield!();
+    }
+  }
+  return () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+})();
+
+// ---------------------------------------------------------------------------
 // Defaults — match the race-primitives chassis tuning.
 
 export const DEFAULT_VEHICLE_OPTS = {
@@ -83,10 +104,37 @@ export const DEFAULT_VEHICLE_OPTS = {
 // ---------------------------------------------------------------------------
 // Event stream
 
+export type TrainingPhase =
+  | 'initializing'
+  | 'collecting'
+  | 'parametric'
+  | 'residual'
+  | 'evaluating';
+
 export type TrainingEvent =
   | { type: 'round-start'; round: number; trialsBeforeRound: number }
-  | { type: 'trial-batch'; round: number; collected: number; discarded: number }
-  | { type: 'fit-progress'; round: number; phase: 'parametric' | 'residual'; event: FitProgressEvent }
+  | { type: 'phase'; round: number; phase: TrainingPhase }
+  | {
+      type: 'trial-batch';
+      round: number;
+      /** Delta — new trials collected since the last `trial-batch` event. */
+      collected: number;
+      /** Delta — new trials discarded since the last `trial-batch` event. */
+      discarded: number;
+      /** Cumulative count of trial slots attempted this round (collected + discarded). */
+      runSoFar?: number;
+      /** Target trial count for this round (cells.length). */
+      runTarget?: number;
+    }
+  | {
+      type: 'fit-progress';
+      round: number;
+      phase: 'parametric' | 'residual';
+      event: FitProgressEvent;
+      /** Optional running counters for "iter X / Y" displays. */
+      iterIndex?: number;
+      iterTotal?: number;
+    }
   | { type: 'evaluation'; round: number; diagnostics: ModelDiagnostics }
   | { type: 'coverage'; round: number; cells: CoverageCellSummary[] }
   | { type: 'round-end'; round: number; trainedModel: LearnedVehicleModel; params: LearnedVehicleParamsV2; diagnostics: ModelDiagnostics; trialsAfter: number }
@@ -202,23 +250,58 @@ async function collectTrialBatch(
   ticks: number,
   sampleEveryNTicks: number,
   startId: number,
+  onChunkProgress?: (delta: { collected: number; discarded: number; totalSoFar: number; outOf: number }) => void,
+  chunkSize = 8,
 ): Promise<{ collected: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[]; discarded: number }> {
   const collected: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[] = [];
   let discarded = 0;
   let idx = startId;
+  let runSinceYield = 0;
+  let chunkCollected = 0;
+  let chunkDiscarded = 0;
+  let done = 0;
   for (const c of cells) {
     const spec = specFor(c, ticks, sampleEveryNTicks, `t-${idx++}`);
     const result = harness.runTrial(spec);
-    if (!result.ok) { discarded++; continue; }
-    const t = result.trial;
-    collected.push({
-      id: t.id,
-      initialState: t.samples[0]!,
-      controlsTrace: spec.controlsTrace,
-      dt: t.dt,
-      samples: t.samples.map((s, i) => ({ t: i * sampleEveryNTicks * t.dt, state: s })),
-      config: t.config,
-      configKey: 'rwd-default',
+    runSinceYield++;
+    done++;
+    if (!result.ok) { discarded++; chunkDiscarded++; }
+    else {
+      const t = result.trial;
+      collected.push({
+        id: t.id,
+        initialState: t.samples[0]!,
+        controlsTrace: spec.controlsTrace,
+        dt: t.dt,
+        samples: t.samples.map((s, i) => ({ t: i * sampleEveryNTicks * t.dt, state: s })),
+        config: t.config,
+        configKey: 'rwd-default',
+      });
+      chunkCollected++;
+    }
+    // Yield every `chunkSize` trials so a 96-trial round (~1.5s sync work)
+    // doesn't pin the main thread, and flush a progress event at the same
+    // cadence so the UI can show a live trial count instead of staying at
+    // 0 until the whole round finishes.
+    if (runSinceYield >= chunkSize) {
+      runSinceYield = 0;
+      onChunkProgress?.({
+        collected: chunkCollected,
+        discarded: chunkDiscarded,
+        totalSoFar: done,
+        outOf: cells.length,
+      });
+      chunkCollected = 0;
+      chunkDiscarded = 0;
+      await yieldToMainThread();
+    }
+  }
+  if (chunkCollected > 0 || chunkDiscarded > 0) {
+    onChunkProgress?.({
+      collected: chunkCollected,
+      discarded: chunkDiscarded,
+      totalSoFar: done,
+      outOf: cells.length,
     });
   }
   return { collected, discarded };
@@ -542,6 +625,19 @@ export class CarV2TrainingPipeline
     return this.rounds;
   }
 
+  /** Max Nelder-Mead iterations the parametric fit will run for a given
+   *  round. Round 0 gets a longer budget because it's starting from
+   *  the default prior. */
+  parametricMaxIter(round: number): number {
+    return round === 0 ? 200 : 120;
+  }
+
+  /** Number of SGD epochs the residual MLP fit will run on the final
+   *  round (no residual fit on earlier rounds — returns 0 there). */
+  residualEpochs(round: number): number {
+    return round === this.rounds - 1 ? 200 : 0;
+  }
+
   /** Current learned model (parametric coefficients + optional residual
    *  ensemble + reference dt). Mutates round-by-round. */
   currentLearnedModel(): LearnedVehicleModel {
@@ -578,9 +674,13 @@ export class CarV2TrainingPipeline
 
   async collectTrials(
     ctx: TrainingContext<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>,
+    onChunkProgress?: (delta: { collected: number; discarded: number; totalSoFar: number; outOf: number }) => void,
   ): Promise<{ collected: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[]; discarded: number }> {
     const cells = this.nextCells(ctx.round);
-    const result = await collectTrialBatch(this.harness, cells, this.ticks, this.sampleEveryN, this.trialIdx);
+    const result = await collectTrialBatch(
+      this.harness, cells, this.ticks, this.sampleEveryN, this.trialIdx,
+      onChunkProgress,
+    );
     this.trialIdx += cells.length;
     return result;
   }
@@ -589,7 +689,7 @@ export class CarV2TrainingPipeline
     ctx: TrainingContext<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>,
     onProgress?: (e: FitProgressEvent) => void,
   ): Promise<LearnedVehicleParamsV2> {
-    const fit = runParametricFit<LearnedVehicleParamsV2, CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
+    const fit = await runParametricFitAsync<LearnedVehicleParamsV2, CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
       init: this.model.params,
       encode: paramsV2ToVec,
       decode: paramsV2FromVec,
@@ -609,6 +709,13 @@ export class CarV2TrainingPipeline
         priorVec: paramsV2ToVec(DEFAULT_LEARNED_PARAMS_V2),
         scales: paramsV2ToVec(REG_SCALES),
       },
+      // Keep Chrome's main thread responsive by yielding between simplex
+      // iterations and once every ~24 trials inside each loss eval. A
+      // single loss eval scans every trial × every sample × substeps, so
+      // mid-eval yielding is what actually keeps the page from freezing.
+      cooperativeYield: yieldToMainThread,
+      yieldEveryNIter: 1,
+      yieldEveryNTrials: 24,
     });
     this.model = { ...this.model, params: fit.params };
     return fit.params;
@@ -626,7 +733,7 @@ export class CarV2TrainingPipeline
     const isFinalRound = ctx.round === this.rounds - 1;
     if (isFinalRound && ctx.store.size() >= 16) {
       const baselineSim = parametricForwardV2(params, this.config);
-      const residualFit = runResidualMLPFit<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
+      const residualFit = await runResidualMLPFitAsync<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
         trials: ctx.store.all(),
         makeBaselineSim: () => baselineSim,
         encodeInput: (s, ctrl, cfg) => buildMLPInput(s, ctrl, cfg),
@@ -648,15 +755,25 @@ export class CarV2TrainingPipeline
         valSplit: 0.2,
         fitSubstepsPerSample: 6,
         onProgress: (e) => {
+          // Residual fit's trainLoss is already a per-sample mean (see
+          // `meanLoss` in residual-mlp-fit.ts), so it's directly
+          // comparable across rounds. Surface it as `lossNormalized` so
+          // the UI can plot it on the same axis as the normalized
+          // parametric loss. `valLoss` flows through for the val-split
+          // diagnostic the UI shows alongside training loss.
           const ev: FitProgressEvent = {
             iter: e.epoch,
             loss: e.trainLoss,
+            lossNormalized: e.trainLoss,
             valLoss: e.valLoss,
             perComponent: undefined,
           };
           onProgress?.(ev);
           this.onResidualProgress?.(ctx.round, ev);
         },
+        cooperativeYield: yieldToMainThread,
+        yieldEveryNEpochs: 1,
+        yieldEveryNBatches: 8,
       });
       this.model = {
         ...this.model,
@@ -687,6 +804,12 @@ export class CarV2TrainingPipeline
 export async function runOfflineTraining(
   opts: RunOfflineTrainingOptions = {},
 ): Promise<RunOfflineTrainingResult> {
+  // Fire an early "initializing" phase event BEFORE the slow Rapier WASM
+  // load inside CarV2TrainingPipeline.create() so the UI shows a live
+  // phase + pulsing activity dot during the 1-3 s cold-start window
+  // (instead of sitting on the default "starting" placeholder).
+  opts.onEvent?.({ type: 'phase', round: 0, phase: 'initializing' });
+  await yieldToMainThread();
   const pipeline = await CarV2TrainingPipeline.create({
     rounds: opts.rounds,
     trialsPerActiveRound: opts.trialsPerActiveRound,
@@ -701,15 +824,36 @@ export async function runOfflineTraining(
   for (let round = 0; round < pipeline.totalRounds(); round++) {
     opts.onEvent?.({ type: 'round-start', round, trialsBeforeRound: store.size() });
     const ctx: TrainingContext<CarKinematicState, WheeledCarControls, LearnableVehicleConfig> = { round, store };
-    const { collected, discarded } = await pipeline.collectTrials(ctx);
+    opts.onEvent?.({ type: 'phase', round, phase: 'collecting' });
+    const { collected, discarded } = await pipeline.collectTrials(ctx, (delta) => {
+      opts.onEvent?.({
+        type: 'trial-batch',
+        round,
+        collected: delta.collected,
+        discarded: delta.discarded,
+        runSoFar: delta.totalSoFar,
+        runTarget: delta.outOf,
+      });
+    });
     for (const t of collected) store.add(t);
-    opts.onEvent?.({ type: 'trial-batch', round, collected: collected.length, discarded });
+    opts.onEvent?.({ type: 'phase', round, phase: 'parametric' });
+    const paramMax = pipeline.parametricMaxIter(round);
     const params = await pipeline.fitParametric(ctx, (event) =>
-      opts.onEvent?.({ type: 'fit-progress', round, phase: 'parametric', event }),
+      opts.onEvent?.({
+        type: 'fit-progress', round, phase: 'parametric', event,
+        iterIndex: event.iter, iterTotal: paramMax,
+      }),
     );
+    opts.onEvent?.({ type: 'phase', round, phase: 'residual' });
+    const resEpochs = pipeline.residualEpochs(round);
     const trained = await pipeline.fitResidual(ctx, params, (event) =>
-      opts.onEvent?.({ type: 'fit-progress', round, phase: 'residual', event }),
+      opts.onEvent?.({
+        type: 'fit-progress', round, phase: 'residual', event,
+        iterIndex: event.iter, iterTotal: resEpochs,
+      }),
     );
+    await yieldToMainThread();
+    opts.onEvent?.({ type: 'phase', round, phase: 'evaluating' });
     finalDiag = pipeline.evaluate(ctx, trained);
     opts.onEvent?.({ type: 'evaluation', round, diagnostics: finalDiag });
     opts.onEvent?.({
@@ -720,6 +864,7 @@ export async function runOfflineTraining(
       diagnostics: finalDiag,
       trialsAfter: store.size(),
     });
+    await yieldToMainThread();
   }
   const finalModel = pipeline.currentLearnedModel();
   if (!opts.keepHarness) pipeline.dispose();
@@ -873,6 +1018,8 @@ export async function collectManeuverBatch(
   opts: ManeuverTrialOptions,
   startId: number,
   startSpeedSchedule?: number[],
+  onChunkProgress?: (delta: { collected: number; discarded: number; totalSoFar: number; outOf: number }) => void,
+  chunkSize = 8,
 ): Promise<{
   collected: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[];
   discarded: number;
@@ -880,6 +1027,10 @@ export async function collectManeuverBatch(
   const collected: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[] = [];
   let discarded = 0;
   let id = startId;
+  let runSinceYield = 0;
+  let chunkCollected = 0;
+  let chunkDiscarded = 0;
+  let done = 0;
   const limits = carManeuverLimits();
   const dt = 1 / 60;
   const speeds = startSpeedSchedule && startSpeedSchedule.length > 0
@@ -904,21 +1055,48 @@ export async function collectManeuverBatch(
     };
     id++;
     const result = harness.runTrial(trialSpec);
-    if (!result.ok) { discarded++; continue; }
-    const t = result.trial;
-    const trial: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig> = {
-      id: t.id,
-      initialState: t.samples[0]!,
-      controlsTrace: trialSpec.controlsTrace,
-      dt: t.dt,
-      samples: t.samples.map((s, i) => ({ t: i * opts.sampleEveryNTicks * t.dt, state: s })),
-      config: t.config,
-      configKey: 'rwd-default',
-      maneuverId: spec.id,
-      maneuverParams: { ...spec.params, startSpeed },
-    };
-    trial.split = assignSplit(trial);
-    collected.push(trial);
+    done++;
+    runSinceYield++;
+    if (!result.ok) {
+      discarded++;
+      chunkDiscarded++;
+    } else {
+      const t = result.trial;
+      const trial: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig> = {
+        id: t.id,
+        initialState: t.samples[0]!,
+        controlsTrace: trialSpec.controlsTrace,
+        dt: t.dt,
+        samples: t.samples.map((s, i) => ({ t: i * opts.sampleEveryNTicks * t.dt, state: s })),
+        config: t.config,
+        configKey: 'rwd-default',
+        maneuverId: spec.id,
+        maneuverParams: { ...spec.params, startSpeed },
+      };
+      trial.split = assignSplit(trial);
+      collected.push(trial);
+      chunkCollected++;
+    }
+    if (runSinceYield >= chunkSize) {
+      runSinceYield = 0;
+      onChunkProgress?.({
+        collected: chunkCollected,
+        discarded: chunkDiscarded,
+        totalSoFar: done,
+        outOf: specs.length,
+      });
+      chunkCollected = 0;
+      chunkDiscarded = 0;
+      await yieldToMainThread();
+    }
+  }
+  if (chunkCollected > 0 || chunkDiscarded > 0) {
+    onChunkProgress?.({
+      collected: chunkCollected,
+      discarded: chunkDiscarded,
+      totalSoFar: done,
+      outOf: specs.length,
+    });
   }
   return { collected, discarded };
 }
@@ -960,6 +1138,8 @@ const DEFAULT_SPEED_SCHEDULE = [0, 4, 8, 12, 16, 20, 24, 28];
 export async function runManeuverTraining(
   opts: ManeuverTrainingOptions = {},
 ): Promise<RunOfflineTrainingResult> {
+  opts.onEvent?.({ type: 'phase', round: 0, phase: 'initializing' });
+  await yieldToMainThread();
   const trialsPerRound = opts.trialsPerRound ?? 200;
   const rounds = opts.rounds ?? 3;
   const ticks = opts.trialTicks ?? 120;
@@ -999,16 +1179,29 @@ export async function runManeuverTraining(
       count: trialsPerRound,
       seed: seed + round * 17,
     });
+    opts.onEvent?.({ type: 'phase', round, phase: 'collecting' });
     const { collected, discarded } = await collectManeuverBatch(
       harness,
       bundle,
       { ticks, sampleEveryNTicks: sampleEveryN },
       trialIdx,
       startSpeedSchedule,
+      (delta) => {
+        opts.onEvent?.({
+          type: 'trial-batch',
+          round,
+          collected: delta.collected,
+          discarded: delta.discarded,
+          runSoFar: delta.totalSoFar,
+          runTarget: delta.outOf,
+        });
+      },
     );
     trialIdx += bundle.length;
     for (const t of collected) store.add(t);
-    opts.onEvent?.({ type: 'trial-batch', round, collected: collected.length, discarded });
+    // NOTE: `collectManeuverBatch` already streams per-chunk `trial-batch`
+    // events via the `delta` callback above, so no summary event is
+    // emitted here — adding one would double-count in UI accumulators.
     // Phase 3 DAgger: race the current v2 model on the actual track and
     // append the recorded (state, controls, next_state) trials. Lifted
     // behind a feature flag so the existing maneuver-only pipeline
@@ -1026,6 +1219,9 @@ export async function runManeuverTraining(
         scenarioId: `dagger-round${round}`,
       });
       for (const t of race.trials) store.add(t);
+      // DAgger's race collector doesn't have incremental progress hooks,
+      // so emit a single summary event so the trial counter reflects the
+      // added trials.
       opts.onEvent?.({
         type: 'trial-batch',
         round,
@@ -1034,12 +1230,24 @@ export async function runManeuverTraining(
       });
     }
     const ctx = { round, store };
+    opts.onEvent?.({ type: 'phase', round, phase: 'parametric' });
+    const paramMax = pipeline.parametricMaxIter(round);
     const params = await pipeline.fitParametric(ctx, (event) =>
-      opts.onEvent?.({ type: 'fit-progress', round, phase: 'parametric', event }),
+      opts.onEvent?.({
+        type: 'fit-progress', round, phase: 'parametric', event,
+        iterIndex: event.iter, iterTotal: paramMax,
+      }),
     );
+    opts.onEvent?.({ type: 'phase', round, phase: 'residual' });
+    const resEpochs = pipeline.residualEpochs(round);
     await pipeline.fitResidual(ctx, params, (event) =>
-      opts.onEvent?.({ type: 'fit-progress', round, phase: 'residual', event }),
+      opts.onEvent?.({
+        type: 'fit-progress', round, phase: 'residual', event,
+        iterIndex: event.iter, iterTotal: resEpochs,
+      }),
     );
+    await yieldToMainThread();
+    opts.onEvent?.({ type: 'phase', round, phase: 'evaluating' });
     const trained = { params, forwardSim: learnedForwardSimV2(pipeline.currentLearnedModel()) };
     finalDiag = pipeline.evaluate(ctx, trained);
     opts.onEvent?.({ type: 'evaluation', round, diagnostics: finalDiag });

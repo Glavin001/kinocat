@@ -11,7 +11,7 @@
 //
 // Persistence + A/B toggle live in the parent (RacePrimitives.tsx).
 
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, BarChart, Bar, ResponsiveContainer,
 } from 'recharts';
@@ -53,6 +53,8 @@ interface RoundSnapshot {
   coverage?: CoverageCellSummary[];
 }
 
+type Phase = 'initializing' | 'collecting' | 'parametric' | 'residual' | 'evaluating' | null;
+
 export function ModelLab(props: ModelLabProps) {
   const isMobile = useIsMobile();
   const [open, setOpen] = useState(false);
@@ -64,7 +66,13 @@ export function ModelLab(props: ModelLabProps) {
   const [currentRound, setCurrentRound] = useState(0);
   const [trialsCollected, setTrialsCollected] = useState(0);
   const [trialsDiscarded, setTrialsDiscarded] = useState(0);
+  const [trialsAttemptedThisRound, setTrialsAttemptedThisRound] = useState(0);
+  const [trialsTargetThisRound, setTrialsTargetThisRound] = useState(0);
   const [latestLoss, setLatestLoss] = useState<number | null>(null);
+  const [currentPhase, setCurrentPhase] = useState<Phase>(null);
+  const [currentIter, setCurrentIter] = useState(0);
+  const [currentIterTotal, setCurrentIterTotal] = useState(0);
+  const [startedAt, setStartedAt] = useState<number | null>(null);
   const [roundHistory, setRoundHistory] = useState<RoundSnapshot[]>([]);
   const [error, setError] = useState<string | null>(null);
   const cancelRef = useRef<{ cancelled: boolean }>({ cancelled: false });
@@ -84,7 +92,13 @@ export function ModelLab(props: ModelLabProps) {
     setCurrentRound(0);
     setTrialsCollected(0);
     setTrialsDiscarded(0);
+    setTrialsAttemptedThisRound(0);
+    setTrialsTargetThisRound(0);
     setLatestLoss(null);
+    setCurrentPhase('initializing');
+    setCurrentIter(0);
+    setCurrentIterTotal(0);
+    setStartedAt(Date.now());
     setRoundHistory([]);
     try {
       const onEvent = (e: TrainingEvent) => {
@@ -95,15 +109,30 @@ export function ModelLab(props: ModelLabProps) {
             fitProgressRef.current = [];
             pendingDiagRef.current = null;
             pendingCoverageRef.current = null;
+            setCurrentPhase('collecting');
+            setTrialsAttemptedThisRound(0);
+            setTrialsTargetThisRound(0);
+            setCurrentIter(0);
+            setCurrentIterTotal(0);
+            break;
+          case 'phase':
+            setCurrentPhase(e.phase);
+            setCurrentIter(0);
+            setCurrentIterTotal(0);
             break;
           case 'trial-batch':
             trialsAccumRef.current += e.collected;
             setTrialsCollected(trialsAccumRef.current);
             setTrialsDiscarded((d) => d + e.discarded);
+            if (typeof e.runSoFar === 'number') setTrialsAttemptedThisRound(e.runSoFar);
+            if (typeof e.runTarget === 'number') setTrialsTargetThisRound(e.runTarget);
             break;
           case 'fit-progress':
             fitProgressRef.current.push(e.event);
             setLatestLoss(e.event.loss);
+            setCurrentPhase(e.phase);
+            if (typeof e.iterIndex === 'number') setCurrentIter(e.iterIndex);
+            if (typeof e.iterTotal === 'number') setCurrentIterTotal(e.iterTotal);
             break;
           case 'evaluation':
             pendingDiagRef.current = e.diagnostics;
@@ -195,8 +224,18 @@ export function ModelLab(props: ModelLabProps) {
 
       {status === 'running' && (
         <Section title={`Progress — Round ${currentRound + 1}/${rounds}`}>
+          <ProgressBar
+            phase={currentPhase}
+            trialsAttemptedThisRound={trialsAttemptedThisRound}
+            trialsTargetThisRound={trialsTargetThisRound}
+            iter={currentIter}
+            iterTotal={currentIterTotal}
+            startedAt={startedAt}
+            round={currentRound}
+            rounds={rounds}
+          />
           <KV k="Trials collected" v={String(trialsCollected)} />
-          <KV k="Trials discarded" v={String(trialsDiscarded)} />
+          {trialsDiscarded > 0 && <KV k="Trials discarded" v={String(trialsDiscarded)} />}
           {latestLoss !== null && <KV k="Latest loss" v={latestLoss.toFixed(4)} />}
         </Section>
       )}
@@ -651,6 +690,161 @@ function Stat({ color, label, value }: { color: string; label: string; value: st
     <div style={{ display: 'flex', flexDirection: 'column', gap: 2, padding: '4px 10px', border: '1px solid #223044', borderRadius: 4, minWidth: 100 }}>
       <span style={{ fontSize: 10, opacity: 0.7 }}>{label}</span>
       <span style={{ color, fontWeight: 600 }}>{value}</span>
+    </div>
+  );
+}
+
+// Live progress block shown during training in the overlay. Shows the
+// current phase with a pulsing activity dot, a per-phase progress bar,
+// elapsed time + ETA, and an overall progress bar so the user always
+// has something visibly moving even during long Nelder-Mead fits.
+
+const OVERLAY_PHASE_COLORS = {
+  starting: '#cdd3de',
+  initializing: '#7fbfff',
+  collecting: '#ffd070',
+  parametric: '#55dcff',
+  residual: '#a888ff',
+  evaluating: '#55ff88',
+} as const;
+
+const OVERLAY_PHASE_WEIGHTS = {
+  collecting: 0.20,
+  parametric: 0.60,
+  residual: 0.15,
+  evaluating: 0.05,
+};
+
+function ProgressBar({
+  phase, trialsAttemptedThisRound, trialsTargetThisRound, iter, iterTotal,
+  startedAt, round, rounds,
+}: {
+  phase: Phase;
+  trialsAttemptedThisRound: number;
+  trialsTargetThisRound: number;
+  iter: number;
+  iterTotal: number;
+  startedAt: number | null;
+  round: number;
+  rounds: number;
+}) {
+  let fraction = 0;
+  let label = '';
+  const color = OVERLAY_PHASE_COLORS[(phase ?? 'starting') as keyof typeof OVERLAY_PHASE_COLORS];
+  if (phase === 'initializing') {
+    fraction = 0.15;
+    label = 'loading Rapier WASM…';
+  } else if (phase === 'collecting' && trialsTargetThisRound > 0) {
+    fraction = trialsAttemptedThisRound / trialsTargetThisRound;
+    label = `${trialsAttemptedThisRound} / ${trialsTargetThisRound} trials`;
+  } else if ((phase === 'parametric' || phase === 'residual') && iterTotal > 0) {
+    fraction = (iter + 1) / iterTotal;
+    label = `iter ${iter + 1} / ${iterTotal}`;
+  } else if (phase === 'evaluating') {
+    fraction = 0.5;
+    label = 'computing diagnostics…';
+  } else {
+    label = 'starting…';
+  }
+  fraction = Math.max(0, Math.min(1, fraction));
+
+  // Overall progress estimate (weighted by phase) for the secondary bar.
+  const intra = (() => {
+    const isLast = round === rounds - 1;
+    const w = OVERLAY_PHASE_WEIGHTS;
+    const total = isLast
+      ? w.collecting + w.parametric + w.residual + w.evaluating
+      : w.collecting + w.parametric + w.evaluating;
+    let done = 0;
+    if (phase === 'collecting') done = w.collecting * fraction;
+    else if (phase === 'parametric') done = w.collecting + w.parametric * fraction;
+    else if (phase === 'residual') done = w.collecting + w.parametric + w.residual * fraction;
+    else if (phase === 'evaluating') {
+      done = w.collecting + w.parametric + (isLast ? w.residual : 0) + w.evaluating * fraction;
+    }
+    return done / total;
+  })();
+  const overall = Math.max(0, Math.min(1, (round + intra) / rounds));
+
+  // Heartbeat tick so elapsed + ETA update even between training events.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(id);
+  }, []);
+  const elapsedMs = startedAt ? Math.max(0, now - startedAt) : 0;
+  const etaMs = overall > 0.02 ? Math.max(0, elapsedMs / overall - elapsedMs) : null;
+  const fmt = (ms: number) => {
+    const s = Math.round(ms / 1000);
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return m === 0 ? `${r}s` : `${m}:${String(r).padStart(2, '0')}`;
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+        <span style={{
+          width: 8, height: 8, borderRadius: '50%', background: color,
+          boxShadow: `0 0 6px ${color}`,
+          animation: 'modelLabPulse 1.1s ease-in-out infinite',
+        }} />
+        <span style={{ color, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.4 }}>
+          {phase ?? 'starting'}
+        </span>
+        <span style={{ opacity: 0.85 }}>{label}</span>
+      </div>
+      <ProgressTrackOverlay fraction={fraction} color={color} />
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, opacity: 0.75 }}>
+        <span>overall {Math.round(overall * 100)}%</span>
+        <span>
+          elapsed <span style={{ color: '#cdeaff' }}>{fmt(elapsedMs)}</span>
+          {etaMs !== null && <> · ETA <span style={{ color: '#cdeaff' }}>~{fmt(etaMs)}</span></>}
+        </span>
+      </div>
+      <ProgressTrackOverlay fraction={overall} color="#55dcff" thin />
+    </div>
+  );
+}
+
+// Inject pulse + shimmer keyframes once. Idempotent across both ModelLab
+// (raceprimitives overlay) and TrainingControls (model-lab dashboard).
+if (typeof document !== 'undefined' && !document.getElementById('model-lab-progress-keyframes')) {
+  const style = document.createElement('style');
+  style.id = 'model-lab-progress-keyframes';
+  style.textContent = `
+    @keyframes modelLabPulse {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.35); opacity: 0.55; }
+    }
+    @keyframes modelLabShimmer {
+      0% { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function ProgressTrackOverlay({ fraction, color, thin }: { fraction: number; color: string; thin?: boolean }) {
+  return (
+    <div style={{
+      position: 'relative',
+      height: thin ? 3 : 6, borderRadius: 3, overflow: 'hidden',
+      background: 'rgba(255, 255, 255, 0.06)',
+    }}>
+      <div style={{
+        width: `${fraction * 100}%`, height: '100%',
+        background: color,
+        transition: 'width 200ms linear',
+      }} />
+      {!thin && (
+        <div style={{
+          position: 'absolute', inset: 0, pointerEvents: 'none',
+          background: `linear-gradient(90deg, transparent 0%, ${color}30 50%, transparent 100%)`,
+          backgroundSize: '200% 100%',
+          animation: 'modelLabShimmer 1.4s linear infinite',
+        }} />
+      )}
     </div>
   );
 }

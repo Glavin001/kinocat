@@ -24,18 +24,20 @@ export {
 
 export type {
   ParametricFitOptions,
+  ParametricFitAsyncOptions,
   ParametricFitResult,
   FitProgressEvent,
   LossDecomposition,
 } from './parametric-fit';
-export { runParametricFit } from './parametric-fit';
+export { runParametricFit, runParametricFitAsync } from './parametric-fit';
 
 export type {
   ResidualMLPFitOptions,
+  ResidualMLPFitAsyncOptions,
   ResidualMLPFitResult,
   ResidualFitProgressEvent,
 } from './residual-mlp-fit';
-export { runResidualMLPFit } from './residual-mlp-fit';
+export { runResidualMLPFit, runResidualMLPFitAsync } from './residual-mlp-fit';
 
 export type {
   ModelDiagnostics,

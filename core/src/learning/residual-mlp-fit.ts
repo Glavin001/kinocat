@@ -174,6 +174,92 @@ export function runResidualMLPFit<S, C, Cfg>(
   return { ensemble, finalTrainLoss: finalTrain, finalValLoss: finalVal, history };
 }
 
+// ---------------------------------------------------------------------------
+// Async, cooperatively-yielding variant for browser callers — same logic as
+// `runResidualMLPFit` but yields to the event loop periodically so a long
+// SGD training run does not lock up the Chrome main thread.
+
+export interface ResidualMLPFitAsyncOptions<S, C, Cfg>
+  extends ResidualMLPFitOptions<S, C, Cfg>
+{
+  /** Yield to the event loop every N epochs. Default 1. */
+  yieldEveryNEpochs?: number;
+  /** Yield to the event loop every N mini-batches within an epoch.
+   *  Default 8. Set to 0 to disable mid-epoch yielding. */
+  yieldEveryNBatches?: number;
+  /** How to yield. Default: `setTimeout(resolve, 0)`. */
+  cooperativeYield?: () => Promise<void>;
+}
+
+const defaultMlpYield = (): Promise<void> =>
+  new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+export async function runResidualMLPFitAsync<S, C, Cfg>(
+  opts: ResidualMLPFitAsyncOptions<S, C, Cfg>,
+): Promise<ResidualMLPFitResult> {
+  const baseSeed = opts.seed ?? 1;
+  const trials = [...opts.trials];
+  const valFrac = opts.valSplit ?? 0.2;
+  const valCount = Math.max(0, Math.floor(trials.length * valFrac));
+  const trainTrials = trials.slice(valCount);
+  const valTrials = trials.slice(0, valCount);
+  const trainSamples = buildSamples(opts, trainTrials);
+  const valSamples = buildSamples(opts, valTrials);
+  const epochs = opts.epochs ?? 200;
+  const batchSize = opts.batchSize ?? 64;
+  const lr = opts.learningRate ?? 1e-3;
+  const coop = opts.cooperativeYield ?? defaultMlpYield;
+  const yieldEveryNEpochs = Math.max(1, opts.yieldEveryNEpochs ?? 1);
+  const yieldEveryNBatches = Math.max(0, opts.yieldEveryNBatches ?? 8);
+
+  const ensemble: MLP[] = [];
+  const adams: AdamState[] = [];
+  for (let m = 0; m < opts.ensembleSize; m++) {
+    const mlp = createMLP(opts.mlpShape, baseSeed + m);
+    ensemble.push(mlp);
+    adams.push(createAdam(mlp, lr));
+  }
+
+  const history: ResidualFitProgressEvent[] = [];
+  for (let ep = 0; ep < epochs; ep++) {
+    for (let m = 0; m < ensemble.length; m++) {
+      const mlp = ensemble[m]!;
+      const adam = adams[m]!;
+      const order = shuffleIndices(trainSamples.length, baseSeed + m * 7919 + ep * 31);
+      let batchIdx = 0;
+      for (let b = 0; b < order.length; b += batchSize) {
+        const grads = zeroGradients(mlp);
+        const end = Math.min(order.length, b + batchSize);
+        const inv = 1 / Math.max(1, end - b);
+        for (let j = b; j < end; j++) {
+          const s = trainSamples[order[j]!]!;
+          const cache = forward(mlp, s.input);
+          const g = backward(mlp, cache, s.target);
+          accumulateGradients(grads, g, inv);
+        }
+        adamStep(mlp, grads, adam);
+        batchIdx++;
+        if (yieldEveryNBatches > 0 && batchIdx % yieldEveryNBatches === 0) {
+          await coop();
+        }
+      }
+    }
+    if (ep % Math.max(1, Math.floor(epochs / 50)) === 0 || ep === epochs - 1) {
+      const trainL = ensemble.reduce((a, m) => a + meanLoss(m, trainSamples), 0) / ensemble.length;
+      const valL = ensemble.reduce((a, m) => a + meanLoss(m, valSamples), 0) / Math.max(1, ensemble.length);
+      const evt: ResidualFitProgressEvent = { epoch: ep, trainLoss: trainL, valLoss: valL };
+      history.push(evt);
+      opts.onProgress?.(evt);
+    }
+    if ((ep + 1) % yieldEveryNEpochs === 0) {
+      await coop();
+    }
+  }
+  const finalTrain = ensemble.reduce((a, m) => a + meanLoss(m, trainSamples), 0) / ensemble.length;
+  const finalVal = ensemble.reduce((a, m) => a + meanLoss(m, valSamples), 0) / Math.max(1, ensemble.length);
+  return { ensemble, finalTrainLoss: finalTrain, finalValLoss: finalVal, history };
+}
+
 function shuffleIndices(n: number, seed: number): number[] {
   const arr = Array.from({ length: n }, (_, i) => i);
   // Mulberry32-style PRNG for reproducibility.
