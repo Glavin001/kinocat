@@ -46,7 +46,6 @@ async function main(): Promise<void> {
       models: { type: 'string', default: 'demos/public/models/v2-default.json' },
       laps: { type: 'string', default: '3' },
       seed: { type: 'string', default: '42' },
-      'replan-ms': { type: 'string', default: '80' },
       'max-sim': { type: 'string', default: '180' },
       json: { type: 'string' },
       ledger: { type: 'string' },
@@ -58,7 +57,7 @@ async function main(): Promise<void> {
   });
   if (values.help) {
     process.stdout.write(`Usage: pnpm run race -- [--models=a.json,b.json,...]
-                      [--laps=N] [--seed=N] [--replan-ms=N] [--max-sim=N]
+                      [--laps=N] [--seed=N] [--max-sim=N]
                       [--json=path] [--ledger=dir] [--quick]
                       [--no-kinematic] [--no-parametric]
 `);
@@ -66,7 +65,6 @@ async function main(): Promise<void> {
   }
 
   const laps = Number(values.laps);
-  const replanBudgetMs = Number(values['replan-ms']);
   const maxSimTime = Number(values['max-sim']);
   const quick = values.quick === true;
 
@@ -95,7 +93,6 @@ async function main(): Promise<void> {
     entries,
     targetLaps,
     maxSimTime,
-    replanBudgetMs,
     onProgress: (msg) => process.stdout.write(`  · ${msg}\n`),
     progressEverySec: 10,
   });

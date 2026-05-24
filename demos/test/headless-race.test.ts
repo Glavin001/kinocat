@@ -25,7 +25,6 @@ describe.skipIf(!RAPIER_OK)('runHeadlessRace', () => {
       entries: [kinematicEntry('kin'), parametricOnlyEntry('para')],
       targetLaps: 1,
       maxSimTime: 120,
-      replanBudgetMs: 80,
     });
     expect(results.length).toBe(2);
     for (const r of results) {
