@@ -66,6 +66,10 @@ export interface FitProgressEvent {
   loss: number;
   /** Optional per-component breakdown (averaged across samples). */
   perComponent?: LossDecomposition;
+  /** Optional held-out (validation-split) loss. Populated by the residual
+   *  MLP fitter (which has an explicit val split); the parametric fitter
+   *  omits this field (no val split). */
+  valLoss?: number;
 }
 
 export interface ParametricFitResult<P> {

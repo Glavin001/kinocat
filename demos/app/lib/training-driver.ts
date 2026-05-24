@@ -34,6 +34,7 @@ import {
   runResidualMLPFit,
   evaluateModel,
   type ModelDiagnostics,
+  type OpenLoopRow,
   type FitProgressEvent,
   proposeNextBatch,
   type ExplorationCell,
@@ -47,10 +48,16 @@ import {
 } from 'kinocat/adapters/rapier';
 import {
   defaultManeuverBundle,
+  CAR_COVERAGE_AXES,
+  carCoverageProjection,
   type ManeuverLimits,
   type ManeuverSpec,
 } from 'kinocat/vehicle/car';
-import { buildControlsTrace } from 'kinocat/training';
+import {
+  buildControlsTrace,
+  createCoverageMeter,
+  type CoverageCellSummary,
+} from 'kinocat/training';
 import type { ForwardSim } from 'kinocat/primitives';
 import type {
   TrainingPipeline,
@@ -81,6 +88,7 @@ export type TrainingEvent =
   | { type: 'trial-batch'; round: number; collected: number; discarded: number }
   | { type: 'fit-progress'; round: number; phase: 'parametric' | 'residual'; event: FitProgressEvent }
   | { type: 'evaluation'; round: number; diagnostics: ModelDiagnostics }
+  | { type: 'coverage'; round: number; cells: CoverageCellSummary[] }
   | { type: 'round-end'; round: number; trainedModel: LearnedVehicleModel; params: LearnedVehicleParamsV2; diagnostics: ModelDiagnostics; trialsAfter: number }
   | { type: 'done'; totalTrials: number; finalModel: LearnedVehicleModel; finalDiagnostics: ModelDiagnostics };
 
@@ -233,16 +241,53 @@ function controlsToVec(c: WheeledCarControls): number[] {
   return [c.steer, c.driveForce, c.brakeForce];
 }
 
+/** Build a coverage summary over the current store contents using the
+ *  canonical car coverage axes. Pure: makes a fresh meter each time so
+ *  callers don't accidentally accumulate across rounds. */
+export function buildCoverageSummary(
+  store: TrialStore<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>,
+): CoverageCellSummary[] {
+  const meter = createCoverageMeter<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
+    axes: CAR_COVERAGE_AXES,
+    project: carCoverageProjection,
+    controlsToVec,
+  });
+  for (const t of store.all()) meter.record(t);
+  return meter.summary();
+}
+
+export { CAR_COVERAGE_AXES };
+
 function evaluate(
   store: TrialStore<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>,
   model: LearnedVehicleModel,
 ): ModelDiagnostics {
-  // Last 25% of trials are held-out evaluation set.
   const all = store.all();
-  const cut = Math.max(1, Math.floor(all.length * 0.75));
-  const heldOut = all.slice(cut);
-  if (heldOut.length === 0) {
+  if (all.length === 0) {
     return { openLoopDivergence: [], perStateRms: [], coverage: [], baselines: {} };
+  }
+  // Split-aware partitioning — Phase 0 of the training-dataset plan.
+  // Falls back to the legacy last-25% slice when no trial in the store
+  // carries a `split` field (e.g. the constant-hold pipeline being
+  // exercised by `training-pipeline-equivalence.test.ts`).
+  const hasSplit = all.some((t) => t.split !== undefined);
+  let heldOut: ReadonlyArray<typeof all[number]>;
+  let trainSet: ReadonlyArray<typeof all[number]>;
+  let valSet: ReadonlyArray<typeof all[number]>;
+  let testSet: ReadonlyArray<typeof all[number]>;
+  if (hasSplit) {
+    trainSet = store.all('train');
+    valSet = store.all('val');
+    testSet = store.all('test');
+    // Headline numbers report the TEST set (frozen, never trained on);
+    // when test is empty (small N) fall back to val, then to all trials.
+    heldOut = testSet.length > 0 ? testSet : valSet.length > 0 ? valSet : all;
+  } else {
+    const cut = Math.max(1, Math.floor(all.length * 0.75));
+    heldOut = all.slice(cut);
+    trainSet = all.slice(0, cut);
+    valSet = [];
+    testSet = heldOut;
   }
   const horizons = [0.5, 1.0, 1.6];
   const agent = defaultVehicleAgent();
@@ -258,17 +303,15 @@ function evaluate(
     steer: controls[0] ?? 0, driveForce: controls[1] ?? 0, brakeForce: controls[2] ?? 0,
   }), dt);
 
-  // Use the FULL learnedForwardSimV2 (parametric + residual-ensemble) so
-  // the headline open-loop divergence reflects what the planner will
-  // actually see at race time. When the ensemble is empty (no residual
-  // trained yet), this falls back to parametric-only.
   const wrap = (a: number): number => {
     let d = a;
     while (d > Math.PI) d -= 2 * Math.PI;
     while (d < -Math.PI) d += 2 * Math.PI;
     return d;
   };
-  return evaluateModel<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
+  // Headline diagnostics: full learnedForwardSimV2 vs baselines, evaluated
+  // on the held-out (test / val / all) set.
+  const headline = evaluateModel<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
     trials: heldOut,
     horizons,
     controlsToVec,
@@ -283,14 +326,30 @@ function evaluate(
     baselines: {
       kinematic: { make: () => composedSim(kinematicForwardSim(agent), wheeledToLegacy) },
       legacyV1: { make: () => composedSim(learnedForwardSim(DEFAULT_LEARNED_PARAMS, agent), wheeledToLegacy) },
-      // Parametric-only (no residual MLP) — shown so the user can see
-      // how much the residual ensemble contributed on top of the
-      // parametric fit alone.
       parametricOnly: {
         make: () => parametricForwardV2(model.params, model.config),
       },
     },
   });
+  // Per-split open-loop only — cheaper than full headline per split, and
+  // it's the column users actually read in the Phase 0 train / val / test
+  // RMS table.
+  const evalOpenLoop = (trials: ReadonlyArray<typeof all[number]>): OpenLoopRow[] | undefined => {
+    if (trials.length === 0) return undefined;
+    return evaluateModel<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
+      trials, horizons, controlsToVec,
+      extractMetricFields: (s) => ({ x: s.x, z: s.z, heading: s.heading, speed: s.speed }),
+      model: { make: () => learnedForwardSimV2(model) },
+    }).openLoopDivergence;
+  };
+  const perSplit = hasSplit
+    ? {
+        train: evalOpenLoop(trainSet),
+        val: evalOpenLoop(valSet),
+        test: evalOpenLoop(testSet),
+      }
+    : undefined;
+  return { ...headline, perSplit };
 }
 
 // ---------------------------------------------------------------------------
@@ -589,7 +648,12 @@ export class CarV2TrainingPipeline
         valSplit: 0.2,
         fitSubstepsPerSample: 6,
         onProgress: (e) => {
-          const ev: FitProgressEvent = { iter: e.epoch, loss: e.trainLoss, perComponent: undefined };
+          const ev: FitProgressEvent = {
+            iter: e.epoch,
+            loss: e.trainLoss,
+            valLoss: e.valLoss,
+            perComponent: undefined,
+          };
           onProgress?.(ev);
           this.onResidualProgress?.(ctx.round, ev);
         },
@@ -933,6 +997,7 @@ export async function runManeuverTraining(
     const trained = { params, forwardSim: learnedForwardSimV2(pipeline.currentLearnedModel()) };
     finalDiag = pipeline.evaluate(ctx, trained);
     opts.onEvent?.({ type: 'evaluation', round, diagnostics: finalDiag });
+    opts.onEvent?.({ type: 'coverage', round, cells: buildCoverageSummary(store) });
     opts.onEvent?.({
       type: 'round-end',
       round,

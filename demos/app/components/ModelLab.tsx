@@ -15,10 +15,11 @@ import { useMemo, useRef, useState } from 'react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, BarChart, Bar, ResponsiveContainer,
 } from 'recharts';
-import { runManeuverTraining, type TrainingEvent } from '../lib/training-driver';
+import { runManeuverTraining, type TrainingEvent, CAR_COVERAGE_AXES } from '../lib/training-driver';
 import { useIsMobile } from '../lib/use-is-mobile';
 import type { LearnedVehicleModel } from 'kinocat/agent';
 import type { ModelDiagnostics, FitProgressEvent } from 'kinocat/learning';
+import type { CoverageCellSummary } from 'kinocat/training';
 
 export interface ModelLabProps {
   onTrained: (model: LearnedVehicleModel, diag: ModelDiagnostics, trialsUsed: number) => void;
@@ -49,6 +50,7 @@ interface RoundSnapshot {
   trialsAfter: number;
   totalLossCurve: FitProgressEvent[];
   diag: ModelDiagnostics;
+  coverage?: CoverageCellSummary[];
 }
 
 export function ModelLab(props: ModelLabProps) {
@@ -69,12 +71,14 @@ export function ModelLab(props: ModelLabProps) {
   const fitProgressRef = useRef<FitProgressEvent[]>([]);
   const trialsAccumRef = useRef(0);
   const pendingDiagRef = useRef<ModelDiagnostics | null>(null);
+  const pendingCoverageRef = useRef<CoverageCellSummary[] | null>(null);
 
   async function startTraining() {
     cancelRef.current = { cancelled: false };
     fitProgressRef.current = [];
     trialsAccumRef.current = 0;
     pendingDiagRef.current = null;
+    pendingCoverageRef.current = null;
     setStatus('running');
     setError(null);
     setCurrentRound(0);
@@ -90,6 +94,7 @@ export function ModelLab(props: ModelLabProps) {
             setCurrentRound(e.round);
             fitProgressRef.current = [];
             pendingDiagRef.current = null;
+            pendingCoverageRef.current = null;
             break;
           case 'trial-batch':
             trialsAccumRef.current += e.collected;
@@ -103,12 +108,17 @@ export function ModelLab(props: ModelLabProps) {
           case 'evaluation':
             pendingDiagRef.current = e.diagnostics;
             break;
+          case 'coverage':
+            pendingCoverageRef.current = e.cells;
+            break;
           case 'round-end': {
             const diag = pendingDiagRef.current ?? { openLoopDivergence: [], perStateRms: [], coverage: [], baselines: {} };
             const trialsAfter = trialsAccumRef.current;
             const curve = [...fitProgressRef.current];
+            const coverage = pendingCoverageRef.current ?? undefined;
+            pendingCoverageRef.current = null;
             setRoundHistory((h) => [...h, {
-              round: e.round, trialsAfter, totalLossCurve: curve, diag,
+              round: e.round, trialsAfter, totalLossCurve: curve, diag, coverage,
             }]);
             break;
           }
@@ -287,11 +297,15 @@ interface ResultsViewProps {
 
 function ResultsView({ roundHistory, loadedMeta }: ResultsViewProps) {
   const lossChartData = useMemo(() => {
-    const rows: { iter: number; loss: number }[] = [];
+    const rows: { iter: number; loss: number; valLoss?: number }[] = [];
     let cumIter = 0;
     for (const r of roundHistory) {
       for (const ev of r.totalLossCurve) {
-        rows.push({ iter: cumIter + ev.iter, loss: ev.loss });
+        rows.push({
+          iter: cumIter + ev.iter,
+          loss: ev.loss,
+          valLoss: ev.valLoss,
+        });
       }
       cumIter += r.totalLossCurve.length > 0 ? r.totalLossCurve[r.totalLossCurve.length - 1]!.iter + 1 : 0;
     }
@@ -364,7 +378,7 @@ function ResultsView({ roundHistory, loadedMeta }: ResultsViewProps) {
       )}
 
       {lossChartData.length > 1 && (
-        <Section title="Training loss (per Nelder-Mead iteration)">
+        <Section title="Training loss (train vs val)">
           <div style={{ width: '100%', height: 160 }}>
             <ResponsiveContainer>
               <LineChart data={lossChartData}>
@@ -372,15 +386,195 @@ function ResultsView({ roundHistory, loadedMeta }: ResultsViewProps) {
                 <XAxis dataKey="iter" stroke="#cdd3de" fontSize={11} />
                 <YAxis stroke="#cdd3de" fontSize={11} scale="log" domain={['auto', 'auto']} />
                 <Tooltip contentStyle={{ background: '#141a26', border: '1px solid #223044', fontSize: 11 }} />
-                <Line type="monotone" dataKey="loss" stroke="#55dcff" dot={false} strokeWidth={2} />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <Line type="monotone" dataKey="loss" name="train" stroke="#55dcff" dot={false} strokeWidth={2} />
+                <Line type="monotone" dataKey="valLoss" name="val" stroke="#ffd070" dot={false} strokeWidth={2} />
               </LineChart>
             </ResponsiveContainer>
           </div>
         </Section>
       )}
+
+      <SplitRmsTable roundHistory={roundHistory} loadedMeta={loadedMeta} />
+
+      <CoverageHeatmap roundHistory={roundHistory} />
     </>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 0 — per-horizon train/val/test RMS table. Honest cross-phase
+// progress surface: the columns are populated from `diag.perSplit` when
+// the trial store carried `split` tags; otherwise the table renders the
+// legacy heldOut row only.
+
+function SplitRmsTable({
+  roundHistory,
+  loadedMeta,
+}: {
+  roundHistory: RoundSnapshot[];
+  loadedMeta?: ModelLabProps['loadedMeta'];
+}) {
+  const finalDiag = roundHistory.length > 0 ? roundHistory[roundHistory.length - 1]!.diag : null;
+  if (!finalDiag) return null;
+  const headlineHorizons = finalDiag.openLoopDivergence.map((r) => r.tSec);
+  if (headlineHorizons.length === 0) return null;
+  const perSplit = finalDiag.perSplit;
+  // Build rows: one per horizon. Columns: held-out (always), train, val, test (when perSplit available).
+  const rows = headlineHorizons.map((tSec) => {
+    const heldOut = finalDiag.openLoopDivergence.find((r) => r.tSec === tSec)?.posRms;
+    const train = perSplit?.train?.find((r) => r.tSec === tSec)?.posRms;
+    const val = perSplit?.val?.find((r) => r.tSec === tSec)?.posRms;
+    const test = perSplit?.test?.find((r) => r.tSec === tSec)?.posRms;
+    return { tSec, heldOut, train, val, test };
+  });
+  const fmt = (v?: number) => (v !== undefined && Number.isFinite(v) ? v.toFixed(3) + ' m' : '—');
+  void loadedMeta; // not used yet
+  return (
+    <Section title="Per-horizon position RMS — train / val / test">
+      <div style={{ fontSize: 11, lineHeight: 1.4 }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead>
+            <tr style={{ borderBottom: '1px solid #223044' }}>
+              <th style={thStyle}>horizon</th>
+              <th style={thStyle}>held-out</th>
+              <th style={thStyle}>train</th>
+              <th style={thStyle}>val</th>
+              <th style={thStyle}>test</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.tSec} style={{ borderBottom: '1px solid #141a26' }}>
+                <td style={tdStyle}>{r.tSec.toFixed(1)}s</td>
+                <td style={tdStyle}>{fmt(r.heldOut)}</td>
+                <td style={tdStyle}>{fmt(r.train)}</td>
+                <td style={tdStyle}>{fmt(r.val)}</td>
+                <td style={{ ...tdStyle, color: '#55dcff' }}>{fmt(r.test)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {!perSplit && (
+          <div style={{ marginTop: 6, color: '#7a8290' }}>
+            Per-split numbers populate when training uses split-tagged trials
+            (Phase 0 of the training-dataset plan). Re-train via the maneuver
+            pipeline to see them.
+          </div>
+        )}
+      </div>
+    </Section>
+  );
+}
+
+const thStyle: React.CSSProperties = {
+  textAlign: 'left',
+  padding: '4px 6px',
+  color: '#7a8290',
+  fontWeight: 600,
+};
+const tdStyle: React.CSSProperties = {
+  padding: '4px 6px',
+};
+
+// ---------------------------------------------------------------------------
+// Phase 0 — coverage heatmap. Two-axis slice picker; cell color = log(count).
+// Empty cells show in dark; hottest cells show in cyan. Pure visualization
+// of the per-bin counts the meter produces.
+
+function CoverageHeatmap({ roundHistory }: { roundHistory: RoundSnapshot[] }) {
+  const lastWithCoverage = [...roundHistory].reverse().find((r) => r.coverage && r.coverage.length > 0);
+  const [xAxisIdx, setXAxisIdx] = useState(0);
+  const [yAxisIdx, setYAxisIdx] = useState(3); // yawRate default — Phase 1 gap is most visible here
+  if (!lastWithCoverage || !lastWithCoverage.coverage) return null;
+  const axes = CAR_COVERAGE_AXES;
+  const cells = lastWithCoverage.coverage;
+  // Project cells onto the chosen (x, y) sub-grid by summing counts across other axes.
+  const xBins = axes[xAxisIdx]!.bins;
+  const yBins = axes[yAxisIdx]!.bins;
+  const grid: number[][] = Array.from({ length: yBins }, () => Array(xBins).fill(0));
+  let maxCount = 0;
+  for (const cell of cells) {
+    const xi = cell.binIndex[xAxisIdx]!;
+    const yi = cell.binIndex[yAxisIdx]!;
+    if (xi < 0 || xi >= xBins || yi < 0 || yi >= yBins) continue;
+    const row = grid[yi]!;
+    row[xi] = (row[xi] ?? 0) + cell.count;
+    if (row[xi]! > maxCount) maxCount = row[xi]!;
+  }
+  const cellW = 18;
+  const cellH = 14;
+  const color = (count: number): string => {
+    if (count === 0) return '#0d1119';
+    const t = Math.log(count + 1) / Math.log(maxCount + 1);
+    // Dark navy to cyan ramp.
+    const r = Math.round(20 + (85 - 20) * t);
+    const g = Math.round(30 + (220 - 30) * t);
+    const b = Math.round(50 + (255 - 50) * t);
+    return `rgb(${r},${g},${b})`;
+  };
+  return (
+    <Section title={`Coverage heatmap — round ${lastWithCoverage.round + 1}`}>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8, fontSize: 11 }}>
+        <label>
+          X axis:{' '}
+          <select value={xAxisIdx} onChange={(e) => setXAxisIdx(Number(e.target.value))} style={selectStyle}>
+            {axes.map((a, i) => (
+              <option key={a.name} value={i}>{a.name}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Y axis:{' '}
+          <select value={yAxisIdx} onChange={(e) => setYAxisIdx(Number(e.target.value))} style={selectStyle}>
+            {axes.map((a, i) => (
+              <option key={a.name} value={i}>{a.name}</option>
+            ))}
+          </select>
+        </label>
+        <span style={{ color: '#7a8290' }}>max cell count = {maxCount}</span>
+      </div>
+      {xAxisIdx === yAxisIdx ? (
+        <div style={{ fontSize: 11, color: '#7a8290' }}>Pick two different axes.</div>
+      ) : (
+        <svg width={xBins * cellW + 60} height={yBins * cellH + 24} style={{ fontSize: 10 }}>
+          <g transform="translate(40, 4)">
+            {grid.map((row, yi) =>
+              row.map((count, xi) => (
+                <g key={`${xi}-${yi}`}>
+                  <rect
+                    x={xi * cellW}
+                    y={(yBins - 1 - yi) * cellH}
+                    width={cellW - 1}
+                    height={cellH - 1}
+                    fill={color(count)}
+                  >
+                    <title>{`${axes[xAxisIdx]!.name}=${axes[xAxisIdx]!.lo + (xi + 0.5) * (axes[xAxisIdx]!.hi - axes[xAxisIdx]!.lo) / xBins}, ${axes[yAxisIdx]!.name}=${axes[yAxisIdx]!.lo + (yi + 0.5) * (axes[yAxisIdx]!.hi - axes[yAxisIdx]!.lo) / yBins}, n=${count}`}</title>
+                  </rect>
+                </g>
+              )),
+            )}
+            <text x={(xBins * cellW) / 2} y={yBins * cellH + 16} textAnchor="middle" fill="#cdd3de">
+              {axes[xAxisIdx]!.name} →
+            </text>
+            <text x={-6} y={(yBins * cellH) / 2} textAnchor="end" fill="#cdd3de">
+              ↑ {axes[yAxisIdx]!.name}
+            </text>
+          </g>
+        </svg>
+      )}
+    </Section>
+  );
+}
+
+const selectStyle: React.CSSProperties = {
+  background: '#0d1119',
+  color: '#cdd3de',
+  border: '1px solid #223044',
+  borderRadius: 4,
+  padding: '2px 4px',
+  fontSize: 11,
+};
 
 // ---------------------------------------------------------------------------
 // Small style helpers — keep dependencies minimal (no styled-components etc.)
