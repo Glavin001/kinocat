@@ -431,6 +431,16 @@ export interface RaceMultiGoalRequest {
   maxExpansions?: number;
   /** Position radius for "gate reached" check. Default 4 m. */
   gateRadius?: number;
+  /**
+   * Optional reference polyline (XZ points) to stay close to. When set,
+   * the planner adds a small `referenceWeight * perpDist` term to every
+   * successor's cost — a cheap hysteresis that prevents the plan from
+   * flipping between near-equal-cost alternatives on noise. Typically
+   * the previously-committed plan.
+   */
+  referencePath?: ReadonlyArray<{ x: number; z: number }>;
+  /** Weight per metre of deviation. Default 0.1 (s/m). */
+  referenceWeight?: number;
 }
 
 /** Single A* through an ordered SEQUENCE of gates. Unlike `planRace`
@@ -454,6 +464,13 @@ export function planRaceMultiGoal(req: RaceMultiGoalRequest): PlanResult<CarKine
     // (chassis pose × gate index).
     maxExpansions: req.maxExpansions ?? RACE_MAX_EXPANSIONS * 2,
     gateRadius: req.gateRadius,
+    envOptions:
+      req.referencePath && req.referencePath.length >= 2
+        ? {
+            referencePath: req.referencePath,
+            referenceWeight: req.referenceWeight,
+          }
+        : undefined,
   });
 }
 

@@ -64,6 +64,21 @@ export interface VehicleEnvOptions {
    * admissibility) scales the grid term. Disabled by default; `{}` enables.
    */
   gridHeuristic?: false | { weight?: number };
+  /**
+   * Trajectory-consistency (a.k.a. "stay close to the previously-committed
+   * plan") cost. When provided, every successor pays an extra
+   * `referenceWeight * perpDist(successor.xz, referencePath)` on its
+   * primitive cost. Cheap hysteresis: with a small weight the planner only
+   * abandons the previous geometry when an alternative is meaningfully
+   * faster. Solves the flip-flopping between near-equal-cost paths that
+   * gives the demo car its visibly jittery plan stream. Added only to g
+   * (not h), so the heuristic remains admissible. Pass `undefined` /
+   * empty to disable.
+   */
+  referencePath?: ReadonlyArray<{ x: number; z: number }>;
+  /** Cost per metre of perpendicular deviation from `referencePath`.
+   *  Default 0.1 (s/m if you read the time-cost as seconds). */
+  referenceWeight?: number;
 }
 
 interface DriveEdgeData {
@@ -107,6 +122,8 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
   private ghGoalZ = NaN;
   private ghLB: ((x: number, z: number, y?: number) => number | null) | null = null;
   private rec: PerfRecorder = NULL_RECORDER;
+  private readonly refPath: ReadonlyArray<{ x: number; z: number }>;
+  private readonly refWeight: number;
 
   constructor(
     private readonly world: NavWorld,
@@ -149,11 +166,45 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
       gh !== false &&
       typeof this.world.buildGoalLowerBound === 'function';
     this.ghWeight = this.ghEnabled ? ((gh as { weight?: number }).weight ?? 1) : 1;
+    this.refPath = opts.referencePath ?? [];
+    this.refWeight = this.refPath.length >= 2 ? (opts.referenceWeight ?? 0.1) : 0;
     this.levels = this.divisors.length;
   }
 
   attachRecorder(rec: PerfRecorder): void {
     this.rec = rec;
+  }
+
+  /** Nearest perpendicular distance from (x, z) to the reference polyline.
+   *  Returns 0 when there is no reference path. Linear scan — fine for the
+   *  ~10–60 sample polylines that primitive planners produce. */
+  private refDist(x: number, z: number): number {
+    const rp = this.refPath;
+    const n = rp.length;
+    if (n < 2 || this.refWeight === 0) return 0;
+    let best = Infinity;
+    for (let i = 0; i < n - 1; i++) {
+      const ax = rp[i]!.x;
+      const az = rp[i]!.z;
+      const bx = rp[i + 1]!.x;
+      const bz = rp[i + 1]!.z;
+      const dx = bx - ax;
+      const dz = bz - az;
+      const lenSq = dx * dx + dz * dz;
+      let u = 0;
+      if (lenSq > 1e-9) {
+        u = ((x - ax) * dx + (z - az) * dz) / lenSq;
+        if (u < 0) u = 0;
+        else if (u > 1) u = 1;
+      }
+      const px = ax + dx * u;
+      const pz = az + dz * u;
+      const ddx = x - px;
+      const ddz = z - pz;
+      const d2 = ddx * ddx + ddz * ddz;
+      if (d2 < best) best = d2;
+    }
+    return Math.sqrt(best);
   }
 
   private headingBucket(h: number): number {
@@ -248,9 +299,12 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
       };
 
       const gearFlip = parentReverse !== undefined && parentReverse !== prim.reverse;
-      const cost =
+      let cost =
         prim.duration * (prim.reverse ? this.agent.reverseCostMultiplier : 1) +
         (gearFlip ? this.agent.directionChangePenalty : 0);
+      if (this.refWeight > 0) {
+        cost += this.refWeight * this.refDist(ex, ez);
+      }
 
       const edge: EdgeRef = {
         cost,

@@ -33,11 +33,12 @@ import {
 import {
   wheeledFromNormalized,
   trimPlan,
+  samplePlanAt,
   type CarForceTuning,
   type CarKinematicState,
   type WheeledCarControls,
 } from 'kinocat/vehicle/car';
-import { purePursuit } from 'kinocat/execute';
+import { purePursuit, smoothSpeedProfile } from 'kinocat/execute';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavWorld } from 'kinocat/environment';
 import type { MotionPrimitiveLibrary } from 'kinocat/primitives';
@@ -67,6 +68,16 @@ export const STALL_TIMEOUT_MS = 4000;
 export const ENGINE_FORCE_N = 4000;
 export const BRAKE_FORCE_N = 2000;
 export const WHEEL_BASE = 1.6;
+/**
+ * Plan-stitching commit window. The controller is guaranteed to follow the
+ * currently-committed plan for this many ms before the next plan takes
+ * over — eliminates mid-flight steering jumps caused by purely periodic
+ * replanning, which is the dominant source of cyan's visible instability
+ * on /raceprimitives. The new plan is computed from the predicted future
+ * state at `simTime + COMMIT_WINDOW_MS`, so it's positionally consistent
+ * with the segment the controller is still executing.
+ */
+export const COMMIT_WINDOW_MS = 200;
 
 const FORCE_TUNING: CarForceTuning = {
   engineForceN: ENGINE_FORCE_N,
@@ -215,6 +226,14 @@ interface CarInternal {
   waypointsCleared: number;
   plan: CarKinematicState[] | null;
   planStartSimTime: number;
+  /**
+   * Pending plan from the most recent replan. Computed from the predicted
+   * future state at `simTime + COMMIT_WINDOW_MS`; promoted to `plan` once
+   * we cross that wall, so the controller never sees a steering jump
+   * caused by replanning alone.
+   */
+  pendingPlan: CarKinematicState[] | null;
+  pendingPlanStartSimTime: number;
   predictedEnd: { state: CarKinematicState; dueSimTime: number } | null;
   predErrSumSq: number;
   predErrCount: number;
@@ -286,6 +305,8 @@ export async function createRaceScenario(
       waypointsCleared: 0,
       plan: null,
       planStartSimTime: 0,
+      pendingPlan: null,
+      pendingPlanStartSimTime: 0,
       predictedEnd: null,
       predErrSumSq: 0,
       predErrCount: 0,
@@ -327,15 +348,74 @@ export async function createRaceScenario(
 
   function replanCar(c: CarInternal): void {
     if (c.holdingForSync || c.finished) return;
-    const state = c.car.readState(simTime);
+    // Commit-window plan stitching. If a plan is already committed, we
+    // plan from the predicted state at `simTime + COMMIT_WINDOW_MS`, not
+    // from the current state — guaranteeing the controller can keep
+    // following the existing plan through the commit window without
+    // discontinuity. First replan (no plan yet) starts from `now`.
+    const commitWindowSec = COMMIT_WINDOW_MS / 1000;
+    let planStartSimTime = simTime;
+    let startState: CarKinematicState;
+    if (c.plan && c.plan.length > 1) {
+      const elapsed = simTime - c.planStartSimTime + commitWindowSec;
+      const sampled = samplePlanAt(c.plan, elapsed);
+      if (sampled) {
+        startState = { ...sampled, t: 0 };
+        planStartSimTime = simTime + commitWindowSec;
+      } else {
+        startState = { ...c.car.readState(simTime), t: 0 };
+      }
+    } else {
+      startState = { ...c.car.readState(simTime), t: 0 };
+    }
+    // Pick the planning loopIndex by walking forward through the
+    // waypoint list as long as the predicted START state is already
+    // within the arrive radius of the next gate — otherwise the commit
+    // window can land the search past a gate that the planner is still
+    // told to reach (the path would loop back). The actual
+    // `c.loopIndex` is only advanced at 60Hz from real state in
+    // `pickNextWaypoint`, so this is a planning-only correction.
+    let planLoopIndex = c.loopIndex;
+    {
+      const advRadiusSq = RACE_ARRIVE_RADIUS * RACE_ARRIVE_RADIUS;
+      for (let i = 0; i < PLAN_LOOKAHEAD_COUNT; i++) {
+        const wp = course.waypoints[planLoopIndex % course.waypoints.length]!;
+        const dx = startState.x - wp.x;
+        const dz = startState.z - wp.z;
+        if (dx * dx + dz * dz <= advRadiusSq) {
+          planLoopIndex = (planLoopIndex + 1) % course.waypoints.length;
+        } else {
+          break;
+        }
+      }
+    }
     const gates: CarKinematicState[] = [];
     for (let i = 0; i < PLAN_LOOKAHEAD_COUNT; i++) {
-      const idx = (c.loopIndex + i) % course.waypoints.length;
+      const idx = (planLoopIndex + i) % course.waypoints.length;
       gates.push({ ...course.waypoints[idx]!, t: 0 });
+    }
+    // Trajectory-consistency reference: feed the freshest plan we have
+    // (pending if available — it's strictly newer than the committed one)
+    // to the planner as a soft hysteresis term, so a freshly-searched
+    // plan only wins when meaningfully better than the one the chassis
+    // is already tracking. Trim to the part of the plan we have NOT yet
+    // executed (relative to the new search's start time) so reference
+    // geometry is only about the future, not the past.
+    let referencePath: ReadonlyArray<{ x: number; z: number }> | undefined;
+    {
+      const refPlan = c.pendingPlan ?? c.plan;
+      const refStart = c.pendingPlan ? c.pendingPlanStartSimTime : c.planStartSimTime;
+      if (refPlan && refPlan.length > 1) {
+        const elapsedForRef = planStartSimTime - refStart;
+        const tail = trimPlan(refPlan, elapsedForRef);
+        if (tail.length >= 2) {
+          referencePath = tail.map((p) => ({ x: p.x, z: p.z }));
+        }
+      }
     }
     const tStart = performance.now();
     const res = planRaceMultiGoal({
-      state: { ...state, t: 0 },
+      state: startState,
       gates,
       lib: c.entry.lib,
       polygons: course.polygons,
@@ -343,22 +423,55 @@ export async function createRaceScenario(
       world: c.navWorld,
       deadlineMs: RACE_REPLAN_BUDGET_MS,
       gateRadius: RACE_PLANNER_GATE_RADIUS,
+      referencePath,
+      referenceWeight: 0.08,
     });
     const replanMs = performance.now() - tStart;
     c.diagnostics.lastReplanMs = replanMs;
     c.diagnostics.lastReplanFound = res.found && res.path.length > 1;
     c.diagnostics.totalReplans += 1;
     if (c.diagnostics.lastReplanFound) {
+      // Friction-circle-aware speed-profile post-pass. The primitive A*
+      // emits a sequence of per-primitive endpoint speeds; we replace
+      // them with a curvature-respecting forward/backward smoothed
+      // profile, killing "hot-into-the-corner" overshoot. Path geometry
+      // (x, z, heading) is preserved; only speeds and `t` change.
+      const smoothed = smoothSpeedProfile(res.path, {
+        aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel,
+        aLonMaxAccel: PURE_PURSUIT_CONFIG.maxAccel,
+        aLonMaxDecel: PURE_PURSUIT_CONFIG.maxDecel,
+        maxSpeed: PURE_PURSUIT_CONFIG.cruiseSpeed,
+        minSpeed: 0.5,
+        honorEntrySpeed: true,
+      });
       c.diagnostics.successfulReplans += 1;
       c.diagnostics.consecutiveFailedReplans = 0;
-      c.plan = res.path;
-      c.planStartSimTime = simTime;
-      const firstEnd = res.path.find((p) => p.t > 0.05) ?? res.path[res.path.length - 1]!;
-      c.predictedEnd = { state: firstEnd, dueSimTime: simTime + firstEnd.t };
+      if (c.plan && c.plan.length > 1) {
+        // Promote later — keep the current plan active through the
+        // commit window. `stepOne` will swap when simTime crosses
+        // pendingPlanStartSimTime.
+        c.pendingPlan = smoothed;
+        c.pendingPlanStartSimTime = planStartSimTime;
+      } else {
+        c.plan = smoothed;
+        c.planStartSimTime = planStartSimTime;
+        c.pendingPlan = null;
+      }
+      const firstEnd = smoothed.find((p) => p.t > 0.05) ?? smoothed[smoothed.length - 1]!;
+      c.predictedEnd = { state: firstEnd, dueSimTime: planStartSimTime + firstEnd.t };
     } else {
       c.diagnostics.consecutiveFailedReplans += 1;
     }
     c.lastReplanSimTime = simTime;
+  }
+
+  /** Promote the pending plan if its commit window has elapsed. */
+  function maybePromotePlan(c: CarInternal): void {
+    if (c.pendingPlan && simTime >= c.pendingPlanStartSimTime) {
+      c.plan = c.pendingPlan;
+      c.planStartSimTime = c.pendingPlanStartSimTime;
+      c.pendingPlan = null;
+    }
   }
 
   function stepOne(c: CarInternal, dt: number): void {
@@ -368,6 +481,10 @@ export async function createRaceScenario(
       return;
     }
     const stateBefore = c.car.readState(simTime);
+    // Promote any pending plan whose commit window has elapsed BEFORE
+    // we decide whether to replan, so the next replan sees the most
+    // recently-committed plan as its baseline.
+    maybePromotePlan(c);
     // Replan if the cadence elapsed.
     if (simTime - c.lastReplanSimTime >= replanIntervalSec) {
       replanCar(c);
@@ -479,6 +596,7 @@ export async function createRaceScenario(
         const wp = course.waypoints[c.loopIndex]!;
         c.car.teleport({ x: wp.x, z: wp.z, heading: wp.heading });
         c.plan = null;
+        c.pendingPlan = null;
         c.lastMoveSimTime = simTime;
         c.lastPos = { x: wp.x, z: wp.z };
       }
@@ -494,6 +612,7 @@ export async function createRaceScenario(
         const target = offTrackRecovery === 'waypoint' ? course.waypoints[c.loopIndex]! : c.spawn;
         c.car.teleport({ x: target.x, z: target.z, heading: target.heading });
         c.plan = null;
+        c.pendingPlan = null;
       }
     }
   }
@@ -529,6 +648,8 @@ export async function createRaceScenario(
       c.waypointsCleared = 0;
       c.plan = null;
       c.planStartSimTime = 0;
+      c.pendingPlan = null;
+      c.pendingPlanStartSimTime = 0;
       c.predictedEnd = null;
       c.predErrSumSq = 0;
       c.predErrCount = 0;
@@ -556,6 +677,7 @@ export async function createRaceScenario(
         for (const c of cars) {
           if (!c.finished) c.holdingForSync = false;
           c.plan = null;
+          c.pendingPlan = null;
         }
         // Force an immediate replan so neither car coasts on a stale plan.
         for (const c of cars) replanCar(c);

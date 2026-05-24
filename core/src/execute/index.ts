@@ -8,3 +8,4 @@ export type {
 } from './types';
 export { purePursuit } from './pure-pursuit';
 export { ReplanState, planPoseAt } from './replan';
+export { smoothSpeedProfile, type SpeedProfileOptions } from './speed-profile';
