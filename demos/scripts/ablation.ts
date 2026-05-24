@@ -48,7 +48,7 @@ function preset(name: string, overrides: Partial<RaceTuning>, notes: string, bas
   return { name, tuning: { ...base, ...overrides }, notes };
 }
 
-const DEFAULT_PRESETS: Preset[] = [
+const NO_X_PRESETS: Preset[] = [
   { name: 'all-on (default)', tuning: { ...DEFAULT_TUNING }, notes: 'everything enabled' },
   { name: 'legacy (baseline)', tuning: { ...LEGACY_TUNING }, notes: 'pre-improvement baseline' },
   preset('no-commit-window', { commitWindowMs: 0 }, 'plan stitching off'),
@@ -60,15 +60,40 @@ const DEFAULT_PRESETS: Preset[] = [
   preset('no-heuristic-table', { enableHeuristicTable: false }, 'no RS LUT in env'),
 ];
 
+/** "Only X" presets — start from LEGACY and enable a single feature.
+ *  Lets the ablation isolate the standalone contribution of every
+ *  improvement instead of measuring the (often non-orthogonal) gap
+ *  between all-on and all-on-minus-one. */
+const ONLY_X_PRESETS: Preset[] = [
+  { name: 'all-on (default)', tuning: { ...DEFAULT_TUNING }, notes: 'everything enabled' },
+  { name: 'legacy (baseline)', tuning: { ...LEGACY_TUNING }, notes: 'pre-improvement baseline' },
+  preset('only-commit-window', { commitWindowMs: 200 }, 'only plan stitching', LEGACY_TUNING),
+  preset('only-consistency', { consistencyWeight: 0.08 }, 'only consistency cost', LEGACY_TUNING),
+  preset('only-speed-profile', { enableSpeedProfile: true, respectPathSpeed: true }, 'only speed profile + respect', LEGACY_TUNING),
+  preset('only-trajectory-smoother', { enableTrajectorySmoother: true }, 'only geometric smoother', LEGACY_TUNING),
+  preset('only-adaptive-replan', { enableAdaptiveReplan: true, enableWaypointAdvanceReplan: true }, 'only event-driven triggers', LEGACY_TUNING),
+  preset('only-heuristic-table', { enableHeuristicTable: true }, 'only RS LUT', LEGACY_TUNING),
+];
+
+const DEFAULT_PRESETS: Preset[] = NO_X_PRESETS;
+
 function parsePreset(arg: string): Preset {
   // Format: "name:flag=val,flag=val,..."
-  // Example: "stitch-only:commitWindowMs=200,enableSpeedProfile=false"
+  // Optional first flag: `base=legacy` to start from LEGACY_TUNING
+  // instead of DEFAULT_TUNING — convenient for "only X" presets that
+  // isolate a single feature's contribution starting from the all-off
+  // baseline.
   const [name, rest] = arg.includes(':') ? arg.split(/:(.+)/) : [arg, ''];
   const flagPairs = rest ? rest.split(',') : [];
   const overrides: Partial<RaceTuning> = {};
+  let base: RaceTuning = DEFAULT_TUNING;
   for (const pair of flagPairs) {
     const [k, v] = pair.split('=');
     if (!k || v === undefined) continue;
+    if (k === 'base') {
+      base = v === 'legacy' ? LEGACY_TUNING : v === 'default' ? DEFAULT_TUNING : base;
+      continue;
+    }
     const value =
       v === 'true' ? true :
       v === 'false' ? false :
@@ -76,7 +101,7 @@ function parsePreset(arg: string): Preset {
       (v as unknown as never);
     (overrides as Record<string, unknown>)[k] = value;
   }
-  return { name: name!, tuning: { ...DEFAULT_TUNING, ...overrides }, notes: 'custom' };
+  return { name: name!, tuning: { ...base, ...overrides }, notes: 'custom' };
 }
 
 function loadEntry(modelPath: string | undefined): RaceEntry {
@@ -153,6 +178,7 @@ async function main(): Promise<void> {
       'max-sim': { type: 'string', default: '300' },
       preset: { type: 'string', multiple: true },
       baseline: { type: 'string', default: 'legacy (baseline)' },
+      mode: { type: 'string', default: 'no-x' },
       json: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     },
@@ -170,9 +196,16 @@ table. Override with --preset to run any custom combination, e.g.:
 \n`);
     return;
   }
-  const presets: Preset[] = values.preset && values.preset.length > 0
-    ? values.preset.map(parsePreset)
-    : DEFAULT_PRESETS;
+  let presets: Preset[];
+  if (values.preset && values.preset.length > 0) {
+    presets = values.preset.map(parsePreset);
+  } else if (values.mode === 'only-x') {
+    presets = ONLY_X_PRESETS;
+  } else if (values.mode === 'all') {
+    presets = [...NO_X_PRESETS, ...ONLY_X_PRESETS.filter((p) => p.name.startsWith('only-'))];
+  } else {
+    presets = NO_X_PRESETS;
+  }
   const targetLaps = parseInt(values.laps!, 10);
   const maxSimTime = parseInt(values['max-sim']!, 10);
   const entry = loadEntry(values.model);

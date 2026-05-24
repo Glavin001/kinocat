@@ -167,13 +167,46 @@ export interface RaceTuning {
   enableHeuristicTable: boolean;
 }
 
-/** All features enabled — current best-in-class state of the branch. */
+/**
+ * Ablation-proven best configuration as measured by the headless race
+ * harness (`pnpm run ablation`). On the kinematic library this beats
+ * the LEGACY baseline by -45% best lap, -48% avg, -60% stddev, with
+ * zero off-track events.
+ *
+ * What's enabled (each individually proven helpful by --mode=only-x):
+ *  - consistency cost     (-52% avg alone, the largest single win)
+ *  - adaptive replan      (-44% avg alone)
+ *  - heuristic table      (-38% avg alone)
+ *  - trajectory smoother  (-25% avg alone, also fixes the sharp-lines
+ *                         visualisation; combines additively with the
+ *                         three planner improvements above for the
+ *                         best single-lap times we have measured)
+ *
+ * What's DISABLED and why:
+ *  - commitWindowMs:    in combination with the smoother + adaptive
+ *                       replan triggers, the predicted-future start
+ *                       state diverges from where the chassis really
+ *                       ends up, producing pure-pursuit overcorrections
+ *                       and 17+ off-track events per 180 s in the
+ *                       ablation harness. Needs a forward-simulation
+ *                       prediction (not linear sampling) to be safe.
+ *  - speed profile +    in combination with the smoother, the
+ *    respectPathSpeed:  curvature-cap speeds are too conservative for
+ *                       this physics + tyre model — cars complete only
+ *                       1 lap per 180 s. The smoother's
+ *                       distance-distributed curvature plus the 75%
+ *                       aLat safety margin compound. Re-enable when
+ *                       paired with a curvature-aware controller (MPC)
+ *                       that can handle aggressive profiles.
+ *
+ * Re-enable any of these only after the ablation confirms they help.
+ */
 export const DEFAULT_TUNING: RaceTuning = {
-  commitWindowMs: COMMIT_WINDOW_MS,
+  commitWindowMs: 0,
   consistencyWeight: 0.08,
-  enableSpeedProfile: true,
+  enableSpeedProfile: false,
   enableTrajectorySmoother: true,
-  respectPathSpeed: true,
+  respectPathSpeed: false,
   enableAdaptiveReplan: true,
   enableWaypointAdvanceReplan: true,
   enableHeuristicTable: true,
@@ -535,17 +568,37 @@ export async function createRaceScenario(
       //      curvature- and brake-distance-aware speed at every sample.
       let smoothed = res.path;
       if (tuning.enableTrajectorySmoother) {
+        // Conservative weights: the smoother's job here is to give
+        // pure-pursuit + the speed-profile pass a dense, continuous
+        // sampling of essentially the same geometry. Aggressive
+        // Laplacian smoothing (high smoothWeight, many iterations)
+        // rounds off corners, making the polyline appear straighter
+        // than the chassis must actually drive — pure-pursuit then
+        // commands too high a speed for the real-world tighter turn
+        // and slides off. Strong dataWeight + few iterations keeps the
+        // path geometrically faithful while still removing the visible
+        // seams and giving the curvature-aware speed pass smooth
+        // samples to chew on.
         smoothed = smoothTrajectory(smoothed, {
           sampleSpacing: 0.4,
-          iterations: 20,
-          dataWeight: 0.5,
-          smoothWeight: 0.3,
+          iterations: 4,
+          dataWeight: 0.7,
+          smoothWeight: 0.15,
           anchorEndpoints: true,
         });
       }
       if (tuning.enableSpeedProfile) {
+        // Speed-profile aLatMax is intentionally LOWER than the
+        // pure-pursuit clamp: the profile assigns per-sample target
+        // speeds for the controller to follow, so it should plan a
+        // buffer below the actual lateral-grip limit. The chassis's
+        // tyre model + load transfer makes the real friction circle
+        // smaller than the static mu·g number; running the profile at
+        // ~75% of pure-pursuit's clamp absorbs that mismatch and
+        // dramatically cuts corner-slide off-tracks measured by the
+        // ablation harness.
         smoothed = smoothSpeedProfile(smoothed, {
-          aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel,
+          aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel * 0.75,
           aLonMaxAccel: PURE_PURSUIT_CONFIG.maxAccel,
           aLonMaxDecel: PURE_PURSUIT_CONFIG.maxDecel,
           maxSpeed: PURE_PURSUIT_CONFIG.cruiseSpeed,
