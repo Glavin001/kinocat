@@ -38,7 +38,19 @@ import {
   type CarKinematicState,
   type WheeledCarControls,
 } from 'kinocat/vehicle/car';
-import { purePursuit, smoothSpeedProfile, smoothTrajectory } from 'kinocat/execute';
+import {
+  purePursuit,
+  smoothSpeedProfile,
+  smoothTrajectory,
+  mpcTrack,
+  createMPCTrackerState,
+  type MPCTrackerState,
+} from 'kinocat/execute';
+import {
+  parametricForwardV2,
+  DEFAULT_LEARNED_PARAMS_V2,
+  DEFAULT_LEARNABLE_CONFIG,
+} from 'kinocat/agent';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavWorld } from 'kinocat/environment';
 import type { MotionPrimitiveLibrary } from 'kinocat/primitives';
@@ -165,6 +177,15 @@ export interface RaceTuning {
   /** Reeds-Shepp heuristic lookup table inside `VehicleEnvironment`
    *  (faster heuristic evaluation; admissible). */
   enableHeuristicTable: boolean;
+  /**
+   * Path-following tracker. `'pure-pursuit'` is the classic geometric
+   * tracker — fast, reactive, no dynamics model. `'mpc'` is a
+   * short-horizon sampling MPC over the v2 parametric model — slower
+   * per tick but accurate enough for high-fidelity execution
+   * (parking, multi-step back-and-forth corrections, terminal-pose
+   * precision). Defaults to `'pure-pursuit'`.
+   */
+  tracker: 'pure-pursuit' | 'mpc';
 }
 
 /**
@@ -210,6 +231,7 @@ export const DEFAULT_TUNING: RaceTuning = {
   enableAdaptiveReplan: true,
   enableWaypointAdvanceReplan: true,
   enableHeuristicTable: true,
+  tracker: 'pure-pursuit',
 };
 
 /** All improvements disabled — reverts to the pre-improvement baseline.
@@ -223,6 +245,7 @@ export const LEGACY_TUNING: RaceTuning = {
   enableAdaptiveReplan: false,
   enableWaypointAdvanceReplan: false,
   enableHeuristicTable: false,
+  tracker: 'pure-pursuit',
 };
 
 // ---------------------------------------------------------------------------
@@ -372,6 +395,9 @@ interface CarInternal {
   lastPos: { x: number; z: number };
   // Spawn pose (for reset / off-track).
   spawn: { x: number; z: number; heading: number };
+  // Persistent MPC tracker state (warm-start sequence + RNG seed) when
+  // the tracker is `'mpc'`. Lazily initialised on first MPC tick.
+  mpcState: MPCTrackerState | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -391,6 +417,41 @@ export async function createRaceScenario(
   const trackerConfig = {
     ...PURE_PURSUIT_CONFIG,
     respectPathSpeed: tuning.respectPathSpeed,
+  };
+
+  // MPC tracker shared config + forward simulator (constant per scenario).
+  // The dynamics model is the v2 parametric model with default coefficients
+  // — captures the Rapier chassis well enough for the controller to plan
+  // accurate short-horizon rollouts even on cars that don't ship their own
+  // learned model. Per-car: a `MPCTrackerState` holds the warm-start
+  // sequence + deterministic RNG seed.
+  const MPC_HORIZON = 6;
+  const mpcForwardSim = parametricForwardV2(
+    DEFAULT_LEARNED_PARAMS_V2,
+    DEFAULT_LEARNABLE_CONFIG,
+  );
+  // Race-tuned MPC weights. For parking / precision scenarios use a
+  // different config (higher wTerminalPosition + wTerminalSpeed, lower
+  // wSpeed). The Race scenario wants to MATCH the plan's target speed
+  // while staying on the line — speed matching is what carries the
+  // chassis around the track, lateral keeps it on the line.
+  const MPC_CONFIG = {
+    horizonSteps: MPC_HORIZON,
+    stepDt: 0.1,
+    samples: 48,
+    maxSteer: VEHICLE_TUNING.maxSteerAngle ?? 0.6,
+    maxDriveForce: ENGINE_FORCE_N,
+    maxBrakeForce: BRAKE_FORCE_N,
+    allowReverse: true,
+    steerStd: 0.18,
+    driveStd: 0.4 * ENGINE_FORCE_N,
+    brakeStd: 0.15 * BRAKE_FORCE_N,
+    wLateral: 4,
+    wHeading: 1.0,
+    wSpeed: 3,
+    wControlRate: 0.2,
+    wTerminalPosition: 0,
+    wTerminalSpeed: 0,
   };
 
   const cars: CarInternal[] = opts.entries.map((entry, i) => {
@@ -453,6 +514,7 @@ export async function createRaceScenario(
       lastMoveSimTime: 0,
       lastPos: { x: spawn.x, z: spawn.z },
       spawn,
+      mpcState: null,
     };
   });
 
@@ -768,18 +830,45 @@ export async function createRaceScenario(
       const elapsed = simTime - c.planStartSimTime;
       const live = trimPlan(c.plan, elapsed);
       if (live.length >= 2) {
-        const trk = purePursuit(stateBefore, live, trackerConfig);
-        const steer = -Math.atan(trk.steering * (2 * WHEEL_BASE));
-        const cmd = wheeledFromNormalized(
-          { steer, throttle: trk.throttle, brake: trk.brake },
-          FORCE_TUNING,
-        );
-        c.car.applyWheeledControls(cmd);
-        c.lastControls = cmd;
-        c.metrics.liveControls = {
-          steer: trk.steering, throttle: trk.throttle, brake: trk.brake,
-          targetSpeed: trk.targetSpeed,
-        };
+        if (tuning.tracker === 'mpc') {
+          // Sampling MPC over the v2 parametric model. Same dynamics
+          // model the planner uses, so the controller's predicted
+          // behaviour matches the chassis the planner planned for —
+          // the gap pure-pursuit can't close. Particularly important
+          // for low-speed precision (parking, multi-step gear changes)
+          // where geometric tracking has no concept of "what does THIS
+          // actuator command do at THIS state".
+          if (!c.mpcState) c.mpcState = createMPCTrackerState(MPC_HORIZON);
+          const cmdRaw = mpcTrack(stateBefore, live, mpcForwardSim, c.mpcState, MPC_CONFIG);
+          const cmd: WheeledCarControls = {
+            steer: cmdRaw.steer,
+            driveForce: cmdRaw.driveForce,
+            brakeForce: cmdRaw.brakeForce,
+          };
+          c.car.applyWheeledControls(cmd);
+          c.lastControls = cmd;
+          c.metrics.liveControls = {
+            steer: cmdRaw.steer,
+            throttle: cmd.driveForce >= 0
+              ? cmd.driveForce / ENGINE_FORCE_N
+              : -cmd.driveForce / ENGINE_FORCE_N,
+            brake: cmd.brakeForce / BRAKE_FORCE_N,
+            targetSpeed: cmdRaw.targetSpeed,
+          };
+        } else {
+          const trk = purePursuit(stateBefore, live, trackerConfig);
+          const steer = -Math.atan(trk.steering * (2 * WHEEL_BASE));
+          const cmd = wheeledFromNormalized(
+            { steer, throttle: trk.throttle, brake: trk.brake },
+            FORCE_TUNING,
+          );
+          c.car.applyWheeledControls(cmd);
+          c.lastControls = cmd;
+          c.metrics.liveControls = {
+            steer: trk.steering, throttle: trk.throttle, brake: trk.brake,
+            targetSpeed: trk.targetSpeed,
+          };
+        }
       } else {
         const cmd = wheeledFromNormalized({ steer: 0, throttle: 0.2, brake: 0 }, FORCE_TUNING);
         c.car.applyWheeledControls(cmd);
