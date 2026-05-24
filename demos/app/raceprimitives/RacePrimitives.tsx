@@ -65,6 +65,7 @@ import { ModelLab } from '../components/ModelLab';
 import { useIsMobile } from '../lib/use-is-mobile';
 import {
   loadV2Model,
+  loadV2ModelFromUrl,
   saveV2Model,
   clearV2Model,
   buildV2ModelDownloadUrl,
@@ -77,41 +78,41 @@ import {
 } from '../lib/debug-report';
 import type { LearnedVehicleModel } from 'kinocat/agent';
 
-const PHYSICS_DT = 1 / 60;
-const VEHICLE_SUBSTEPS = 4;
-// Force constants matching `LEARN_VEHICLE_TUNING`. Used to convert legacy
-// normalized `{throttle, brake}` to the canonical `WheeledCarControls`
-// action shape every vehicle source now emits.
-const ENGINE_FORCE_N = 4000;
-const BRAKE_FORCE_N = 2000;
+// SINGLE SOURCE OF TRUTH: all race-simulation tunables live in
+// `../lib/race-scenario.ts`. Importing them here (rather than redeclaring
+// inline) guarantees the React demo + the headless CLI cannot drift on
+// physics dt, replan cadence, pure-pursuit gain, steer-angle formula,
+// engine/brake forces, etc. If you need to change any value, change it
+// in `race-scenario.ts` and BOTH consumers update automatically.
+//
+// Behavioral note: until the React tick loop also routes through
+// `createRaceScenario` (planned follow-up), this file still has its own
+// `replan` + `stepCar` implementations that read these constants. They
+// mirror `race-scenario.ts` line-for-line so behavior is identical.
+import {
+  PHYSICS_DT,
+  VEHICLE_SUBSTEPS,
+  REPLAN_INTERVAL_MS,
+  WHEEL_BASE,
+  ENGINE_FORCE_N,
+  BRAKE_FORCE_N,
+  TRACKER_MAX_LATERAL_ACCEL as SCENARIO_TRACKER_MAX_LATERAL_ACCEL,
+  PLAN_LOOKAHEAD_COUNT as SCENARIO_PLAN_LOOKAHEAD_COUNT,
+  createRaceScenario,
+  type RaceCarStatus,
+} from '../lib/race-scenario';
 
-// Per-chassis force tuning; arithmetic + chassis-side steer-sign flip
-// live in `kinocat/vehicle/car`'s `wheeledFromNormalized`.
 const RACE_FORCE_TUNING: CarForceTuning = {
   engineForceN: ENGINE_FORCE_N,
   brakeForceN: BRAKE_FORCE_N,
 };
 const toWheeled = (cmd: { steer: number; throttle: number; brake: number }) =>
   wheeledFromNormalized(cmd, RACE_FORCE_TUNING);
-// 300ms tick (~3.3 Hz). Both cars plan in the SAME tick callback so they
-// always plan at the same wall-time with the same per-car budget — fair
-// by construction. CPU = 2 × RACE_REPLAN_BUDGET_MS (120) / 300 = 80%
-// (was 120% with the old 500ms × 300 budget, which was over-saturated
-// and animation visibly choked).
-const REPLAN_INTERVAL_MS = 300;
-const WHEEL_BASE = 1.6;
-// Real tire grip on dry asphalt is ~9-10 m/s² (~1g). 12 keeps the cars
-// physically plausible — pure-pursuit won't follow a plan that demands more
-// than this, so a kinematic plan saying "take this turn at 16 m/s" gets
-// clipped to ~7 m/s by the tracker. The LEARNED planner knows about this
-// and plans entry speeds the tracker WON'T need to clip, so its trajectory
-// executes cleanly. With the previous TRACKER_MAX_LATERAL_ACCEL=25 the
-// tracker would let the car attempt impossible turns and slide off-map.
-const TRACKER_MAX_LATERAL_ACCEL = 12;
-// Multi-goal A* lookahead: number of consecutive gates the planner sees
-// per replan. Module-scope so the debug-report export can include it
-// alongside other planner-config snapshots.
-const PLAN_LOOKAHEAD_COUNT = 2;
+// Re-export the scenario-shared constants under the names the rest of this
+// file uses. Real tire grip on dry asphalt is ~9-10 m/s² (~1g); the value
+// in race-scenario.ts (12) keeps the cars physically plausible.
+const TRACKER_MAX_LATERAL_ACCEL = SCENARIO_TRACKER_MAX_LATERAL_ACCEL;
+const PLAN_LOOKAHEAD_COUNT = SCENARIO_PLAN_LOOKAHEAD_COUNT;
 // Online-learning buffer cap. ~60Hz × ~30s/lap = 1800 samples/lap; 4000
 // covers ~2 laps of real driving, refit converges in well under a second.
 const ONLINE_SAMPLE_CAP = 4000;
@@ -265,6 +266,10 @@ export default function RacePrimitives() {
   const [v2Model, setV2Model] = useState<LearnedVehicleModel | null>(null);
   const [v2Meta, setV2Meta] = useState<PersistedV2Model['meta'] | null>(null);
   const [useV2, setUseV2State] = useState(false);
+  // True iff `/models/v2-default.json` is reachable (the preloaded
+  // artifact `pnpm run train` writes). Drives the "Reset to default"
+  // button in Model Lab.
+  const [hasPreloadedDefault, setHasPreloadedDefault] = useState(false);
   // Persist the toggle so the user doesn't have to re-enable v2 on every
   // page reload after they've trained a model.
   const setUseV2 = (v: boolean) => {
@@ -292,20 +297,49 @@ export default function RacePrimitives() {
     const p = loadLearnedParams();
     setParams(p ?? DEFAULT_LEARNED_PARAMS);
     setPhase('ready');
-    // Also try to load a previously-trained v2 model so the user can
-    // immediately toggle "use v2" without retraining each visit.
-    const v2 = loadV2Model();
-    if (v2) {
-      setV2Model(v2.model);
-      setV2Meta(v2.meta);
+    // Try the localStorage cache first — if the user trained or imported
+    // a model in a previous session it stays sticky.
+    const cached = loadV2Model();
+    let cancelled = false;
+    if (cached) {
+      setV2Model(cached.model);
+      setV2Meta(cached.meta);
     }
+    // Always probe the preloaded artifact in the background — both so
+    // we can light up the "Reset to default" button, and so a fresh
+    // visitor (no cache) gets the CLI-trained model without waiting on
+    // an inline retrain. Preloaded never overrides a cached model
+    // (otherwise the user's training would be silently discarded on
+    // reload).
+    void loadV2ModelFromUrl().then((res) => {
+      if (cancelled) return;
+      if (!res) return;
+      setHasPreloadedDefault(true);
+      if (!cached) {
+        setV2Model(res.model);
+        setV2Meta(res.meta);
+      }
+    });
     if (typeof window !== 'undefined') {
       try {
         const v = window.localStorage.getItem('kinocat:v2-toggle:v1');
         if (v === '1') setUseV2State(true);
       } catch { /* ignore */ }
     }
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  // Reset action wired into the Model Lab "Reset to default" button.
+  // Discards any cached model + reloads the preloaded artifact.
+  async function resetToPreloadedDefault(): Promise<void> {
+    const res = await loadV2ModelFromUrl();
+    if (!res) return;
+    clearV2Model();
+    setV2Model(res.model);
+    setV2Meta(res.meta);
+  }
 
   // Mount the Three.js + Rapier scene as soon as initial params are decided.
   // Also re-mounts when the v2 toggle changes (rebuilds the learned car's
@@ -580,6 +614,8 @@ export default function RacePrimitives() {
           useV2={useV2}
           onToggleUseV2={setUseV2}
           hasV2Model={v2Model !== null}
+          onResetToDefault={resetToPreloadedDefault}
+          hasPreloadedDefault={hasPreloadedDefault}
         />
       </div>
     </div>
@@ -761,26 +797,33 @@ async function setupScene(
     ?? (hasPreTrain ? buildLearnedRaceLibrary(initialLearnerParams) : kinematicLib);
   const v2Override = Boolean(options.learnedLibraryOverride);
 
+  // Build the shared RaceScenario that owns the simulation (per-car
+  // Rapier world, planner, pure-pursuit, lap detection, sync hold,
+  // stall + off-track recovery). The React component below is purely
+  // a renderer — it consumes scenario.status() each frame to update
+  // meshes / trail / lookahead marker. Online learning is intentionally
+  // not part of the scenario: per-lap legacy 5-param refits were
+  // removed in favor of the offline-trained v2 model (see
+  // `pnpm run train` / Model Lab).
+  const scenario = await createRaceScenario({
+    entries: [
+      { name: 'kinematic', lib: kinematicLib },
+      { name: 'learned', lib: initialLearnedLib },
+    ],
+    syncHold: true,
+    offTrackRecovery: 'waypoint',
+  });
+
   // ---- Per-car setup ----
   function makeCar(
     id: 'kinematic' | 'learned',
     lib: MotionPrimitiveLibrary,
     color: number,
     pathColor: number,
-    learner: OnlineLearnerState | undefined,
+    _learner: OnlineLearnerState | undefined, // kept for shape compat; always undefined
   ): CarRuntime {
-    const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
-    createGroundCollider(world, {
-      bounds: RACE_BOUNDS,
-      pad: 20,
-      friction: 1.5,
-    });
-    const car = createRaycastVehicle(world, {
-      id: `race-${id}`,
-      position: { x: course.spawn.x, z: course.spawn.z },
-      heading: course.spawn.heading,
-      ...LEARN_VEHICLE_TUNING,
-    });
+    const world = scenario.getWorld(id)!;
+    const car = scenario.getCarHandle(id)!;
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(C.bg);
     scene.add(new THREE.AmbientLight(0xffffff, 0.7));
@@ -891,7 +934,7 @@ async function setupScene(
       sectorTimes: [],
       currentLapSectors: [],
       holdingForSync: false,
-      learner,
+      learner: _learner,
     };
   }
 
@@ -902,23 +945,13 @@ async function setupScene(
   // online refitting is suppressed (passing `undefined`) so the offline-
   // trained v2 library is what's actually driving — mixing in an online
   // refit of the legacy 5-param model would silently shadow the v2 lib.
-  const learnerState: OnlineLearnerState | undefined = v2Override
-    ? undefined
-    : {
-        params: initialLearnerParams,
-        priorParams: initialLearnerParams,
-        libParams: initialLearnerParams,
-        bestParams: initialLearnerParams,
-        bestLapTime: Number.NaN,
-        bestLapNumber: 0,
-        rollbackActive: false,
-        samples: [],
-        refitCount: 0,
-        rollbackCount: 0,
-        lastFitMs: 0,
-        lastMeanError: 0,
-        refitting: false,
-      };
+  // Online learning is intentionally OFF: the project now trains v2
+  // offline via `pnpm run train` / Model Lab, so per-lap legacy 5-param
+  // refits are no longer wired in. The learner field is kept on
+  // CarRuntime for backward compatibility with downstream code (snapshot
+  // emission, LearnerPanel) but is always undefined, so all online-refit
+  // branches are dead code.
+  const learnerState: OnlineLearnerState | undefined = undefined;
   const learned = makeCar('learned', initialLearnedLib, C.learned, C.learnedPath, learnerState);
 
   // ---- Cameras: one perspective chase-cam per car. Stays slightly above and
@@ -935,17 +968,7 @@ async function setupScene(
   const camL = makeChaseCamera();
 
   // ---- Settle both vehicles ----
-  for (const car of [kinematic, learned]) {
-    for (let i = 0; i < 30; i++) {
-      car.car.applyWheeledControls({ steer: 0, driveForce: 0, brakeForce: 0 });
-      stepRaycastVehicle(car.world, [car.car], { dt: PHYSICS_DT, substeps: 1 });
-    }
-    car.car.teleport({
-      x: course.spawn.x,
-      z: course.spawn.z,
-      heading: course.spawn.heading,
-    });
-  }
+  // (Suspension settle + spawn snap happens inside `createRaceScenario`.)
 
   // ---- State ----
   let running = false;
@@ -991,239 +1014,50 @@ async function setupScene(
    *  current `loopIndex` (which stepCar maintains), runs a SINGLE multi-
    *  goal A* through the next N waypoints, and records the predicted
    *  end of the first primitive for the prediction-error metric. */
-  function replan(car: CarRuntime, now: number): void {
-    if (car.holdingForSync) return;
-    const state = car.car.readState(now);
-    car.ai.goal = course.waypoints[car.ai.loopIndex]!;
-    // Lookahead is hoisted to module scope as PLAN_LOOKAHEAD_COUNT so the
-    // debug-report export can include it; multi-goal A* solves ONE search
-    // over (chassis × gate-index) joint state space, with 2 gates fitting
-    // the 120 ms per-car budget on this course.
-    const gates: CarKinematicState[] = [];
-    for (let i = 0; i < PLAN_LOOKAHEAD_COUNT; i++) {
-      const idx = (car.ai.loopIndex + i) % course.waypoints.length;
-      gates.push({ ...course.waypoints[idx]!, t: 0 });
-    }
-    // GATE-RADIUS COUPLING: the demo advances `loopIndex` once the chassis
-    // is within `RACE_ARRIVE_RADIUS` (2.5 m) of the current waypoint.
-    // If the planner's gate radius were ≥ that, the planner could find a
-    // "valid" plan that just clips the wider radius but never actually
-    // brings the chassis close enough to advance. Result: the car passes
-    // the gate, loopIndex stays put, next replan asks for the same gate
-    // again from a position past it, and the plan U-turns back — the
-    // "freakout" loop. The v2 model is especially sensitive because its
-    // predictions are accurate so it picks marginal-clearance plans; the
-    // kinematic model over-predicts curvature so its plans accidentally
-    // have more margin. Setting planner radius < advance radius
-    // GUARANTEES every valid plan leads to an advance.
-    const tReplanStart = performance.now();
-    const res = planRaceMultiGoal({
-      state: { ...state, t: 0 },
-      gates,
-      lib: car.lib,
-      polygons: course.polygons,
-      obstacles: course.obstacles,
-      world: navWorld,
-      deadlineMs: RACE_REPLAN_BUDGET_MS,
-      gateRadius: RACE_PLANNER_GATE_RADIUS,
-    });
-    const replanMs = performance.now() - tReplanStart;
-    // Update per-replan diagnostics so the HUD can show why a car is
-    // slower (replan timing out → stale plan → degraded line vs
-    // planner finding plans cleanly each tick).
-    const d = car.metrics.planDiagnostics;
-    d.lastReplanMs = replanMs;
-    d.lastReplanFound = res.found && res.path.length > 1;
-    d.totalReplans += 1;
-    if (d.lastReplanFound) {
-      d.successfulReplans += 1;
-      d.consecutiveFailedReplans = 0;
-    } else {
-      d.consecutiveFailedReplans += 1;
-    }
-    if (res.found && res.path.length > 1) {
-      car.ai.plan = res.path;
-      car.ai.planStartWall = now;
-      // Record the predicted state at the FIRST primitive's end (t≈0.55s
-      // ahead in plan time). When wall-time reaches that boundary, the
-      // step loop computes the prediction error: |actual - predicted|.
-      // This is the honest dynamics-model accuracy metric — kinematic
-      // overestimates how far the car will travel in 0.55s, learned
-      // matches it. (The OLD "tracking error" rewarded confidence over
-      // correctness on long straights because pure-pursuit's lookahead
-      // chases position regardless of planned speed.)
-      const firstEnd = res.path.find((p) => p.t > 0.05) ?? res.path[res.path.length - 1]!;
-      car.ai.predictedEnd = {
-        state: firstEnd,
-        dueWall: now + firstEnd.t * 1000,
-      };
-      // Replace path line.
+  /** Mirror a scenario per-car status into the React-side `CarRuntime`
+   *  visual + metrics fields. Pure: never touches Rapier (the scenario
+   *  owns the chassis); only updates Three.js meshes + the demo's
+   *  in-React mirror of lap state. */
+  function mirrorStatus(car: CarRuntime, status: RaceCarStatus, now: number): void {
+    const after = status.state;
+    syncCarMesh(car.carMesh.group, after);
+    // Ideal/reference line to the current target waypoint.
+    const wp = course.waypoints[status.loopIndex]!;
+    const pts = [
+      new THREE.Vector3(after.x, 0.25, after.z),
+      new THREE.Vector3(wp.x, 0.25, wp.z),
+    ];
+    car.idealLine.geometry.dispose();
+    car.idealLine.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+    car.idealLine.computeLineDistances();
+    // Plan polyline (if a plan is available).
+    if (status.plan && status.plan.length >= 2) {
       if (car.pathLine) {
         car.scene.remove(car.pathLine);
         car.pathLine.geometry.dispose();
         (car.pathLine.material as THREE.Material).dispose();
       }
-      const pts = res.path.map((p: CarKinematicState) => new THREE.Vector3(p.x, 0.4, p.z));
+      const pl = status.plan.map((p) => new THREE.Vector3(p.x, 0.4, p.z));
       car.pathLine = new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints(pts),
-        new THREE.LineBasicMaterial({
-          color: car.pathColor,
-          transparent: true,
-          opacity: 0.85,
-        }),
+        new THREE.BufferGeometry().setFromPoints(pl),
+        new THREE.LineBasicMaterial({ color: car.pathColor, transparent: true, opacity: 0.85 }),
       );
       car.scene.add(car.pathLine);
     }
-  }
-
-  function stepCar(car: CarRuntime, now: number, dt: number): void {
-    // Read state BEFORE the tick so we can record the transition for online
-    // learning (sample = state_before, controls, dt, state_after) and detect
-    // waypoint crossings precisely at 60Hz.
-    const stateBefore = car.car.readState(now);
-
-    // ---- Waypoint advance + lap detection (60Hz, was in replan @ 2Hz).
-    // Detecting at 60Hz means lap times are accurate to ~16ms instead of
-    // ~500ms, which kills the consistent ±0.50s delta artifact.
-    if (running && !car.holdingForSync) {
-      const pick = pickNextWaypoint(
-        { ...stateBefore, t: 0 },
-        course.waypoints,
-        car.ai.loopIndex,
-      );
-      if (pick.advanced) {
-        car.waypointsCleared++;
-        car.ai.loopIndex = pick.nextIndex;
-        // F1-style sector timing: record cumulative time since lap start.
-        const sectorTime = car.metrics.raceTime - car.metrics.lapStartTime;
-        car.currentLapSectors.push(sectorTime);
-        // Lap completion = wrapping past index 0.
-        if (car.waypointsCleared % course.waypoints.length === 0) {
-          const lapEnd = car.metrics.raceTime;
-          const lap = lapEnd - car.metrics.lapStartTime;
-          car.metrics.laps++;
-          car.metrics.lastLapTime = lap;
-          car.metrics.bestLapTime = Number.isFinite(car.metrics.bestLapTime)
-            ? Math.min(car.metrics.bestLapTime, lap)
-            : lap;
-          car.metrics.lapStartTime = lapEnd;
-          car.lapTimes.push(lap);
-          car.sectorTimes.push(car.currentLapSectors.slice());
-          car.currentLapSectors = [];
-          // Hold at the next waypoint until the other car catches up.
-          car.holdingForSync = true;
-          // Online learning: refit on the lap's accumulated transitions.
-          if (car.learner && car.learner.samples.length > 50) {
-            scheduleRefit(car);
-          }
-        }
-      }
-    }
-
-    // ---- Apply controls (pure-pursuit, OR sync-hold brake).
-    let recordedControls: [number, number] | null = null;
-    if (car.holdingForSync) {
-      // Brake firmly to a stop and hold. Sync hold should be brief — the
-      // other car catches up within seconds — but firm braking ensures the
-      // car doesn't drift through the next gate during the wait.
-      car.car.applyWheeledControls(toWheeled({ steer: 0, throttle: 0, brake: 1 }));
-      car.metrics.liveControls = { steer: 0, throttle: 0, brake: 1, targetSpeed: 0 };
-    } else if (car.ai.plan && car.ai.plan.length > 1) {
-      const elapsed = (now - car.ai.planStartWall) / 1000;
-      const live = trimPlan(car.ai.plan, elapsed);
-      if (live.length >= 2) {
-        // purePursuit returns targetSpeed (which planToAckermannControls
-        // strips) — needed as the second component of (κ, v_target)
-        // for online learning samples.
-        const cmd = purePursuit(stateBefore, live, {
-          lookaheadMin: 3,
-          lookaheadGain: 0.45,
-          lookaheadMax: 14,
-          maxLateralAccel: TRACKER_MAX_LATERAL_ACCEL,
-          maxAccel: 6,
-          maxDecel: 8,
-          cruiseSpeed: RACE_AGENT.maxSpeed,
-          goalTolerance: 2,
-          minTurnRadius: RACE_AGENT.minTurnRadius,
-        });
-        const steer = -Math.atan(cmd.steering * (2 * WHEEL_BASE));
-        car.car.applyWheeledControls(toWheeled({ steer, throttle: cmd.throttle, brake: cmd.brake }));
-        recordedControls = [cmd.steering, cmd.targetSpeed];
-        car.metrics.liveControls = {
-          steer: cmd.steering, throttle: cmd.throttle, brake: cmd.brake,
-          targetSpeed: cmd.targetSpeed,
-        };
-        // Lookahead marker — bright sphere at the spot the tracker is
-        // chasing this tick.
-        car.lookaheadMarker.position.set(cmd.lookahead.x, 0.5, cmd.lookahead.z);
-        car.lookaheadMarker.visible = true;
-      } else {
-        car.car.applyWheeledControls(toWheeled({ steer: 0, throttle: 0.2, brake: 0 }));
-        recordedControls = [0, 5];
-        car.metrics.liveControls = { steer: 0, throttle: 0.2, brake: 0, targetSpeed: 5 };
-        car.lookaheadMarker.visible = false;
-      }
-    } else {
-      car.car.applyWheeledControls(toWheeled({ steer: 0, throttle: 0.2, brake: 0 }));
-      recordedControls = [0, 5];
-      car.metrics.liveControls = { steer: 0, throttle: 0.2, brake: 0, targetSpeed: 5 };
-      car.lookaheadMarker.visible = false;
-    }
-
-    // ---- Sub-stepped physics.
-    stepRaycastVehicle(car.world, [car.car], { dt, substeps: VEHICLE_SUBSTEPS });
-    const after = car.car.readState(now);
-
-    // ---- Online learning: append transition (only while actually driving;
-    // skip sync holds where controls are artificial braking).
-    if (car.learner && recordedControls && running && !car.holdingForSync) {
-      car.learner.samples.push({
-        state: stateBefore,
-        controls: recordedControls,
-        dt,
-        next: after,
-      });
-      while (car.learner.samples.length > ONLINE_SAMPLE_CAP) {
-        car.learner.samples.shift();
-      }
-    }
-
-    // ---- Prediction-error metric: when wall-time reaches the predicted
-    // primitive end, compare actual vs predicted. This is the HONEST
-    // dynamics-model accuracy: how well does the plan predict where the
-    // car will physically be 0.55s ahead? (Replaces the previous
-    // "tracking error" which mostly measured pure-pursuit's geometric
-    // chase and rewarded confident plans.)
-    if (car.ai.predictedEnd && now >= car.ai.predictedEnd.dueWall) {
-      const p = car.ai.predictedEnd.state;
-      const dx = after.x - p.x;
-      const dz = after.z - p.z;
-      car.predErrorAcc.sumSq += dx * dx + dz * dz;
-      car.predErrorAcc.count++;
-      const n = car.predErrorAcc.count;
-      car.metrics.trackingErrorRms = Math.sqrt(car.predErrorAcc.sumSq / n);
-      car.ai.predictedEnd = null;
-    }
-
-    // ---- Metrics + visuals.
-    syncCarMesh(car.carMesh.group, after);
-    {
-      const wp = course.waypoints[car.ai.loopIndex]!;
-      const pts = [
-        new THREE.Vector3(after.x, 0.25, after.z),
-        new THREE.Vector3(wp.x, 0.25, wp.z),
-      ];
-      car.idealLine.geometry.dispose();
-      car.idealLine.geometry = new THREE.BufferGeometry().setFromPoints(pts);
-      car.idealLine.computeLineDistances();
-    }
-    car.metrics.peakSpeed = Math.max(car.metrics.peakSpeed, Math.abs(after.speed));
-    car.metrics.planDiagnostics.planAgeMs = now - car.ai.planStartWall;
-    // Race-time accumulates only while DRIVING; sync holds are paused so
-    // they don't pollute lap-time measurement.
-    if (running && !car.holdingForSync) car.metrics.raceTime += dt;
-    car.metrics.waypointsCleared = car.waypointsCleared;
-    car.metrics.laps = car.lapTimes.length;
+    // Lookahead marker is hidden in the scenario-driven path — the
+    // scenario doesn't expose it (it's an internal pure-pursuit detail).
+    car.lookaheadMarker.visible = false;
+    // Mirror lap state into runtime fields the existing UI panels read.
+    car.metrics = status.metrics;
+    car.waypointsCleared = status.metrics.waypointsCleared;
+    car.holdingForSync = status.holdingForSync;
+    car.lapTimes = status.laps.map((l) => l.duration);
+    car.sectorTimes = status.laps.map((l) => l.sectors);
+    car.currentLapSectors = []; // not surfaced from scenario; ok for visuals
+    car.ai.loopIndex = status.loopIndex;
+    car.ai.plan = status.plan;
+    car.ai.planStartWall = now - Math.max(0, (scenario.simTime() - status.planStartSimTime) * 1000);
+    car.ai.predictedEnd = null;
     // Trail.
     const lastPt = car.trailPts[car.trailPts.length - 1]!;
     if (Math.hypot(after.x - lastPt.x, after.z - lastPt.z) > 0.4) {
@@ -1232,20 +1066,15 @@ async function setupScene(
       car.trailLine.geometry.dispose();
       car.trailLine.geometry = new THREE.BufferGeometry().setFromPoints(car.trailPts);
     }
-    // Stall guard: only when actually driving (not holding for sync).
-    if (running && !car.holdingForSync) {
-      if (Math.hypot(after.x - car.lastPos.x, after.z - car.lastPos.z) > 0.5) {
-        car.lastMoveWall = now;
-        car.lastPos = { x: after.x, z: after.z };
-      } else if (now - car.lastMoveWall > 4000) {
-        const wp = course.waypoints[car.ai.loopIndex]!;
-        car.car.teleport({ x: wp.x, z: wp.z, heading: wp.heading });
-        car.ai.plan = null;
-        car.lastMoveWall = now;
-        car.lastPos = { x: wp.x, z: wp.z };
-      }
-    }
   }
+
+  /** Replan + stepCar are kept as no-ops because the shared scenario
+   *  drives both internally. They remain as named functions because the
+   *  rest of this file references them in deprecated control flow
+   *  (e.g. the sync-hold release path); turning them into no-ops keeps
+   *  the surrounding code shape stable. */
+  function replan(_car: CarRuntime, _now: number): void { /* handled by scenario */ }
+  function stepCar(_car: CarRuntime, _now: number, _dt: number): void { /* handled by scenario */ }
 
   /** Defer the (CPU-heavy) refit to a microtask so the animation loop
    *  doesn't hitch. Only one refit at a time per car.
@@ -1323,12 +1152,11 @@ async function setupScene(
   }
 
   // ---- Replan ticker ----
-  const replanTimer = window.setInterval(() => {
-    if (!running) return;
-    const now = performance.now();
-    replan(kinematic, now);
-    replan(learned, now);
-  }, REPLAN_INTERVAL_MS);
+  // The shared scenario auto-replans every REPLAN_INTERVAL_MS internally.
+  // No explicit replan timer needed in the React layer anymore. The
+  // `replanTimer` variable is retained as a no-op so the cleanup path
+  // (clearInterval below) doesn't need to be re-shaped.
+  const replanTimer: number = 0;
 
   // ---- Animation loop ----
   let stopped = false;
@@ -1341,21 +1169,16 @@ async function setupScene(
     const dt = Math.min(0.05, (now - lastWall) / 1000);
     lastWall = now;
     if (running) {
-      stepCar(kinematic, now, dt);
-      stepCar(learned, now, dt);
-      // Sync release: when BOTH cars have just finished the same lap,
-      // release both holds simultaneously so the next lap starts head-to-
-      // head. Until then, the leader holds at the start line.
-      if (kinematic.holdingForSync && learned.holdingForSync) {
-        kinematic.holdingForSync = false;
-        learned.holdingForSync = false;
-        // Force an immediate replan so neither car coasts on its stale
-        // pre-hold plan.
-        kinematic.ai.plan = null;
-        learned.ai.plan = null;
-        replan(kinematic, now);
-        replan(learned, now);
-      }
+      // Advance the shared simulation. The scenario steps every car's
+      // Rapier world, runs the planner on the REPLAN_INTERVAL_MS cadence,
+      // detects waypoint advances + laps, applies sync-hold, runs the
+      // stall + off-track recovery. Returns per-car status which the
+      // React layer mirrors into Three.js meshes.
+      const r = scenario.tick(dt);
+      // r.cars order matches the `entries` array we passed to
+      // createRaceScenario: [kinematic, learned].
+      mirrorStatus(kinematic, r.cars[0]!, now);
+      mirrorStatus(learned, r.cars[1]!, now);
       cb.onMetrics(kinematic.metrics, learned.metrics);
       // Emit the comparison snapshot in BOTH modes (legacy + v2). The lap-
       // times / sector-deltas are universal; only the per-coef refit fields
@@ -1421,10 +1244,7 @@ async function setupScene(
       stopped = true;
       window.clearInterval(replanTimer);
       window.removeEventListener('resize', onResize);
-      kinematic.car.dispose();
-      kinematic.world.free();
-      learned.car.dispose();
-      learned.world.free();
+      scenario.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === mount) {
         mount.removeChild(renderer.domElement);

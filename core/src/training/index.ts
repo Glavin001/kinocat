@@ -20,6 +20,34 @@ import type {
   FitProgressEvent,
 } from '../learning';
 
+export type {
+  CoverageAxis,
+  CoverageProjection,
+  CoverageCellSummary,
+  CoverageMeter,
+  CoverageMeterOptions,
+} from './coverage-meter';
+export { createCoverageMeter } from './coverage-meter';
+
+export type { ManeuverRunOptions } from './maneuver-runner';
+export { runManeuver } from './maneuver-runner';
+
+export type { BuildControlsTraceOptions } from './maneuver-trace';
+export { buildControlsTrace } from './maneuver-trace';
+
+export type {
+  HardExampleMiner,
+  HardExampleMinerOptions,
+  MinerFrame,
+} from './hard-example-miner';
+export { createHardExampleMiner } from './hard-example-miner';
+
+export type {
+  ScenarioCollector,
+  ScenarioCollectorOptions,
+} from './scenario-collector';
+export { createScenarioCollector } from './scenario-collector';
+
 /** A learned model's fit, ready to plug into a planner. Concrete vehicle
  *  pipelines instantiate `model` with their own parametric + residual
  *  blocks; here we only assert it has a `ForwardSim<S>` for evaluation. */

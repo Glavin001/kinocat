@@ -95,6 +95,44 @@ export function loadV2Model(): { model: LearnedVehicleModel; meta: PersistedV2Mo
   }
 }
 
+/** Default location the headless training CLI (`pnpm run train`) writes
+ *  the preloaded model artifact to. Served by Next.js from `public/`. */
+export const DEFAULT_PRELOADED_V2_URL = '/models/v2-default.json';
+
+/** Fetch + rebuild a v2 model from a URL (typically the preloaded
+ *  `/models/v2-default.json` artifact). Returns null on any error
+ *  (404, parse failure, unknown version) so demo pages can fall back
+ *  to default-parametric without ceremony. */
+export async function loadV2ModelFromUrl(
+  url: string = DEFAULT_PRELOADED_V2_URL,
+): Promise<{ model: LearnedVehicleModel; meta: PersistedV2Model['meta'] } | null> {
+  if (typeof window === 'undefined') return null;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const migrated = migrate(await res.json());
+    if (!migrated) return null;
+    return { model: rebuildModel(migrated), meta: migrated.meta };
+  } catch {
+    return null;
+  }
+}
+
+/** Load the cached v2 model from localStorage; if absent, fall back to
+ *  the preloaded artifact at `url`. Cache hit is synchronous; the
+ *  preloaded fetch is async. Callers typically wire this into a mount
+ *  effect so the first paint shows the parametric baseline and the
+ *  preloaded model lands a tick later. */
+export async function loadV2ModelWithFallback(
+  url: string = DEFAULT_PRELOADED_V2_URL,
+): Promise<{ model: LearnedVehicleModel; meta: PersistedV2Model['meta']; source: 'localStorage' | 'preloaded' } | null> {
+  const cached = loadV2Model();
+  if (cached) return { ...cached, source: 'localStorage' };
+  const preloaded = await loadV2ModelFromUrl(url);
+  if (preloaded) return { ...preloaded, source: 'preloaded' };
+  return null;
+}
+
 function buildPayload(model: LearnedVehicleModel, meta: PersistedV2Model['meta']): PersistedV2Model {
   // Lazy import to avoid SSR / cold-path issues.
   // eslint-disable-next-line @typescript-eslint/no-require-imports

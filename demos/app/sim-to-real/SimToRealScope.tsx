@@ -61,7 +61,12 @@ import {
   RACE_BOUNDS,
   buildLearnedRaceLibraryV2,
 } from '../lib/race-primitives-scenarios';
-import { loadV2Model } from '../lib/v2-model-persistence';
+import { loadV2Model, loadV2ModelFromUrl } from '../lib/v2-model-persistence';
+import { createHardExampleMiner } from 'kinocat/training';
+import type { Trial } from 'kinocat/learning';
+import type { LearnableVehicleConfig } from 'kinocat/agent';
+import { deriveLearnableConfig } from 'kinocat/adapters/rapier';
+import { DEFAULT_VEHICLE_OPTS } from '../lib/training-driver';
 import {
   projectFuture,
   poseGap,
@@ -141,6 +146,8 @@ export default function SimToRealScope() {
 
   const resetFnRef = useRef<(() => void) | null>(null);
   const exportFnRef = useRef<((fmt: 'json' | 'md') => string) | null>(null);
+  const minedTrialsRef = useRef<Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[] | null>(null);
+  const [minedCount, setMinedCount] = useState(0);
   const [toast, setToast] = useState<string | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flashToast = (msg: string) => {
@@ -170,6 +177,24 @@ export default function SimToRealScope() {
     URL.revokeObjectURL(url);
     flashToast('Downloaded JSON snapshot');
   };
+  /** Download the Phase 3.5 hard-example miner pool as a JSONL bundle so
+   *  the offline trainer (`pnpm run train`) can ingest it. */
+  const downloadMinedTrials = () => {
+    const trials = minedTrialsRef.current;
+    if (!trials || trials.length === 0) {
+      flashToast('No mined trials yet — drive into a regime the ghost predicts poorly');
+      return;
+    }
+    const payload = { version: 1, trials };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `sim-to-real-mined-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    flashToast(`Downloaded ${trials.length} mined trial${trials.length === 1 ? '' : 's'}`);
+  };
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -179,9 +204,18 @@ export default function SimToRealScope() {
     (async () => {
       await ensureRapier();
       if (cancelled) return;
-      const cached = loadV2Model();
-      setHasModel(cached !== null);
-      cleanup = setupScene(mount, cached?.model ?? null);
+      // Prefer localStorage (user's own trained / imported model); fall
+      // back to the preloaded `/models/v2-default.json` artifact the
+      // `pnpm run train` CLI shipped with the project so a fresh visitor
+      // sees the v2 ghost without retraining.
+      let resolved = loadV2Model();
+      if (!resolved) {
+        const preloaded = await loadV2ModelFromUrl();
+        if (cancelled) return;
+        resolved = preloaded;
+      }
+      setHasModel(resolved !== null);
+      cleanup = setupScene(mount, resolved?.model ?? null);
       setReady(true);
     })();
     return () => {
@@ -381,6 +415,38 @@ export default function SimToRealScope() {
       formatters: carRecorderFormatters,
     });
 
+    // Phase 3.5 hard-example miner — every divergence the user sees on
+    // this scope is a training trial we are missing. Subscribe a generic
+    // miner to the same per-tick frame stream the recorder consumes; it
+    // emits a `Trial` whenever the (real, predicted) gap exceeds the
+    // predicate. The mined trials live in an in-memory pool and can be
+    // exported as JSON for offline re-fit.
+    const minerConfig = deriveLearnableConfig({
+      id: 'sim-to-real',
+      position: { x: 0, z: 0 },
+      heading: 0,
+      ...DEFAULT_VEHICLE_OPTS,
+    });
+    const minedTrials: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[] = [];
+    const hardMiner = createHardExampleMiner<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>({
+      gapPredicate: (f) => {
+        if (!f.predicted) return false;
+        const dx = f.state.x - f.predicted.x;
+        const dz = f.state.z - f.predicted.z;
+        const dPos = Math.hypot(dx, dz);
+        let dH = (f.state.heading ?? 0) - (f.predicted.heading ?? 0);
+        while (dH > Math.PI) dH -= 2 * Math.PI;
+        while (dH < -Math.PI) dH += 2 * Math.PI;
+        return dPos > 1.5 || Math.abs(dH) > (10 * Math.PI / 180);
+      },
+      windowTicks: 30, // ±0.5 s around the trigger at 60Hz
+      dt: 1 / 60,
+      sampleEveryNTicks: 6,
+      config: minerConfig,
+      configKey: 'rwd-default',
+      scenarioId: 'sim-to-real',
+    });
+
     // Plan-execute overlay (cyan polyline). Built on demand.
     const planMat = new THREE.LineBasicMaterial({ color: 0x00ffff, transparent: true, opacity: 0.95 });
     const planGeom = new THREE.BufferGeometry();
@@ -496,6 +562,8 @@ export default function SimToRealScope() {
       recorder.clear();
     }
     resetFnRef.current = resetAll;
+
+    minedTrialsRef.current = minedTrials;
 
     exportFnRef.current = (fmt: 'json' | 'md') => {
       const meta: RecorderMeta = {
@@ -730,6 +798,21 @@ export default function SimToRealScope() {
         controls: wheeled,
         ghosts: ghostStates,
       });
+      // Feed the same frame into the hard-example miner. Use the FIRST
+      // ghost (typically the v2-full model) as the divergence reference;
+      // if no ghosts are present, the miner sees no `predicted` and the
+      // predicate is a no-op.
+      const referenceGhost = ghostStates[0];
+      const mined = hardMiner.observe({
+        simTime,
+        state: { ...realAfter },
+        controls: wheeled,
+        predicted: referenceGhost ? { ...referenceGhost.state } : undefined,
+      });
+      if (mined) {
+        minedTrials.push(mined);
+        setMinedCount(minedTrials.length);
+      }
 
       // ---- chase-cam follow when orbit is idle? Leave manual. ----
 
@@ -800,6 +883,27 @@ export default function SimToRealScope() {
             No trained v2 model in cache — using defaults. Train one in /model-lab for a real Gap A test.
           </span>
         )}
+        <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 11, color: minedCount > 0 ? '#55dcff' : '#7a8290' }}>
+            Hard examples: {minedCount}
+          </span>
+          <button
+            onClick={downloadMinedTrials}
+            disabled={minedCount === 0}
+            title="Download mined hard examples as a JSON trial pool — feed back into `pnpm run train` for a targeted retrain on the regimes the ghost predicts poorly."
+            style={{
+              background: minedCount > 0 ? 'rgba(85, 220, 255, 0.15)' : 'rgba(122, 130, 144, 0.1)',
+              color: minedCount > 0 ? '#55dcff' : '#7a8290',
+              border: `1px solid ${minedCount > 0 ? '#55dcff' : '#223044'}`,
+              borderRadius: 4,
+              padding: '3px 8px',
+              fontSize: 11,
+              cursor: minedCount > 0 ? 'pointer' : 'not-allowed',
+            }}
+          >
+            Download
+          </button>
+        </span>
       </div>
     </div>
   );

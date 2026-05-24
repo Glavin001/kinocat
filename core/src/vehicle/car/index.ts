@@ -34,3 +34,42 @@ export {
   type PlaybackPatternSegment,
 } from './drivers';
 export { carRecorderFormatters } from './recorder-formatters';
+
+// Maneuver library — Phase 1 of the training-dataset plan.
+export type {
+  ManeuverLimits,
+  ManeuverSpec,
+  OuParams,
+  MixtureMode,
+} from './maneuvers';
+export {
+  seededRng,
+  ouControls,
+  mixtureRandomWalk,
+  throttleRelease,
+  throttleToBrake,
+  brakeToThrottle,
+  steerToZero,
+  steerReversal,
+  panicTurn,
+  liftOffOversteer,
+  reverseWithSteer,
+  stepSteer,
+  sinSweepSteer,
+  slalom,
+  trailBrake,
+  throttleOnApex,
+  jTurn,
+  fishhook,
+  scandinavianFlick,
+  doubleLaneChange,
+  donut,
+  defaultManeuverBundle,
+} from './maneuvers';
+
+// Coverage projection — Phase 0 of the training-dataset plan.
+export {
+  CAR_COVERAGE_AXES,
+  carCoverageProjection,
+  wheeledControlsToVec,
+} from './coverage-projection';

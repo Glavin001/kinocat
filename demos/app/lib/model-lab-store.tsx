@@ -32,6 +32,7 @@ import type {
   TrialStore,
 } from 'kinocat/learning';
 import type { HeadlessTrialHarness } from 'kinocat/adapters/rapier';
+import { ensureRapier } from 'kinocat/adapters/rapier';
 import {
   runOfflineTraining,
   createScenarioHarness,
@@ -47,8 +48,15 @@ import {
 
 export interface FitCurvePoint {
   iter: number;
+  /** Raw optimizer loss (parametric = SUM across all sample residuals,
+   *  residual = per-sample MSE). Different magnitudes across phases. */
   loss: number;
+  /** Per-sample mean loss — comparable across rounds AND across phases.
+   *  Prefer this for any cross-round / cross-phase chart. */
+  lossNormalized: number;
   phase: 'parametric' | 'residual';
+  /** Which training round this point came from (0-based). */
+  round: number;
 }
 
 export interface RoundSnapshot {
@@ -86,8 +94,19 @@ export interface ModelLabState {
   rounds: number;
   trialsCollected: number;
   trialsDiscarded: number;
+  /** Cumulative trial slots attempted in the current round. */
+  trialsAttemptedThisRound: number;
+  /** Target trial count for the current round (cells.length). */
+  trialsTargetThisRound: number;
   latestLoss: number | null;
-  currentPhase: 'parametric' | 'residual' | null;
+  currentPhase: 'initializing' | 'collecting' | 'parametric' | 'residual' | 'evaluating' | null;
+  /** Most-recent fit iteration (0-based). Resets per phase. */
+  currentIter: number;
+  /** Configured maximum iterations for the current fit phase. */
+  currentIterTotal: number;
+  /** Epoch (Date.now()) when the current training run started, or null
+   *  when idle. Used by the UI to render elapsed time + ETA. */
+  trainingStartedAt: number | null;
   roundHistory: RoundSnapshot[];
   liveFitCurve: FitCurvePoint[];
   error: string | null;
@@ -117,8 +136,13 @@ export function ModelLabProvider({ children }: { children: ReactNode }) {
   const [currentRound, setCurrentRound] = useState(0);
   const [trialsCollected, setTrialsCollected] = useState(0);
   const [trialsDiscarded, setTrialsDiscarded] = useState(0);
+  const [trialsAttemptedThisRound, setTrialsAttemptedThisRound] = useState(0);
+  const [trialsTargetThisRound, setTrialsTargetThisRound] = useState(0);
   const [latestLoss, setLatestLoss] = useState<number | null>(null);
-  const [currentPhase, setCurrentPhase] = useState<'parametric' | 'residual' | null>(null);
+  const [currentPhase, setCurrentPhase] = useState<ModelLabState['currentPhase']>(null);
+  const [currentIter, setCurrentIter] = useState(0);
+  const [currentIterTotal, setCurrentIterTotal] = useState(0);
+  const [trainingStartedAt, setTrainingStartedAt] = useState<number | null>(null);
   const [roundHistory, setRoundHistory] = useState<RoundSnapshot[]>([]);
   const [liveFitCurve, setLiveFitCurve] = useState<FitCurvePoint[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -128,7 +152,11 @@ export function ModelLabProvider({ children }: { children: ReactNode }) {
   const liveCurveRef = useRef<FitCurvePoint[]>([]);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Load any previously-saved model on mount.
+  // Load any previously-saved model on mount AND pre-warm the Rapier
+  // WASM module in the background. Cold-loading Rapier takes 1-3 s, and
+  // doing it eagerly here means the first "Train" click doesn't sit at
+  // a frozen "initializing" state — the harness builder finishes
+  // almost instantly once `ensureRapier()` is cached.
   useEffect(() => {
     const cached = loadV2Model();
     if (cached) {
@@ -136,8 +164,8 @@ export function ModelLabProvider({ children }: { children: ReactNode }) {
       setMeta(cached.meta);
       setConfig(cached.model.config);
     }
+    void ensureRapier().catch(() => { /* surface lazily on first train */ });
     return () => {
-      // Best-effort harness cleanup on unmount.
       try { harness?.dispose(); } catch { /* noop */ }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -184,8 +212,17 @@ export function ModelLabProvider({ children }: { children: ReactNode }) {
     setCurrentRound(0);
     setTrialsCollected(0);
     setTrialsDiscarded(0);
+    setTrialsAttemptedThisRound(0);
+    setTrialsTargetThisRound(0);
     setLatestLoss(null);
-    setCurrentPhase(null);
+    // Start in `initializing` so the user sees a colored, animated
+    // progress indicator immediately when they hit Train (the actual
+    // training pipeline still emits its own `phase` events from
+    // `runOfflineTraining`, which overwrite this).
+    setCurrentPhase('initializing');
+    setCurrentIter(0);
+    setCurrentIterTotal(0);
+    setTrainingStartedAt(Date.now());
     setRoundHistory([]);
 
     // Per-round accumulators so each snapshot owns its own curve copy.
@@ -200,24 +237,42 @@ export function ModelLabProvider({ children }: { children: ReactNode }) {
           setCurrentRound(e.round);
           perRoundCurve = [];
           pendingDiag = null;
-          setCurrentPhase('parametric');
+          setCurrentPhase('collecting');
+          setTrialsAttemptedThisRound(0);
+          setTrialsTargetThisRound(0);
+          setCurrentIter(0);
+          setCurrentIterTotal(0);
+          break;
+        case 'phase':
+          setCurrentPhase(e.phase);
+          setCurrentIter(0);
+          setCurrentIterTotal(0);
           break;
         case 'trial-batch':
           trialsAccum += e.collected;
           setTrialsCollected(trialsAccum);
           setTrialsDiscarded((d) => d + e.discarded);
+          if (typeof e.runSoFar === 'number') setTrialsAttemptedThisRound(e.runSoFar);
+          if (typeof e.runTarget === 'number') setTrialsTargetThisRound(e.runTarget);
           break;
         case 'fit-progress': {
+          const normalized = e.event.lossNormalized ?? e.event.loss;
           const point: FitCurvePoint = {
             iter: e.event.iter,
             loss: e.event.loss,
+            lossNormalized: normalized,
             phase: e.phase,
+            round: e.round,
           };
           perRoundCurve.push(point);
           liveCurveRef.current.push(point);
-          setLatestLoss(e.event.loss);
+          // Headline "latest loss" should be the per-sample mean so the
+          // number is meaningful (not a scary 10000+ that's actually
+          // just "10k samples × small per-sample error").
+          setLatestLoss(normalized);
           setCurrentPhase(e.phase);
-          // Throttle live curve flushes — Recharts is heavy.
+          if (typeof e.iterIndex === 'number') setCurrentIter(e.iterIndex);
+          if (typeof e.iterTotal === 'number') setCurrentIterTotal(e.iterTotal);
           if (flushTimerRef.current === null) {
             flushTimerRef.current = setTimeout(flushLiveCurve, 100);
           }
@@ -250,6 +305,11 @@ export function ModelLabProvider({ children }: { children: ReactNode }) {
       // fresh one with the canonical vehicle config.
       try { harness?.dispose(); } catch { /* noop */ }
       setHarness(null);
+      // Yield once so React can flush the "initializing" state to the
+      // DOM BEFORE we enter the long-running async training call. Without
+      // this, the first paint can happen after Rapier WASM has already
+      // started loading, making the card look frozen at "starting".
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
       const result: RunOfflineTrainingResult = await runOfflineTraining({
         rounds: settings.rounds,
@@ -300,12 +360,18 @@ export function ModelLabProvider({ children }: { children: ReactNode }) {
   const state: ModelLabState = useMemo(() => ({
     model, meta, trialStore, harness, config, sampleDt,
     status, currentRound, rounds: settings.rounds,
-    trialsCollected, trialsDiscarded, latestLoss, currentPhase,
+    trialsCollected, trialsDiscarded,
+    trialsAttemptedThisRound, trialsTargetThisRound,
+    latestLoss, currentPhase, currentIter, currentIterTotal,
+    trainingStartedAt,
     roundHistory, liveFitCurve, error, settings,
   }), [
     model, meta, trialStore, harness, config, sampleDt,
     status, currentRound, settings, trialsCollected, trialsDiscarded,
-    latestLoss, currentPhase, roundHistory, liveFitCurve, error,
+    trialsAttemptedThisRound, trialsTargetThisRound,
+    latestLoss, currentPhase, currentIter, currentIterTotal,
+    trainingStartedAt,
+    roundHistory, liveFitCurve, error,
   ]);
 
   const api: ModelLabApi = useMemo(() => ({

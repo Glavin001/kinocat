@@ -22,3 +22,22 @@ jobs:
       - run: pnpm --filter kinocat build
       - run: pnpm size
       - run: pnpm typecheck
+      # Phase 0 / Phase 1 of the training-dataset plan: the maneuver-based
+      # training pipeline must run end-to-end and emit a v2 model artifact.
+      # Catches refactors that silently break the pipeline.
+      - run: pnpm run train:quick
+      # Phase 3 acceptance surface: the headless race scenario completes
+      # for the baselines. Lap-time bounds are asserted in
+      # `demos/test/headless-race.test.ts`; this run additionally
+      # confirms the CLI shape works against the freshly-trained model.
+      - run: pnpm run race:quick
+      # Persist the race-results ledger as a build artifact so the
+      # lap-time-vs-commit history is reviewable from the GitHub UI.
+      # (Future: a follow-up CI step can append/push to docs/race-results
+      # on `main` so the ledger grows over time.)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: race-results-${{ github.sha }}
+          path: docs/race-results/
+          if-no-files-found: warn

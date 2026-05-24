@@ -44,6 +44,16 @@ export interface ModelDiagnostics {
   /** Baseline `ForwardSim`s' open-loop divergence at the same horizons,
    *  keyed by name. Empty if no baselines were supplied. */
   baselines: Record<string, OpenLoopRow[]>;
+  /** Optional per-split breakdown — populated by callers that re-evaluate
+   *  the model on each of `train` / `val` / `test` partitions of the trial
+   *  store. Absent when the caller didn't supply a split-aware trial set.
+   *  Phase 0 of the training-dataset plan asserts this is the honest
+   *  surface for cross-phase progress reports. */
+  perSplit?: {
+    train?: OpenLoopRow[];
+    val?: OpenLoopRow[];
+    test?: OpenLoopRow[];
+  };
 }
 
 export interface ForwardSimUnderTest<S, C, Cfg> {
