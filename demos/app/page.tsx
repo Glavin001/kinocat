@@ -152,6 +152,12 @@ const groups: { heading: string; demos: Demo[] }[] = [
         tag: '2D · training · diagnostic',
       },
       {
+        href: '/sim-to-real',
+        title: 'Sim-to-Real Scope — model prediction vs Rapier reality in 3D',
+        desc: 'A dedicated 3D scope that overlays the v2 model\'s open-loop prediction (and parametric-only + kinematic baselines) on top of the live Rapier raycast-vehicle controller, in the same world, at the same time. Three modes: Playback (replay a control trace through both Rapier and each model), Free Drive (WASD; ghosts predict 1s ahead from the current state+controls), and Plan & Execute (click a goal; pure-pursuit drives the plan while the HUD reports plan-vs-actual error). Ghost cars, speed-colored trail ribbons, future polylines, an ensemble uncertainty cloud, live error arrows from real → ghost, and per-wheel friction-circle disks at the contact points. Isolates the two gaps that matter: pure dynamics (model.forward vs Rapier.step on identical controls) and end-to-end execution (planner output vs pure-pursuit-driven chassis).',
+        tag: '3D · diagnostic · sim-to-real',
+      },
+      {
         href: '/primitive-explorer',
         title: 'Primitive / action-space explorer — see what each planner can actually do',
         desc: 'A diagnostic tool for the /raceprimitives racing libraries. Side-by-side fan plots of the kinematic and v2-learned primitive libraries at each start-speed bucket. Below: an overlay view connecting kinematic↔v2 endpoint predictions per control so you can see exactly which controls the two models disagree about. Plus resolution diagnostics — primitive count, max angular gap, reachable-area hull — to verify the action space is dense enough. The honest answer to "why does the v2 car drive a different racing line?"',

@@ -33,6 +33,7 @@ export type {
   GroundColliderOptions,
   HeightfieldColliderOptions,
   HeightSampler,
+  WheelTelemetry,
 } from './raycast-vehicle';
 
 export { createHeadlessTrialHarness } from './headless-trial';

@@ -669,6 +669,7 @@ const TESTED_DEMOS = new Set([
   'primitives', // 'primitives demo' — buildPrimitiveFan
   'primitive-explorer', // 'primitive-explorer demo' — kinematic-vs-v2 action-space diagnostics (tested in primitive-diagnostics.test.ts)
   'model-lab', // 'model-lab demo' — v2 training + diagnostics dashboard (helpers tested in fan-plot-ground-truth.test.ts; training pipeline in training-driver.test.ts)
+  'sim-to-real', // 'sim-to-real demo' — 3D scope overlaying model prediction on Rapier reality (pure helpers tested in sim-to-real-scene.test.ts; wheel telemetry in core/test/adapters/raycast-vehicle.test.ts)
   'reverse', // 'reverse demo' — planReverse
   'swarm', // 'swarm demo' — buildSwarm
   'world3d', // 'world3d demo' — planWorld3d

@@ -70,7 +70,40 @@ export interface CarHandle {
     pose: { x: number; z: number; heading: number },
     kin: { forwardSpeed: number; lateralVelocity?: number; yawRate?: number },
   ): void;
+  /** Read per-wheel telemetry for the LAST `vehicle.updateVehicle(dt)` call.
+   *  Used by sim-to-real diagnostics to render friction-circle widgets and
+   *  detect tire saturation / airborne wheels. Values are zero-filled when
+   *  Rapier returns null (typically when a wheel is not in contact). */
+  readWheelTelemetry(): WheelTelemetry[];
   dispose(): void;
+}
+
+/** Snapshot of a single wheel's last-tick state for diagnostics.
+ *
+ *  `forwardImpulse` / `sideImpulse` are the impulses (N·s) applied over the
+ *  most recent `updateVehicle(dt)` step. They are NOT steady-state forces —
+ *  callers comparing across tick sizes should divide by `dt`. Both signs are
+ *  in the Rapier wheel-local frame (forward+ along the wheel's roll direction,
+ *  side+ along the wheel's axle).
+ *
+ *  `suspensionForce` is the vertical reaction from the suspension spring (N).
+ *  Multiplied by `frictionSlip` it bounds the tire's friction-circle radius —
+ *  the visualization uses that product as the "available grip" denominator. */
+export interface WheelTelemetry {
+  /** Wheel raycast made ground contact this tick. When false, the other
+   *  fields may be stale / zero. */
+  inContact: boolean;
+  /** World-space ground-contact point under the wheel; null when airborne. */
+  contactPoint: { x: number; y: number; z: number } | null;
+  /** Impulse applied along the wheel's forward axis last tick (N·s). */
+  forwardImpulse: number;
+  /** Impulse applied along the wheel's side axis last tick (N·s). */
+  sideImpulse: number;
+  /** Suspension reaction force this tick (N). */
+  suspensionForce: number;
+  /** Friction-slip multiplier configured on this wheel (used as the radius
+   *  factor of the friction circle). */
+  frictionSlip: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +350,23 @@ export function createRaycastVehicle(
     chassis.setAngvel({ x: 0, y: -yr, z: 0 }, true);
   }
 
+  function readWheelTelemetry(): WheelTelemetry[] {
+    const out: WheelTelemetry[] = [];
+    for (let i = 0; i < 4; i++) {
+      const inContact = vehicle.wheelIsInContact(i);
+      const cp = vehicle.wheelContactPoint(i);
+      out.push({
+        inContact,
+        contactPoint: cp ? { x: cp.x, y: cp.y, z: cp.z } : null,
+        forwardImpulse: vehicle.wheelForwardImpulse(i) ?? 0,
+        sideImpulse: vehicle.wheelSideImpulse(i) ?? 0,
+        suspensionForce: vehicle.wheelSuspensionForce(i) ?? 0,
+        frictionSlip: vehicle.wheelFrictionSlip(i) ?? 0,
+      });
+    }
+    return out;
+  }
+
   function dispose() {
     world.removeVehicleController(vehicle);
     world.removeRigidBody(chassis);
@@ -332,6 +382,7 @@ export function createRaycastVehicle(
     teleport,
     teleportWithSpeed,
     teleportFull,
+    readWheelTelemetry,
     dispose,
   };
 }

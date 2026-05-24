@@ -149,6 +149,36 @@ describe.skipIf(!RAPIER_OK)('createRaycastVehicle wiring', () => {
     world.free();
   });
 
+  it('readWheelTelemetry exposes per-wheel contact + impulses for the last tick', () => {
+    const world = makeWorld();
+    const car = createRaycastVehicle(world, {
+      id: 'telemetry',
+      position: { x: 0, z: 0 },
+      heading: 0,
+    });
+    // Settle so the chassis is on the ground; then drive a tick under load
+    // (throttle + slight steer) so impulses are non-zero.
+    for (let i = 0; i < 30; i++) step(world, car, { steer: 0, throttle: 0, brake: 0 });
+    for (let i = 0; i < 5; i++) step(world, car, { steer: 0.2, throttle: 1, brake: 0 });
+    const wheels = car.readWheelTelemetry();
+    expect(wheels).toHaveLength(4);
+    // At least one wheel should be in contact and reporting a valid point.
+    const grounded = wheels.filter((w) => w.inContact);
+    expect(grounded.length).toBeGreaterThanOrEqual(2);
+    for (const w of grounded) {
+      expect(w.contactPoint).not.toBeNull();
+      expect(Number.isFinite(w.contactPoint!.x)).toBe(true);
+      expect(Number.isFinite(w.contactPoint!.y)).toBe(true);
+      expect(Number.isFinite(w.contactPoint!.z)).toBe(true);
+      expect(w.suspensionForce).toBeGreaterThan(0);
+      expect(w.frictionSlip).toBeGreaterThan(0);
+      expect(Number.isFinite(w.forwardImpulse)).toBe(true);
+      expect(Number.isFinite(w.sideImpulse)).toBe(true);
+    }
+    car.dispose();
+    world.free();
+  });
+
   it('driveTrain: fwd applies engine force to front wheels only', () => {
     const world = makeWorld();
     const car = createRaycastVehicle(world, {

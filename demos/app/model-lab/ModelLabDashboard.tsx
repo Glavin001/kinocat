@@ -72,6 +72,7 @@ function DashboardInner() {
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 16, flexWrap: 'wrap' }}>
           <a href="/" style={linkStyle}>← demos</a>
           <a href="/raceprimitives" style={linkStyle}>/raceprimitives</a>
+          <a href="/sim-to-real" style={linkStyle}>/sim-to-real</a>
           <h1 style={{ fontSize: 20, margin: 0 }}>model lab · v2 training + diagnostics</h1>
           <span style={{ opacity: 0.6, fontSize: 12, marginLeft: 'auto' }}>
             {model ? 'model loaded' : 'no model trained'}
