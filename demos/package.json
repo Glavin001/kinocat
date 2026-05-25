@@ -9,7 +9,15 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "e2e:carchase": "node test/carchase-e2e.mjs"
+    "e2e:carchase": "node test/carchase-e2e.mjs",
+    "train": "tsx scripts/train.ts",
+    "train:quick": "tsx scripts/train.ts --profile=quick --out=demos/public/models/v2-ci.json",
+    "train:sweep": "tsx scripts/train.ts --profile=sweep",
+    "train:overnight": "tsx scripts/train.ts --profile=overnight",
+    "race": "tsx scripts/race.ts",
+    "race:quick": "tsx scripts/race.ts --quick --no-parametric --ledger=docs/race-results",
+    "ablation": "tsx scripts/ablation.ts",
+    "ablation:quick": "tsx scripts/ablation.ts --laps=3 --max-sim=180"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.14.0",
@@ -19,6 +27,7 @@
     "next": "^15.1.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "recharts": "^3.8.1",
     "three": "^0.180.0"
   },
   "devDependencies": {
@@ -26,6 +35,7 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@types/three": "^0.180.0",
+    "tsx": "^4.22.3",
     "typescript": "^5.7.0"
   }
 }

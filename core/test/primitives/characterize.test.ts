@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { characterizeVehicle } from '../../src/primitives/characterize';
 import { MotionPrimitiveLibrary } from '../../src/primitives/library';
 import { defaultVehicleAgent, kinematicForwardSim } from '../../src/agent/vehicle';
-import type { VehicleState } from '../../src/agent/types';
+import type { CarKinematicState } from '../../src/agent/types';
 
 const agent = defaultVehicleAgent({ minTurnRadius: 3, maxSpeed: 8, maxReverseSpeed: 4 });
 const sim = kinematicForwardSim(agent);
@@ -36,7 +36,7 @@ describe('characterizeVehicle', () => {
       substeps,
       startSpeeds: [0],
     });
-    let s: VehicleState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
+    let s: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
     for (let k = 0; k < substeps; k++) s = sim(s, controls, duration / substeps);
     const p = lib.primitives[0]!;
     expect(p.end.dx).toBeCloseTo(s.x, 9);

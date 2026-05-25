@@ -13,8 +13,11 @@
 //      kinocat itself doesn't manage scene graphs.
 
 import * as THREE from 'three';
-import type { VehicleState } from '../../agent/types';
+import type { CarKinematicState } from '../../agent/types';
 import type { HeightSampler, RampSpec } from '../../environment/ramp';
+
+export { updateChaseCamera } from './chase-camera';
+export type { ChaseCameraTarget, ChaseCameraOpts } from './chase-camera';
 
 export interface PlanarPoint {
   x: number;
@@ -470,7 +473,7 @@ export interface CarMesh {
 }
 
 /** A simple chassis + cabin + four wheels mesh, ready to be synced from a
- *  planner VehicleState via {@link syncCarMesh}. Visual only; physics wheels
+ *  planner CarKinematicState via {@link syncCarMesh}. Visual only; physics wheels
  *  live in Rapier. */
 export function createCarMeshHelper(opts: CarMeshOptions): CarMesh {
   const group = new THREE.Group();
@@ -527,10 +530,10 @@ export function createCarMeshHelper(opts: CarMeshOptions): CarMesh {
   return out;
 }
 
-/** Position + rotate a car group from a planner `VehicleState`. kinocat
+/** Position + rotate a car group from a planner `CarKinematicState`. kinocat
  *  heading 0 = +X; THREE mesh forward (BoxGeometry +X) aligns with
  *  `rotation.y = -heading` (THREE Y-up right-handed yaw sign-flips kinocat). */
-export function syncCarMesh(group: THREE.Group, s: VehicleState): void {
+export function syncCarMesh(group: THREE.Group, s: CarKinematicState): void {
   group.position.set(s.x, group.position.y, s.z);
   group.rotation.y = -s.heading;
 }

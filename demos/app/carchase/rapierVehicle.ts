@@ -4,7 +4,7 @@
 // Everything else (world creation, raycast vehicle, pure-pursuit conversion)
 // lives in core.
 import RAPIER from '@dimforge/rapier3d-compat';
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import {
   createRaycastVehicle,
   createBoxCollider,
@@ -28,6 +28,12 @@ export const ensureRapier = coreEnsureRapier;
 // Wheel-base used by the car-chase tuning; pure-pursuit needs `2*WHEEL_BASE`.
 const WHEEL_BASE = 1.6;
 
+// Force constants exported so call sites can build canonical
+// `WheeledCarControls` without hard-coding magic numbers.
+export const CARCHASE_ENGINE_FORCE_N = 4000;
+export const CARCHASE_BRAKE_FORCE_N = 2000;
+export const CARCHASE_MAX_STEER_RAD = 0.6;
+
 const CARCHASE_VEHICLE_TUNING: Omit<RaycastVehicleOptions, 'id' | 'position' | 'heading'> = {
   chassisHalf: { x: 2.4, y: 0.5, z: 1.0 },
   chassisDensity: 60,
@@ -36,9 +42,9 @@ const CARCHASE_VEHICLE_TUNING: Omit<RaycastVehicleOptions, 'id' | 'position' | '
   wheelRadius: 0.35,
   suspensionRestLength: 0.3,
   suspensionMaxTravel: 0.2,
-  engineForce: 4000,
-  brakeForce: 2000,
-  maxSteerAngle: 0.6,
+  engineForce: CARCHASE_ENGINE_FORCE_N,
+  brakeForce: CARCHASE_BRAKE_FORCE_N,
+  maxSteerAngle: CARCHASE_MAX_STEER_RAD,
   driveTrain: 'rwd',
 };
 
@@ -128,8 +134,8 @@ export function spawnCar(world: RAPIER.World, opts: SpawnCarOptions): CarHandle 
 /** Convert a kinocat plan tail to (steer, throttle, brake) for the car-chase
  *  tuning. Wraps the core helper with the chase's pure-pursuit config. */
 export function planToControls(
-  state: VehicleState,
-  path: VehicleState[],
+  state: CarKinematicState,
+  path: CarKinematicState[],
 ): { steer: number; throttle: number; brake: number; atGoal: boolean; lookahead: { x: number; z: number } } {
   return planToAckermannControls(state, path, {
     wheelBase: 2 * WHEEL_BASE,

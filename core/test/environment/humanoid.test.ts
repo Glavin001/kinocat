@@ -9,7 +9,7 @@ import {
   defaultVehicleAgent,
   kinematicForwardSim,
 } from '../../src/agent';
-import type { HumanoidState, VehicleState } from '../../src/agent/types';
+import type { HumanoidState, CarKinematicState } from '../../src/agent/types';
 
 function rect(id: number, x0: number, z0: number, x1: number, z1: number): NavPolygon {
   return { id, y: 0, ring: [[x0, z0], [x1, z0], [x1, z1], [x0, z1]] };
@@ -80,8 +80,8 @@ describe('HumanoidEnvironment', () => {
     });
     const vr = plan(
       {
-        start: { ...start, speed: 0 } as VehicleState,
-        goal: { ...goalXZ, heading: Math.PI / 2, speed: 0, t: 0 } as VehicleState,
+        start: { ...start, speed: 0 } as CarKinematicState,
+        goal: { ...goalXZ, heading: Math.PI / 2, speed: 0, t: 0 } as CarKinematicState,
         environment: vEnv,
         options: { maxExpansions: 40000 },
       },

@@ -5,7 +5,7 @@ import { VehicleEnvironment } from '../src/environment/vehicle-environment';
 import type { VehicleEnvOptions } from '../src/environment/vehicle-environment';
 import { defaultVehicleAgent, kinematicForwardSim } from '../src/agent/vehicle';
 import { characterizeVehicle } from '../src/primitives/characterize';
-import type { VehicleState } from '../src/agent/types';
+import type { CarKinematicState } from '../src/agent/types';
 
 // Reeds-Shepp heuristic LUT (spec §12.3): the RS shortest-path heuristic is
 // the dominant per-successor cost. This benchmarks the SAME query with the
@@ -67,8 +67,8 @@ function world(): InMemoryNavWorld {
   );
 }
 
-const start: VehicleState = { x: 3, z: 0, heading: 0, speed: 0, t: 0 };
-const goal: VehicleState = { x: 41, z: 0, heading: 0, speed: 0, t: 0 };
+const start: CarKinematicState = { x: 3, z: 0, heading: 0, speed: 0, t: 0 };
+const goal: CarKinematicState = { x: 41, z: 0, heading: 0, speed: 0, t: 0 };
 
 const base: VehicleEnvOptions = {
   posCell: 0.8,

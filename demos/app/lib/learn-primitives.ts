@@ -16,7 +16,7 @@
 // test.ts` (headless). No browser-only APIs anywhere in this module.
 
 import RAPIER from '@dimforge/rapier3d-compat';
-import type { VehicleAgent, VehicleState, LearnedVehicleParams } from 'kinocat/agent';
+import type { VehicleAgent, CarKinematicState, LearnedVehicleParams } from 'kinocat/agent';
 import {
   DEFAULT_LEARNED_PARAMS,
   kinematicForwardSim,
@@ -30,9 +30,15 @@ import {
   createRaycastVehicle,
   createGroundCollider,
   ensureRapier,
+  stepRaycastVehicle,
   type CarHandle,
   type RaycastVehicleOptions,
 } from 'kinocat/adapters/rapier';
+import {
+  wheeledFromNormalized,
+  ZERO_WHEELED,
+  type CarForceTuning,
+} from 'kinocat/vehicle/car';
 import { CARCHASE_AGENT } from './carchase-scenarios';
 
 // ---------------------------------------------------------------------------
@@ -55,6 +61,14 @@ export const LEARN_VEHICLE_TUNING: Omit<RaycastVehicleOptions, 'id' | 'position'
   brakeForce: 2000,
   maxSteerAngle: 0.6,
   driveTrain: 'rwd',
+};
+
+// Per-chassis force tuning for the headless learner, consumed by the
+// shared `wheeledFromNormalized` helper so every action source (demos,
+// trial harness, model rollout) shares one arithmetic path.
+const LEARN_FORCE_TUNING: CarForceTuning = {
+  engineForceN: LEARN_VEHICLE_TUNING.engineForce!,
+  brakeForceN: LEARN_VEHICLE_TUNING.brakeForce!,
 };
 
 /** Primitive duration in seconds. Matches `carchase-scenarios.ts`. */
@@ -167,10 +181,8 @@ export async function createSweepWorld(agent: VehicleAgent = CARCHASE_AGENT): Pr
   // Settle the chassis on its suspension once at the start so the wheels are
   // at rest length before the first trial begins driving.
   for (let i = 0; i < 30; i++) {
-    car.applyControls({ steer: 0, throttle: 0, brake: 0 });
-    world.timestep = PHYSICS_DT;
-    car.vehicle.updateVehicle(PHYSICS_DT);
-    world.step();
+    car.applyWheeledControls(ZERO_WHEELED);
+    stepRaycastVehicle(world, [car], { dt: PHYSICS_DT, substeps: 1 });
   }
   return {
     rapier,
@@ -218,10 +230,10 @@ const MAX_RAMP_TICKS = 600; // up to 10s of simulated ramp-up
 const SPEED_TOL = 0.25;     // m/s — "close enough" to target start speed
 
 function physicsStep(sw: SweepWorld, cmd: { steer: number; throttle: number; brake: number }): void {
-  sw.car.applyControls(cmd);
-  sw.world.timestep = PHYSICS_DT;
-  sw.car.vehicle.updateVehicle(PHYSICS_DT);
-  sw.world.step();
+  // `wheeledFromNormalized` owns the steer-sign flip + force scaling so the
+  // headless learner and the live demos drive through identical arithmetic.
+  sw.car.applyWheeledControls(wheeledFromNormalized(cmd, LEARN_FORCE_TUNING));
+  stepRaycastVehicle(sw.world, [sw.car], { dt: PHYSICS_DT, substeps: 1 });
 }
 
 /** Brake to a near-stop using ONLY the brake input. No teleport. */
@@ -292,10 +304,8 @@ export function runTrial(
   for (let tick = 1; tick <= TICKS_PER_TRIAL; tick++) {
     const state = car.readState(0);
     const cmd = controlsToWheelCommand(state.speed, controls[0], controls[1], wheelBase);
-    car.applyControls(cmd);
-    world.timestep = PHYSICS_DT;
-    car.vehicle.updateVehicle(PHYSICS_DT);
-    world.step();
+    car.applyWheeledControls(wheeledFromNormalized(cmd, LEARN_FORCE_TUNING));
+    stepRaycastVehicle(world, [car], { dt: PHYSICS_DT, substeps: 1 });
     if (sampleTicks.has(tick)) {
       const s = car.readState(0);
       const [lx, lz] = rotate(s.x - origin.x, s.z - origin.z, c0, s0);
@@ -401,7 +411,7 @@ function rolloutAndLoss(
   // matches the resolution of the open-loop trial (33 physics ticks across
   // 6 samples ≈ 5-6 ticks per sample window).
   for (const tr of data.trials) {
-    let s: VehicleState = {
+    let s: CarKinematicState = {
       x: 0,
       z: 0,
       heading: 0,
@@ -641,10 +651,10 @@ export function buildLearnedLibrary(
  *  (curvature, targetSpeed) pair the pure-pursuit tracker produced for this
  *  tick — the same form the parametric model accepts. */
 export interface TransitionSample {
-  state: VehicleState;
+  state: CarKinematicState;
   controls: [number, number];
   dt: number;
-  next: VehicleState;
+  next: CarKinematicState;
 }
 
 function transitionLoss(
@@ -736,7 +746,7 @@ export function summariseKinematicGap(data: SweepData): DiscrepancySummary {
   const errors: number[] = [];
   const speedErrors: number[] = [];
   for (const tr of data.trials) {
-    let s: VehicleState = {
+    let s: CarKinematicState = {
       x: 0,
       z: 0,
       heading: 0,

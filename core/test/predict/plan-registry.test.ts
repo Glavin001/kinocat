@@ -7,7 +7,7 @@ import { characterizeVehicle } from '../../src/primitives/characterize';
 import { defaultVehicleAgent, kinematicForwardSim } from '../../src/agent/vehicle';
 import { PlanRegistry, fromPublishedPlan } from '../../src/predict/plan-registry';
 import { asObstacle } from '../../src/predict/factories';
-import type { VehicleAgent, VehicleState } from '../../src/agent/types';
+import type { VehicleAgent, CarKinematicState } from '../../src/agent/types';
 
 function rect(id: number, x0: number, z0: number, x1: number, z1: number): NavPolygon {
   return { id, y: 0, ring: [[x0, z0], [x1, z0], [x1, z1], [x0, z1]] };
@@ -37,7 +37,7 @@ const lib = buildLib(agent);
 describe('PlanRegistry', () => {
   it('interpolates a published plan; clamps before/after', () => {
     const reg = new PlanRegistry();
-    const path: VehicleState[] = [
+    const path: CarKinematicState[] = [
       { x: 0, z: 0, heading: 0, speed: 4, t: 0 },
       { x: 10, z: 0, heading: 0, speed: 4, t: 2 },
     ];
@@ -61,8 +61,8 @@ describe('PlanRegistry', () => {
 
 describe('emergent coordination via shared plans', () => {
   const world = new InMemoryNavWorld([rect(1, 0, -14, 32, 14)]);
-  const start: VehicleState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
-  const goal: VehicleState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
+  const start: CarKinematicState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
+  const goal: CarKinematicState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
 
   it('NPC B routes around NPC A read from the registry', () => {
     const reg = new PlanRegistry();

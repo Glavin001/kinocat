@@ -1,5 +1,5 @@
 import type { Predict, MovingObstacle } from './types';
-import type { VehicleState } from '../agent/types';
+import type { CarKinematicState } from '../agent/types';
 import type { ForwardSim } from '../primitives/types';
 import { wrapAngle } from '../internal/math';
 
@@ -7,9 +7,9 @@ const DEFAULT_HORIZON = 10; // seconds
 
 /** Constant-velocity extrapolation of a vehicle along its current heading. */
 export function constantVelocity(
-  state: VehicleState,
+  state: CarKinematicState,
   horizon = DEFAULT_HORIZON,
-): Predict<VehicleState> {
+): Predict<CarKinematicState> {
   const vx = state.speed * Math.cos(state.heading);
   const vz = state.speed * Math.sin(state.heading);
   return (t) => {
@@ -27,10 +27,10 @@ export function constantVelocity(
 
 /** Constant-acceleration extrapolation (world-frame accel a = [ax, az]). */
 export function constantAcceleration(
-  state: VehicleState,
+  state: CarKinematicState,
   accel: { ax: number; az: number },
   horizon = DEFAULT_HORIZON,
-): Predict<VehicleState> {
+): Predict<CarKinematicState> {
   const vx0 = state.speed * Math.cos(state.heading);
   const vz0 = state.speed * Math.sin(state.heading);
   return (t) => {
@@ -50,13 +50,13 @@ export function constantAcceleration(
 
 /** Roll a ForwardSim forward once, sample at `dtStep`, and lerp on query. */
 export function fromPhysicsRollout(
-  initial: VehicleState,
+  initial: CarKinematicState,
   controls: number[],
-  forwardSim: ForwardSim<VehicleState>,
+  forwardSim: ForwardSim<CarKinematicState>,
   dtStep: number,
   horizon = DEFAULT_HORIZON,
-): Predict<VehicleState> {
-  const samples: VehicleState[] = [initial];
+): Predict<CarKinematicState> {
+  const samples: CarKinematicState[] = [initial];
   let s = initial;
   const steps = Math.ceil(horizon / dtStep);
   for (let i = 0; i < steps; i++) {
@@ -86,9 +86,9 @@ export function fromPhysicsRollout(
  *  extrapolate (for players / adversarial NPCs that publish no plan).
  *  `smoothing` ∈ [0,1] EMA-blends the observed speed. */
 export function fromObservations(
-  getCurrentState: () => VehicleState,
+  getCurrentState: () => CarKinematicState,
   opts: { horizon?: number; smoothing?: number } = {},
-): Predict<VehicleState> {
+): Predict<CarKinematicState> {
   const horizon = opts.horizon ?? DEFAULT_HORIZON;
   const alpha = opts.smoothing ?? 1;
   let smoothedSpeed: number | null = null;

@@ -10,7 +10,7 @@ import {
   constantVelocity,
 } from 'kinocat/predict';
 import type { Predict, MovingObstacle } from 'kinocat/predict';
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import type { ObstacleDescriptor, WorkerPlanResponse } from 'kinocat/worker';
 import {
   CARCHASE_AGENT,
@@ -30,12 +30,32 @@ import {
 } from '../lib/carchase-scenarios';
 import { CarChasePlannerHost } from './plannerWorkerHost';
 import {
+  CARCHASE_BRAKE_FORCE_N,
+  CARCHASE_ENGINE_FORCE_N,
   createCarChaseWorld,
   ensureRapier,
   planToControls,
   spawnCar,
   type CarHandle,
 } from './rapierVehicle';
+import { stepRaycastVehicle } from 'kinocat/adapters/rapier';
+import { updateChaseCamera } from 'kinocat/adapters/three';
+import {
+  trimPlan,
+  wheeledFromNormalized,
+  ZERO_WHEELED,
+  type CarForceTuning,
+} from 'kinocat/vehicle/car';
+
+// Tuning consumed by the shared `wheeledFromNormalized` helper —
+// `kinocat/vehicle/car` owns the normalized → WheeledCarControls
+// arithmetic and the chassis-side steer-sign flip.
+const CARCHASE_FORCE_TUNING: CarForceTuning = {
+  engineForceN: CARCHASE_ENGINE_FORCE_N,
+  brakeForceN: CARCHASE_BRAKE_FORCE_N,
+};
+const toWheeled = (cmd: { steer: number; throttle: number; brake: number }) =>
+  wheeledFromNormalized(cmd, CARCHASE_FORCE_TUNING);
 import {
   createBuildingHelper,
   createJumpArcHelper,
@@ -58,10 +78,10 @@ interface CopAI {
   id: string;
   color: number;
   car: CarHandle;
-  plan: VehicleState[] | null;
+  plan: CarKinematicState[] | null;
   planStartWall: number;
   mode: CopTacticalMode;
-  goal: VehicleState | null;
+  goal: CarKinematicState | null;
   lastReplanWall: number;
   lastExpansions: number;
   lastBudgetMs: number;
@@ -89,10 +109,10 @@ interface CopAI {
 
 interface RobberAI {
   car: CarHandle;
-  plan: VehicleState[] | null;
+  plan: CarKinematicState[] | null;
   planStartWall: number;
   loopIndex: number;
-  goal: VehicleState | null;
+  goal: CarKinematicState | null;
   lastReplanWall: number;
   lastExpansions: number;
   lastBudgetMs: number;
@@ -414,7 +434,7 @@ export default function CarChase() {
     const copPathLines: (THREE.Line | null)[] = cops.map(() => null);
     function replacePathLine(
       old: THREE.Line | null,
-      path: VehicleState[],
+      path: CarKinematicState[],
       color: number,
     ): THREE.Line {
       if (old) {
@@ -518,7 +538,7 @@ export default function CarChase() {
 
     /** Reset a single car in-place: fix rotation to upright, nudge back
      *  slightly along the heading to clear whatever it's stuck on. */
-    function resetCarInPlace(target: UnstickTarget & { plan: VehicleState[] | null }) {
+    function resetCarInPlace(target: UnstickTarget & { plan: CarKinematicState[] | null }) {
       const state = target.car.readState(performance.now());
       // Nudge 3 m backward along heading to clear the obstacle.
       const nudge = 3;
@@ -556,7 +576,7 @@ export default function CarChase() {
 
     function applyPlanResult(
       npcId: string,
-      resp: { found: boolean; path: VehicleState[]; stats: { expansions: number } },
+      resp: { found: boolean; path: CarKinematicState[]; stats: { expansions: number } },
       budgetMs: number,
     ) {
       if (npcId === 'robber') {
@@ -606,8 +626,8 @@ export default function CarChase() {
 
     function prepareRobberReplan(now: number): {
       npcId: string;
-      start: VehicleState;
-      goal: VehicleState;
+      start: CarKinematicState;
+      goal: CarKinematicState;
       obstacles: ObstacleDescriptor[];
     } | null {
       if (playerDrivingRef.current) return null;
@@ -641,15 +661,15 @@ export default function CarChase() {
 
     function prepareCopReplan(co: CopAI, copIndex: number, now: number): {
       npcId: string;
-      start: VehicleState;
-      goal: VehicleState;
+      start: CarKinematicState;
+      goal: CarKinematicState;
       obstacles: ObstacleDescriptor[];
     } {
       const robberState = robber.car.readState(now);
       const copState = co.car.readState(now);
       const mode = selectTacticalMode(robberState, copState, copIndex);
-      const robberPredict: Predict<VehicleState> = (t) => {
-        const p = registry.predictNPC('robber')(t) as VehicleState | null;
+      const robberPredict: Predict<CarKinematicState> = (t) => {
+        const p = registry.predictNPC('robber')(t) as CarKinematicState | null;
         return p ?? predictRobberFromState(robberState, 8)(t);
       };
       const goal = tacticalGoal(robberState, robberPredict, copState, mode, course.buildings, course);
@@ -801,11 +821,11 @@ export default function CarChase() {
           (keys.has('a') || keys.has('arrowleft') ? 1 : 0) -
           (keys.has('d') || keys.has('arrowright') ? 1 : 0);
         const brake = keys.has(' ') ? 1 : 0;
-        robber.car.applyControls({
+        robber.car.applyWheeledControls(toWheeled({
           steer: steerIn * 0.55,
           throttle: accel,
           brake,
-        });
+        }));
       } else if (maybeUnstick(robber, robberState, now)) {
         // Reverse burst is active — controls already applied.
       } else if (robber.plan && robber.plan.length > 1) {
@@ -815,7 +835,7 @@ export default function CarChase() {
         const live = trimPlan(robber.plan, elapsed);
         if (live.length >= 2) {
           const cmd = planToControls(robberState, live);
-          robber.car.applyControls(cmd);
+          robber.car.applyWheeledControls(toWheeled(cmd));
         } else if (robber.goal) {
           // Plan exhausted — steer toward the goal at moderate speed so the
           // robber keeps moving while a new plan is computed.
@@ -824,16 +844,16 @@ export default function CarChase() {
           const bearing = Math.atan2(dz, dx) - robberState.heading;
           const wrapped = Math.atan2(Math.sin(bearing), Math.cos(bearing));
           const steer = Math.max(-0.55, Math.min(0.55, wrapped / 0.8));
-          robber.car.applyControls({ steer, throttle: 0.5, brake: 0 });
+          robber.car.applyWheeledControls(toWheeled({ steer, throttle: 0.5, brake: 0 }));
         } else {
-          robber.car.applyControls({ steer: 0, throttle: 0.3, brake: 0 });
+          robber.car.applyWheeledControls(toWheeled({ steer: 0, throttle: 0.3, brake: 0 }));
         }
       } else {
         // No plan yet — coast in neutral instead of idling forward. The old
         // behaviour applied 0.15 throttle until the first plan arrived, which
         // on slopes is enough to creep into the nearest wall before the AI
         // gets going (see bug-audit notes in the plan).
-        robber.car.applyControls({ steer: 0, throttle: 0, brake: 0 });
+        robber.car.applyWheeledControls(ZERO_WHEELED);
       }
       for (let i = 0; i < cops.length; i++) {
         const co = cops[i]!;
@@ -843,7 +863,7 @@ export default function CarChase() {
           continue;
         }
         if (co.capturedAtWall + CAPTURE_COOLDOWN_MS > now) {
-          co.car.applyControls({ steer: 0, throttle: 0, brake: 1 });
+          co.car.applyWheeledControls(toWheeled({ steer: 0, throttle: 0, brake: 1 }));
           // Don't accumulate "stuck" time during the post-bust freeze.
           co.lastMovedWall = now;
           co.unstickUntilWall = -Infinity;
@@ -855,7 +875,7 @@ export default function CarChase() {
           const live = trimPlan(co.plan, elapsed);
           if (live.length >= 2) {
             const cmd = planToControls(copStates[i]!, live);
-            co.car.applyControls(cmd);
+            co.car.applyWheeledControls(toWheeled(cmd));
             continue;
           }
         }
@@ -872,11 +892,11 @@ export default function CarChase() {
         const wrapped = Math.atan2(Math.sin(bearing), Math.cos(bearing));
         const forward = Math.abs(wrapped) < Math.PI / 2;
         const steer = Math.max(-1, Math.min(1, (forward ? wrapped : Math.atan2(Math.sin(Math.PI - wrapped), Math.cos(Math.PI - wrapped))) / 0.55));
-        co.car.applyControls({
+        co.car.applyWheeledControls(toWheeled({
           steer: steer * 0.55,
           throttle: forward ? 0.6 : -0.4,
           brake: 0,
-        });
+        }));
       }
 
       // Canonical Rapier raycast-vehicle order: updateVehicle BEFORE
@@ -884,14 +904,11 @@ export default function CarChase() {
       // next one). Sub-step both together so suspension stays stable.
       // EXCLUDE_DYNAMIC keeps wheel rays from hitting other cars' chassis
       // colliders — without it cars ride up on each other when close.
-      const subDt = PHYSICS_DT / VEHICLE_SUBSTEPS;
-      world.timestep = subDt;
-      const wheelFilter = RAPIER.QueryFilterFlags.EXCLUDE_DYNAMIC;
-      for (let s = 0; s < VEHICLE_SUBSTEPS; s++) {
-        robber.car.vehicle.updateVehicle(subDt, wheelFilter);
-        for (const co of cops) co.car.vehicle.updateVehicle(subDt, wheelFilter);
-        world.step();
-      }
+      stepRaycastVehicle(
+        world,
+        [robber.car as unknown as Parameters<typeof stepRaycastVehicle>[1][number], ...cops.map((c) => c.car as unknown as Parameters<typeof stepRaycastVehicle>[1][number])],
+        { dt: PHYSICS_DT, substeps: VEHICLE_SUBSTEPS },
+      );
 
       // Re-read post-step states for rendering + capture detection.
       const robberStateAfter = robber.car.readState(now);
@@ -913,7 +930,7 @@ export default function CarChase() {
         const dx = robberStateAfter.x - copStatesAfter[i]!.x;
         const dz = robberStateAfter.z - copStatesAfter[i]!.z;
         // Vertical separation comes from the physics body translation, NOT
-        // from VehicleState (which is the XZ planning plane). A cop directly
+        // from CarKinematicState (which is the XZ planning plane). A cop directly
         // below a mid-air robber should NOT count as touching.
         const copY = cops[i]!.car.chassis.translation().y;
         const dy = robberY - copY;
@@ -1011,16 +1028,11 @@ export default function CarChase() {
 
       // Chase camera tracks the robber from behind.
       if (chaseRef.current) {
-        const c = Math.cos(robberStateAfter.heading);
-        const s = Math.sin(robberStateAfter.heading);
-        const cam = new THREE.Vector3(
-          robberStateAfter.x - 14 * c,
-          7,
-          robberStateAfter.z - 14 * s,
+        updateChaseCamera(
+          camera,
+          { x: robberStateAfter.x, z: robberStateAfter.z, heading: robberStateAfter.heading },
+          { orbit },
         );
-        camera.position.lerp(cam, 0.12);
-        orbit.target.set(robberStateAfter.x, 1.5, robberStateAfter.z);
-        orbit.update();
       }
 
       // HUD throttle (~10 Hz to avoid React thrash).
@@ -1221,12 +1233,6 @@ export default function CarChase() {
 
 /** Drop path samples already passed; resample t-origin so pure-pursuit picks
  *  a fresh lookahead. */
-function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
-  let i = 0;
-  while (i < plan.length - 1 && plan[i + 1]!.t <= elapsed) i++;
-  return plan.slice(i);
-}
-
 /** Anything that holds a car handle plus the stuck-detector bookkeeping.
  *  Both RobberAI and CopAI satisfy this — the helper doesn't care which.
  *  Mutates `lastMovedWall` / `unstickUntilWall` on the passed-in object. */
@@ -1249,7 +1255,7 @@ interface UnstickTarget {
  *  each other don't both reverse the same way and re-wedge. */
 function maybeUnstick(
   target: UnstickTarget,
-  state: VehicleState,
+  state: CarKinematicState,
   now: number,
 ): boolean {
   // Active burst — keep applying reverse controls until it elapses.
@@ -1257,7 +1263,7 @@ function maybeUnstick(
     // Counter-steer based on a stable hash of the car id so the squad
     // fans out instead of all reversing in the same arc.
     const sign = (target.car.id.charCodeAt(target.car.id.length - 1) % 2) * 2 - 1;
-    target.car.applyControls({ steer: 0.4 * sign, throttle: -0.7, brake: 0 });
+    target.car.applyWheeledControls(toWheeled({ steer: 0.4 * sign, throttle: -0.7, brake: 0 }));
     return true;
   }
   // Not actively bursting — update the moved-recently timestamp and
@@ -1279,7 +1285,7 @@ function maybeUnstick(
       target.burstCount++;
     }
     const sign = (target.car.id.charCodeAt(target.car.id.length - 1) % 2) * 2 - 1;
-    target.car.applyControls({ steer: 0.4 * sign, throttle: -0.7, brake: 0 });
+    target.car.applyWheeledControls(toWheeled({ steer: 0.4 * sign, throttle: -0.7, brake: 0 }));
     return true;
   }
   return false;
@@ -1290,7 +1296,7 @@ function maybeUnstick(
  *  Nudges the car backward along its heading to clear the obstacle.
  *  Falls back to spawnPose only when the car is off-world. */
 function maybeAutoReset(
-  target: UnstickTarget & { plan: VehicleState[] | null },
+  target: UnstickTarget & { plan: CarKinematicState[] | null },
   spawnPose: { x: number; z: number; heading: number },
   now: number,
 ): boolean {

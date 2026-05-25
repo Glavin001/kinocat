@@ -19,7 +19,7 @@ import {
   combineHeightSamplers,
 } from 'kinocat/environment';
 import type { HeightSampler } from 'kinocat/environment';
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import {
   ensureRapier,
   createRaycastVehicle,
@@ -27,6 +27,7 @@ import {
   createBoxCollider,
   createHeightfieldCollider,
   planToAckermannControls,
+  stepRaycastVehicle,
 } from 'kinocat/adapters/rapier';
 import {
   createGroundPlaneHelper,
@@ -44,7 +45,14 @@ import {
   createRampChevronsHelper,
   createJumpArcHelper,
   createRapierDebugRenderer,
+  updateChaseCamera,
 } from 'kinocat/adapters/three';
+import {
+  trimPlan,
+  wheeledFromNormalized,
+  ZERO_WHEELED,
+  type CarForceTuning,
+} from 'kinocat/vehicle/car';
 import {
   OBS_AGENT,
   OBS_BOUNDS,
@@ -62,6 +70,19 @@ const PHYSICS_DT = 1 / 60;
 const VEHICLE_SUBSTEPS = 4;
 const REPLAN_INTERVAL_MS = 120;
 const WHEEL_BASE = 1.6; // matches default in createRaycastVehicle
+// Force constants — match createRaycastVehicle defaults so the wheeled
+// control conversion below has the same physical effect as the legacy
+// `applyControls` normalized path.
+const ENGINE_FORCE_N = 4000;
+const BRAKE_FORCE_N = 2000;
+
+// Tuning consumed by the shared `wheeledFromNormalized` helper. Centralizing
+// the conversion in `kinocat/vehicle/car` keeps every demo, the headless
+// trial harness, and the offline training driver on the same arithmetic.
+const OBSTACLE_FORCE_TUNING: CarForceTuning = {
+  engineForceN: ENGINE_FORCE_N,
+  brakeForceN: BRAKE_FORCE_N,
+};
 
 // Gentle terrain so a flat-ground vehicle still copes. Bumps + bowls let us
 // see suspension behaviour without making the planner-vs-physics gap obvious.
@@ -301,10 +322,10 @@ export default function ObstacleCourse() {
     scene.add(carMesh.group);
 
     const ai = {
-      plan: null as VehicleState[] | null,
+      plan: null as CarKinematicState[] | null,
       planStartWall: performance.now(),
       loopIndex: 0,
-      goal: null as VehicleState | null,
+      goal: null as CarKinematicState | null,
       lastExpansions: 0,
       lastBudgetMs: 0,
     };
@@ -313,7 +334,7 @@ export default function ObstacleCourse() {
     scene.add(goalMarker);
 
     let pathLine: THREE.Line | null = null;
-    function replacePathLine(path: VehicleState[]): void {
+    function replacePathLine(path: CarKinematicState[]): void {
       if (pathLine) {
         scene.remove(pathLine);
         pathLine.geometry.dispose();
@@ -419,44 +440,47 @@ export default function ObstacleCourse() {
           (keys.has('a') || keys.has('arrowleft') ? 1 : 0) -
           (keys.has('d') || keys.has('arrowright') ? 1 : 0);
         const brake = keys.has(' ') ? 1 : 0;
-        car.applyControls({ steer: steerIn * 0.55, throttle: accel, brake });
+        car.applyWheeledControls(
+          wheeledFromNormalized(
+            { steer: steerIn * 0.55, throttle: accel, brake },
+            OBSTACLE_FORCE_TUNING,
+          ),
+        );
       } else if (ai.plan && ai.plan.length > 1) {
         const elapsed = (now - ai.planStartWall) / 1000;
         const live = trimPlan(ai.plan, elapsed);
         if (live.length >= 2) {
-          car.applyControls(
-            planToAckermannControls(state, live, {
-              wheelBase: 2 * WHEEL_BASE,
-              lookaheadMin: 3,
-              lookaheadGain: 0.45,
-              lookaheadMax: 14,
-              maxLateralAccel: 8,
-              maxAccel: 6,
-              maxDecel: 8,
-              cruiseSpeed: OBS_AGENT.maxSpeed,
-              goalTolerance: 2,
-              minTurnRadius: OBS_AGENT.minTurnRadius,
-            }),
-          );
+          const cmd = planToAckermannControls(state, live, {
+            wheelBase: 2 * WHEEL_BASE,
+            lookaheadMin: 3,
+            lookaheadGain: 0.45,
+            lookaheadMax: 14,
+            maxLateralAccel: 8,
+            maxAccel: 6,
+            maxDecel: 8,
+            cruiseSpeed: OBS_AGENT.maxSpeed,
+            goalTolerance: 2,
+            minTurnRadius: OBS_AGENT.minTurnRadius,
+          });
+          car.applyWheeledControls(wheeledFromNormalized(cmd, OBSTACLE_FORCE_TUNING));
         } else {
-          car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
+          car.applyWheeledControls(
+            wheeledFromNormalized(
+              { steer: 0, throttle: 0.2, brake: 0 },
+              OBSTACLE_FORCE_TUNING,
+            ),
+          );
         }
       } else {
         // No plan yet — coast in neutral. Idling forward into the first plan
         // sounds harmless until a heightfield slope flips the car into a
         // wall; see bug-audit notes.
-        car.applyControls({ steer: 0, throttle: 0, brake: 0 });
+        car.applyWheeledControls(ZERO_WHEELED);
       }
 
       // Physics: vehicle update before world step, sub-stepped (Rapier
       // raycast-vehicle is twitchy at 60 Hz on its own).
-      const subDt = PHYSICS_DT / VEHICLE_SUBSTEPS;
-      world.timestep = subDt;
-      const wheelFilter = RAPIER.QueryFilterFlags.EXCLUDE_DYNAMIC;
-      for (let s = 0; s < VEHICLE_SUBSTEPS; s++) {
-        car.vehicle.updateVehicle(subDt, wheelFilter);
-        world.step();
-      }
+      stepRaycastVehicle(world, [car], { dt: PHYSICS_DT, substeps: VEHICLE_SUBSTEPS });
 
       const after = car.readState(now);
       syncCarMesh(carMesh.group, after);
@@ -474,16 +498,7 @@ export default function ObstacleCourse() {
       if (ai.goal) goalMarker.position.set(ai.goal.x, 2, ai.goal.z);
 
       if (chaseRef.current) {
-        const c = Math.cos(after.heading);
-        const s = Math.sin(after.heading);
-        const cam = new THREE.Vector3(
-          after.x - 14 * c,
-          7,
-          after.z - 14 * s,
-        );
-        camera.position.lerp(cam, 0.12);
-        orbit.target.set(after.x, 1.5, after.z);
-        orbit.update();
+        updateChaseCamera(camera, { x: after.x, z: after.z, heading: after.heading }, { orbit });
       }
 
       if (now - lastHudWall > 100) {
@@ -610,12 +625,6 @@ export default function ObstacleCourse() {
       </div>
     </div>
   );
-}
-
-function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
-  let i = 0;
-  while (i < plan.length - 1 && plan[i + 1]!.t <= elapsed) i++;
-  return plan.slice(i);
 }
 
 function ToggleButton({

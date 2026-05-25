@@ -13,7 +13,7 @@ import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import type {
   LearnedVehicleParams,
-  VehicleState,
+  CarKinematicState,
   VehicleAgent,
 } from 'kinocat/agent';
 import { kinematicForwardSim } from 'kinocat/agent';
@@ -231,7 +231,7 @@ export default function LearnPrimitives() {
           // Kinematic ghost — dashed gray, current params (or default).
           for (const tr of sweep.trials) {
             const sim = kinematicForwardSim(sweep.agent as VehicleAgent);
-            let s: VehicleState = {
+            let s: CarKinematicState = {
               x: 0,
               z: 0,
               heading: 0,

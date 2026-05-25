@@ -4,7 +4,7 @@
 // Environment.succ time only when nearby and usable at the corresponding time.
 
 import type { Predict, AffordanceState } from './types';
-import type { VehicleState } from '../agent/types';
+import type { CarKinematicState } from '../agent/types';
 
 export enum AffordanceType {
   BallisticJump = 'ballistic_jump',
@@ -19,7 +19,7 @@ export enum AffordanceType {
 }
 
 export interface AffordanceUseResult {
-  resultState: VehicleState;
+  resultState: CarKinematicState;
   /** Sampled (x, y, z, t) along the use, for tracking/visualization. */
   trajectory: Array<{ x: number; y: number; z: number; t: number }>;
   duration: number;
@@ -36,7 +36,7 @@ export interface Affordance {
   /** Proximity bound (world XZ + radius) for `queryNearby`. */
   spatialBound: { x: number; z: number; radius: number };
   /** Try to use this affordance from `agentState` at `useTime`. */
-  tryUse(agentState: VehicleState, useTime: number): AffordanceUseResult | null;
+  tryUse(agentState: CarKinematicState, useTime: number): AffordanceUseResult | null;
 }
 
 export class AffordanceRegistry {
@@ -79,7 +79,7 @@ export function createJumpAffordance(opts: {
   id: string;
   launch: { x: number; z: number };
   entryRadius: number;
-  land: VehicleState;
+  land: CarKinematicState;
   apexY?: number;
   duration: number;
   cost: number;
@@ -104,7 +104,7 @@ export function createJumpAffordance(opts: {
       const dx = agentState.x - opts.launch.x;
       const dz = agentState.z - opts.launch.z;
       if (dx * dx + dz * dz > opts.entryRadius * opts.entryRadius) return null;
-      const land: VehicleState = { ...opts.land, t: useTime + opts.duration };
+      const land: CarKinematicState = { ...opts.land, t: useTime + opts.duration };
       return {
         resultState: land,
         duration: opts.duration,
@@ -133,7 +133,7 @@ export function createBoostAffordance(opts: {
   id: string;
   pad: { x: number; z: number };
   entryRadius: number;
-  exit: VehicleState;
+  exit: CarKinematicState;
   duration: number;
   cost: number;
   validFrom?: number;
@@ -156,7 +156,7 @@ export function createBoostAffordance(opts: {
       const dx = agentState.x - opts.pad.x;
       const dz = agentState.z - opts.pad.z;
       if (dx * dx + dz * dz > opts.entryRadius * opts.entryRadius) return null;
-      const out: VehicleState = { ...opts.exit, t: useTime + opts.duration };
+      const out: CarKinematicState = { ...opts.exit, t: useTime + opts.duration };
       return {
         resultState: out,
         duration: opts.duration,
@@ -183,7 +183,7 @@ export function createMisdirectAffordance(opts: {
   launch: { x: number; z: number };
   entryRadius: number;
   /** Where it actually drops the agent (a trap / dead-end / detour). */
-  land: VehicleState;
+  land: CarKinematicState;
   duration: number;
   /** The true (high) cost — reported honestly so the planner rejects it. */
   cost: number;
@@ -209,7 +209,7 @@ export function createMisdirectAffordance(opts: {
       const dx = agentState.x - opts.launch.x;
       const dz = agentState.z - opts.launch.z;
       if (dx * dx + dz * dz > opts.entryRadius * opts.entryRadius) return null;
-      const land: VehicleState = { ...opts.land, t: useTime + opts.duration };
+      const land: CarKinematicState = { ...opts.land, t: useTime + opts.duration };
       return {
         resultState: land,
         duration: opts.duration,

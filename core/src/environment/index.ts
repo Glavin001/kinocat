@@ -24,6 +24,14 @@ export type {
 } from './heightfield-airspace';
 export { TimeAwareEnvironment } from './time-aware';
 export type { TimeAwareOptions } from './time-aware';
+// Multi-goal Environment wrapper — single A* over an ordered SEQUENCE of
+// intermediate goals. Domain-agnostic; usable with any base Environment.
+export {
+  MultiGoalEnvironment,
+  multiGoalStart,
+  multiGoalTerminal,
+} from './multi-goal';
+export type { MultiGoalState, MultiGoalOptions } from './multi-goal';
 export { nudgeGoalClear } from './nudge-goal';
 export type { NudgeGoalOptions } from './nudge-goal';
 export {

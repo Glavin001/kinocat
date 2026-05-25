@@ -31,7 +31,7 @@ import {
 } from 'kinocat/predict';
 import type { Predict, MovingObstacle } from 'kinocat/predict';
 import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
-import type { VehicleAgent, VehicleState } from 'kinocat/agent';
+import type { VehicleAgent, CarKinematicState } from 'kinocat/agent';
 import { characterizeVehicle } from 'kinocat/primitives';
 import { MotionPrimitiveLibrary } from 'kinocat/primitives';
 import type { ObstacleDescriptor } from 'kinocat/worker';
@@ -417,8 +417,8 @@ const LEAD_MIN_SPEED = 3.0; // m/s — robber slower than this → pursue
 const CLOSE_RANGE = 18; // m — cop closer than this → pursue regardless
 
 export function selectTacticalMode(
-  robber: VehicleState,
-  cop: VehicleState,
+  robber: CarKinematicState,
+  cop: CarKinematicState,
   copIndex: number,
 ): CopTacticalMode {
   const dx = robber.x - cop.x;
@@ -446,7 +446,7 @@ export function selectTacticalMode(
   return copIndex % 2 === 0 ? 'FLANK_LEFT' : 'FLANK_RIGHT';
 }
 
-/** Translate a cop tactic into a goal `VehicleState`. The planner uses a
+/** Translate a cop tactic into a goal `CarKinematicState`. The planner uses a
  *  generous goalRadius so these only need to be in the right neighbourhood.
  *
  *  Goal-nudging delegates to `kinocat/environment`'s generic helper, which
@@ -465,11 +465,11 @@ function navWorldFor(course: CarChaseCourse): InMemoryNavWorld {
 }
 
 function nudgeGoalToNavClear(
-  goal: VehicleState,
-  near: VehicleState,
+  goal: CarKinematicState,
+  near: CarKinematicState,
   buildings: BuildingSpec[] | undefined,
   course?: CarChaseCourse,
-): VehicleState {
+): CarKinematicState {
   // Building list is no longer needed for the check itself (the NavWorld
   // owns inflated obstacle geometry); we only keep the parameter so callers
   // pass `course.buildings` if they want nudging enabled.
@@ -479,13 +479,13 @@ function nudgeGoalToNavClear(
 }
 
 export function tacticalGoal(
-  robber: VehicleState,
-  robberPredict: Predict<VehicleState>,
-  cop: VehicleState,
+  robber: CarKinematicState,
+  robberPredict: Predict<CarKinematicState>,
+  cop: CarKinematicState,
   mode: CopTacticalMode,
   buildings?: BuildingSpec[],
   course?: CarChaseCourse,
-): VehicleState {
+): CarKinematicState {
   const ahead = (t: number) => robberPredict(t) ?? robber;
   const dist = Math.hypot(robber.x - cop.x, robber.z - cop.z);
   const eta = Math.min(6, Math.max(0.8, dist / CARCHASE_AGENT.maxSpeed));
@@ -500,7 +500,7 @@ export function tacticalGoal(
   // very-slow robbers to PURSUE; this handles the in-between band.)
   const leadFrac = Math.min(1, Math.abs(robber.speed) / 8);
 
-  let goal: VehicleState;
+  let goal: CarKinematicState;
   switch (mode) {
     case 'PURSUE': {
       const c = Math.cos(future.heading);
@@ -588,7 +588,7 @@ const ROBBER_MAX_WP_SKIPS = 3;
 
 function waypointBlockedByCop(
   wp: { x: number; z: number },
-  cops: ReadonlyArray<VehicleState>,
+  cops: ReadonlyArray<CarKinematicState>,
   radius: number,
 ): boolean {
   for (const c of cops) {
@@ -600,13 +600,13 @@ function waypointBlockedByCop(
 }
 
 export function robberGoal(
-  robber: VehicleState,
+  robber: CarKinematicState,
   loop: CarChaseCourse['robberLoop'],
   loopIndex: number,
-  cops: VehicleState[],
+  cops: CarKinematicState[],
   buildings?: BuildingSpec[],
   course?: CarChaseCourse,
-): { goal: VehicleState; nextIndex: number } {
+): { goal: CarKinematicState; nextIndex: number } {
   // 1. Advance to the next waypoint well before reaching the current one.
   //    At maxSpeed 14 m/s, 20 m gives ~1.4 s of lead time — enough for a
   //    full replan cycle (~440 ms worst case) so the robber never pauses.
@@ -668,7 +668,7 @@ export function robberGoal(
 
 /** Pull the goal pose back inside the planning rectangle. Keeps a small
  *  margin so the agent's footprint still fits on the walkable mesh. */
-function clampGoalToBounds(s: VehicleState): VehicleState {
+function clampGoalToBounds(s: CarKinematicState): CarKinematicState {
   const m = 4;
   const b = CARCHASE_BOUNDS;
   return {
@@ -685,8 +685,8 @@ function clampGoalToBounds(s: VehicleState): VehicleState {
 export interface CarChasePlanRequest {
   /** Stable id; matches the PlanRegistry key. */
   npcId: string;
-  state: VehicleState;
-  goal: VehicleState;
+  state: CarKinematicState;
+  goal: CarKinematicState;
   /** Other agents whose published plans should be treated as moving
    *  obstacles (sibling cops + the robber/player for cop calls; the cops for
    *  robber calls). The robber state shows up as a Predict; sibling NPC
@@ -713,7 +713,7 @@ export const CARCHASE_TEST_MAX_EXPANSIONS = 25000;
  *  core defaults. */
 export function planCarChaseAI(
   req: CarChasePlanRequest,
-): PlanResult<VehicleState> {
+): PlanResult<CarKinematicState> {
   return planVehicleOnce({
     start: req.state,
     goal: req.goal,
@@ -736,13 +736,13 @@ export function planCarChaseAI(
 export function dehydrateObstacle(
   npcId: string,
   registry: PlanRegistry,
-  fallbackState: VehicleState,
+  fallbackState: CarKinematicState,
   radius: number,
   horizon = 4,
 ): ObstacleDescriptor {
   const pub = registry.get(npcId);
   if (pub && pub.states.length > 0) {
-    return { kind: 'plan', path: pub.states as VehicleState[], radius };
+    return { kind: 'plan', path: pub.states as CarKinematicState[], radius };
   }
   return { kind: 'cv', state: fallbackState, horizon, radius };
 }
@@ -754,9 +754,9 @@ export function dehydrateObstacle(
 // constant-velocity.
 
 export function predictRobberFromState(
-  robber: VehicleState,
+  robber: CarKinematicState,
   horizon = 4,
-): Predict<VehicleState> {
+): Predict<CarKinematicState> {
   return constantVelocity(robber, horizon);
 }
 
@@ -769,21 +769,21 @@ export function predictRobberFromState(
 export interface CarChaseSnapshot {
   course: CarChaseCourse;
   robber: {
-    state: VehicleState;
-    goal: VehicleState;
+    state: CarKinematicState;
+    goal: CarKinematicState;
     loopIndex: number;
-    result: PlanResult<VehicleState>;
+    result: PlanResult<CarKinematicState>;
   };
   cops: Array<{
     id: string;
-    state: VehicleState;
+    state: CarKinematicState;
     mode: CopTacticalMode;
-    goal: VehicleState;
-    result: PlanResult<VehicleState>;
+    goal: CarKinematicState;
+    result: PlanResult<CarKinematicState>;
   }>;
 }
 
-const SPAWN_ROBBER: VehicleState = {
+const SPAWN_ROBBER: CarKinematicState = {
   x: 50,
   z: 70,
   heading: -Math.PI / 2,
@@ -791,7 +791,7 @@ const SPAWN_ROBBER: VehicleState = {
   t: 0,
 };
 
-const SPAWN_COPS: VehicleState[] = [
+const SPAWN_COPS: CarKinematicState[] = [
   { x: 95, z: 70, heading: Math.PI, speed: 0, t: 0 },
   { x: 50, z: -80, heading: Math.PI / 2, speed: 0, t: 0 },
   { x: -100, z: 0, heading: 0, speed: 0, t: 0 },
@@ -844,8 +844,8 @@ export function buildCarChaseSnapshot(): CarChaseSnapshot {
     const mode = selectTacticalMode(SPAWN_ROBBER, cop, i);
     // Predict the robber from its published plan when available; fall back
     // to constant-velocity. Either way, asObstacle wraps it.
-    const robberPredict: Predict<VehicleState> = (t) => {
-      const fromPlan = registry.predictNPC('robber')(t) as VehicleState | null;
+    const robberPredict: Predict<CarKinematicState> = (t) => {
+      const fromPlan = registry.predictNPC('robber')(t) as CarKinematicState | null;
       return fromPlan ?? predictRobberFromState(SPAWN_ROBBER, 4)(t);
     };
     const goal = tacticalGoal(SPAWN_ROBBER, robberPredict, cop, mode, course.buildings, course);

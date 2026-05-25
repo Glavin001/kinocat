@@ -1,14 +1,25 @@
 import type { Pt } from '../internal/geom';
 
-/** Vehicle search state. Planning plane is world XZ; Y is derived from
- *  polygon containment and is NOT part of the search state. `speed` is signed
- *  (negative = reverse). `t` is absolute time (used from M4 on). */
-export interface VehicleState {
+/** Car (ground-vehicle) kinematic search state. Planning plane is world XZ;
+ *  Y is derived from polygon containment and is NOT part of the search
+ *  state. `speed` is signed (negative = reverse). `t` is absolute time.
+ *
+ *  `yawRate` (rad/s about world +Y, planning-frame sign) and `lateralVelocity`
+ *  (m/s along chassis +right) are OPTIONAL: legacy producers (kinematic sim,
+ *  scenarios, older recorded data) omit them and consumers should default to
+ *  0. The v2 learned dynamics model and the Rapier adapter populate them so
+ *  the planner can carry yaw / slip continuity across primitives — the missing
+ *  Markov state in the original 4-D `(x, z, heading, speed)` formulation. */
+export interface CarKinematicState {
   x: number;
   z: number;
   heading: number;
   speed: number;
   t: number;
+  /** rad/s about world +Y. Defaults to 0 when absent. */
+  yawRate?: number;
+  /** m/s along chassis +right (slip indicator). Defaults to 0 when absent. */
+  lateralVelocity?: number;
 }
 
 /** Humanoid search state — no inertial `speed` dimension (M7). */
@@ -19,7 +30,7 @@ export interface HumanoidState {
   t: number;
 }
 
-/** Aircraft search state. Unlike VehicleState, altitude `y` is part of the
+/** Aircraft search state. Unlike CarKinematicState, altitude `y` is part of the
  *  searched state — a genuinely 3D plan, not an XZ plan with derived height.
  *  `heading` is the XZ-plane bearing (yaw), `pitch` the flight-path angle
  *  (climb positive), `roll` the bank angle around the forward axis (lets the
@@ -36,7 +47,7 @@ export interface AircraftState {
   t: number;
 }
 
-export type AgentState = VehicleState | HumanoidState | AircraftState;
+export type AgentState = CarKinematicState | HumanoidState | AircraftState;
 
 export interface VehicleAgent {
   kind: 'vehicle';

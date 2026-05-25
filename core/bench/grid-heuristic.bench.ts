@@ -4,7 +4,7 @@ import { navWorldFromTriangleMesh } from '../src/adapters/navcat/index';
 import { VehicleEnvironment } from '../src/environment/vehicle-environment';
 import { defaultVehicleAgent, kinematicForwardSim } from '../src/agent/vehicle';
 import { characterizeVehicle } from '../src/primitives/characterize';
-import type { VehicleState } from '../src/agent/types';
+import type { CarKinematicState } from '../src/agent/types';
 
 // Opt 2 (spec §10.3): the Reeds-Shepp/Euclid heuristic is blind to
 // obstacles, so on a serpentine it expands deep into dead-ends. The
@@ -76,8 +76,8 @@ try {
   built = null;
 }
 
-const start: VehicleState = { x: 4, z: 15, heading: 0, speed: 0, t: 0 };
-const goal: VehicleState = { x: 47, z: 15, heading: 0, speed: 0, t: 0 };
+const start: CarKinematicState = { x: 4, z: 15, heading: 0, speed: 0, t: 0 };
+const goal: CarKinematicState = { x: 47, z: 15, heading: 0, speed: 0, t: 0 };
 
 function run(gridHeuristic: boolean): void {
   if (!built) return;

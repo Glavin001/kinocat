@@ -1,6 +1,6 @@
 import type { Environment, EdgeRef, Node } from './types';
 import type { NavWorld } from './nav-world';
-import type { VehicleAgent, VehicleState } from '../agent/types';
+import type { VehicleAgent, CarKinematicState } from '../agent/types';
 import type { MotionPrimitiveLibrary } from '../primitives/library';
 import { makeNode } from '../planner/node';
 import { pack3 } from '../planner/resolution';
@@ -64,6 +64,21 @@ export interface VehicleEnvOptions {
    * admissibility) scales the grid term. Disabled by default; `{}` enables.
    */
   gridHeuristic?: false | { weight?: number };
+  /**
+   * Trajectory-consistency (a.k.a. "stay close to the previously-committed
+   * plan") cost. When provided, every successor pays an extra
+   * `referenceWeight * perpDist(successor.xz, referencePath)` on its
+   * primitive cost. Cheap hysteresis: with a small weight the planner only
+   * abandons the previous geometry when an alternative is meaningfully
+   * faster. Solves the flip-flopping between near-equal-cost paths that
+   * gives the demo car its visibly jittery plan stream. Added only to g
+   * (not h), so the heuristic remains admissible. Pass `undefined` /
+   * empty to disable.
+   */
+  referencePath?: ReadonlyArray<{ x: number; z: number }>;
+  /** Cost per metre of perpendicular deviation from `referencePath`.
+   *  Default 0.1 (s/m if you read the time-cost as seconds). */
+  referenceWeight?: number;
 }
 
 interface DriveEdgeData {
@@ -78,7 +93,7 @@ export interface AnalyticEdgeData {
   samples: [number, number][];
 }
 
-export class VehicleEnvironment implements Environment<VehicleState> {
+export class VehicleEnvironment implements Environment<CarKinematicState> {
   readonly levels: number;
   private readonly posCell: number;
   private readonly headingBuckets: number;
@@ -107,6 +122,8 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   private ghGoalZ = NaN;
   private ghLB: ((x: number, z: number, y?: number) => number | null) | null = null;
   private rec: PerfRecorder = NULL_RECORDER;
+  private readonly refPath: ReadonlyArray<{ x: number; z: number }>;
+  private readonly refWeight: number;
 
   constructor(
     private readonly world: NavWorld,
@@ -149,11 +166,45 @@ export class VehicleEnvironment implements Environment<VehicleState> {
       gh !== false &&
       typeof this.world.buildGoalLowerBound === 'function';
     this.ghWeight = this.ghEnabled ? ((gh as { weight?: number }).weight ?? 1) : 1;
+    this.refPath = opts.referencePath ?? [];
+    this.refWeight = this.refPath.length >= 2 ? (opts.referenceWeight ?? 0.1) : 0;
     this.levels = this.divisors.length;
   }
 
   attachRecorder(rec: PerfRecorder): void {
     this.rec = rec;
+  }
+
+  /** Nearest perpendicular distance from (x, z) to the reference polyline.
+   *  Returns 0 when there is no reference path. Linear scan — fine for the
+   *  ~10–60 sample polylines that primitive planners produce. */
+  private refDist(x: number, z: number): number {
+    const rp = this.refPath;
+    const n = rp.length;
+    if (n < 2 || this.refWeight === 0) return 0;
+    let best = Infinity;
+    for (let i = 0; i < n - 1; i++) {
+      const ax = rp[i]!.x;
+      const az = rp[i]!.z;
+      const bx = rp[i + 1]!.x;
+      const bz = rp[i + 1]!.z;
+      const dx = bx - ax;
+      const dz = bz - az;
+      const lenSq = dx * dx + dz * dz;
+      let u = 0;
+      if (lenSq > 1e-9) {
+        u = ((x - ax) * dx + (z - az) * dz) / lenSq;
+        if (u < 0) u = 0;
+        else if (u > 1) u = 1;
+      }
+      const px = ax + dx * u;
+      const pz = az + dz * u;
+      const ddx = x - px;
+      const ddz = z - pz;
+      const d2 = ddx * ddx + ddz * ddz;
+      if (d2 < best) best = d2;
+    }
+    return Math.sqrt(best);
   }
 
   private headingBucket(h: number): number {
@@ -162,10 +213,10 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   }
 
   createNode(
-    state: VehicleState,
-    parent: Node<VehicleState> | null,
+    state: CarKinematicState,
+    parent: Node<CarKinematicState> | null,
     edge: EdgeRef | null,
-  ): Node<VehicleState> {
+  ): Node<CarKinematicState> {
     const ix = Math.round(state.x / this.posCell);
     const iz = Math.round(state.z / this.posCell);
     const ih = this.headingBucket(state.heading);
@@ -178,7 +229,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     return makeNode(state, parent, edge, index, `${ix},${iz},${ih},${isp},${it}`);
   }
 
-  private sweepClear(node: VehicleState, primSweep: ReadonlyArray<{ x: number; z: number; heading: number }>): boolean {
+  private sweepClear(node: CarKinematicState, primSweep: ReadonlyArray<{ x: number; z: number; heading: number }>): boolean {
     const c = Math.cos(node.heading);
     const s = Math.sin(node.heading);
     let px = node.x;
@@ -226,20 +277,20 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     return true;
   }
 
-  succ(node: Node<VehicleState>, goal: Node<VehicleState>): Node<VehicleState>[] {
+  succ(node: Node<CarKinematicState>, goal: Node<CarKinematicState>): Node<CarKinematicState>[] {
     const st = node.state;
     const c = Math.cos(st.heading);
     const s = Math.sin(st.heading);
     const parentReverse =
       node.edge && (node.edge.data as DriveEdgeData | undefined)?.reverse === true;
-    const out: Node<VehicleState>[] = [];
+    const out: Node<CarKinematicState>[] = [];
 
     for (const prim of this.lib.lookup(st.speed)) {
       if (!this.sweepClear(st, prim.sweep)) continue;
 
       const ex = st.x + prim.end.dx * c - prim.end.dz * s;
       const ez = st.z + prim.end.dx * s + prim.end.dz * c;
-      const next: VehicleState = {
+      const next: CarKinematicState = {
         x: ex,
         z: ez,
         heading: wrapAngle(st.heading + prim.end.dHeading),
@@ -248,9 +299,12 @@ export class VehicleEnvironment implements Environment<VehicleState> {
       };
 
       const gearFlip = parentReverse !== undefined && parentReverse !== prim.reverse;
-      const cost =
+      let cost =
         prim.duration * (prim.reverse ? this.agent.reverseCostMultiplier : 1) +
         (gearFlip ? this.agent.directionChangePenalty : 0);
+      if (this.refWeight > 0) {
+        cost += this.refWeight * this.refDist(ex, ez);
+      }
 
       const edge: EdgeRef = {
         cost,
@@ -277,9 +331,9 @@ export class VehicleEnvironment implements Environment<VehicleState> {
   /** Reeds-Shepp shot from `node` to the goal; a single goal-reaching
    *  successor if the swept footprint is collision-free, else null. */
   private tryAnalyticShot(
-    node: Node<VehicleState>,
-    goal: Node<VehicleState>,
-  ): Node<VehicleState> | null {
+    node: Node<CarKinematicState>,
+    goal: Node<CarKinematicState>,
+  ): Node<CarKinematicState> | null {
     const a = node.state;
     const b = goal.state;
     const path = reedsSheppShortestPath(
@@ -330,7 +384,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
       prevReverse = rev;
     }
 
-    const next: VehicleState = {
+    const next: CarKinematicState = {
       x: b.x,
       z: b.z,
       heading: b.heading,
@@ -349,7 +403,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     return n;
   }
 
-  heuristic(from: VehicleState, to: VehicleState): number {
+  heuristic(from: CarKinematicState, to: CarKinematicState): number {
     this.rec.counters.heuristicCalls++;
     const euclid = dist(from.x, from.z, to.x, to.z);
     let tRS: number;
@@ -402,7 +456,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     return tRS;
   }
 
-  private poseClear(s: VehicleState): boolean {
+  private poseClear(s: CarKinematicState): boolean {
     this.rec.counters.collisionChecks++;
     const ok = this.world.footprintClear(
       placeFootprint(this.agent.footprint, s.x, s.z, s.heading),
@@ -411,7 +465,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     return ok;
   }
 
-  checkValidity(_start: VehicleState, goal: VehicleState): [boolean, boolean] {
+  checkValidity(_start: CarKinematicState, goal: CarKinematicState): [boolean, boolean] {
     // Always accept the start. In a chase / contact-rich physics simulation
     // the chassis can spend frames slightly clipping a wall or another car,
     // even though it is on the verge of breaking free. Refusing to plan
@@ -424,7 +478,7 @@ export class VehicleEnvironment implements Environment<VehicleState> {
     return [true, this.poseClear(goal)];
   }
 
-  reachedGoalRegion(node: Node<VehicleState>, goal: Node<VehicleState>): boolean {
+  reachedGoalRegion(node: Node<CarKinematicState>, goal: Node<CarKinematicState>): boolean {
     const a = node.state;
     const b = goal.state;
     if (dist(a.x, a.z, b.x, b.z) > this.goalRadius) return false;

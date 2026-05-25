@@ -32,7 +32,7 @@ import {
   createJumpAffordance,
 } from 'kinocat/predict';
 import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
-import type { VehicleAgent, VehicleState } from 'kinocat/agent';
+import type { VehicleAgent, CarKinematicState } from 'kinocat/agent';
 import { characterizeVehicle, MotionPrimitiveLibrary } from 'kinocat/primitives';
 
 export { rampHeightSampler };
@@ -68,8 +68,8 @@ export interface RampCourse {
   ramps: RampSpec[];
   gaps: RampGapSpec[];
   jumps: RampJumpSpec[];
-  spawn: VehicleState;
-  goal: VehicleState;
+  spawn: CarKinematicState;
+  goal: CarKinematicState;
 }
 
 const GAP_INFLATE = 0.5;
@@ -244,8 +244,8 @@ export const RAMP_MAX_EXPANSIONS = 20000;
 export const RAMP_TEST_MAX_EXPANSIONS = 60000;
 
 export interface RampPlanRequest {
-  state: VehicleState;
-  goal: VehicleState;
+  state: CarKinematicState;
+  goal: CarKinematicState;
   course: RampCourse;
   world?: NavWorld;
   /** Disable affordances on this plan (without rebuilding the course). */
@@ -254,7 +254,7 @@ export interface RampPlanRequest {
   maxExpansions?: number;
 }
 
-export function planRampDemo(req: RampPlanRequest): PlanResult<VehicleState> {
+export function planRampDemo(req: RampPlanRequest): PlanResult<CarKinematicState> {
   const world =
     req.world ?? new InMemoryNavWorld(req.course.polygons, req.course.obstacles);
   return planVehicleOnce({
@@ -274,9 +274,9 @@ export function planRampDemo(req: RampPlanRequest): PlanResult<VehicleState> {
 
 export interface RampSnapshot {
   course: RampCourse;
-  start: VehicleState;
-  goal: VehicleState;
-  result: PlanResult<VehicleState>;
+  start: CarKinematicState;
+  goal: CarKinematicState;
+  result: PlanResult<CarKinematicState>;
 }
 
 export function buildRampSnapshot(
