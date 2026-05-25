@@ -425,7 +425,7 @@ export async function createRaceScenario(
   // accurate short-horizon rollouts even on cars that don't ship their own
   // learned model. Per-car: a `MPCTrackerState` holds the warm-start
   // sequence + deterministic RNG seed.
-  const MPC_HORIZON = 6;
+  const MPC_HORIZON = 10;
   const mpcForwardSim = parametricForwardV2(
     DEFAULT_LEARNED_PARAMS_V2,
     DEFAULT_LEARNABLE_CONFIG,
@@ -437,19 +437,39 @@ export async function createRaceScenario(
   // chassis around the track, lateral keeps it on the line.
   const MPC_CONFIG = {
     horizonSteps: MPC_HORIZON,
-    stepDt: 0.1,
-    samples: 48,
+    // Fine MPC step (= physics step) so the cost integration sees every
+    // intermediate state. At v=18 m/s the chassis covers 0.9 m per
+    // 0.05 s step — fine enough that the controller can't oscillate
+    // through bad intermediate states the cost function never sampled.
+    stepDt: 0.05,
+    samples: 64,
     maxSteer: VEHICLE_TUNING.maxSteerAngle ?? 0.6,
     maxDriveForce: ENGINE_FORCE_N,
     maxBrakeForce: BRAKE_FORCE_N,
-    allowReverse: true,
-    steerStd: 0.18,
-    driveStd: 0.4 * ENGINE_FORCE_N,
-    brakeStd: 0.15 * BRAKE_FORCE_N,
-    wLateral: 4,
-    wHeading: 1.0,
-    wSpeed: 3,
-    wControlRate: 0.2,
+    // Reverse intentionally OFF for racing — the planner doesn't emit
+    // reverse on the race course, and allowing reverse samples wastes
+    // budget exploring directions that race plans never need. Parking
+    // scenarios should override `allowReverse: true`.
+    allowReverse: false,
+    // Tight steer exploration — at v=18 m/s the chassis covers 1.8 m
+    // per 0.1 s MPC step, and any steer > ~0.1 rad creates large yaw
+    // changes per step. Wide steer sampling produces overcorrection
+    // oscillations. Drive can be sampled aggressively (less penalised).
+    steerStd: 0.04,
+    driveStd: 0.5 * ENGINE_FORCE_N,
+    brakeStd: 0.10 * BRAKE_FORCE_N,
+    // Heavy heading + steer-rate damping. Random-shooting MPC has no
+    // intrinsic self-stabilising feedback law (unlike pure-pursuit's
+    // geometric lookahead-rotation), so high-speed stability requires
+    // STRONG penalties on heading deviation and steer jumps to suppress
+    // the per-tick prediction-vs-reality miss that drives oscillation.
+    // The trade is a slower but stable racing run; pure-pursuit remains
+    // the right tracker for time-pressure cruising.
+    wLateral: 3,
+    wHeading: 20,
+    wSpeed: 6,
+    wControlRate: 0.15,
+    wSteerRate: 80,
     wTerminalPosition: 0,
     wTerminalSpeed: 0,
   };

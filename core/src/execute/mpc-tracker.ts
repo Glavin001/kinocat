@@ -68,6 +68,12 @@ export interface MPCTrackerConfig {
   wHeading?: number;
   wSpeed?: number;
   wControlRate?: number;
+  /** Separate, MUCH higher weight on steer-rate jumps. At race speeds
+   *  (~18 m/s) even a 0.1-rad steer change produces a ~30°/s yaw rate
+   *  — penalising it with the same coefficient as drive-rate makes the
+   *  controller wildly oscillate. Keep this an order of magnitude above
+   *  `wControlRate` for any high-speed scenario. Default 3. */
+  wSteerRate?: number;
   wTerminalPosition?: number;
   wTerminalSpeed?: number;
   /** Goal pose at the end of the plan — used by the terminal-pose
@@ -175,7 +181,7 @@ function scoreRollout(
   prevSeed: Float64Array,
   goal: CarKinematicState | undefined,
   w: Required<Pick<MPCTrackerConfig,
-    'wLateral' | 'wHeading' | 'wSpeed' | 'wControlRate' | 'wTerminalPosition' | 'wTerminalSpeed'
+    'wLateral' | 'wHeading' | 'wSpeed' | 'wControlRate' | 'wSteerRate' | 'wTerminalPosition' | 'wTerminalSpeed'
   >>,
 ): number {
   let cost = 0;
@@ -190,18 +196,20 @@ function scoreRollout(
     cost += w.wHeading * dh * dh;
     const dv = Math.abs(s.speed) - Math.abs(r.speed);
     cost += w.wSpeed * dv * dv;
-    if (w.wControlRate > 0 && i > 0) {
+    if (i > 0) {
       const ds = controls[i * 3]! - controls[(i - 1) * 3]!;
       const dd = controls[i * 3 + 1]! - controls[(i - 1) * 3 + 1]!;
       const db = controls[i * 3 + 2]! - controls[(i - 1) * 3 + 2]!;
-      cost += w.wControlRate * (ds * ds + dd * dd * 1e-6 + db * db * 1e-6);
+      // Steer changes get their own weight — they have outsized effect
+      // at high speed and are the dominant source of MPC oscillation
+      // unless penalised separately.
+      cost += w.wSteerRate * ds * ds;
+      cost += w.wControlRate * (dd * dd * 1e-6 + db * db * 1e-6);
     }
     if (i === 0) {
-      // Rate vs the previous tick's first command (the actual previous
-      // actuator setpoint) — penalises actuator chatter between ticks,
-      // not just within one MPC horizon.
+      // Inter-tick steer rate (vs the previous tick's first command).
       const ds0 = controls[0]! - prevSeed[0]!;
-      cost += w.wControlRate * 0.5 * ds0 * ds0;
+      cost += w.wSteerRate * 0.5 * ds0 * ds0;
     }
   }
   // Terminal pose cost — critical for parking precision.
@@ -246,6 +254,7 @@ export function mpcTrack(
     wHeading: config.wHeading ?? 1,
     wSpeed: config.wSpeed ?? 1,
     wControlRate: config.wControlRate ?? 0.5,
+    wSteerRate: config.wSteerRate ?? 3,
     wTerminalPosition: config.wTerminalPosition ?? 0,
     wTerminalSpeed: config.wTerminalSpeed ?? 0,
   };
@@ -273,15 +282,72 @@ export function mpcTrack(
 
   let bestCost = Infinity;
   let bestSeq = new Float64Array(H * 3);
-  // First "sample" is always the prior itself (no perturbation) so the
-  // warm-start path is in the candidate set.
   const work = new Float64Array(H * 3);
+
+  // Inject a handful of deterministic "anchor" candidates BEFORE the
+  // random samples. Without these, random-shooting MPC tends to get
+  // stuck in low-speed steady states: warm-start is zero on tick one,
+  // Gaussian noise around zero is symmetric so half the drive samples
+  // are reverse and most have non-zero brake, and the chassis never
+  // discovers the "full throttle, no brake, follow plan speed" basin.
+  // The anchors guarantee that basin is always in the candidate set.
+  function setAnchor(k: number, steer: number, drive: number, brake: number): void {
+    if (k >= K) return;
+    // This isn't perturbed; we mark its slot by writing directly into
+    // `work` and then explicitly disabling perturbation for this k below
+    // via a sentinel. Simpler: short-circuit the random loop for k<numAnchors.
+  }
+  void setAnchor; // helper kept for clarity; loop below does the actual work
+  const numAnchors = K >= 6 ? 5 : 0; // 5 anchors when budget allows
+  // Anchor[0]: prior unperturbed (warm-start)
+  // Anchor[1]: full-throttle, zero brake, follow prior steer
+  // Anchor[2]: coast (zero drive, zero brake, follow prior steer)
+  // Anchor[3]: hard brake (zero drive, full brake, zero steer)
+  // Anchor[4]: cruise-match (drive matched to plan acceleration)
   for (let k = 0; k < K; k++) {
     for (let i = 0; i < H; i++) {
-      const noiseFactor = k === 0 ? 0 : 1;
-      let steer = prior[i * 3]! + sStd * gauss(state) * noiseFactor;
-      let drive = prior[i * 3 + 1]! + dStd * gauss(state) * noiseFactor;
-      let brake = prior[i * 3 + 2]! + bStd * gauss(state) * noiseFactor;
+      let steer: number;
+      let drive: number;
+      let brake: number;
+      if (k === 0) {
+        // Anchor 0: prior unperturbed.
+        steer = prior[i * 3]!;
+        drive = prior[i * 3 + 1]!;
+        brake = prior[i * 3 + 2]!;
+      } else if (numAnchors >= 2 && k === 1) {
+        // Anchor 1: full-throttle along prior steer.
+        steer = prior[i * 3]!;
+        drive = config.maxDriveForce;
+        brake = 0;
+      } else if (numAnchors >= 3 && k === 2) {
+        // Anchor 2: coast.
+        steer = prior[i * 3]!;
+        drive = 0;
+        brake = 0;
+      } else if (numAnchors >= 4 && k === 3) {
+        // Anchor 3: hard brake straight.
+        steer = 0;
+        drive = 0;
+        brake = config.maxBrakeForce;
+      } else if (numAnchors >= 5 && k === 4) {
+        // Anchor 4: drive matched to reference-step speed. If the chassis
+        // is below the reference speed, push positive; above, push zero
+        // (brake is left at 0 — anchor 3 covers braking).
+        const refV = Math.abs(ref[i]?.speed ?? cruiseSpeed);
+        const cv = Math.abs(current.speed);
+        steer = prior[i * 3]!;
+        drive = refV > cv + 0.5 ? config.maxDriveForce * 0.7 : 0;
+        brake = 0;
+      } else {
+        // Random sample around prior.
+        steer = prior[i * 3]! + sStd * gauss(state);
+        drive = prior[i * 3 + 1]! + dStd * gauss(state);
+        // Sample brake from |Normal| - bias so most samples have brake=0
+        // (clamped below). Keeps the sampling distribution honest: the
+        // chassis spends most of its time NOT braking, so the prior
+        // should reflect that.
+        brake = prior[i * 3 + 2]! + bStd * (Math.abs(gauss(state)) - 0.7);
+      }
       steer = clamp(steer, -config.maxSteer, config.maxSteer);
       const minDrive = allowReverse ? -config.maxDriveForce : 0;
       drive = clamp(drive, minDrive, config.maxDriveForce);
