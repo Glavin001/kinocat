@@ -30,7 +30,10 @@ jobs:
       # for the baselines. Lap-time bounds are asserted in
       # `demos/test/headless-race.test.ts`; this run additionally
       # confirms the CLI shape works against the freshly-trained model.
-      - run: pnpm run race:quick
+      # `train:quick` writes to v2-ci.json (not v2-default.json) so it
+      # doesn't clobber the canonical shipped model — point race:quick
+      # at the CI artifact explicitly.
+      - run: pnpm --filter @kinocat/demos exec tsx scripts/race.ts --quick --no-parametric --models=demos/public/models/v2-ci.json --ledger=docs/race-results
       # Persist the race-results ledger as a build artifact so the
       # lap-time-vs-commit history is reviewable from the GitHub UI.
       # (Future: a follow-up CI step can append/push to docs/race-results
