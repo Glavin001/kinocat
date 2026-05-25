@@ -113,13 +113,15 @@ const TRAIL_CAPACITY = 1500;
 const RE_ANCHOR_SEC = 2.0;
 
 interface GhostKind {
-  id: 'v2-full' | 'parametric' | 'kinematic';
+  id: string;
   label: string;
   color: number;
 }
 
-const GHOSTS: GhostKind[] = [
-  { id: 'v2-full', label: 'v2 (parametric + residual)', color: 0x4dd2ff },
+/** Base ghosts always present. A 'v2-trained' ghost is appended at
+ *  runtime when a user-trained model exists in localStorage. */
+const BASE_GHOSTS: GhostKind[] = [
+  { id: 'v2-default', label: 'v2-default.json (preloaded)', color: 0x4dd2ff },
   { id: 'parametric', label: 'parametric-only', color: 0xb47bff },
   { id: 'kinematic', label: 'kinematic', color: 0xffcc55 },
 ];
@@ -132,17 +134,22 @@ export default function SimToRealScope() {
   const [showFriction, setShowFriction] = useState(true);
   const [showUncertainty, setShowUncertainty] = useState(true);
   const [matchSubsteps, setMatchSubsteps] = useState(false);
-  const [hasModel, setHasModel] = useState(false);
+  const [hasTrainedModel, setHasTrainedModel] = useState(false);
+  /** Which ghosts + 'real' car are visible. */
+  const [visibility, setVisibility] = useState<Record<string, boolean>>({});
+  const [ghostIds, setGhostIds] = useState<string[]>([]);
 
   // Mutable refs so the imperative scene loop reads the latest UI state.
   const modeRef = useRef(mode);
   const showFrictionRef = useRef(showFriction);
   const showUncertaintyRef = useRef(showUncertainty);
   const matchSubstepsRef = useRef(matchSubsteps);
+  const visibilityRef = useRef(visibility);
   modeRef.current = mode;
   showFrictionRef.current = showFriction;
   showUncertaintyRef.current = showUncertainty;
   matchSubstepsRef.current = matchSubsteps;
+  visibilityRef.current = visibility;
 
   const resetFnRef = useRef<(() => void) | null>(null);
   const exportFnRef = useRef<((fmt: 'json' | 'md') => string) | null>(null);
@@ -204,18 +211,26 @@ export default function SimToRealScope() {
     (async () => {
       await ensureRapier();
       if (cancelled) return;
-      // Prefer localStorage (user's own trained / imported model); fall
-      // back to the preloaded `/models/v2-default.json` artifact the
-      // `pnpm run train` CLI shipped with the project so a fresh visitor
-      // sees the v2 ghost without retraining.
-      let resolved = loadV2Model();
-      if (!resolved) {
-        const preloaded = await loadV2ModelFromUrl();
-        if (cancelled) return;
-        resolved = preloaded;
+      // Always load the preloaded v2-default.json as a reference ghost.
+      // If the user also has a trained model in localStorage, show it as
+      // an additional ghost so they can compare side-by-side.
+      const preloaded = await loadV2ModelFromUrl();
+      if (cancelled) return;
+      const local = loadV2Model();
+      setHasTrainedModel(local !== null);
+
+      // Build ghost list: base ghosts + optional trained ghost.
+      const ghostList = [...BASE_GHOSTS];
+      if (local) {
+        ghostList.push({ id: 'v2-trained', label: 'v2-trained (localStorage)', color: 0x55ff99 });
       }
-      setHasModel(resolved !== null);
-      cleanup = setupScene(mount, resolved?.model ?? null);
+      const ids = ['real', ...ghostList.map((g) => g.id)];
+      const initVis: Record<string, boolean> = {};
+      for (const id of ids) initVis[id] = true;
+      setGhostIds(ids);
+      setVisibility(initVis);
+
+      cleanup = setupScene(mount, preloaded?.model ?? null, local?.model ?? null, ghostList);
       setReady(true);
     })();
     return () => {
@@ -227,78 +242,49 @@ export default function SimToRealScope() {
 
   function setupScene(
     mount: HTMLDivElement,
-    persistedModel: LearnedVehicleModel | null,
+    preloadedModel: LearnedVehicleModel | null,
+    trainedModel: LearnedVehicleModel | null,
+    ghostList: GhostKind[],
   ): () => void {
     // ---- model setup --------------------------------------------------
-    // v2-full model: prefer the persisted one (trained in /model-lab) so
-    // the visual gap reflects the user's actual model. Fall back to a
-    // pure parametric model with defaults if the user hasn't trained yet.
-    const v2Model: LearnedVehicleModel =
-      persistedModel ?? buildParametricOnlyModel(DEFAULT_LEARNED_PARAMS_V2, DEFAULT_LEARNABLE_CONFIG);
+    // v2-default: always the preloaded artifact (or parametric fallback).
+    // v2-trained: the user's localStorage model (only if present).
+    const v2DefaultModel: LearnedVehicleModel =
+      preloadedModel ?? buildParametricOnlyModel(DEFAULT_LEARNED_PARAMS_V2, DEFAULT_LEARNABLE_CONFIG);
     const paramModel: LearnedVehicleModel = buildParametricOnlyModel(
-      v2Model.params, v2Model.config,
+      v2DefaultModel.params, v2DefaultModel.config,
     );
 
-    // Chassis force constants. v2/parametric take these directly as the
-    // driveForce / brakeForce N in their control vector; the kinematic
-    // sim derives target speed from throttle/brake instead.
-    //
-    // CRITICAL: read these from the v2 model's OWN embedded config, not
-    // hardcode. The model was trained against a specific chassis tuning
-    // (maxDriveForce / maxBrakeForce in LearnableVehicleConfig); feeding
-    // it a different magnitude is a silent scale-mismatch bug. The
-    // raycast vehicle here also uses the same defaults (engineForce=4000,
-    // brakeForce=2000) since we don't override RaycastVehicleOptions —
-    // and `deriveLearnableConfig(options)` is how /raceprimitives keeps
-    // them in lockstep. We could pull the chassis's `D.engineForce` if
-    // we ever start customizing, but for now the model's config is the
-    // contract both sides must agree on.
-    const ENGINE_FORCE_N = v2Model.config.maxDriveForce;
-    const BRAKE_FORCE_N = v2Model.config.maxBrakeForce;
+    // Chassis force constants — read from the default model's config.
+    const ENGINE_FORCE_N = v2DefaultModel.config.maxDriveForce;
+    const BRAKE_FORCE_N = v2DefaultModel.config.maxBrakeForce;
 
-    const sims: Record<GhostKind['id'], ForwardSim<CarKinematicState>> = {
-      'v2-full': learnedForwardSimV2(v2Model),
+    const sims: Record<string, ForwardSim<CarKinematicState>> = {
+      'v2-default': learnedForwardSimV2(v2DefaultModel),
       'parametric': parametricForwardV2(paramModel.params, paramModel.config),
       'kinematic': kinematicForwardSim(RACE_AGENT),
     };
+    if (trainedModel) {
+      sims['v2-trained'] = learnedForwardSimV2(trainedModel);
+    }
 
-    // Control-vector encoding differs per forward sim:
-    //   - v2-full and parametric take WheeledCarControls native form:
-    //       [steer_rad, driveForce_N, brakeForce_N]
-    //   - kinematic takes [curvature_1/m, target_speed_m_s] (see
-    //     core/src/agent/vehicle.ts).
-    //   The same applied {steer, throttle, brake} must therefore be
-    //   re-encoded per sim. Without this conversion the kinematic ghost
-    //   always reads driveForce=4500 as "target speed 4500 m/s", clamps
-    //   to maxSpeed (30), and predicts that for every tick — making the
-    //   speed gap roughly equal to (30 - real.speed) on every frame.
-    //
-    // STEER SIGN: `car.applyControls(c)` interprets `c.steer` in Rapier
-    // native sign (handed to the wheel controller directly). The model
-    // forward sims use kinocat planning sign (heading 0 = +X, +heading
-    // rotates +X → +Z) — the SAME wheeled-controls convention that
-    // `applyWheeledControls` adopts by explicitly negating its input.
-    // We therefore negate `steer` here when encoding for the ghost
-    // sims; otherwise the chassis turns left, every ghost predicts
-    // right, and the user notices instantly (they did).
-    // Control encoders. The steer-sign-flip rule (Rapier raycast frame ->
-    // kinocat planning frame) lives once, in `kinocat/vehicle/car`'s
-    // `encodeForParametricV2`. Demos no longer reinvent it inline.
-    const encodeForSim: Record<GhostKind['id'], (steer: number, throttle: number, brake: number) => number[]> = {
-      'v2-full': (steer, throttle, brake) =>
-        encodeForParametricV2({ steer, driveForce: throttle * ENGINE_FORCE_N, brakeForce: brake * BRAKE_FORCE_N }),
-      'parametric': (steer, throttle, brake) =>
-        encodeForParametricV2({ steer, driveForce: throttle * ENGINE_FORCE_N, brakeForce: brake * BRAKE_FORCE_N }),
-      'kinematic': (steer, throttle, brake) =>
-        encodeForKinematic(
-          { steer, driveForce: 0, brakeForce: 0 },
-          {
-            wheelBase: Math.max(0.5, 2 * RACE_AGENT.minTurnRadius),
-            maxSpeed: RACE_AGENT.maxSpeed,
-            throttle,
-            brake,
-          },
-        ),
+    const v2Encode = (steer: number, throttle: number, brake: number) =>
+      encodeForParametricV2({ steer, driveForce: throttle * ENGINE_FORCE_N, brakeForce: brake * BRAKE_FORCE_N });
+    const kinEncode = (steer: number, throttle: number, brake: number) =>
+      encodeForKinematic(
+        { steer, driveForce: 0, brakeForce: 0 },
+        {
+          wheelBase: Math.max(0.5, 2 * RACE_AGENT.minTurnRadius),
+          maxSpeed: RACE_AGENT.maxSpeed,
+          throttle,
+          brake,
+        },
+      );
+    const encodeForSim: Record<string, (steer: number, throttle: number, brake: number) => number[]> = {
+      'v2-default': v2Encode,
+      'v2-trained': v2Encode,
+      'parametric': v2Encode,
+      'kinematic': kinEncode,
     };
 
     // ---- Three.js scene -----------------------------------------------
@@ -357,7 +343,7 @@ export default function SimToRealScope() {
     scene.add(realTrail.line);
 
     const ghosts = new Map<
-      GhostKind['id'],
+      string,
       {
         kind: GhostKind;
         car: GhostCar;
@@ -377,7 +363,7 @@ export default function SimToRealScope() {
       }
     >();
 
-    for (const k of GHOSTS) {
+    for (const k of ghostList) {
       const g = createGhostCar(k.color);
       scene.add(g.group);
       const trail = createTrailRibbon(V_MAX, TRAIL_CAPACITY);
@@ -491,7 +477,7 @@ export default function SimToRealScope() {
       }],
       [],
     );
-    const lib = buildLearnedRaceLibraryV2(v2Model);
+    const lib = buildLearnedRaceLibraryV2(v2DefaultModel);
 
     const onClick = (e: MouseEvent) => {
       if (modeRef.current !== 'plan-execute') return;
@@ -574,7 +560,8 @@ export default function SimToRealScope() {
         modelDt: matchSubstepsRef.current ? PHYSICS_DT / VEHICLE_SUBSTEPS : PHYSICS_DT,
         engineForceN: ENGINE_FORCE_N,
         brakeForceN: BRAKE_FORCE_N,
-        hasPersistedV2: persistedModel !== null,
+        hasPreloaded: preloadedModel !== null,
+        hasTrained: trainedModel !== null,
       };
       return fmt === 'md' ? recorder.toMarkdown(meta) : recorder.toJSON(meta);
     };
@@ -674,6 +661,9 @@ export default function SimToRealScope() {
       simTime += PHYSICS_DT;
       syncCarMesh(realCarMesh.group, realAfter);
       realTrail.push(realAfter);
+      const vis = visibilityRef.current;
+      realCarMesh.group.visible = vis['real'] !== false;
+      realTrail.line.visible = vis['real'] !== false;
 
       // ---- step ghosts open-loop with the SAME controls --------------
       // This is the Gap A measurement: same (state_t, controls_t, dt)
@@ -706,8 +696,8 @@ export default function SimToRealScope() {
           ent.lastAnchorT = simTime;
         }
         let s = ent.playbackTrace![ent.playbackTrace!.length - 1]!;
-        const sim = sims[ent.kind.id];
-        const cv = encodeForSim[ent.kind.id](appliedControls.steer, appliedControls.throttle, appliedControls.brake);
+        const sim = sims[ent.kind.id]!;
+        const cv = encodeForSim[ent.kind.id]!(appliedControls.steer, appliedControls.throttle, appliedControls.brake);
         for (let i = 0; i < innerSteps; i++) {
           s = sim(s, cv, modelDt);
         }
@@ -722,6 +712,12 @@ export default function SimToRealScope() {
         ent.last = gap;
         ent.arrow.setFromTo(realAfter, predicted);
 
+        // Visibility toggle per ghost.
+        const ghostVis = vis[ent.kind.id] !== false;
+        ent.car.group.visible = ghostVis;
+        ent.trail.line.visible = ghostVis;
+        ent.arrow.arrow.visible = ghostVis;
+
         // For Free Drive: schedule a T-second future projection from
         // the CURRENT state with the CURRENT controls; show the polyline
         // and the ghost-at-T position. Every 200ms only.
@@ -734,11 +730,9 @@ export default function SimToRealScope() {
           );
           ent.future.setPath(future);
           ent.tracker.schedule(future[future.length - 1]!, simTime, FREE_DRIVE_HORIZON_SEC);
-          // Uncertainty ellipsoid at T (v2-full ghost only). predictWithUncertainty
-          // takes the v2/wheeled encoding regardless of ghost.kind.id.
-          if (ent.kind.id === 'v2-full' && showUncertaintyRef.current) {
-            const v2CtrlVec = encodeForSim['v2-full'](appliedControls.steer, appliedControls.throttle, appliedControls.brake);
-            const pred = predictWithUncertainty(v2Model, realAfter, v2CtrlVec, modelDt);
+          if (ent.kind.id === 'v2-default' && showUncertaintyRef.current && ghostVis) {
+            const v2CtrlVec = encodeForSim['v2-default']!(appliedControls.steer, appliedControls.throttle, appliedControls.brake);
+            const pred = predictWithUncertainty(v2DefaultModel, realAfter, v2CtrlVec, modelDt);
             const stdSteps = Math.sqrt(FREE_DRIVE_HORIZON_SEC / modelDt);
             ent.cloud.setAt(future[future.length - 1]!, (pred.std[0] ?? 0) * stdSteps, (pred.std[1] ?? 0) * stdSteps);
             ent.cloud.setVisible(true);
@@ -749,7 +743,7 @@ export default function SimToRealScope() {
           ent.future.setVisible(false);
           ent.cloud.setVisible(false);
         } else {
-          ent.future.setVisible(true);
+          ent.future.setVisible(ghostVis);
         }
         // Drain matured predictions into rolling RMS so Free Drive's
         // RMS is actually "what we predicted T seconds ago, vs now".
@@ -770,7 +764,7 @@ export default function SimToRealScope() {
       // wheeled encoding). The kinematic ghost uses a different encoding
       // internally (see encodeForSim) but for the captured controls we
       // use the wheeled form, which is what the planner ultimately emits.
-      const recCtrl = encodeForSim['v2-full'](appliedControls.steer, appliedControls.throttle, appliedControls.brake);
+      const recCtrl = encodeForSim['v2-default']!(appliedControls.steer, appliedControls.throttle, appliedControls.brake);
       const wheeled: WheeledCarControls = {
         steer: recCtrl[0]!,
         driveForce: recCtrl[1]!,
@@ -799,7 +793,7 @@ export default function SimToRealScope() {
         ghosts: ghostStates,
       });
       // Feed the same frame into the hard-example miner. Use the FIRST
-      // ghost (typically the v2-full model) as the divergence reference;
+      // ghost (typically the v2-default model) as the divergence reference;
       // if no ghosts are present, the miner sees no `predicted` and the
       // predicate is a no-op.
       const referenceGhost = ghostStates[0];
@@ -860,6 +854,9 @@ export default function SimToRealScope() {
         mode={mode}
         onChange={setMode}
         onReset={() => resetFnRef.current?.()}
+        ghostIds={ghostIds}
+        visibility={visibility}
+        onToggleVisibility={(id) => setVisibility((v) => ({ ...v, [id]: !v[id] }))}
         showFriction={showFriction}
         onToggleFriction={setShowFriction}
         showUncertainty={showUncertainty}
@@ -878,9 +875,9 @@ export default function SimToRealScope() {
         <Link href="/model-lab" style={linkStyle}>model-lab</Link>
         <span style={{ opacity: 0.6 }}>·</span>
         <Link href="/raceprimitives" style={linkStyle}>raceprimitives</Link>
-        {ready && !hasModel && (
-          <span style={{ marginLeft: 12, color: '#ffcc55', fontSize: 12 }}>
-            No trained v2 model in cache — using defaults. Train one in /model-lab for a real Gap A test.
+        {ready && hasTrainedModel && (
+          <span style={{ marginLeft: 12, color: '#55ff99', fontSize: 12 }}>
+            + trained model from /model-lab
           </span>
         )}
         <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 8 }}>
