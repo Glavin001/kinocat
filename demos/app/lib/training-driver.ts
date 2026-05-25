@@ -207,6 +207,16 @@ export function buildSeedGrid(): CellSpec[] {
     cells.push({ startSpeed: v, steer: -maxSt * 0.4, driveForce: 0, brakeForce: 0 });
     cells.push({ startSpeed: v, steer: +maxSt * 0.3, driveForce: 0, brakeForce: brakeLow });   // trail-brake gentle
     cells.push({ startSpeed: v, steer: -maxSt * 0.3, driveForce: 0, brakeForce: brakeLow });
+    // Racing-regime cells: aggressive steer + brake at high speed.
+    // Fills the gap between the gentle seed grid and the racing control
+    // sets (highSpeedV2Controls / topSpeedV2Controls) which command up
+    // to full steer + full brake at 20-28 m/s.
+    cells.push({ startSpeed: v, steer: +maxSt * 0.5, driveForce: 0, brakeForce: brakeMid });       // trail-brake entry
+    cells.push({ startSpeed: v, steer: -maxSt * 0.5, driveForce: 0, brakeForce: brakeMid });
+    cells.push({ startSpeed: v, steer: +maxSt * 0.8, driveForce: 0, brakeForce: brakeMid * 1.2 }); // brake-into-corner
+    cells.push({ startSpeed: v, steer: -maxSt * 0.8, driveForce: 0, brakeForce: brakeMid * 1.2 });
+    cells.push({ startSpeed: v, steer: +maxSt, driveForce: 0, brakeForce: brakeMid * 1.4 });       // extreme racing entry
+    cells.push({ startSpeed: v, steer: -maxSt, driveForce: 0, brakeForce: brakeMid * 1.4 });
   }
   return cells;
 }
@@ -225,6 +235,10 @@ export function extremeProbes(): CellSpec[] {
     { startSpeed: 24, steer: 0, driveForce: 0, brakeForce: DEFAULT_VEHICLE_OPTS.brakeForce },           // full brake from high
     { startSpeed: 28, steer: DEFAULT_VEHICLE_OPTS.maxSteerAngle * 0.15, driveForce: 0, brakeForce: 0 }, // gentle top-speed turn
     { startSpeed: 28, steer: -DEFAULT_VEHICLE_OPTS.maxSteerAngle * 0.15, driveForce: 0, brakeForce: 0 },
+    // Aggressive high-speed probes matching the racing primitive action space.
+    { startSpeed: 20, steer: DEFAULT_VEHICLE_OPTS.maxSteerAngle * 0.6, driveForce: 0, brakeForce: DEFAULT_VEHICLE_OPTS.brakeForce * 0.8 },
+    { startSpeed: 24, steer: -DEFAULT_VEHICLE_OPTS.maxSteerAngle * 0.5, driveForce: 0, brakeForce: DEFAULT_VEHICLE_OPTS.brakeForce },
+    { startSpeed: 28, steer: DEFAULT_VEHICLE_OPTS.maxSteerAngle * 0.3, driveForce: 0, brakeForce: DEFAULT_VEHICLE_OPTS.brakeForce * 0.6 },
   ];
 }
 
@@ -1136,6 +1150,13 @@ export interface ManeuverTrainingOptions {
    *  reverse from rest, etc.). Default `'default'` for backward
    *  compatibility. */
   bundle?: 'default' | 'universal';
+  /** Per-round trial cache callbacks. When undefined, caching is disabled
+   *  (default). CLI-only — the browser Model Lab never sets this.
+   *  Injected from train.ts to avoid pulling node:fs/crypto into browser. */
+  trialCache?: {
+    tryRead(round: number): Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[] | null;
+    write(round: number, trials: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[]): void;
+  };
 }
 
 const DEFAULT_SPEED_SCHEDULE = [0, 4, 8, 12, 16, 20, 24, 28];
@@ -1182,37 +1203,60 @@ export async function runManeuverTraining(
   const daggerWindowSec = opts.daggerWindowSec ?? 1.0;
 
   const bundleKind = opts.bundle ?? 'default';
+  const cache = opts.trialCache ?? null;
   for (let round = 0; round < rounds; round++) {
     opts.onEvent?.({ type: 'round-start', round, trialsBeforeRound: store.size() });
-    const bundle = bundleKind === 'universal'
-      ? universalManeuverBundle({
-          limits: carManeuverLimits(),
-          count: trialsPerRound,
-          seed: seed + round * 17,
-        })
-      : buildDefaultManeuverBundle({
-          count: trialsPerRound,
-          seed: seed + round * 17,
-        });
     opts.onEvent?.({ type: 'phase', round, phase: 'collecting' });
-    const { collected, discarded } = await collectManeuverBatch(
-      harness,
-      bundle,
-      { ticks, sampleEveryNTicks: sampleEveryN },
-      trialIdx,
-      startSpeedSchedule,
-      (delta) => {
-        opts.onEvent?.({
-          type: 'trial-batch',
-          round,
-          collected: delta.collected,
-          discarded: delta.discarded,
-          runSoFar: delta.totalSoFar,
-          runTarget: delta.outOf,
-        });
-      },
-    );
-    trialIdx += bundle.length;
+
+    // -- Trial cache: attempt read ----------------------------------------
+    let collected: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[];
+    let discarded: number;
+    const cached = cache ? cache.tryRead(round) : null;
+
+    if (cached) {
+      collected = cached;
+      discarded = 0;
+      trialIdx += collected.length;
+      opts.onEvent?.({
+        type: 'trial-batch', round,
+        collected: collected.length, discarded: 0,
+      });
+    } else {
+      const bundle = bundleKind === 'universal'
+        ? universalManeuverBundle({
+            limits: carManeuverLimits(),
+            count: trialsPerRound,
+            seed: seed + round * 17,
+          })
+        : buildDefaultManeuverBundle({
+            count: trialsPerRound,
+            seed: seed + round * 17,
+          });
+      const result = await collectManeuverBatch(
+        harness,
+        bundle,
+        { ticks, sampleEveryNTicks: sampleEveryN },
+        trialIdx,
+        startSpeedSchedule,
+        (delta) => {
+          opts.onEvent?.({
+            type: 'trial-batch',
+            round,
+            collected: delta.collected,
+            discarded: delta.discarded,
+            runSoFar: delta.totalSoFar,
+            runTarget: delta.outOf,
+          });
+        },
+      );
+      trialIdx += bundle.length;
+      collected = result.collected;
+      discarded = result.discarded;
+      // -- Trial cache: write on miss ------------------------------------
+      if (cache) {
+        cache.write(round, collected);
+      }
+    }
     for (const t of collected) store.add(t);
     // NOTE: `collectManeuverBatch` already streams per-chunk `trial-batch`
     // events via the `delta` callback above, so no summary event is
