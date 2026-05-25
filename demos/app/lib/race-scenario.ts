@@ -34,6 +34,7 @@ import {
   wheeledFromNormalized,
   trimPlan,
   samplePlanAt,
+  expandPlanSweeps,
   type CarForceTuning,
   type CarKinematicState,
   type WheeledCarControls,
@@ -805,8 +806,14 @@ export async function createRaceScenario(
       // curvature, resampled onto the smoothed samples by arc-length,
       // so the smoother's geometric rounding doesn't fool the speed
       // pass into commanding impossible speeds.
-      let smoothed = res.path;
-      const kRaw = tuning.enableSpeedProfile ? curvaturePerSample(res.path) : null;
+      // Expand sparse primitive endpoints → dense sweep-sampled path.
+      // This gives the smoother and visualisation a much more faithful
+      // representation of the actual curved trajectories the planner chose.
+      const densePath = res.nodes.length > 1
+        ? expandPlanSweeps(res.nodes, c.entry.lib.primitives)
+        : res.path;
+      let smoothed = densePath;
+      const kRaw = tuning.enableSpeedProfile ? curvaturePerSample(densePath) : null;
       if (tuning.enableTrajectorySmoother) {
         smoothed = smoothTrajectory(smoothed, {
           sampleSpacing: 0.4,
@@ -817,7 +824,7 @@ export async function createRaceScenario(
         });
       }
       if (tuning.enableSpeedProfile && kRaw) {
-        const kForProfile = resampleScalarByArcLength(res.path, kRaw, smoothed);
+        const kForProfile = resampleScalarByArcLength(densePath, kRaw, smoothed);
         smoothed = smoothSpeedProfile(smoothed, {
           aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel * 0.85,
           aLonMaxAccel: PURE_PURSUIT_CONFIG.maxAccel,

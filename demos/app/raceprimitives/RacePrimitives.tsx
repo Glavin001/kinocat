@@ -127,6 +127,17 @@ const REFIT_DEFER_MS = 0;
 const PARAMS_KEY = 'kinocat:learned-params:v2';
 const LIBRARY_KEY = 'kinocat:learned-library:v2';
 
+/** Map a normalized speed (0–1) to an RGB triple: blue → green → red. */
+function speedToRGB(u: number): [number, number, number] {
+  // 0 = blue (0,0.4,1), 0.5 = green (0,1,0.2), 1 = red (1,0.2,0)
+  if (u < 0.5) {
+    const t = u * 2;
+    return [0, 0.4 + 0.6 * t, 1 - 0.8 * t];
+  }
+  const t = (u - 0.5) * 2;
+  return [t, 1 - 0.8 * t, 0.2 - 0.2 * t];
+}
+
 type Phase = 'loading' | 'learning' | 'ready' | 'racing' | 'finished';
 
 interface CarRuntime {
@@ -1046,11 +1057,26 @@ async function setupScene(
       }
       const elapsed = Math.max(0, scenario.simTime() - status.planStartSimTime);
       const tail = trimPlan(status.plan, elapsed);
-      const pl: THREE.Vector3[] = [new THREE.Vector3(after.x, 0.4, after.z)];
-      for (const p of tail) pl.push(new THREE.Vector3(p.x, 0.4, p.z));
+      // Build vertex-colored line: speed → blue (slow) → green → red (fast).
+      const positions: number[] = [after.x, 0.4, after.z];
+      const colors: number[] = [];
+      const maxSpeed = 30; // approximate max for color normalization
+      // First vertex: use current state speed for color.
+      {
+        const u = Math.min((after.speed ?? 0) / maxSpeed, 1);
+        colors.push(...speedToRGB(u));
+      }
+      for (const p of tail) {
+        positions.push(p.x, 0.4, p.z);
+        const u = Math.min((p.speed ?? 0) / maxSpeed, 1);
+        colors.push(...speedToRGB(u));
+      }
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
       car.pathLine = new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints(pl),
-        new THREE.LineBasicMaterial({ color: car.pathColor, transparent: true, opacity: 0.85 }),
+        geom,
+        new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.85 }),
       );
       car.scene.add(car.pathLine);
     }
