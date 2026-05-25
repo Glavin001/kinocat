@@ -75,20 +75,50 @@ function parkingCourse(s: ParkingScenario): import('../lib/race-scenario').RaceS
   };
 }
 
+interface ParkingHud {
+  speed: number;
+  goalDist: number;
+  headingError: number;
+  totalReplans: number;
+  lastReplanMs: number;
+  steer: number;
+  throttle: number;
+  brake: number;
+  targetSpeed: number;
+  trackingErrorRms: number;
+  planAgeMs: number;
+  consecutiveFailedReplans: number;
+  predErrorRms: number;
+  planLength: number;
+  activeSegmentIndex: number;
+  totalSegments: number;
+  activeSegmentGear: 'fwd' | 'rev' | 'unknown';
+}
+
+function angleDiff(a: number, b: number): number {
+  let d = a - b;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return d;
+}
+
 export default function Parking() {
   const mountRef = useRef<HTMLDivElement>(null);
   const [scenarioId, setScenarioId] = useState<ParkingScenarioId>('forward-pullin');
   const [paused, setPaused] = useState(false);
   const [showPath, setShowPath] = useState(true);
-  const [hud, setHud] = useState('');
+  const [debug, setDebug] = useState(false);
+  const [hud, setHud] = useState<ParkingHud | null>(null);
   const [status, setStatus] = useState('initialising...');
 
   const scenarioIdRef = useRef(scenarioId);
   const pausedRef = useRef(paused);
   const showPathRef = useRef(showPath);
+  const debugRef = useRef(debug);
   scenarioIdRef.current = scenarioId;
   pausedRef.current = paused;
   showPathRef.current = showPath;
+  debugRef.current = debug;
 
   useEffect(() => {
     if (!mountRef.current) return;
@@ -123,6 +153,7 @@ export default function Parking() {
     let goalMesh: THREE.Mesh | null = null;
     let raceScenario: RaceScenario | null = null;
     let cancelled = false;
+    let buildGeneration = 0;
 
     function clearScenarioMeshes() {
       for (const m of scenarioMeshes) scene.remove(m);
@@ -190,6 +221,7 @@ export default function Parking() {
     }
 
     async function buildScenario(id: ParkingScenarioId) {
+      const gen = ++buildGeneration;
       clearScenarioMeshes();
       if (raceScenario) {
         raceScenario.dispose();
@@ -203,7 +235,7 @@ export default function Parking() {
       scene.add(goalMesh);
       // Build the shared scenario runner — same code path as the
       // controller-bench CLI.
-      raceScenario = await createRaceScenario({
+      const rs = await createRaceScenario({
         entries: [parkingEntry('ego')],
         targetLaps: 1,
         syncHold: false,
@@ -211,6 +243,9 @@ export default function Parking() {
         tuning: PARKING_BENCH_TUNING,
         course: parkingCourse(s),
       });
+      // Guard: a newer build may have started while we awaited.
+      if (gen !== buildGeneration) { rs.dispose(); return; }
+      raceScenario = rs;
       // Car mesh attached to the chassis from the scenario.
       const handle = raceScenario.getCarHandle('ego');
       if (handle) {
@@ -220,7 +255,9 @@ export default function Parking() {
       setStatus(`scenario: ${PARKING_LABELS[id]}`);
     }
 
-    void buildScenario(scenarioId);
+    // Initial build is triggered by the [scenarioId] effect via rebuildRef.
+    // Do NOT also call buildScenario here — the two concurrent async builds
+    // race and produce duplicate car meshes.
 
     function refreshPathLine(plan: ReadonlyArray<{ x: number; z: number }> | null) {
       if (pathLine) {
@@ -259,15 +296,29 @@ export default function Parking() {
         if (s && carMesh) {
           syncCarMesh(carMesh.group, s.state);
           refreshPathLine(s.plan);
-          const goalDist = (() => {
-            const c = parkingCourse(buildParkingScenario(scenarioIdRef.current));
-            const wp = c?.waypoints[0];
-            if (!wp) return NaN;
-            return Math.hypot(s.state.x - wp.x, s.state.z - wp.z);
-          })();
-          setHud(
-            `v=${s.state.speed.toFixed(2)} m/s · goal=${goalDist.toFixed(2)} m · replans=${s.diagnostics.totalReplans} · plan-ms=${s.diagnostics.lastReplanMs.toFixed(0)}`,
-          );
+          const course = parkingCourse(buildParkingScenario(scenarioIdRef.current));
+          const wp = course?.waypoints[0];
+          const goalDist = wp ? Math.hypot(s.state.x - wp.x, s.state.z - wp.z) : NaN;
+          const headingError = wp ? angleDiff(s.state.heading, wp.heading) * (180 / Math.PI) : NaN;
+          setHud({
+            speed: s.state.speed,
+            goalDist,
+            headingError,
+            totalReplans: s.diagnostics.totalReplans,
+            lastReplanMs: s.diagnostics.lastReplanMs,
+            steer: s.metrics.liveControls.steer,
+            throttle: s.metrics.liveControls.throttle,
+            brake: s.metrics.liveControls.brake,
+            targetSpeed: s.metrics.liveControls.targetSpeed,
+            trackingErrorRms: s.metrics.trackingErrorRms,
+            planAgeMs: s.diagnostics.planAgeMs,
+            consecutiveFailedReplans: s.diagnostics.consecutiveFailedReplans,
+            predErrorRms: s.diagnostics.predErrorRms,
+            planLength: s.plan?.length ?? 0,
+            activeSegmentIndex: s.activeSegmentIndex,
+            totalSegments: s.totalSegments,
+            activeSegmentGear: s.activeSegmentGear,
+          });
           if (s.laps.length >= 1 && s.laps[0]) setStatus(`PARKED · ${s.laps[0].duration.toFixed(2)}s`);
         }
       }
@@ -287,6 +338,7 @@ export default function Parking() {
       else if (e.key === 'r' || e.key === 'R') rebuildRef.current?.(scenarioIdRef.current);
       else if (e.key === 'p' || e.key === 'P') setPaused((p) => !p);
       else if (e.key === 'l' || e.key === 'L') setShowPath((s) => !s);
+      else if (e.key === 'd' || e.key === 'D') setDebug((d) => !d);
     }
     window.addEventListener('keydown', onKey);
 
@@ -340,7 +392,36 @@ export default function Parking() {
           tight parking — bench-parity runner
         </div>
         <div>{status}</div>
-        <div style={{ opacity: 0.75, marginTop: 4 }}>{hud}</div>
+        {hud && (
+          <div style={{ opacity: 0.75, marginTop: 4, fontSize: 11 }}>
+            <span>v={hud.speed.toFixed(2)} m/s</span>
+            {' · '}
+            <span>goal={hud.goalDist.toFixed(2)} m</span>
+            {' · '}
+            <span>{'\u0394\u03b8'}={hud.headingError >= 0 ? '+' : ''}{hud.headingError.toFixed(1)}&deg;</span>
+            {' · '}
+            <span>replans={hud.totalReplans}</span>
+            {' · '}
+            <span>plan-ms={hud.lastReplanMs.toFixed(0)}</span>
+          </div>
+        )}
+        {debug && hud && (
+          <div style={{ marginTop: 6, fontSize: 11, opacity: 0.8, borderTop: '1px solid #1c2840', paddingTop: 6 }}>
+            <div style={{ color: '#55dcff', fontSize: 10, marginBottom: 3 }}>CONTROLS</div>
+            <div>steer={((hud.steer * 180) / Math.PI).toFixed(1)}&deg; · throttle={(hud.throttle * 100).toFixed(0)}%{hud.brake > 0 && ` · brake=${(hud.brake * 100).toFixed(0)}%`}</div>
+            <div>target spd={hud.targetSpeed.toFixed(1)} m/s</div>
+
+            <div style={{ color: '#55dcff', fontSize: 10, marginTop: 6, marginBottom: 3 }}>SEGMENT</div>
+            <div>seg {hud.activeSegmentIndex + 1}/{hud.totalSegments} · gear={hud.activeSegmentGear}</div>
+
+            <div style={{ color: '#55dcff', fontSize: 10, marginTop: 6, marginBottom: 3 }}>PLAN HEALTH</div>
+            <div>age={hud.planAgeMs.toFixed(0)} ms · pts={hud.planLength}</div>
+            <div>track err={hud.trackingErrorRms.toFixed(3)} m · pred err={hud.predErrorRms.toFixed(3)} m</div>
+            {hud.consecutiveFailedReplans > 0 && (
+              <div style={{ color: '#ff6b6b' }}>failed replans={hud.consecutiveFailedReplans}</div>
+            )}
+          </div>
+        )}
         <div style={{ marginTop: 8, opacity: 0.65, fontSize: 11 }}>
           Same `createRaceScenario` runner as the controller-bench CLI:
           identical planner discretisation, multi-cusp segment executor,
@@ -370,13 +451,14 @@ export default function Parking() {
             </button>
           ))}
         </div>
-        <div style={{ marginTop: 8, display: 'flex', gap: 6, fontSize: 11 }}>
+        <div style={{ marginTop: 8, display: 'flex', gap: 6, fontSize: 11, flexWrap: 'wrap' }}>
           <button onClick={() => setPaused((p) => !p)}>{`[p] ${paused ? 'paused' : 'running'}`}</button>
           <button onClick={() => setShowPath((s) => !s)}>{`[l] path ${showPath ? 'on' : 'off'}`}</button>
+          <button onClick={() => setDebug((d) => !d)}>{`[d] debug ${debug ? 'on' : 'off'}`}</button>
           <button onClick={() => rebuildRef.current?.(scenarioId)}>[r] reset</button>
         </div>
         <div style={{ marginTop: 6, opacity: 0.5, fontSize: 10 }}>
-          [1] [2] [3] scenarios · [r] reset · [p] pause · [l] path
+          [1] [2] [3] scenarios · [r] reset · [p] pause · [l] path · [d] debug
         </div>
       </div>
     </div>
