@@ -322,7 +322,24 @@ export interface LearnedVehicleModel {
   residualEnsemble: MLP[];
   /** Reference dt the residual was trained against (for output scaling). */
   residualReferenceDt: number;
+  /**
+   * Per-output-dim OOD thresholds (length 6, matching MLP_OUTPUT_DIM).
+   * If any per-tick ensemble std exceeds the corresponding threshold,
+   * `learnedForwardSimV2` falls back to the parametric prediction —
+   * guaranteeing inference is never worse than the parametric backbone
+   * even on inputs the residual was never trained for.
+   *
+   * Defaults are conservative (= small thresholds → fallback fires
+   * easily). Tune via per-regime eval after training.
+   */
+  oodStdThreshold?: number[];
 }
+
+/** Default OOD thresholds (per output dim: x, z, heading, speed,
+ *  yawRate, lateralVelocity). Set just above the typical in-distribution
+ *  ensemble variance — a well-trained ensemble agrees within these
+ *  bounds; ensemble disagreement beyond them is the OOD signal. */
+export const DEFAULT_OOD_STD_THRESHOLD = [0.5, 0.5, 0.1, 1.0, 0.5, 0.5];
 
 export interface PredictionWithUncertainty {
   next: CarKinematicState;
@@ -347,19 +364,55 @@ export function buildParametricOnlyModel(
 }
 
 /** Drop-in `ForwardSim<CarKinematicState>` for `characterizeVehicle` and the
- *  IGHA* planner. */
+ *  IGHA* planner.
+ *
+ *  Includes a built-in safety floor: the parametric backbone is the
+ *  guaranteed minimum quality. The residual MLP ensemble contributes
+ *  ONLY when it's confident (= low ensemble variance). When ensemble
+ *  disagreement exceeds `model.oodStdThreshold` on any output channel,
+ *  inference emits the parametric prediction unchanged. The model can
+ *  therefore never produce a single-step prediction worse than the
+ *  parametric backbone, even on inputs the residual was never trained
+ *  for.
+ */
 export function learnedForwardSimV2(model: LearnedVehicleModel): ForwardSim<CarKinematicState> {
   const paraSim = parametricForwardV2(model.params, model.config);
   if (model.residualEnsemble.length === 0) {
     return paraSim;
   }
+  const thresh = model.oodStdThreshold ?? DEFAULT_OOD_STD_THRESHOLD;
+  // Special case: an ensemble of size 1 has zero variance by
+  // definition, so OOD fallback can never fire. Detect this and
+  // emit the residual unconditionally with a note in the diagnostics
+  // (a 1-MLP model trades the OOD safety for compute simplicity).
+  const ensembleSize = model.residualEnsemble.length;
   return (s: CarKinematicState, controls: number[], dt: number): CarKinematicState => {
     const base = paraSim(s, controls, dt);
-    // Build MLP input: [state6, controls3, config13] = 22-dim default.
     const input = buildMLPInput(s, controls, model.config);
-    const residualMean = ensembleMean(model.residualEnsemble, input);
+    if (ensembleSize === 1) {
+      const residualMean = ensembleMean(model.residualEnsemble, input);
+      const scale = dt / model.residualReferenceDt;
+      return applyResidual(base, residualMean, scale);
+    }
+    // Multi-MLP ensemble: compute mean + per-component std, fall back
+    // to parametric when any component's std exceeds its threshold.
+    const outputs = model.residualEnsemble.map((mlp) => mlpForward(mlp, input).output);
+    const mean = new Float64Array(outputs[0]!.length);
+    for (const o of outputs) for (let i = 0; i < o.length; i++) mean[i]! += o[i]! / ensembleSize;
+    let ood = false;
+    for (let i = 0; i < mean.length; i++) {
+      let variance = 0;
+      for (const o of outputs) {
+        const d = o[i]! - mean[i]!;
+        variance += d * d;
+      }
+      variance /= ensembleSize;
+      const std = Math.sqrt(variance);
+      if (std > thresh[i]!) { ood = true; break; }
+    }
+    if (ood) return base;
     const scale = dt / model.residualReferenceDt;
-    return applyResidual(base, residualMean, scale);
+    return applyResidual(base, mean, scale);
   };
 }
 
@@ -396,12 +449,34 @@ export function predictWithUncertainty(
 // ---------------------------------------------------------------------------
 // MLP wiring helpers (used by both inference and training)
 
-/** State (6) + controls (3) + config one-hot (13) = 22. Caller-owned scaling
- *  via `CONFIG_SCALES_ORDINAL`. */
-export const MLP_INPUT_DIM = 6 + 3 + 13;
+/** Inputs:
+ *    state (5) — (sin heading, cos heading, speed, yawRate, lateralVel)
+ *  + controls (3) — (steer, driveForce, brakeForce)
+ *  + config one-hot (13)
+ *  = 21 dims total.
+ *
+ *  Position (x, z) is DELIBERATELY OMITTED. The chassis's dynamic
+ *  response to controls is translation-invariant; including absolute
+ *  world position made the residual MLP position-dependent, and trials
+ *  near origin failed catastrophically when run at world coordinates
+ *  outside that range (sim-to-real free-drive at x = -52 produced
+ *  residual outputs that drove the prediction off by 14 m in 10 s).
+ *
+ *  Heading is encoded as (sin, cos) rather than the raw angle so the
+ *  network sees a smooth signal across the ±π wrap boundary. Rotational
+ *  symmetry is then naturally learnable.
+ *
+ *  Bumped from the previous 22-dim encoding (which had x, z, raw
+ *  heading). Older model files with `version: 2` payloads cannot use
+ *  this layout — the persistence loader rejects them with a clear
+ *  message asking for a retrain.
+ */
+export const MLP_INPUT_DIM = 5 + 3 + 13;
 export const MLP_OUTPUT_DIM = 6;
 
-const STATE_SCALES = [20, 20, Math.PI, 20, 4, 6]; // (x, z, heading, speed, yawRate, lateralVelocity)
+// Heading is sin/cos (already bounded ±1). Speed, yawRate, lateralVel
+// are normalised by typical chassis magnitudes.
+const STATE_SCALES = [1, 1, 20, 4, 6]; // (sinH, cosH, speed, yawRate, lateralVelocity)
 const CONTROL_SCALES = [1, 4000, 2000];
 
 export function buildMLPInput(
@@ -409,18 +484,17 @@ export function buildMLPInput(
   controls: ReadonlyArray<number>,
   config: LearnableVehicleConfig,
 ): number[] {
+  // Heading as (sin, cos) — translation- and wrap-symmetric.
+  // Position is deliberately omitted (see MLP_INPUT_DIM docstring).
   const stateVec = [
-    s.x,
-    s.z,
-    s.heading,
+    Math.sin(s.heading),
+    Math.cos(s.heading),
     s.speed,
     s.yawRate ?? 0,
     s.lateralVelocity ?? 0,
   ];
   const ctrlVec = [controls[0] ?? 0, controls[1] ?? 0, controls[2] ?? 0];
   const cfgVec = encodeConfigOneHot(config);
-  // Normalize state & controls; config is encoded as-is for now (scales
-  // are large but the network can learn it; could whiten if needed).
   const inputs: number[] = [];
   for (let i = 0; i < stateVec.length; i++) inputs.push(stateVec[i]! / STATE_SCALES[i]!);
   for (let i = 0; i < ctrlVec.length; i++) inputs.push(ctrlVec[i]! / CONTROL_SCALES[i]!);

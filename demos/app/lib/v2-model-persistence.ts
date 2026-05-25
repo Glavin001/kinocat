@@ -1,7 +1,19 @@
 // localStorage persistence + JSON export/import for the v2 trained model.
 // Stores the parametric params + LearnableVehicleConfig + residual MLP
-// ensemble (each MLP is serialized via core's serializeMLP). Bumped to
-// version 2; v1 cached models load with empty ensemble (parametric only).
+// ensemble (each MLP is serialized via core's serializeMLP).
+//
+// Version history:
+//   v1  → no residual ensemble (parametric-only legacy payload).
+//   v2  → adds residualEnsembleJson + residualReferenceDt. MLP input was
+//         22 dims: [x, z, heading, speed, yawRate, lateralVel, steer,
+//         drive, brake, config13]. Position-dependent (BROKEN).
+//   v3  → MLP input is 21 dims: [sin h, cos h, speed, yawRate, lateralVel,
+//         steer, drive, brake, config13]. Position-invariant +
+//         heading-wrap-symmetric. v2 payloads CANNOT be re-used because
+//         the MLP layer dimensions differ — the loader rejects them
+//         with a clear retrain prompt rather than silently producing
+//         garbage (the same kind of failure the sim-to-real free-drive
+//         trace exposed on v2 payloads).
 
 import {
   DEFAULT_LEARNED_PARAMS_V2,
@@ -12,11 +24,12 @@ import {
   type LearnedVehicleModel,
 } from 'kinocat/agent';
 
-const STORAGE_KEY = 'kinocat:v2-learned-model:v2';
+const STORAGE_KEY = 'kinocat:v2-learned-model:v3';
 const STORAGE_KEY_LEGACY = 'kinocat:v2-learned-model:v1';
+const STORAGE_KEY_V2 = 'kinocat:v2-learned-model:v2';
 
 export interface PersistedV2Model {
-  version: 2;
+  version: 3;
   params: LearnedVehicleParamsV2;
   config: LearnableVehicleConfig;
   /** Residual MLP ensemble — each entry is a `serializeMLP(mlp)` JSON
@@ -24,6 +37,11 @@ export interface PersistedV2Model {
   residualEnsembleJson: string[];
   /** Reference dt the residual was trained against (seconds). */
   residualReferenceDt: number;
+  /** Per-output OOD threshold (length 6). Inference falls back to
+   *  parametric prediction when ensemble std on any output exceeds
+   *  the corresponding threshold. Optional — sensible defaults applied
+   *  by the loader. */
+  oodStdThreshold?: number[];
   /** Headline diagnostic at save time, for the UI to show "trained on …". */
   meta: {
     trialsUsed: number;
@@ -45,11 +63,34 @@ interface PersistedV2ModelV1 {
 function migrate(parsed: unknown): PersistedV2Model | null {
   if (!parsed || typeof parsed !== 'object') return null;
   const obj = parsed as { version?: number };
-  if (obj.version === 2) return obj as PersistedV2Model;
+  if (obj.version === 3) return obj as PersistedV2Model;
+  if (obj.version === 2) {
+    // v2 payloads contain residual MLPs whose first layer expects the
+    // OBSOLETE 22-dim input (with absolute position). They cannot be
+    // loaded into the 21-dim v3 architecture without retraining; doing
+    // so produces destructive predictions (the failure mode the
+    // sim-to-real debug exposed). Discard the residual ensemble and
+    // fall back to parametric — equivalent to "this model needs to be
+    // retrained against the new input layout."
+    const v2 = obj as {
+      params: LearnedVehicleParamsV2;
+      config: LearnableVehicleConfig;
+      meta: PersistedV2Model['meta'];
+      residualReferenceDt?: number;
+    };
+    return {
+      version: 3,
+      params: v2.params,
+      config: v2.config,
+      residualEnsembleJson: [],
+      residualReferenceDt: v2.residualReferenceDt ?? 0.1,
+      meta: v2.meta,
+    };
+  }
   if (obj.version === 1) {
     const v1 = obj as PersistedV2ModelV1;
     return {
-      version: 2,
+      version: 3,
       params: v1.params,
       config: v1.config,
       residualEnsembleJson: [],
@@ -83,8 +124,11 @@ function rebuildModel(payload: PersistedV2Model): LearnedVehicleModel {
 export function loadV2Model(): { model: LearnedVehicleModel; meta: PersistedV2Model['meta'] } | null {
   if (typeof window === 'undefined') return null;
   try {
-    // Prefer the v2 slot; fall back to v1 for legacy users.
+    // Prefer the current (v3) slot; fall back to v2 then v1 for legacy
+    // users. Both fallbacks discard the residual ensemble during
+    // migration — see comments on `migrate`.
     let raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) raw = window.localStorage.getItem(STORAGE_KEY_V2);
     if (!raw) raw = window.localStorage.getItem(STORAGE_KEY_LEGACY);
     if (!raw) return null;
     const migrated = migrate(JSON.parse(raw));
@@ -146,7 +190,7 @@ function buildPayload(model: LearnedVehicleModel, meta: PersistedV2Model['meta']
     }
   }
   return {
-    version: 2,
+    version: 3,
     params: model.params,
     config: model.config,
     residualEnsembleJson: ensembleJson,

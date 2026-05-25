@@ -12,6 +12,10 @@ import {
   buildParametricOnlyModel,
   learnedForwardSimV2,
   predictWithUncertainty,
+  buildMLPInput,
+  MLP_INPUT_DIM,
+  createMLP,
+  type MLP,
 } from 'kinocat/agent';
 import { DEFAULT_LEARNABLE_CONFIG } from 'kinocat/agent';
 import type { CarKinematicState } from 'kinocat/agent';
@@ -119,5 +123,143 @@ describe('learnedForwardSimV2 + predictWithUncertainty', () => {
     };
     const ctrl = [0.05, 800, 100];
     expect(wrapped(start, ctrl, 1 / 60)).toEqual(direct(start, ctrl, 1 / 60));
+  });
+});
+
+describe('MLP input layout — translation + heading invariance', () => {
+  it('buildMLPInput omits absolute position (translation-invariant)', () => {
+    // Same dynamic state at two world positions → identical MLP input.
+    const a = buildMLPInput(
+      { x: 0, z: 0, heading: 0.3, speed: 5, yawRate: 0.1, lateralVelocity: -0.2, t: 0 },
+      [0.05, 800, 100],
+      DEFAULT_LEARNABLE_CONFIG,
+    );
+    const b = buildMLPInput(
+      { x: -52, z: -1.5, heading: 0.3, speed: 5, yawRate: 0.1, lateralVelocity: -0.2, t: 0 },
+      [0.05, 800, 100],
+      DEFAULT_LEARNABLE_CONFIG,
+    );
+    expect(a).toEqual(b);
+  });
+
+  it('buildMLPInput represents heading as (sin, cos) — smooth across the ±π wrap', () => {
+    const justBelowPi = buildMLPInput(
+      { x: 0, z: 0, heading: Math.PI - 1e-6, speed: 5, yawRate: 0, lateralVelocity: 0, t: 0 },
+      [0, 0, 0],
+      DEFAULT_LEARNABLE_CONFIG,
+    );
+    const justAboveNegPi = buildMLPInput(
+      { x: 0, z: 0, heading: -Math.PI + 1e-6, speed: 5, yawRate: 0, lateralVelocity: 0, t: 0 },
+      [0, 0, 0],
+      DEFAULT_LEARNABLE_CONFIG,
+    );
+    // Same physical heading wrapped on opposite sides of ±π → input
+    // vectors are within FP noise of each other.
+    for (let i = 0; i < justBelowPi.length; i++) {
+      expect(Math.abs(justBelowPi[i]! - justAboveNegPi[i]!)).toBeLessThan(1e-3);
+    }
+  });
+
+  it('MLP_INPUT_DIM is 21 (5 state + 3 controls + 13 config)', () => {
+    expect(MLP_INPUT_DIM).toBe(21);
+    const input = buildMLPInput(
+      { x: 0, z: 0, heading: 0, speed: 0, t: 0 },
+      [0, 0, 0],
+      DEFAULT_LEARNABLE_CONFIG,
+    );
+    expect(input).toHaveLength(MLP_INPUT_DIM);
+  });
+});
+
+describe('learnedForwardSimV2 — OOD fallback', () => {
+  // Untrained MLPs initialised with different random seeds disagree
+  // on most inputs (small but nonzero std) — perfect for testing
+  // that the fallback FIRES under OOD-like conditions when we drop
+  // the OOD threshold low enough to catch even untrained-ensemble
+  // disagreement.
+  function makeUntrainedEnsemble(size: number): MLP[] {
+    return Array.from({ length: size }, (_, i) =>
+      createMLP({ inputDim: MLP_INPUT_DIM, hiddenDims: [16], outputDim: 6 }, i + 1),
+    );
+  }
+
+  it('falls back to parametric prediction when ensemble disagrees beyond threshold', () => {
+    const para = buildParametricOnlyModel();
+    // Tight threshold (0.001 on every channel) — even small disagreement
+    // among untrained MLPs trips the fallback.
+    const ood = {
+      ...para,
+      residualEnsemble: makeUntrainedEnsemble(3),
+      residualReferenceDt: 1 / 60,
+      oodStdThreshold: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001],
+    };
+    const fwd = learnedForwardSimV2(ood);
+    const directParam = parametricForwardV2(para.params, para.config);
+    const s: CarKinematicState = {
+      x: 0, z: 0, heading: 0, speed: 5, yawRate: 0, lateralVelocity: 0, t: 0,
+    };
+    const ctrl = [0, 0, 0];
+    const got = fwd(s, ctrl, 1 / 60);
+    const expected = directParam(s, ctrl, 1 / 60);
+    // OOD fallback fires → output equals parametric exactly.
+    expect(got.speed).toBeCloseTo(expected.speed, 10);
+    expect(got.x).toBeCloseTo(expected.x, 10);
+    expect(got.z).toBeCloseTo(expected.z, 10);
+    expect(got.heading).toBeCloseTo(expected.heading, 10);
+  });
+
+  it('does NOT fall back when ensemble disagreement is within threshold', () => {
+    const para = buildParametricOnlyModel();
+    // Generous threshold (1.0 on every channel) — untrained MLPs disagree
+    // by less than 1.0 on their output (final-layer std is 0.01), so the
+    // fallback should NOT fire and the residual is applied.
+    const model = {
+      ...para,
+      residualEnsemble: makeUntrainedEnsemble(3),
+      residualReferenceDt: 1 / 60,
+      oodStdThreshold: [100, 100, 100, 100, 100, 100],
+    };
+    const fwd = learnedForwardSimV2(model);
+    const directParam = parametricForwardV2(para.params, para.config);
+    const s: CarKinematicState = {
+      x: 0, z: 0, heading: 0, speed: 5, yawRate: 0, lateralVelocity: 0, t: 0,
+    };
+    const ctrl = [0, 0, 0];
+    const got = fwd(s, ctrl, 1 / 60);
+    const baseParam = directParam(s, ctrl, 1 / 60);
+    // The residual ensemble agrees-ish (untrained, small outputs) — its
+    // mean is applied as a delta. Outputs differ from pure parametric
+    // by a small amount.
+    const diff = Math.abs(got.speed - baseParam.speed) +
+      Math.abs(got.x - baseParam.x) +
+      Math.abs(got.z - baseParam.z);
+    // Untrained MLPs output ~0.01-scale values; with dt=1/60 the delta
+    // is small but non-zero.
+    expect(diff).toBeGreaterThan(0);
+  });
+
+  it('single-MLP "ensemble" skips OOD check (no variance to measure)', () => {
+    const para = buildParametricOnlyModel();
+    const single = {
+      ...para,
+      residualEnsemble: makeUntrainedEnsemble(1),
+      residualReferenceDt: 1 / 60,
+      oodStdThreshold: [0.001, 0.001, 0.001, 0.001, 0.001, 0.001],
+    };
+    const fwd = learnedForwardSimV2(single);
+    const directParam = parametricForwardV2(para.params, para.config);
+    const s: CarKinematicState = {
+      x: 0, z: 0, heading: 0, speed: 5, yawRate: 0, lateralVelocity: 0, t: 0,
+    };
+    const ctrl = [0, 0, 0];
+    const got = fwd(s, ctrl, 1 / 60);
+    const baseParam = directParam(s, ctrl, 1 / 60);
+    // 1-MLP ensemble always applies residual unconditionally (can't
+    // measure variance over a single sample). Output differs from
+    // pure parametric.
+    const diff = Math.abs(got.speed - baseParam.speed) +
+      Math.abs(got.x - baseParam.x) +
+      Math.abs(got.z - baseParam.z);
+    expect(diff).toBeGreaterThan(0);
   });
 });

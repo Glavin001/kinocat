@@ -25,7 +25,7 @@ interface Profile {
   sampleEveryNTicks: number;
 }
 
-const PROFILES: Record<string, Profile> = {
+const PROFILES: Record<string, Profile & { bundle?: 'default' | 'universal' }> = {
   // Smoke profile for CI / refactor sanity checks — ~30 s.
   quick: { rounds: 1, trialsPerRound: 30, trialTicks: 60, sampleEveryNTicks: 6 },
   // Default: ~5-10 min on a laptop.
@@ -34,6 +34,11 @@ const PROFILES: Record<string, Profile> = {
   sweep: { rounds: 5, trialsPerRound: 200, trialTicks: 150, sampleEveryNTicks: 6 },
   // Overnight: max rounds till val plateau (single config for now).
   overnight: { rounds: 12, trialsPerRound: 300, trialTicks: 180, sampleEveryNTicks: 6 },
+  // Universal: covers all 45 regimes from the universal coverage matrix
+  // (passive coast, reverse, multi-cusp parking, etc.) — the bundle the
+  // shipped v2-default.json should be trained on for "one model, all
+  // driving" capability. Larger trial count + the universal bundle.
+  universal: { rounds: 4, trialsPerRound: 500, trialTicks: 180, sampleEveryNTicks: 6, bundle: 'universal' },
 };
 
 function gitSha(): string {
@@ -62,6 +67,8 @@ async function main(): Promise<void> {
       out: { type: 'string' },
       dagger: { type: 'string' },
       'import-mined': { type: 'string' },
+      bundle: { type: 'string' },
+      'mine-from-trace': { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -85,6 +92,7 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
   const trialsPerRound = values.trials ? Number(values.trials) : profile.trialsPerRound;
   const trialTicks = values.ticks ? Number(values.ticks) : profile.trialTicks;
   const sampleEveryNTicks = profile.sampleEveryNTicks;
+  const bundle = (values.bundle ? String(values.bundle) : (profile.bundle ?? 'default')) as 'default' | 'universal';
   const seed = Number(values.seed);
   // Repo root = parent of `demos/` directory; this file lives at
   // demos/scripts/train.ts so root = ../.. from here.
@@ -104,7 +112,7 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
 
   // Phase 3.5: import sim-to-real-mined trials before round 0 so the
   // residual MLP sees the hard regimes from the first fit.
-  let minedTrials = undefined;
+  let minedTrials: unknown[] = [];
   if (values['import-mined']) {
     const arg = String(values['import-mined']);
     const minedPath = isAbsolute(arg) ? arg : resolve(repoRoot, arg);
@@ -112,6 +120,47 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
     const parsed = JSON.parse(raw);
     minedTrials = parsed.trials ?? [];
     process.stdout.write(`  · Imported ${minedTrials.length} mined trial${minedTrials.length === 1 ? '' : 's'} from ${minedPath}\n`);
+  }
+  // New: convert a sim-to-real debug JSON's frames into Trial format
+  // (each consecutive frame pair → one Trial). Lets us train on the
+  // user's reported failure trace by direct import.
+  if (values['mine-from-trace']) {
+    const { DEFAULT_LEARNABLE_CONFIG } = await import('kinocat/agent');
+    const arg = String(values['mine-from-trace']);
+    const tracePath = isAbsolute(arg) ? arg : resolve(repoRoot, arg);
+    const trace = JSON.parse(readFileSync(tracePath, 'utf-8'));
+    const frames = trace.frames ?? [];
+    const sampleDt = trace.meta?.physicsDt ?? 1 / 60;
+    const cfg = trace.meta?.vehicleConfig ?? DEFAULT_LEARNABLE_CONFIG;
+    // The codebase uses string config keys like 'rwd-default' (see
+    // training-driver / sim-to-real). Use the same convention so
+    // mined trials group with the synthetic ones during training.
+    const cfgKey = 'rwd-default';
+    let added = 0;
+    for (let i = 0; i + 1 < frames.length; i++) {
+      const cur = frames[i];
+      const nxt = frames[i + 1];
+      if (!cur?.real || !cur?.controls || !nxt?.real) continue;
+      const wheeled = {
+        steer: cur.controls.steer,
+        driveForce: cur.controls.driveForce,
+        brakeForce: cur.controls.brakeForce,
+      };
+      minedTrials.push({
+        id: `mined-trace-${i}`,
+        initialState: cur.real,
+        controlsTrace: [wheeled],
+        dt: sampleDt,
+        samples: [
+          { t: 0, state: cur.real },
+          { t: sampleDt, state: nxt.real },
+        ],
+        config: cfg,
+        configKey: cfgKey,
+      });
+      added++;
+    }
+    process.stdout.write(`  · Mined ${added} trial${added === 1 ? '' : 's'} from trace ${tracePath}\n`);
   }
 
   const result = await runManeuverTraining({
@@ -121,7 +170,8 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
     sampleEveryNTicks,
     seed,
     daggerStartRound,
-    minedTrials,
+    minedTrials: minedTrials.length > 0 ? (minedTrials as never) : undefined,
+    bundle,
     onEvent: (e: TrainingEvent) => {
       switch (e.type) {
         case 'round-start':

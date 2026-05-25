@@ -48,6 +48,7 @@ import {
 } from 'kinocat/adapters/rapier';
 import {
   defaultManeuverBundle,
+  universalManeuverBundle,
   CAR_COVERAGE_AXES,
   carCoverageProjection,
   type ManeuverLimits,
@@ -1128,6 +1129,13 @@ export interface ManeuverTrainingOptions {
    *  miner pool. Added to the store before the first round so they
    *  participate in every parametric + residual fit. */
   minedTrials?: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[];
+  /** Which maneuver bundle to use. `'default'` (= existing) covers OU
+   *  random-walks + named maneuvers. `'universal'` (recommended for a
+   *  single-model-handles-everything fit) covers all 45 regimes from
+   *  the universal coverage matrix (passive coast, multi-cusp parking,
+   *  reverse from rest, etc.). Default `'default'` for backward
+   *  compatibility. */
+  bundle?: 'default' | 'universal';
 }
 
 const DEFAULT_SPEED_SCHEDULE = [0, 4, 8, 12, 16, 20, 24, 28];
@@ -1173,12 +1181,19 @@ export async function runManeuverTraining(
   const daggerMaxSimTime = opts.daggerMaxSimTime ?? 120;
   const daggerWindowSec = opts.daggerWindowSec ?? 1.0;
 
+  const bundleKind = opts.bundle ?? 'default';
   for (let round = 0; round < rounds; round++) {
     opts.onEvent?.({ type: 'round-start', round, trialsBeforeRound: store.size() });
-    const bundle = buildDefaultManeuverBundle({
-      count: trialsPerRound,
-      seed: seed + round * 17,
-    });
+    const bundle = bundleKind === 'universal'
+      ? universalManeuverBundle({
+          limits: carManeuverLimits(),
+          count: trialsPerRound,
+          seed: seed + round * 17,
+        })
+      : buildDefaultManeuverBundle({
+          count: trialsPerRound,
+          seed: seed + round * 17,
+        });
     opts.onEvent?.({ type: 'phase', round, phase: 'collecting' });
     const { collected, discarded } = await collectManeuverBatch(
       harness,

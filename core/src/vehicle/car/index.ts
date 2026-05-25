@@ -65,6 +65,12 @@ export {
   doubleLaneChange,
   donut,
   defaultManeuverBundle,
+  passiveCoast,
+  wheelspin,
+  stuckState,
+  multiCuspParkingScript,
+  threePointTurnScript,
+  universalManeuverBundle,
 } from './maneuvers';
 
 // Coverage projection — Phase 0 of the training-dataset plan.
