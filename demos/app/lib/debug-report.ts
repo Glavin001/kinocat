@@ -16,6 +16,7 @@ import type { MotionPrimitiveLibrary } from 'kinocat/primitives';
 import { diagnoseLibrary } from './primitive-diagnostics';
 import type { PersistedV2Model } from './v2-model-persistence';
 import type { RaceMetrics } from './race-primitives-scenarios';
+import type { ReplanSnapshot } from './race-scenario';
 
 export interface DebugReportArgs {
   // Page / scene state
@@ -48,6 +49,9 @@ export interface DebugReportArgs {
     advanceRadius: number;
     trackerMaxLateralAccel: number;
   };
+  // Per-car replan history snapshots.
+  kinematicReplanHistory?: ReplanSnapshot[];
+  learnedReplanHistory?: ReplanSnapshot[];
   // User note (free-text) — caller can prepend "what was happening when
   // you exported this". Optional.
   note?: string;
@@ -205,6 +209,58 @@ export function buildDebugReport(args: DebugReportArgs): string {
   push(`- **Planner gate radius:** ${pc.plannerGateRadius} m`);
   push(`- **Demo advance radius:** ${pc.advanceRadius} m (planner < advance ⇒ valid plans always reach the advance circle)`);
   push(`- **Pure-pursuit max lateral accel:** ${pc.trackerMaxLateralAccel} m/s²`);
+
+  // Replan history (plan stability diagnostics)
+  function renderReplanHistory(label: string, history: ReplanSnapshot[] | undefined): void {
+    if (!history || history.length === 0) return;
+    push('');
+    push(`### ${label} — replan history (last ${history.length})`);
+    // Summary stats.
+    const found = history.filter((h) => h.found);
+    const meanSearch = found.length > 0
+      ? found.reduce((s, h) => s + h.searchMs, 0) / found.length
+      : 0;
+    const meanExp = found.length > 0
+      ? found.reduce((s, h) => s + h.expansions, 0) / found.length
+      : 0;
+    const deadlineHits = history.filter((h) => h.deadlineHit).length;
+    const withDrift = found.filter((h) => h.vsLastPlan.meanDist >= 0);
+    const meanDrift = withDrift.length > 0
+      ? withDrift.reduce((s, h) => s + h.vsLastPlan.meanDist, 0) / withDrift.length
+      : -1;
+    const maxDrift = withDrift.length > 0
+      ? Math.max(...withDrift.map((h) => h.vsLastPlan.maxDist))
+      : -1;
+    push(`- **Success rate:** ${found.length}/${history.length}`);
+    push(`- **Mean search:** ${meanSearch.toFixed(1)} ms · mean expansions: ${meanExp.toFixed(0)}`);
+    push(`- **Deadline hits:** ${deadlineHits}`);
+    if (meanDrift >= 0) {
+      push(`- **Plan drift (vs prev):** mean ${meanDrift.toFixed(2)} m · max ${maxDrift.toFixed(2)} m`);
+    }
+    push('');
+    tableHeader(['sim_t', 'ok', 'ms', 'exp', 'impr', 'cost', 'dl?', 'pts', 'loop', 'drift_mean', 'drift_max', 'start_xy', 'chassis_xy', 'gap']);
+    for (const h of history) {
+      const gap = Math.hypot(h.startState.x - h.chassisState.x, h.startState.z - h.chassisState.z);
+      push(
+        `| ${h.simTime.toFixed(2)}` +
+        ` | ${h.found ? 'Y' : 'N'}` +
+        ` | ${h.searchMs.toFixed(1)}` +
+        ` | ${h.expansions}` +
+        ` | ${h.improvements}` +
+        ` | ${Number.isFinite(h.cost) ? h.cost.toFixed(1) : '∞'}` +
+        ` | ${h.deadlineHit ? 'Y' : ''}` +
+        ` | ${h.planLength}` +
+        ` | ${h.loopIndex}` +
+        ` | ${h.vsLastPlan.meanDist >= 0 ? h.vsLastPlan.meanDist.toFixed(2) : '—'}` +
+        ` | ${h.vsLastPlan.maxDist >= 0 ? h.vsLastPlan.maxDist.toFixed(2) : '—'}` +
+        ` | (${h.startState.x.toFixed(1)},${h.startState.z.toFixed(1)})` +
+        ` | (${h.chassisState.x.toFixed(1)},${h.chassisState.z.toFixed(1)})` +
+        ` | ${gap.toFixed(2)} |`,
+      );
+    }
+  }
+  renderReplanHistory('KINEMATIC', args.kinematicReplanHistory);
+  renderReplanHistory('LEARNED (v2)', args.learnedReplanHistory);
 
   // System
   push('');

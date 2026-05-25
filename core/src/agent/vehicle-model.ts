@@ -139,15 +139,15 @@ export const PARAMS_V2_LO: LearnedVehicleParamsV2 = {
   engineScale: 0.7,           // chassis can't deliver < 70% of commanded force
   reverseEffScale: 0.7,
   brakeScale: 0.8,            // Rapier brakeForce maps ~1:1 to chassis decel
-  accelTau: 0.08,
+  accelTau: 0.02,             // chassis may respond near-instantly
   gripScale: 0.7,
   frictionCircleSlack: 0.95,  // < 1 = chassis exceeds its own friction limit → incoherent
   steerRatio: 0.7,
   understeerOffThrottle: 0,
   understeerPowerOn: -0.01,
-  yawRateTau: 0.1,            // chassis inertia is real — < 100 ms is unphysical
-  lateralDamping: 2,
-  lateralFromSteer: 0.2,      // must be positive (steering DOES produce sideslip)
+  yawRateTau: 0.05,           // yaw response may be faster than 100ms
+  lateralDamping: 0.5,        // sideslip may persist significantly
+  lateralFromSteer: 0.1,      // small but positive
   slipDrag: 0,
   loadTransferCoeff: 0,
   driveDeadzone: 0,
@@ -155,22 +155,22 @@ export const PARAMS_V2_LO: LearnedVehicleParamsV2 = {
 };
 
 export const PARAMS_V2_HI: LearnedVehicleParamsV2 = {
-  engineScale: 1.05,          // > 100% means the model "amplifies" commanded force — unphysical
-  reverseEffScale: 1.1,
-  brakeScale: 2.0,            // generous upper to allow some over-fit, well short of the old 3.5
+  engineScale: 1.3,            // widened — still pinning at 1.15
+  reverseEffScale: 1.5,       // widened — still pinning at 1.3
+  brakeScale: 4.0,            // widened — still pinning at 3.0; Rapier brake applies more than commanded
   accelTau: 0.6,
   gripScale: 1.3,
-  frictionCircleSlack: 1.3,   // allows brief tire-slip excursions past µ·g but not 2×
-  steerRatio: 1.3,
+  frictionCircleSlack: 1.5,   // widened — was pinned at 1.3; Rapier tire slip allows transient overshoot
+  steerRatio: 1.6,            // widened — was pinned at 1.3; raycast vehicle effective steer exceeds commanded
   understeerOffThrottle: 0.05, // 0.05 × 784 (at v=28) = 40× yaw attenuation — already extreme
   understeerPowerOn: 0.04,
   yawRateTau: 0.4,
   lateralDamping: 9,          // > 9 means sideslip decays in < 0.1 s → unphysical for car chassis
   lateralFromSteer: 1.5,
-  slipDrag: 1.5,
+  slipDrag: 2.5,              // widened — was pinned at 1.5; high-speed lateral slip may cause more drag
   loadTransferCoeff: 0.1,
   driveDeadzone: 250,
-  rollingResistance: 0.2,
+  rollingResistance: 0.6,     // widened — still pinning at 0.4
 };
 
 export const PARAMS_V2_ORDER: (keyof LearnedVehicleParamsV2)[] = [
@@ -339,7 +339,7 @@ export interface LearnedVehicleModel {
  *  yawRate, lateralVelocity). Set just above the typical in-distribution
  *  ensemble variance — a well-trained ensemble agrees within these
  *  bounds; ensemble disagreement beyond them is the OOD signal. */
-export const DEFAULT_OOD_STD_THRESHOLD = [0.5, 0.5, 0.1, 1.0, 0.5, 0.5];
+export const DEFAULT_OOD_STD_THRESHOLD = [1.0, 1.0, 0.3, 2.0, 1.0, 1.0];
 
 export interface PredictionWithUncertainty {
   next: CarKinematicState;

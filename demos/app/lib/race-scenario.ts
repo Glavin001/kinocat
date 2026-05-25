@@ -79,9 +79,9 @@ import {
 export const PHYSICS_DT = 1 / 60;
 export const VEHICLE_SUBSTEPS = 4;
 export const REPLAN_INTERVAL_MS = 300;
-export const PLAN_LOOKAHEAD_COUNT = 2;
+export const PLAN_LOOKAHEAD_COUNT = 3;
 export const TRACKER_MAX_LATERAL_ACCEL = 12;
-export const STALL_TIMEOUT_MS = 4000;
+export const STALL_TIMEOUT_MS = 2000;
 export const ENGINE_FORCE_N = 4000;
 export const BRAKE_FORCE_N = 2000;
 export const WHEEL_BASE = 1.6;
@@ -378,6 +378,41 @@ export interface RaceCarDiagnostics {
   predErrorRms: number;
 }
 
+/** Per-replan snapshot for diagnosing plan instability. */
+export interface ReplanSnapshot {
+  /** Sim time when replanCar() was called. */
+  simTime: number;
+  /** Wall-clock ms the planner search took. */
+  searchMs: number;
+  /** Whether a valid path was found. */
+  found: boolean;
+  /** A* expansion count. */
+  expansions: number;
+  /** Total nodes generated. */
+  generated: number;
+  /** Whether the deadline was hit. */
+  deadlineHit: boolean;
+  /** Plan cost (Infinity if not found). */
+  cost: number;
+  /** Number of anytime improvements found. */
+  improvements: number;
+  /** Start state the planner used (may differ from chassis if commit-window). */
+  startState: CarKinematicState;
+  /** Actual chassis state at replan time. */
+  chassisState: CarKinematicState;
+  /** Gate sequence the planner targeted. */
+  gates: Array<{ x: number; z: number }>;
+  /** loopIndex at replan time. */
+  loopIndex: number;
+  /** Planned path endpoint count (after expansion/smoothing). */
+  planLength: number;
+  /** First 3 + last 3 plan waypoints (compact summary). */
+  planEndpoints: CarKinematicState[];
+  /** Path displacement vs previous plan: mean + max distance (m) between
+   *  corresponding arc-length-sampled points. -1 if no previous plan. */
+  vsLastPlan: { meanDist: number; maxDist: number };
+}
+
 export interface RaceCarStatus {
   name: string;
   state: CarKinematicState;
@@ -403,6 +438,8 @@ export interface RaceCarStatus {
   totalSegments: number;
   /** Gear of the active segment: 'fwd' | 'rev' | 'unknown'. */
   activeSegmentGear: 'fwd' | 'rev' | 'unknown';
+  /** Recent replan snapshots (ring buffer, newest last, max 30). */
+  replanHistory: ReplanSnapshot[];
 }
 
 export interface RaceTickResult {
@@ -526,6 +563,8 @@ interface CarInternal {
   // Persistent MPC tracker state (warm-start sequence + RNG seed) when
   // the tracker is `'mpc'`. Lazily initialised on first MPC tick.
   mpcState: MPCTrackerState | null;
+  /** Recent replan snapshots (ring buffer, newest last). */
+  replanHistory: ReplanSnapshot[];
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +706,7 @@ export async function createRaceScenario(
       lastPos: { x: spawn.x, z: spawn.z },
       spawn,
       mpcState: null,
+      replanHistory: [],
     };
   });
 
@@ -687,6 +727,8 @@ export async function createRaceScenario(
 
   function replanCar(c: CarInternal): void {
     if (c.holdingForSync || c.finished) return;
+    // Snapshot the previous plan before it's replaced (for drift comparison).
+    const prevPlan = c.plan;
     // Commit-window plan stitching. If a plan is already committed, we
     // plan from the predicted state at `simTime + COMMIT_WINDOW_MS`, not
     // from the current state — guaranteeing the controller can keep
@@ -862,6 +904,59 @@ export async function createRaceScenario(
       c.predictedEnd = { state: firstEnd, dueSimTime: planStartSimTime + firstEnd.t };
     } else {
       c.diagnostics.consecutiveFailedReplans += 1;
+    }
+    // --- Capture replan snapshot for debugging plan instability ---
+    const MAX_REPLAN_HISTORY = 30;
+    const chassisNow = c.car.readState(simTime);
+    const finalPlan = c.diagnostics.lastReplanFound ? (c.plan ?? []) : [];
+    // Compact plan summary: first 3 + last 3 samples.
+    const planEndpoints: CarKinematicState[] = [];
+    if (finalPlan.length > 0) {
+      for (let i = 0; i < Math.min(3, finalPlan.length); i++) planEndpoints.push(finalPlan[i]!);
+      for (let i = Math.max(finalPlan.length - 3, 3); i < finalPlan.length; i++) planEndpoints.push(finalPlan[i]!);
+    }
+    // Compare vs previous plan: sample both at evenly-spaced arc lengths
+    // and compute displacement stats.
+    let vsLastPlan = { meanDist: -1, maxDist: -1 };
+    if (prevPlan && prevPlan.length >= 2 && finalPlan.length >= 2) {
+      // Sample 10 evenly-spaced points along each plan by index-fraction
+      // and measure positional difference between old and new plan.
+      {
+        const N = 10;
+        let sumDist = 0;
+        let maxDist = 0;
+        for (let i = 0; i < N; i++) {
+          const u = i / (N - 1);
+          const ai = Math.min(Math.floor(u * (finalPlan.length - 1)), finalPlan.length - 1);
+          const bi = Math.min(Math.floor(u * (prevPlan.length - 1)), prevPlan.length - 1);
+          const a = finalPlan[ai]!;
+          const b = prevPlan[bi]!;
+          const d = Math.hypot(a.x - b.x, a.z - b.z);
+          sumDist += d;
+          if (d > maxDist) maxDist = d;
+        }
+        vsLastPlan = { meanDist: sumDist / N, maxDist };
+      }
+    }
+    c.replanHistory.push({
+      simTime,
+      searchMs: replanMs,
+      found: c.diagnostics.lastReplanFound,
+      expansions: res.stats.expansions,
+      generated: res.stats.generated,
+      deadlineHit: res.stats.deadlineHit,
+      cost: res.cost,
+      improvements: res.stats.improvements,
+      startState: { ...startState },
+      chassisState: { ...chassisNow, t: 0 },
+      gates: gates.map((g) => ({ x: g.x, z: g.z })),
+      loopIndex: planLoopIndex,
+      planLength: finalPlan.length,
+      planEndpoints,
+      vsLastPlan,
+    });
+    if (c.replanHistory.length > MAX_REPLAN_HISTORY) {
+      c.replanHistory.shift();
     }
     c.lastReplanSimTime = simTime;
   }
@@ -1074,16 +1169,22 @@ export async function createRaceScenario(
           };
         }
       } else {
-        const cmd = wheeledFromNormalized({ steer: 0, throttle: 0.2, brake: 0 }, FORCE_TUNING);
+        // Short plan — apply stronger throttle if stalled to escape zero-speed deadzone.
+        const stalled = Math.abs(stateBefore.speed) < 0.5;
+        const thr = stalled ? 0.6 : 0.2;
+        const cmd = wheeledFromNormalized({ steer: 0, throttle: thr, brake: 0 }, FORCE_TUNING);
         c.car.applyWheeledControls(cmd);
         c.lastControls = cmd;
-        c.metrics.liveControls = { steer: 0, throttle: 0.2, brake: 0, targetSpeed: 5 };
+        c.metrics.liveControls = { steer: 0, throttle: thr, brake: 0, targetSpeed: 5 };
       }
     } else {
-      const cmd = wheeledFromNormalized({ steer: 0, throttle: 0.2, brake: 0 }, FORCE_TUNING);
+      // No plan yet — apply stronger throttle if stalled.
+      const stalled = Math.abs(stateBefore.speed) < 0.5;
+      const thr = stalled ? 0.6 : 0.2;
+      const cmd = wheeledFromNormalized({ steer: 0, throttle: thr, brake: 0 }, FORCE_TUNING);
       c.car.applyWheeledControls(cmd);
       c.lastControls = cmd;
-      c.metrics.liveControls = { steer: 0, throttle: 0.2, brake: 0, targetSpeed: 5 };
+      c.metrics.liveControls = { steer: 0, throttle: thr, brake: 0, targetSpeed: 5 };
     }
     stepRaycastVehicle(c.world, [c.car], { dt, substeps: VEHICLE_SUBSTEPS });
     const after = c.car.readState(simTime + dt);
@@ -1165,6 +1266,7 @@ export async function createRaceScenario(
         const sample = seg[1];
         return sample && sample.speed >= 0 ? 'fwd' as const : 'rev' as const;
       })(),
+      replanHistory: c.replanHistory,
     };
   }
 
@@ -1197,6 +1299,7 @@ export async function createRaceScenario(
       c.offTrackEvents = 0;
       c.lastMoveSimTime = 0;
       c.lastPos = { x: c.spawn.x, z: c.spawn.z };
+      c.replanHistory = [];
     }
   }
 
