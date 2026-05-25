@@ -410,10 +410,32 @@ export interface RacePlanRequest {
   obstacles: Array<[number, number][]>;
   deadlineMs?: number;
   maxExpansions?: number;
+  /** Override the planner's pose discretisation. Tight values (e.g.
+   *  posCell=0.3, headingBuckets=36, goalRadius=0.35, goalHeadingTol=0.15)
+   *  let the planner find sub-meter parking maneuvers; race defaults
+   *  (1.5 / 16 / 4 / ∞) trade precision for speed. */
+  posCell?: number;
+  headingBuckets?: number;
+  goalRadius?: number;
+  goalHeadingTol?: number;
+  /** Enable Reeds-Shepp heuristic LUT (default on). */
+  enableHeuristicTable?: boolean;
 }
 
 export function planRace(req: RacePlanRequest): PlanResult<CarKinematicState> {
   const world = req.world ?? new InMemoryNavWorld(req.polygons, req.obstacles);
+  const envOpts: import('kinocat/environment').VehicleEnvOptions = {
+    ...(req.posCell !== undefined && { posCell: req.posCell }),
+    ...(req.headingBuckets !== undefined && { headingBuckets: req.headingBuckets }),
+    ...(req.goalRadius !== undefined && { goalRadius: req.goalRadius }),
+    ...(req.goalHeadingTol !== undefined && { goalHeadingTol: req.goalHeadingTol }),
+    ...(req.enableHeuristicTable === false ? { heuristicTable: false } : { heuristicTable: {} }),
+    // Tight scenarios benefit from sweep-segment collision checks +
+    // denser analytic-shot sampling — the parking branch's tuning.
+    ...(req.posCell !== undefined && req.posCell < 1.0
+      ? { sweepSegmentCheck: true, analyticExpansion: { everyN: 3, step: 0.15 } }
+      : {}),
+  };
   return planVehicleOnce({
     start: req.state,
     goal: req.goal,
@@ -422,6 +444,7 @@ export function planRace(req: RacePlanRequest): PlanResult<CarKinematicState> {
     lib: req.lib,
     deadlineMs: req.deadlineMs ?? RACE_REPLAN_BUDGET_MS,
     maxExpansions: req.maxExpansions ?? RACE_MAX_EXPANSIONS,
+    envOptions: Object.keys(envOpts).length > 0 ? envOpts : undefined,
   });
 }
 

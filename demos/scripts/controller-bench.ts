@@ -160,6 +160,18 @@ function makeParkingScenario(
           cruiseSpeed: 2,
           goalTolerance: 0.4,
           arriveRadius: 0.6,
+          // Sub-meter planner discretisation + terminal-heading
+          // constraint — the parking branch's tuning, ported via
+          // `RaceTuning` so pure-pursuit + MPPI use the same
+          // planner-side knobs. Single-waypoint courses (parking)
+          // auto-route through `planRace` (planVehicleOnce with
+          // heading constraint).
+          plannerPosCell: 0.3,
+          plannerHeadingBuckets: 36,
+          plannerGoalRadius: 0.35,
+          plannerGoalHeadingTol: 0.2,
+          plannerBudgetMs: 500,
+          plannerMaxExpansions: 80_000,
           mpcWTerminalPosition: 50,
           mpcWTerminalSpeed: 30,
         },

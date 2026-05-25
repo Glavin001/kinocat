@@ -59,11 +59,13 @@ import type { MotionPrimitiveLibrary } from 'kinocat/primitives';
 import {
   buildRaceCourse,
   planRaceMultiGoal,
+  planRace,
   pickNextWaypoint,
   RACE_AGENT,
   RACE_REPLAN_BUDGET_MS,
   RACE_ARRIVE_RADIUS,
   RACE_PLANNER_GATE_RADIUS,
+  RACE_MAX_EXPANSIONS,
   emptyMetrics,
   type RaceMetrics,
 } from './race-primitives-scenarios';
@@ -145,6 +147,41 @@ const PURE_PURSUIT_CONFIG = {
 };
 
 // ---------------------------------------------------------------------------
+// Multi-cusp plan segmentation.
+
+/**
+ * Split a plan polyline at every forward↔reverse cusp (sample where
+ * the sign of `speed` flips). Within each returned segment the chassis
+ * is in a single gear, so pure-pursuit's geometric tracking is well-
+ * defined and its brake-to-goal logic naturally stops the chassis at
+ * the cusp pose before the next-segment gear change. Plans with no
+ * cusps return `[plan]` and downstream code is unchanged.
+ *
+ * Borrowed verbatim from the WIP parking branch
+ * (claude/fervent-cori-KXMEy → `splitAtGearCusps` in Parking.tsx).
+ */
+export function splitAtGearCusps(plan: CarKinematicState[]): CarKinematicState[][] {
+  if (plan.length < 2) return [plan.slice()];
+  const out: CarKinematicState[][] = [];
+  let cur: CarKinematicState[] = [plan[0]!];
+  for (let i = 1; i < plan.length; i++) {
+    const s = plan[i]!;
+    const prev = cur[cur.length - 1]!;
+    const flipped =
+      (prev.speed > 1e-3 && s.speed < -1e-3) ||
+      (prev.speed < -1e-3 && s.speed > 1e-3);
+    if (flipped) {
+      if (cur.length >= 2) out.push(cur);
+      cur = [s];
+    } else {
+      cur.push(s);
+    }
+  }
+  if (cur.length >= 2) out.push(cur);
+  return out.length > 0 ? out : [plan.slice()];
+}
+
+// ---------------------------------------------------------------------------
 // Feature flags — for ablation studies.
 //
 // Every "best-in-class" planner improvement landed on this branch is gated
@@ -223,6 +260,23 @@ export interface RaceTuning {
   cruiseSpeed?: number;
   goalTolerance?: number;
   arriveRadius?: number;
+  /**
+   * Planner pose discretisation. Race uses defaults (1.5 m grid,
+   * 16 heading buckets, 4 m goal radius, ignore terminal heading);
+   * parking sets tight values (0.3 m / 36 / 0.35 / 0.15) so the
+   * planner finds sub-meter precision plans with terminal-heading
+   * constraints. Plumbed to `planVehicleOnce` / `planRaceMultiGoal`
+   * via their `envOptions` override.
+   */
+  plannerPosCell?: number;
+  plannerHeadingBuckets?: number;
+  plannerGoalRadius?: number;
+  plannerGoalHeadingTol?: number;
+  /** Planner replan budget (ms). Race=120 ms; tight parking maneuvers
+   *  need ~500 ms to find a maneuver through sub-meter clearances. */
+  plannerBudgetMs?: number;
+  /** Planner expansion cap. Race=30k; parking=80k. */
+  plannerMaxExpansions?: number;
 }
 
 /**
@@ -426,6 +480,24 @@ interface CarInternal {
    */
   pendingPlan: CarKinematicState[] | null;
   pendingPlanStartSimTime: number;
+  /**
+   * Plan split into single-gear segments at forward↔reverse cusps.
+   * Pure-pursuit's geometric tracking assumes monotonic forward (or
+   * reverse) motion within a segment; without this split, when the
+   * chassis crosses a cusp the lookahead point can land in the
+   * opposite-gear segment and the controller commands a nonsensical
+   * steer. Each segment is executed end-to-end (brake to cusp pose,
+   * advance to next segment which starts the gear change). For plans
+   * with no cusps (race plans), `segments = [plan]` and behaviour is
+   * unchanged.
+   */
+  segments: CarKinematicState[][];
+  activeSegIdx: number;
+  /** Sim time of the chassis state when the active segment was
+   *  entered — used to gate the "segment done, advance" check on
+   *  ≥0.2 s elapsed so the controller doesn't insta-skip a segment
+   *  whose first sample happens to be within arrive radius. */
+  activeSegStartSimTime: number;
   predictedEnd: { state: CarKinematicState; dueSimTime: number } | null;
   predErrSumSq: number;
   predErrCount: number;
@@ -563,6 +635,9 @@ export async function createRaceScenario(
       planStartSimTime: 0,
       pendingPlan: null,
       pendingPlanStartSimTime: 0,
+      segments: [],
+      activeSegIdx: 0,
+      activeSegStartSimTime: 0,
       predictedEnd: null,
       predErrSumSq: 0,
       predErrCount: 0,
@@ -671,19 +746,45 @@ export async function createRaceScenario(
       }
     }
     const tStart = performance.now();
-    const res = planRaceMultiGoal({
-      state: startState,
-      gates,
-      lib: c.entry.lib,
-      polygons: course.polygons,
-      obstacles: course.obstacles,
-      world: c.navWorld,
-      deadlineMs: RACE_REPLAN_BUDGET_MS,
-      gateRadius: RACE_PLANNER_GATE_RADIUS,
-      referencePath,
-      referenceWeight: tuning.consistencyWeight,
-      disableHeuristicTable: !tuning.enableHeuristicTable,
-    });
+    // Single-waypoint courses (parking) use `planRace` (=
+    // `planVehicleOnce` with terminal-heading constraint + tight
+    // discretisation). Multi-waypoint courses (race loops) use the
+    // multi-goal planner that trades off entries/exits across
+    // gates. The bench's parking entries always supply exactly one
+    // waypoint (the goal pose), so this branch is the natural
+    // discriminator — no extra config flag needed.
+    const isParking = course.waypoints.length === 1;
+    const plannerBudget = tuning.plannerBudgetMs ?? RACE_REPLAN_BUDGET_MS;
+    const plannerMaxExp = tuning.plannerMaxExpansions ?? RACE_MAX_EXPANSIONS;
+    const res = isParking
+      ? planRace({
+          state: startState,
+          goal: gates[0]!,
+          lib: c.entry.lib,
+          polygons: course.polygons,
+          obstacles: course.obstacles,
+          world: c.navWorld,
+          deadlineMs: plannerBudget,
+          maxExpansions: plannerMaxExp,
+          posCell: tuning.plannerPosCell,
+          headingBuckets: tuning.plannerHeadingBuckets,
+          goalRadius: tuning.plannerGoalRadius,
+          goalHeadingTol: tuning.plannerGoalHeadingTol,
+          enableHeuristicTable: tuning.enableHeuristicTable,
+        })
+      : planRaceMultiGoal({
+          state: startState,
+          gates,
+          lib: c.entry.lib,
+          polygons: course.polygons,
+          obstacles: course.obstacles,
+          world: c.navWorld,
+          deadlineMs: plannerBudget,
+          gateRadius: RACE_PLANNER_GATE_RADIUS,
+          referencePath,
+          referenceWeight: tuning.consistencyWeight,
+          disableHeuristicTable: !tuning.enableHeuristicTable,
+        });
     const replanMs = performance.now() - tStart;
     c.diagnostics.lastReplanMs = replanMs;
     c.diagnostics.lastReplanFound = res.found && res.path.length > 1;
@@ -739,7 +840,10 @@ export async function createRaceScenario(
       } else {
         c.plan = smoothed;
         c.planStartSimTime = planStartSimTime;
-        c.pendingPlan = null;
+        c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
+        c.segments = splitAtGearCusps(smoothed);
+        c.activeSegIdx = 0;
+        c.activeSegStartSimTime = simTime;
       }
       const firstEnd = smoothed.find((p) => p.t > 0.05) ?? smoothed[smoothed.length - 1]!;
       c.predictedEnd = { state: firstEnd, dueSimTime: planStartSimTime + firstEnd.t };
@@ -754,7 +858,10 @@ export async function createRaceScenario(
     if (c.pendingPlan && simTime >= c.pendingPlanStartSimTime) {
       c.plan = c.pendingPlan;
       c.planStartSimTime = c.pendingPlanStartSimTime;
-      c.pendingPlan = null;
+      c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
+      c.segments = splitAtGearCusps(c.plan);
+      c.activeSegIdx = 0;
+      c.activeSegStartSimTime = simTime;
     }
   }
 
@@ -886,8 +993,39 @@ export async function createRaceScenario(
       c.lastControls = cmd;
       c.metrics.liveControls = { steer: 0, throttle: 0, brake: 1, targetSpeed: 0 };
     } else if (c.plan && c.plan.length > 1) {
-      const elapsed = simTime - c.planStartSimTime;
-      const live = trimPlan(c.plan, elapsed);
+      // Multi-cusp segment advancement: when the chassis reaches the
+      // end of the active segment (within arrive radius AND nearly
+      // stopped) AND ≥0.2 s has elapsed in the segment (avoid insta-
+      // skipping segments whose first sample is already inside the
+      // arrive radius), move to the next segment. The brake-to-end
+      // logic in pure-pursuit naturally drives the chassis to a
+      // near-stop at the cusp pose; the gear change happens at the
+      // segment boundary by the new segment's plan-speed sign. For
+      // plans with no cusps (race), `segments = [plan]` and this
+      // never advances past 0.
+      if (c.segments.length > 1 && c.activeSegIdx < c.segments.length - 1) {
+        const seg = c.segments[c.activeSegIdx]!;
+        const segEnd = seg[seg.length - 1]!;
+        const segElapsed = simTime - c.activeSegStartSimTime;
+        const dist = Math.hypot(stateBefore.x - segEnd.x, stateBefore.z - segEnd.z);
+        if (
+          segElapsed >= 0.2 &&
+          dist <= (tuning.arriveRadius ?? RACE_ARRIVE_RADIUS) &&
+          Math.abs(stateBefore.speed) < 0.5
+        ) {
+          c.activeSegIdx++;
+          c.activeSegStartSimTime = simTime;
+        }
+      }
+      // Source of truth for the controller: the current single-gear
+      // segment, NOT the full plan. Pure-pursuit's geometric formula
+      // assumes monotonic motion within the path it sees; feeding it
+      // a multi-cusp plan makes its lookahead land in the wrong gear.
+      // Pure-pursuit's own `nearestIndex` walk handles "where am I on
+      // this segment" so we don't need to trim by elapsed time — the
+      // last sample of the segment is naturally the brake-to-goal
+      // target (the cusp pose or the final goal).
+      const live = c.segments[c.activeSegIdx] ?? c.plan;
       if (live.length >= 2) {
         if (tuning.tracker === 'mpc') {
           // Sampling MPC over the v2 parametric model.
@@ -969,7 +1107,7 @@ export async function createRaceScenario(
         const wp = course.waypoints[c.loopIndex]!;
         c.car.teleport({ x: wp.x, z: wp.z, heading: wp.heading });
         c.plan = null;
-        c.pendingPlan = null;
+        c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
         c.lastMoveSimTime = simTime;
         c.lastPos = { x: wp.x, z: wp.z };
       }
@@ -985,7 +1123,7 @@ export async function createRaceScenario(
         const target = offTrackRecovery === 'waypoint' ? course.waypoints[c.loopIndex]! : c.spawn;
         c.car.teleport({ x: target.x, z: target.z, heading: target.heading });
         c.plan = null;
-        c.pendingPlan = null;
+        c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
       }
     }
   }
@@ -1021,7 +1159,7 @@ export async function createRaceScenario(
       c.waypointsCleared = 0;
       c.plan = null;
       c.planStartSimTime = 0;
-      c.pendingPlan = null;
+      c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
       c.pendingPlanStartSimTime = 0;
       c.predictedEnd = null;
       c.predErrSumSq = 0;
@@ -1050,7 +1188,7 @@ export async function createRaceScenario(
         for (const c of cars) {
           if (!c.finished) c.holdingForSync = false;
           c.plan = null;
-          c.pendingPlan = null;
+          c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
         }
         // Force an immediate replan so neither car coasts on a stale plan.
         for (const c of cars) replanCar(c);
