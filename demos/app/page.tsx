@@ -172,6 +172,12 @@ const GROUPS: readonly DemoGroup[] = [
         tags: ['3D', 'Learning', 'Physics'],
       },
       {
+        href: '/parking',
+        title: 'Tight parking',
+        desc: 'Three progressively harder parking scenarios — forward pull-in, reverse perpendicular, parallel — driven through sub-meter clearances by the same planner the racing demos use.',
+        tags: ['3D', 'Physics', 'Interactive'],
+      },
+      {
         href: '/model-lab',
         title: 'Model Lab',
         desc: 'Train the v2 dynamics model and inspect it visually — fan plots, coverage heatmaps, rollout playback, per-component RMS.',

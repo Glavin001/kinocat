@@ -665,6 +665,7 @@ const TESTED_DEMOS = new Set([
   'plane', // 'aircraft demo' — waypoint/canyon/restricted/gauntlet/knife-edge
   'playground', // 'playground demo' — planPlayground
   'raceprimitives', // 'raceprimitives demo' — side-by-side kinematic vs learned library race
+  'parking', // 'parking demo' — three tight-parking scenarios; the same parking scenarios are exercised headlessly by the controller-bench harness (`pnpm run controller-bench`) which is the canonical coverage path for the unified planner+tracker stack
   'ramp', // 'ramp + affordance demo' — drivable heightfield ramp + planner-only BallisticJump
   'primitives', // 'primitives demo' — buildPrimitiveFan
   'primitive-explorer', // 'primitive-explorer demo' — kinematic-vs-v2 action-space diagnostics (tested in primitive-diagnostics.test.ts)
