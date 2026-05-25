@@ -16,6 +16,84 @@
 
 import type { CarKinematicState } from '../agent/types';
 
+/** Discrete curvature at every sample of a polyline using the Menger
+ *  formula on (prev, here, next). Endpoints are 0. Returns an array of
+ *  the same length as `path`. Useful as `SpeedProfileOptions.curvatureOverride`
+ *  when you want speeds derived from the original (sharp) primitive
+ *  polyline applied to a separately-smoothed tracking polyline. */
+export function curvaturePerSample(
+  path: ReadonlyArray<CarKinematicState>,
+): number[] {
+  const n = path.length;
+  const out = new Array<number>(n).fill(0);
+  if (n < 3) return out;
+  for (let i = 1; i < n - 1; i++) {
+    const ax = path[i - 1]!.x;
+    const az = path[i - 1]!.z;
+    const bx = path[i]!.x;
+    const bz = path[i]!.z;
+    const cx = path[i + 1]!.x;
+    const cz = path[i + 1]!.z;
+    const a = Math.hypot(bx - ax, bz - az);
+    const b = Math.hypot(cx - bx, cz - bz);
+    const c = Math.hypot(cx - ax, cz - az);
+    if (a < 1e-6 || b < 1e-6 || c < 1e-6) continue;
+    const cross = (bx - ax) * (cz - az) - (bz - az) * (cx - ax);
+    const area = 0.5 * Math.abs(cross);
+    out[i] = (4 * area) / (a * b * c);
+  }
+  return out;
+}
+
+/** Resample a per-sample scalar field (e.g. curvature) from one polyline
+ *  onto another by matched arc-length. Useful when post-processing has
+ *  changed the sample count (e.g. trajectory smoother → dense) and we
+ *  need a scalar attached to the original samples mapped onto the new
+ *  ones. Both polylines are expected to cover the same physical span. */
+export function resampleScalarByArcLength(
+  fromPath: ReadonlyArray<CarKinematicState>,
+  fromScalar: ReadonlyArray<number>,
+  toPath: ReadonlyArray<CarKinematicState>,
+): number[] {
+  const m = fromPath.length;
+  const n = toPath.length;
+  if (m === 0 || n === 0) return [];
+  if (m === 1) return new Array<number>(n).fill(fromScalar[0] ?? 0);
+  // Cumulative arc lengths on both.
+  const fromCum: number[] = [0];
+  for (let i = 1; i < m; i++) {
+    fromCum.push(fromCum[i - 1]! + Math.hypot(
+      fromPath[i]!.x - fromPath[i - 1]!.x,
+      fromPath[i]!.z - fromPath[i - 1]!.z,
+    ));
+  }
+  const fromTotal = fromCum[m - 1]!;
+  const toCum: number[] = [0];
+  for (let i = 1; i < n; i++) {
+    toCum.push(toCum[i - 1]! + Math.hypot(
+      toPath[i]!.x - toPath[i - 1]!.x,
+      toPath[i]!.z - toPath[i - 1]!.z,
+    ));
+  }
+  const toTotal = toCum[n - 1]!;
+  const out = new Array<number>(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    // Map this `to` sample's normalized arc onto the `from` polyline.
+    const u = toTotal > 1e-9 ? toCum[i]! / toTotal : 0;
+    const targetS = u * fromTotal;
+    let j = 0;
+    while (j < m - 2 && fromCum[j + 1]! < targetS) j++;
+    const seg = fromCum[j + 1]! - fromCum[j]!;
+    const t = seg > 1e-9 ? (targetS - fromCum[j]!) / seg : 0;
+    const a = fromScalar[j] ?? 0;
+    const b = fromScalar[j + 1] ?? a;
+    // For curvature take the MAX (worst-case) within the matched segment
+    // rather than linear interp — keeps the safety bound tight.
+    out[i] = Math.max(a, b) * (1 - 0) + 0 * t;
+  }
+  return out;
+}
+
 export interface SpeedProfileOptions {
   /** Max lateral accel for curvature speed cap (m/s²). */
   aLatMax: number;
@@ -33,6 +111,16 @@ export interface SpeedProfileOptions {
   maxSpeed?: number;
   /** Floor on speed magnitude when curvature would force v→0. Default 0.5 m/s. */
   minSpeed?: number;
+  /**
+   * Optional pre-computed per-sample curvature (1/m, unsigned). When
+   * supplied, the friction-circle cap uses these values instead of
+   * estimating curvature from the path samples. Essential when the
+   * `path` argument has already been smoothed (which under-estimates
+   * the real curvature the chassis must drive) but you still want
+   * speeds derived from the ORIGINAL primitive geometry. Length must
+   * equal `path.length`.
+   */
+  curvatureOverride?: ReadonlyArray<number>;
 }
 
 function curvatureAt(
@@ -80,11 +168,15 @@ export function smoothSpeedProfile(
   const sign = new Array<number>(n);
   for (let i = 0; i < n; i++) sign[i] = (path[i]!.speed ?? 0) < 0 ? -1 : 1;
 
-  // Curvature speed cap per sample.
+  // Curvature speed cap per sample. Prefer caller-supplied curvature
+  // (so we can compute the cap from the ORIGINAL primitive geometry
+  // even when `path` here has been smoothed downstream).
   const vCap = new Array<number>(n);
   for (let i = 0; i < n; i++) {
     let k: number;
-    if (i === 0 || i === n - 1) {
+    if (opts.curvatureOverride && opts.curvatureOverride.length === n) {
+      k = Math.abs(opts.curvatureOverride[i] ?? 0);
+    } else if (i === 0 || i === n - 1) {
       k = 0;
     } else {
       k = curvatureAt(path[i - 1]!, path[i]!, path[i + 1]!);

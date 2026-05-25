@@ -42,6 +42,8 @@ import {
   purePursuit,
   smoothSpeedProfile,
   smoothTrajectory,
+  curvaturePerSample,
+  resampleScalarByArcLength,
   mpcTrack,
   createMPCTrackerState,
   type MPCTrackerState,
@@ -648,19 +650,15 @@ export async function createRaceScenario(
       //      piecewise-linear interpolation of primitive endpoints.
       //  (b) Friction-circle speed-profile pass — assigns a
       //      curvature- and brake-distance-aware speed at every sample.
+      // Two-stage plan post-process: smoother (sparse → dense C¹) +
+      // friction-circle speed pass (curvature-aware speeds the chassis
+      // can physically achieve). Speed profile uses ORIGINAL primitive
+      // curvature, resampled onto the smoothed samples by arc-length,
+      // so the smoother's geometric rounding doesn't fool the speed
+      // pass into commanding impossible speeds.
       let smoothed = res.path;
+      const kRaw = tuning.enableSpeedProfile ? curvaturePerSample(res.path) : null;
       if (tuning.enableTrajectorySmoother) {
-        // Conservative weights: the smoother's job here is to give
-        // pure-pursuit + the speed-profile pass a dense, continuous
-        // sampling of essentially the same geometry. Aggressive
-        // Laplacian smoothing (high smoothWeight, many iterations)
-        // rounds off corners, making the polyline appear straighter
-        // than the chassis must actually drive — pure-pursuit then
-        // commands too high a speed for the real-world tighter turn
-        // and slides off. Strong dataWeight + few iterations keeps the
-        // path geometrically faithful while still removing the visible
-        // seams and giving the curvature-aware speed pass smooth
-        // samples to chew on.
         smoothed = smoothTrajectory(smoothed, {
           sampleSpacing: 0.4,
           iterations: 4,
@@ -669,23 +667,16 @@ export async function createRaceScenario(
           anchorEndpoints: true,
         });
       }
-      if (tuning.enableSpeedProfile) {
-        // Speed-profile aLatMax is intentionally LOWER than the
-        // pure-pursuit clamp: the profile assigns per-sample target
-        // speeds for the controller to follow, so it should plan a
-        // buffer below the actual lateral-grip limit. The chassis's
-        // tyre model + load transfer makes the real friction circle
-        // smaller than the static mu·g number; running the profile at
-        // ~75% of pure-pursuit's clamp absorbs that mismatch and
-        // dramatically cuts corner-slide off-tracks measured by the
-        // ablation harness.
+      if (tuning.enableSpeedProfile && kRaw) {
+        const kForProfile = resampleScalarByArcLength(res.path, kRaw, smoothed);
         smoothed = smoothSpeedProfile(smoothed, {
-          aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel * 0.75,
+          aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel * 0.85,
           aLonMaxAccel: PURE_PURSUIT_CONFIG.maxAccel,
           aLonMaxDecel: PURE_PURSUIT_CONFIG.maxDecel,
           maxSpeed: PURE_PURSUIT_CONFIG.cruiseSpeed,
           minSpeed: 0.5,
           honorEntrySpeed: true,
+          curvatureOverride: kForProfile,
         });
       }
       c.diagnostics.successfulReplans += 1;
@@ -851,13 +842,7 @@ export async function createRaceScenario(
       const live = trimPlan(c.plan, elapsed);
       if (live.length >= 2) {
         if (tuning.tracker === 'mpc') {
-          // Sampling MPC over the v2 parametric model. Same dynamics
-          // model the planner uses, so the controller's predicted
-          // behaviour matches the chassis the planner planned for —
-          // the gap pure-pursuit can't close. Particularly important
-          // for low-speed precision (parking, multi-step gear changes)
-          // where geometric tracking has no concept of "what does THIS
-          // actuator command do at THIS state".
+          // Sampling MPC over the v2 parametric model.
           if (!c.mpcState) c.mpcState = createMPCTrackerState(MPC_HORIZON);
           const cmdRaw = mpcTrack(stateBefore, live, mpcForwardSim, c.mpcState, MPC_CONFIG);
           const cmd: WheeledCarControls = {
