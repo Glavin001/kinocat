@@ -279,14 +279,21 @@ export function mpcTrack(
   const cruiseSpeed = goal ? Math.max(Math.abs(goal.speed), 1) : 5;
   const { ref } = buildReference(current, plan, H, cruiseSpeed, dt);
 
-  // Terminal-cost auto-activation. The plan is asking us to STOP near
-  // a pose when: (a) goal speed magnitude is near zero AND (b) we can
-  // physically reach the goal within H steps of MPC (so the terminal
-  // cost meaningfully fires in the rollout). This is the
-  // single-controller mechanism that turns the cruise tracker into a
-  // parking controller automatically — no mode switching.
+  // Terminal-cost activation. Requires:
+  //   (a) caller opted in via non-zero `wTerminalPosition` or
+  //       `wTerminalSpeed` weights (intent signal from the scenario:
+  //       "this plan asks the chassis to come to rest at a pose"),
+  //   (b) the plan's terminal speed is near zero (so the plan agrees
+  //       this is a stop, not a drive-through gate), AND
+  //   (c) the goal is reachable within the MPC horizon (so terminal
+  //       cost meaningfully fires inside the rollout — telling MPPI
+  //       to optimise for a goal 100 m away is just noise).
+  // The race scenario sets `wTerminalPosition=0` so this never
+  // triggers there even when individual gate poses happen to have
+  // `speed=0` from the planner's pose() helper.
   let terminalActive = false;
-  if (goal && Math.abs(goal.speed) < 0.5) {
+  const wantsTerminal = weights.wTerminalPosition > 0 || weights.wTerminalSpeed > 0;
+  if (wantsTerminal && goal && Math.abs(goal.speed) < 0.5) {
     const distToGoal = Math.hypot(current.x - goal.x, current.z - goal.z);
     const maxReachInHorizon = Math.max(Math.abs(current.speed), 1) * H * dt + 2.0;
     if (distToGoal <= maxReachInHorizon) terminalActive = true;

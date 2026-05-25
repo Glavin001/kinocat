@@ -181,13 +181,22 @@ export interface RaceTuning {
   enableHeuristicTable: boolean;
   /**
    * Path-following tracker. `'pure-pursuit'` is the classic geometric
-   * tracker — fast, reactive, no dynamics model. `'mpc'` is a
-   * short-horizon sampling MPC over the v2 parametric model — slower
-   * per tick but accurate enough for high-fidelity execution
-   * (parking, multi-step back-and-forth corrections, terminal-pose
-   * precision). Defaults to `'pure-pursuit'`.
+   * tracker — fast, reactive, no dynamics model. `'mpc'` is the
+   * MPPI sampling MPC over the v2 parametric model — slower per tick
+   * but accurate enough for high-fidelity execution (parking, multi-
+   * step back-and-forth corrections, terminal-pose precision).
+   * Defaults to `'pure-pursuit'`.
    */
   tracker: 'pure-pursuit' | 'mpc';
+  /**
+   * MPC terminal-pose cost weights. Scenario intent signal:
+   * non-zero values mean "this plan asks the chassis to come to rest
+   * at a pose" (parking, terminal-pose precision). Zero means "drive
+   * through any goal you see" (racing, cruise). The bench's parking
+   * entries set these explicitly; the race entry leaves them at 0.
+   */
+  mpcWTerminalPosition: number;
+  mpcWTerminalSpeed: number;
 }
 
 /**
@@ -234,6 +243,8 @@ export const DEFAULT_TUNING: RaceTuning = {
   enableWaypointAdvanceReplan: true,
   enableHeuristicTable: true,
   tracker: 'pure-pursuit',
+  mpcWTerminalPosition: 0,
+  mpcWTerminalSpeed: 0,
 };
 
 /** All improvements disabled — reverts to the pre-improvement baseline.
@@ -248,6 +259,8 @@ export const LEGACY_TUNING: RaceTuning = {
   enableWaypointAdvanceReplan: false,
   enableHeuristicTable: false,
   tracker: 'pure-pursuit',
+  mpcWTerminalPosition: 0,
+  mpcWTerminalSpeed: 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -333,6 +346,12 @@ export interface RaceScenarioOptions {
    *  (everything ON). Used by ablation tooling and the CLI to A/B test
    *  individual improvements. */
   tuning?: Partial<RaceTuning>;
+  /** Override the default race course. Used by the controller-bench
+   *  to drive the same `createRaceScenario` runner through arbitrary
+   *  test scenarios (parking, cruise, custom obstacle layouts...) —
+   *  one scenario runner, many courses. Shape matches
+   *  `buildRaceCourse()`'s return type. */
+  course?: ReturnType<typeof buildRaceCourse>;
 }
 
 export interface RaceScenario {
@@ -409,7 +428,7 @@ export async function createRaceScenario(
   opts: RaceScenarioOptions,
 ): Promise<RaceScenario> {
   const rapier = await ensureRapier();
-  const course = buildRaceCourse();
+  const course = opts.course ?? buildRaceCourse();
   const targetLaps = opts.targetLaps;
   const syncHold = opts.syncHold ?? false;
   const offTrackRecovery = opts.offTrackRecovery ?? 'spawn';
@@ -465,8 +484,8 @@ export async function createRaceScenario(
     wSpeed: 10,
     wControlRate: 0.15,
     wSteerRate: 25,
-    wTerminalPosition: 50,
-    wTerminalSpeed: 30,
+    wTerminalPosition: tuning.mpcWTerminalPosition,
+    wTerminalSpeed: tuning.mpcWTerminalSpeed,
     goalTolerance: 0.5,
   };
 

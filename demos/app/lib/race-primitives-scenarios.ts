@@ -58,20 +58,26 @@ export const RACE_PALETTE = {
  *  is most efficient for the trajectory. Flow-through behaviour is
  *  achieved by the lookahead in `pickNextWaypoint`, not by goal speed. */
 function pose(x: number, z: number, heading: number): CarKinematicState {
-  return { x, z, heading, speed: 0, t: 0 };
+  // Default waypoint speed > 0 so the MPC tracker treats race gates as
+  // drive-through targets, not "stop-here" terminals. The parking
+  // bench adapter explicitly sets `speed: 0` on its single goal pose
+  // to signal terminal-pose intent.
+  return { x, z, heading, speed: 5, t: 0 };
 }
 
 /** A challenging waypoint loop. Coordinates picked so the kinematic library
  *  plan goes wrong (overshoot at the slalom, late braking into the 90°) but
  *  remains FEASIBLE — both cars can complete it, the question is who finishes
  *  faster with less tracking error. */
-export function buildRaceCourse(): {
-  bounds: typeof RACE_BOUNDS;
+export interface RaceCourse {
+  bounds: { x0: number; x1: number; z0: number; z1: number };
   polygons: NavPolygon[];
   obstacles: Array<[number, number][]>;
   waypoints: CarKinematicState[];
   spawn: CarKinematicState;
-} {
+}
+
+export function buildRaceCourse(): RaceCourse {
   const b = RACE_BOUNDS;
   const polygons: NavPolygon[] = [
     {
