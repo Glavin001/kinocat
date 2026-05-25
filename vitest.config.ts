@@ -15,7 +15,13 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['core/test/**/*.test.ts', 'demos/test/**/*.test.ts'],
-    testTimeout: 20000,
+    // 30 s test timeout. `training-driver.test.ts` legitimately runs
+    // ~18 s on a warm dev machine; CI runners under load have been
+    // observed to push it past the previous 20 s ceiling, surfacing
+    // as an `onTimeoutError` from vitest's RPC layer (intermittent CI
+    // failure on PR #23). 30 s gives headroom without masking any
+    // test that's actually broken.
+    testTimeout: 30000,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'lcov', 'html'],
