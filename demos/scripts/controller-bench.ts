@@ -150,11 +150,19 @@ function makeParkingScenario(
         targetLaps: 1,
         syncHold: false,
         offTrackRecovery: 'none',
-        // Opt the MPC into terminal-pose cost — parking IS asking the
-        // chassis to come to rest precisely at a pose. Race scenarios
-        // leave these at 0 so MPPI cruises through gates without
-        // trying to stop at each one.
-        tuning: { ...tuning, mpcWTerminalPosition: 50, mpcWTerminalSpeed: 30 },
+        // Parking-specific tuning: tracker-agnostic knobs (low cruise
+        // speed, tight goal tolerance, sub-meter arrive radius) that
+        // both pure-pursuit AND MPPI obey, PLUS MPC terminal-pose
+        // weights for MPPI's parking mode. Race scenarios leave these
+        // at defaults / 0 so the same controller code runs both.
+        tuning: {
+          ...tuning,
+          cruiseSpeed: 2,
+          goalTolerance: 0.4,
+          arriveRadius: 0.6,
+          mpcWTerminalPosition: 50,
+          mpcWTerminalSpeed: 30,
+        },
         course,
       });
       while (scenario.simTime() < maxSim) {

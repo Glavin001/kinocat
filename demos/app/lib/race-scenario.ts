@@ -197,6 +197,32 @@ export interface RaceTuning {
    */
   mpcWTerminalPosition: number;
   mpcWTerminalSpeed: number;
+  /**
+   * Scenario-level tracker / waypoint knobs. These belong in the
+   * tuning bundle (not in MPC config alone) because they govern
+   * pure-pursuit AND MPPI alike — both controllers need to know
+   * the chassis's cruise speed cap and how close it must get to the
+   * goal pose for the scenario to consider it "done". Setting them
+   * lets a scenario reuse the same `createRaceScenario` runner for
+   * racing (fast cruise, generous gate radius) and parking (slow
+   * cruise, tight terminal tolerance) without forking the runner.
+   *
+   * `cruiseSpeed`: max forward speed pure-pursuit will request.
+   *                Defaults to `RACE_AGENT.maxSpeed`. Parking
+   *                scenarios set this to the parking library's
+   *                top speed (~2 m/s) so the controller doesn't
+   *                blow past the planner's slow-maneuver primitives.
+   * `goalTolerance`: distance at which `atGoal` triggers pure-
+   *                pursuit's terminal brake. Defaults to 2.
+   *                Parking sets this to ~0.4 m so the chassis
+   *                actually stops in the stall.
+   * `arriveRadius`: waypoint-advance radius in `pickNextWaypoint`.
+   *                Defaults to RACE_ARRIVE_RADIUS (2.5 m). Parking
+   *                needs sub-meter precision so this drops to ~0.5 m.
+   */
+  cruiseSpeed?: number;
+  goalTolerance?: number;
+  arriveRadius?: number;
 }
 
 /**
@@ -245,6 +271,8 @@ export const DEFAULT_TUNING: RaceTuning = {
   tracker: 'pure-pursuit',
   mpcWTerminalPosition: 0,
   mpcWTerminalSpeed: 0,
+  // cruiseSpeed / goalTolerance / arriveRadius left undefined — fall
+  // through to PURE_PURSUIT_CONFIG / RACE_ARRIVE_RADIUS chassis defaults.
 };
 
 /** All improvements disabled — reverts to the pre-improvement baseline.
@@ -435,10 +463,17 @@ export async function createRaceScenario(
   const stallTimeoutMs = opts.stallTimeoutMs ?? STALL_TIMEOUT_MS;
   const spacing = opts.spawnSpacingZ ?? 3;
   const tuning: RaceTuning = { ...DEFAULT_TUNING, ...(opts.tuning ?? {}) };
+  // Tracker config derives from the tuning bundle so a single
+  // `createRaceScenario` instance handles racing or parking based on
+  // the scenario's per-tuning overrides. Anything not set falls
+  // through to the chassis-level race defaults.
   const trackerConfig = {
     ...PURE_PURSUIT_CONFIG,
+    cruiseSpeed: tuning.cruiseSpeed ?? PURE_PURSUIT_CONFIG.cruiseSpeed,
+    goalTolerance: tuning.goalTolerance ?? PURE_PURSUIT_CONFIG.goalTolerance,
     respectPathSpeed: tuning.respectPathSpeed,
   };
+  const arriveRadius = tuning.arriveRadius ?? RACE_ARRIVE_RADIUS;
 
   // MPC tracker shared config + forward simulator (constant per scenario).
   // The dynamics model is the v2 parametric model with default coefficients
@@ -599,7 +634,7 @@ export async function createRaceScenario(
     // `pickNextWaypoint`, so this is a planning-only correction.
     let planLoopIndex = c.loopIndex;
     {
-      const advRadiusSq = RACE_ARRIVE_RADIUS * RACE_ARRIVE_RADIUS;
+      const advRadiusSq = arriveRadius * arriveRadius;
       for (let i = 0; i < PLAN_LOOKAHEAD_COUNT; i++) {
         const wp = course.waypoints[planLoopIndex % course.waypoints.length]!;
         const dx = startState.x - wp.x;
@@ -802,7 +837,7 @@ export async function createRaceScenario(
         { ...stateBefore, t: 0 },
         course.waypoints,
         c.loopIndex,
-        RACE_ARRIVE_RADIUS,
+        arriveRadius,
       );
       if (pick.advanced) {
         c.waypointsCleared++;
