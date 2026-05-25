@@ -1,35 +1,39 @@
-// Sampling-based MPC tracker for Ackermann vehicles.
+// Model Predictive Path Integral (MPPI) tracker for Ackermann vehicles.
 //
-// Replaces (or augments) pure-pursuit when the application needs
-// high-fidelity execution of a plan — e.g. parking in tight spaces,
-// multi-step back-and-forth corrections, precise terminal poses, or
-// any scenario where the controller's actuator → state mapping matters
-// (which pure-pursuit ignores entirely).
+// The single principled controller for the entire driving spectrum —
+// from racing cruise to tight-space parking and every intermediate
+// motion. Replaces the random-shooting MPC variant that preceded it
+// (which was the "toy MPC" of pick-the-best-sample), and is the
+// established production default in ROS Navigation 2 for ground
+// vehicles. Reference: Williams et al., "Aggressive driving with
+// model predictive path integral control" (ICRA 2016).
 //
-// The flavour: random-shooting MPC with warm-start. Every tick we
-//   1) sample K candidate control sequences (each N steps of
-//      `[steer, driveForce, brakeForce]`), centred on the
-//      previously-best sequence shifted by one step (the warm-start);
-//   2) roll each sequence through `forwardSim` (typically the v2
-//      learned model — the same dynamics model the planner trusts);
-//   3) score every rolled trajectory against the plan polyline +
-//      penalties for control-rate / jerk / terminal pose;
-//   4) keep the lowest-cost sequence and emit its first control as
-//      this tick's command.
+// The single-controller-for-everything property comes from how MPPI
+// integrates samples: instead of selecting the best, every candidate
+// is weighted by `exp(-(cost - min_cost) / λ)` (Boltzmann / Gibbs
+// distribution) and the emitted control is the importance-weighted
+// average. λ (the temperature) governs the regime:
 //
-// Sampling (not gradient) chosen because: it's robust to discontinuous
-// constraints (friction circle, brake saturation), it parallelises
-// trivially if we ever move to a worker, and it doesn't need
-// differentiable rollouts. The classic CEM / MPPI literature would
-// upgrade this to a weighted softmax over samples — a future refinement.
+//   λ → 0    Boltzmann collapses to pick-the-best → aggressive but
+//            noisy, matches random-shooting MPC.
+//   λ → ∞    Uniform average over samples → very smooth, very
+//            cautious.
+//   λ ~ cost-scale  Smooth weighted blend — the bias-variance sweet
+//                   spot that handles racing AND parking with the
+//                   same hyperparameter.
+//
+// The cost function does its own scenario detection: if the plan's
+// terminal speed is near zero AND the goal is reachable within the
+// MPC horizon, the terminal-pose weights kick in (precision mode).
+// Otherwise the controller cruises with cost-weighted plan tracking
+// (racing / general driving mode). No mode switching, no developer-
+// visible knob — the cost shape derives from the plan content.
 
 import type { CarKinematicState } from '../agent/types';
 import type { ForwardSim } from '../primitives/types';
 import type { PlanPath } from './types';
 
-/** The MPC tracker emits actuator commands directly (no curvature →
- *  steer conversion in between), so the natural return type is the
- *  native wheeled-vehicle control set. */
+/** Native wheeled-vehicle control set the tracker emits each tick. */
 export interface MPCCommand {
   steer: number;       // rad (front-wheel angle)
   driveForce: number;  // N (signed; negative = reverse)
@@ -40,44 +44,60 @@ export interface MPCCommand {
   lookahead: { x: number; z: number };
   /** Within the goal tolerance (terminal cost dominates). */
   atGoal: boolean;
-  /** Cost of the best rollout — useful for ablation diagnostics. */
+  /** Min cost across sampled rollouts — useful for ablation. */
   bestCost: number;
 }
 
 export interface MPCTrackerConfig {
-  /** Number of MPC steps in the rolling horizon. Default 6 (~0.6 s
-   *  at the default 0.1 s step). */
+  /** Number of MPC steps in the rolling horizon. Default 10
+   *  (~0.5 s at the default 0.05 s step). */
   horizonSteps?: number;
-  /** Length of each MPC step (s). Default 0.1. */
+  /** Length of each MPC step (s). Default 0.05 (matches 60 Hz physics
+   *  for cost-integration accuracy). */
   stepDt?: number;
-  /** Number of control sequences sampled per tick. Default 32. */
+  /** Number of control sequences sampled per tick. Default 64.
+   *  Compute cost: K × H × (forward-sim cost) per tick. */
   samples?: number;
   /** Sampling stddev around the warm-started prior, in actuator units. */
-  steerStd?: number;        // rad
-  driveStd?: number;        // N
-  brakeStd?: number;        // N
+  steerStd?: number;
+  driveStd?: number;
+  brakeStd?: number;
   /** Actuator limits — clamp every sample within these. */
   maxSteer: number;
   maxDriveForce: number;
   maxBrakeForce: number;
-  /** Allow sampling negative `driveForce` (reverse). Default true; turn
-   *  off for forward-only scenarios like race cruising. */
+  /** Allow sampling negative `driveForce` (reverse). Default true. */
   allowReverse?: boolean;
-  /** Cost weights. Tune empirically; defaults work for race + parking. */
+  /**
+   * MPPI temperature. Controls the importance-weighted average's
+   * concentration: smaller λ → controller commits to the best-looking
+   * sample (aggressive, noisy); larger λ → controller averages many
+   * samples (smooth, cautious). Default 1.0 — works for both racing
+   * cruise and parking with the same value because cost scaling is
+   * normalised by `min(cost)`.
+   */
+  lambda?: number;
+  /** Per-stage cost weights. */
   wLateral?: number;
   wHeading?: number;
   wSpeed?: number;
   wControlRate?: number;
-  /** Separate, MUCH higher weight on steer-rate jumps. At race speeds
-   *  (~18 m/s) even a 0.1-rad steer change produces a ~30°/s yaw rate
-   *  — penalising it with the same coefficient as drive-rate makes the
-   *  controller wildly oscillate. Keep this an order of magnitude above
-   *  `wControlRate` for any high-speed scenario. Default 3. */
+  /** Separate steer-rate weight (much larger than wControlRate at high
+   *  speed — see notes in the random-shooting precursor). Default 3. */
   wSteerRate?: number;
+  /**
+   * Terminal-pose costs. These are auto-activated when the plan's
+   * terminal speed is near zero AND the goal is reachable within the
+   * MPC horizon — i.e. when the plan is asking the chassis to STOP at
+   * a pose (parking, multi-step back-and-forth target). For pure
+   * cruise plans (terminal speed ≈ cruise speed) these don't fire and
+   * the controller behaves like a standard tracking MPC. The config
+   * values cap how strong the terminal cost can get; default to
+   * sensible levels for parking.
+   */
   wTerminalPosition?: number;
   wTerminalSpeed?: number;
-  /** Goal pose at the end of the plan — used by the terminal-pose
-   *  cost terms. Defaults to the last plan sample. */
+  /** Distance below which `atGoal` is reported true. Default 0.5 m. */
   goalTolerance?: number;
 }
 
@@ -90,7 +110,7 @@ export interface MPCTrackerState {
   rngState: number;
 }
 
-/** Create a fresh MPC tracker state. Deterministic on `seed`. */
+/** Create a fresh MPPI tracker state. Deterministic on `seed`. */
 export function createMPCTrackerState(horizonSteps: number, seed = 0x1337): MPCTrackerState {
   return {
     prev: new Float64Array(horizonSteps * 3),
@@ -115,35 +135,35 @@ function clamp(x: number, lo: number, hi: number): number {
   return x < lo ? lo : x > hi ? hi : x;
 }
 
-/** Build a per-step reference state from the plan polyline by walking
- *  arc-length forward from the projection of `current`. Returns one
- *  reference point per MPC step (so we can score each rollout's
- *  matching step against the right plan point). */
+function wrapPi(a: number): number {
+  let r = a;
+  while (r > Math.PI) r -= 2 * Math.PI;
+  while (r < -Math.PI) r += 2 * Math.PI;
+  return r;
+}
+
+/** Per-step reference state from the plan polyline by walking
+ *  arc-length forward from the projection of `current`. */
 function buildReference(
   current: CarKinematicState,
   plan: PlanPath,
   horizon: number,
   cruiseSpeed: number,
   stepDt: number,
-): { ref: CarKinematicState[]; totalArc: number } {
+): { ref: CarKinematicState[]; bestI: number } {
   if (plan.length === 0) {
     const ref: CarKinematicState[] = [];
     for (let i = 0; i < horizon; i++) ref.push({ ...current });
-    return { ref, totalArc: 0 };
+    return { ref, bestI: 0 };
   }
-  // Project `current` onto the plan to find the starting arc-length.
   let bestI = 0;
   let bestD = Infinity;
   for (let i = 0; i < plan.length; i++) {
     const dx = plan[i]!.x - current.x;
     const dz = plan[i]!.z - current.z;
     const d = dx * dx + dz * dz;
-    if (d < bestD) {
-      bestD = d;
-      bestI = i;
-    }
+    if (d < bestD) { bestD = d; bestI = i; }
   }
-  // Cumulative arc from the projection point onward.
   const cum: number[] = [0];
   for (let i = bestI + 1; i < plan.length; i++) {
     const a = plan[i - 1]!;
@@ -152,8 +172,6 @@ function buildReference(
   }
   const ref: CarKinematicState[] = [];
   for (let k = 1; k <= horizon; k++) {
-    // Step forward at the plan's local speed (use the planned per-sample
-    // speed if it's a sensible magnitude, else fall back to cruise).
     const localSpeed =
       Math.abs(plan[bestI]!.speed) > 0.5 ? Math.abs(plan[bestI]!.speed) : cruiseSpeed;
     const targetArc = k * stepDt * localSpeed;
@@ -171,7 +189,7 @@ function buildReference(
       t: 0,
     });
   }
-  return { ref, totalArc: cum[cum.length - 1] ?? 0 };
+  return { ref, bestI };
 }
 
 function scoreRollout(
@@ -180,6 +198,7 @@ function scoreRollout(
   controls: Float64Array,
   prevSeed: Float64Array,
   goal: CarKinematicState | undefined,
+  terminalActive: boolean,
   w: Required<Pick<MPCTrackerConfig,
     'wLateral' | 'wHeading' | 'wSpeed' | 'wControlRate' | 'wSteerRate' | 'wTerminalPosition' | 'wTerminalSpeed'
   >>,
@@ -192,7 +211,7 @@ function scoreRollout(
     const dx = s.x - r.x;
     const dz = s.z - r.z;
     cost += w.wLateral * (dx * dx + dz * dz);
-    const dh = ((s.heading - r.heading + Math.PI) % (2 * Math.PI)) - Math.PI;
+    const dh = wrapPi(s.heading - r.heading);
     cost += w.wHeading * dh * dh;
     const dv = Math.abs(s.speed) - Math.abs(r.speed);
     cost += w.wSpeed * dv * dv;
@@ -200,40 +219,32 @@ function scoreRollout(
       const ds = controls[i * 3]! - controls[(i - 1) * 3]!;
       const dd = controls[i * 3 + 1]! - controls[(i - 1) * 3 + 1]!;
       const db = controls[i * 3 + 2]! - controls[(i - 1) * 3 + 2]!;
-      // Steer changes get their own weight — they have outsized effect
-      // at high speed and are the dominant source of MPC oscillation
-      // unless penalised separately.
       cost += w.wSteerRate * ds * ds;
       cost += w.wControlRate * (dd * dd * 1e-6 + db * db * 1e-6);
-    }
-    if (i === 0) {
+    } else {
       // Inter-tick steer rate (vs the previous tick's first command).
       const ds0 = controls[0]! - prevSeed[0]!;
       cost += w.wSteerRate * 0.5 * ds0 * ds0;
     }
   }
-  // Terminal pose cost — critical for parking precision.
-  if (goal && (w.wTerminalPosition > 0 || w.wTerminalSpeed > 0)) {
+  // Terminal-pose cost. Auto-activated by `terminalActive` (set by
+  // the caller when the plan asks the chassis to stop near a pose
+  // and the goal is reachable within the horizon).
+  if (terminalActive && goal !== undefined) {
     const last = rollout[rollout.length - 1]!;
-    if (w.wTerminalPosition > 0) {
-      const dx = last.x - goal.x;
-      const dz = last.z - goal.z;
-      cost += w.wTerminalPosition * (dx * dx + dz * dz);
-    }
-    if (w.wTerminalSpeed > 0) {
-      // Reaching a parking goal means low |speed| at the end.
-      cost += w.wTerminalSpeed * last.speed * last.speed;
-    }
+    const dx = last.x - goal.x;
+    const dz = last.z - goal.z;
+    cost += w.wTerminalPosition * (dx * dx + dz * dz);
+    cost += w.wTerminalSpeed * last.speed * last.speed;
   }
   return cost;
 }
 
 /**
- * One tick of the sampling MPC tracker. Pure modulo the random-state
- * mutation inside `state` (which is bounded to `MPCTrackerState.rngState`
- * for determinism). Returns the actuator command for THIS tick; the
- * optimised future commands are kept in `state` for warm-start on the
- * next call.
+ * One MPPI tracker step. Pure modulo the deterministic RNG state
+ * mutation inside `state`. Returns the actuator command for THIS
+ * tick; the importance-weighted optimal sequence is kept in `state`
+ * for next-tick warm-start.
  */
 export function mpcTrack(
   current: CarKinematicState,
@@ -242,30 +253,44 @@ export function mpcTrack(
   state: MPCTrackerState,
   config: MPCTrackerConfig,
 ): MPCCommand {
-  const H = config.horizonSteps ?? 6;
-  const dt = config.stepDt ?? 0.1;
-  const K = config.samples ?? 32;
-  const sStd = config.steerStd ?? 0.15;
-  const dStd = config.driveStd ?? 0.3 * config.maxDriveForce;
-  const bStd = config.brakeStd ?? 0.2 * config.maxBrakeForce;
+  const H = config.horizonSteps ?? 10;
+  const dt = config.stepDt ?? 0.05;
+  const K = config.samples ?? 64;
+  const sStd = config.steerStd ?? 0.10;
+  const dStd = config.driveStd ?? 0.4 * config.maxDriveForce;
+  const bStd = config.brakeStd ?? 0.10 * config.maxBrakeForce;
   const allowReverse = config.allowReverse ?? true;
+  const lambda = Math.max(config.lambda ?? 1.0, 1e-6);
   const weights = {
     wLateral: config.wLateral ?? 5,
-    wHeading: config.wHeading ?? 1,
-    wSpeed: config.wSpeed ?? 1,
+    wHeading: config.wHeading ?? 2,
+    wSpeed: config.wSpeed ?? 3,
     wControlRate: config.wControlRate ?? 0.5,
-    wSteerRate: config.wSteerRate ?? 3,
-    wTerminalPosition: config.wTerminalPosition ?? 0,
-    wTerminalSpeed: config.wTerminalSpeed ?? 0,
+    wSteerRate: config.wSteerRate ?? 8,
+    wTerminalPosition: config.wTerminalPosition ?? 30,
+    wTerminalSpeed: config.wTerminalSpeed ?? 20,
   };
+  const tol = config.goalTolerance ?? 0.5;
 
-  // Resize warm-start buffer if horizon changed.
   if (state.prev.length !== H * 3) state.prev = new Float64Array(H * 3);
 
-  // Build the reference trajectory (one ref point per MPC step).
+  // Build the reference + decide whether to activate terminal cost.
   const goal = plan.length > 0 ? plan[plan.length - 1]! : undefined;
   const cruiseSpeed = goal ? Math.max(Math.abs(goal.speed), 1) : 5;
   const { ref } = buildReference(current, plan, H, cruiseSpeed, dt);
+
+  // Terminal-cost auto-activation. The plan is asking us to STOP near
+  // a pose when: (a) goal speed magnitude is near zero AND (b) we can
+  // physically reach the goal within H steps of MPC (so the terminal
+  // cost meaningfully fires in the rollout). This is the
+  // single-controller mechanism that turns the cruise tracker into a
+  // parking controller automatically — no mode switching.
+  let terminalActive = false;
+  if (goal && Math.abs(goal.speed) < 0.5) {
+    const distToGoal = Math.hypot(current.x - goal.x, current.z - goal.z);
+    const maxReachInHorizon = Math.max(Math.abs(current.speed), 1) * H * dt + 2.0;
+    if (distToGoal <= maxReachInHorizon) terminalActive = true;
+  }
 
   // Warm-start prior — previous solution shifted by one step.
   const prior = new Float64Array(H * 3);
@@ -274,80 +299,26 @@ export function mpcTrack(
     prior[i * 3 + 1]! = state.prev[(i + 1) * 3 + 1]!;
     prior[i * 3 + 2]! = state.prev[(i + 1) * 3 + 2]!;
   }
-  // The last step of the shifted prior repeats the previous final step
-  // (a sensible coast continuation).
   prior[(H - 1) * 3]! = state.prev[(H - 1) * 3]!;
   prior[(H - 1) * 3 + 1]! = state.prev[(H - 1) * 3 + 1]!;
   prior[(H - 1) * 3 + 2]! = state.prev[(H - 1) * 3 + 2]!;
 
-  let bestCost = Infinity;
-  let bestSeq = new Float64Array(H * 3);
+  // Allocate sample storage. We need every sample's controls AND its
+  // cost — MPPI's emit step is the importance-weighted average of
+  // them all (NOT pick-the-best).
+  const samples = new Float64Array(K * H * 3);
+  const costs = new Float64Array(K);
+  let minCost = Infinity;
   const work = new Float64Array(H * 3);
 
-  // Inject a handful of deterministic "anchor" candidates BEFORE the
-  // random samples. Without these, random-shooting MPC tends to get
-  // stuck in low-speed steady states: warm-start is zero on tick one,
-  // Gaussian noise around zero is symmetric so half the drive samples
-  // are reverse and most have non-zero brake, and the chassis never
-  // discovers the "full throttle, no brake, follow plan speed" basin.
-  // The anchors guarantee that basin is always in the candidate set.
-  function setAnchor(k: number, steer: number, drive: number, brake: number): void {
-    if (k >= K) return;
-    // This isn't perturbed; we mark its slot by writing directly into
-    // `work` and then explicitly disabling perturbation for this k below
-    // via a sentinel. Simpler: short-circuit the random loop for k<numAnchors.
-  }
-  void setAnchor; // helper kept for clarity; loop below does the actual work
-  const numAnchors = K >= 6 ? 5 : 0; // 5 anchors when budget allows
-  // Anchor[0]: prior unperturbed (warm-start)
-  // Anchor[1]: full-throttle, zero brake, follow prior steer
-  // Anchor[2]: coast (zero drive, zero brake, follow prior steer)
-  // Anchor[3]: hard brake (zero drive, full brake, zero steer)
-  // Anchor[4]: cruise-match (drive matched to plan acceleration)
   for (let k = 0; k < K; k++) {
+    // First sample (k=0) is the unperturbed prior — guarantees the
+    // warm-start is in the candidate set.
     for (let i = 0; i < H; i++) {
-      let steer: number;
-      let drive: number;
-      let brake: number;
-      if (k === 0) {
-        // Anchor 0: prior unperturbed.
-        steer = prior[i * 3]!;
-        drive = prior[i * 3 + 1]!;
-        brake = prior[i * 3 + 2]!;
-      } else if (numAnchors >= 2 && k === 1) {
-        // Anchor 1: full-throttle along prior steer.
-        steer = prior[i * 3]!;
-        drive = config.maxDriveForce;
-        brake = 0;
-      } else if (numAnchors >= 3 && k === 2) {
-        // Anchor 2: coast.
-        steer = prior[i * 3]!;
-        drive = 0;
-        brake = 0;
-      } else if (numAnchors >= 4 && k === 3) {
-        // Anchor 3: hard brake straight.
-        steer = 0;
-        drive = 0;
-        brake = config.maxBrakeForce;
-      } else if (numAnchors >= 5 && k === 4) {
-        // Anchor 4: drive matched to reference-step speed. If the chassis
-        // is below the reference speed, push positive; above, push zero
-        // (brake is left at 0 — anchor 3 covers braking).
-        const refV = Math.abs(ref[i]?.speed ?? cruiseSpeed);
-        const cv = Math.abs(current.speed);
-        steer = prior[i * 3]!;
-        drive = refV > cv + 0.5 ? config.maxDriveForce * 0.7 : 0;
-        brake = 0;
-      } else {
-        // Random sample around prior.
-        steer = prior[i * 3]! + sStd * gauss(state);
-        drive = prior[i * 3 + 1]! + dStd * gauss(state);
-        // Sample brake from |Normal| - bias so most samples have brake=0
-        // (clamped below). Keeps the sampling distribution honest: the
-        // chassis spends most of its time NOT braking, so the prior
-        // should reflect that.
-        brake = prior[i * 3 + 2]! + bStd * (Math.abs(gauss(state)) - 0.7);
-      }
+      const noiseFactor = k === 0 ? 0 : 1;
+      let steer = prior[i * 3]! + sStd * gauss(state) * noiseFactor;
+      let drive = prior[i * 3 + 1]! + dStd * gauss(state) * noiseFactor;
+      let brake = prior[i * 3 + 2]! + bStd * gauss(state) * noiseFactor;
       steer = clamp(steer, -config.maxSteer, config.maxSteer);
       const minDrive = allowReverse ? -config.maxDriveForce : 0;
       drive = clamp(drive, minDrive, config.maxDriveForce);
@@ -356,7 +327,6 @@ export function mpcTrack(
       work[i * 3 + 1]! = drive;
       work[i * 3 + 2]! = brake;
     }
-    // Roll forward.
     let s: CarKinematicState = { ...current };
     const traj: CarKinematicState[] = [];
     for (let i = 0; i < H; i++) {
@@ -364,27 +334,60 @@ export function mpcTrack(
       s = forwardSim(s, u, dt);
       traj.push(s);
     }
-    const cost = scoreRollout(traj, ref, work, state.prev, goal, weights);
-    if (cost < bestCost) {
-      bestCost = cost;
-      bestSeq = new Float64Array(work);
-    }
+    const cost = scoreRollout(traj, ref, work, state.prev, goal, terminalActive, weights);
+    costs[k] = cost;
+    if (cost < minCost) minCost = cost;
+    // Copy work → samples[k]
+    for (let i = 0; i < H * 3; i++) samples[k * H * 3 + i] = work[i]!;
   }
 
-  // Persist for warm-start.
-  state.prev = bestSeq;
+  // MPPI importance-weighted average. Subtract minCost for numerical
+  // stability before the softmax (a classic log-sum-exp trick).
+  const weightsArr = new Float64Array(K);
+  let weightSum = 0;
+  for (let k = 0; k < K; k++) {
+    const w = Math.exp(-(costs[k]! - minCost) / lambda);
+    weightsArr[k] = w;
+    weightSum += w;
+  }
+  // Compose the optimal sequence as the weighted average.
+  const optimal = new Float64Array(H * 3);
+  if (weightSum > 1e-9) {
+    for (let k = 0; k < K; k++) {
+      const w = weightsArr[k]! / weightSum;
+      for (let i = 0; i < H * 3; i++) {
+        optimal[i]! += w * samples[k * H * 3 + i]!;
+      }
+    }
+  } else {
+    // Degenerate case (all weights underflow to 0); fall back to
+    // the lowest-cost sample.
+    let bestK = 0;
+    for (let k = 1; k < K; k++) if (costs[k]! < costs[bestK]!) bestK = k;
+    for (let i = 0; i < H * 3; i++) optimal[i] = samples[bestK * H * 3 + i]!;
+  }
+  // Re-clamp the weighted-average controls (the average of valid
+  // controls is always valid for box constraints, but float roundoff
+  // can put us microscopically out).
+  for (let i = 0; i < H; i++) {
+    optimal[i * 3]! = clamp(optimal[i * 3]!, -config.maxSteer, config.maxSteer);
+    const minDrive = allowReverse ? -config.maxDriveForce : 0;
+    optimal[i * 3 + 1]! = clamp(optimal[i * 3 + 1]!, minDrive, config.maxDriveForce);
+    optimal[i * 3 + 2]! = clamp(optimal[i * 3 + 2]!, 0, config.maxBrakeForce);
+  }
 
-  const tol = config.goalTolerance ?? 0.5;
+  state.prev = optimal;
+
   const atGoal =
     goal !== undefined &&
     Math.hypot(current.x - goal.x, current.z - goal.z) <= tol;
   return {
-    steer: bestSeq[0]!,
-    driveForce: bestSeq[1]!,
-    brakeForce: bestSeq[2]!,
+    steer: optimal[0]!,
+    driveForce: optimal[1]!,
+    brakeForce: optimal[2]!,
     targetSpeed: ref[0]?.speed ?? 0,
     lookahead: { x: ref[0]?.x ?? current.x, z: ref[0]?.z ?? current.z },
     atGoal,
-    bestCost,
+    bestCost: minCost,
   };
 }

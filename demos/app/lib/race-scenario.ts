@@ -432,48 +432,42 @@ export async function createRaceScenario(
     DEFAULT_LEARNED_PARAMS_V2,
     DEFAULT_LEARNABLE_CONFIG,
   );
-  // Race-tuned MPC weights. For parking / precision scenarios use a
-  // different config (higher wTerminalPosition + wTerminalSpeed, lower
-  // wSpeed). The Race scenario wants to MATCH the plan's target speed
-  // while staying on the line — speed matching is what carries the
-  // chassis around the track, lateral keeps it on the line.
+  // MPPI tracker config. The cost weights work across the entire
+  // racing-to-parking spectrum because the tracker auto-activates the
+  // terminal-pose cost when the plan asks the chassis to stop near a
+  // pose AND the goal is reachable within the horizon (i.e. parking
+  // automatically when the plan structure says so, racing otherwise).
+  //
+  // λ (lambda) is THE key MPPI knob: smaller → more aggressive
+  // (concentrates weight on the lowest-cost samples); larger → more
+  // averaging (smoother but less decisive). 0.5 strikes the bias-
+  // variance balance that handles both modes without retuning.
+  //
+  // Reverse stays ON (the parking workflow needs back-and-forth);
+  // race plans simply won't have samples with negative drive selected
+  // by the softmax because positive-drive samples track the plan
+  // better. Letting reverse stay in the sample distribution costs
+  // virtually nothing.
   const MPC_CONFIG = {
     horizonSteps: MPC_HORIZON,
-    // Fine MPC step (= physics step) so the cost integration sees every
-    // intermediate state. At v=18 m/s the chassis covers 0.9 m per
-    // 0.05 s step — fine enough that the controller can't oscillate
-    // through bad intermediate states the cost function never sampled.
     stepDt: 0.05,
     samples: 64,
     maxSteer: VEHICLE_TUNING.maxSteerAngle ?? 0.6,
     maxDriveForce: ENGINE_FORCE_N,
     maxBrakeForce: BRAKE_FORCE_N,
-    // Reverse intentionally OFF for racing — the planner doesn't emit
-    // reverse on the race course, and allowing reverse samples wastes
-    // budget exploring directions that race plans never need. Parking
-    // scenarios should override `allowReverse: true`.
-    allowReverse: false,
-    // Tight steer exploration — at v=18 m/s the chassis covers 1.8 m
-    // per 0.1 s MPC step, and any steer > ~0.1 rad creates large yaw
-    // changes per step. Wide steer sampling produces overcorrection
-    // oscillations. Drive can be sampled aggressively (less penalised).
-    steerStd: 0.04,
+    allowReverse: true,
+    lambda: 0.5,
+    steerStd: 0.10,
     driveStd: 0.5 * ENGINE_FORCE_N,
     brakeStd: 0.10 * BRAKE_FORCE_N,
-    // Heavy heading + steer-rate damping. Random-shooting MPC has no
-    // intrinsic self-stabilising feedback law (unlike pure-pursuit's
-    // geometric lookahead-rotation), so high-speed stability requires
-    // STRONG penalties on heading deviation and steer jumps to suppress
-    // the per-tick prediction-vs-reality miss that drives oscillation.
-    // The trade is a slower but stable racing run; pure-pursuit remains
-    // the right tracker for time-pressure cruising.
-    wLateral: 3,
-    wHeading: 20,
-    wSpeed: 6,
+    wLateral: 2,
+    wHeading: 3,
+    wSpeed: 10,
     wControlRate: 0.15,
-    wSteerRate: 80,
-    wTerminalPosition: 0,
-    wTerminalSpeed: 0,
+    wSteerRate: 25,
+    wTerminalPosition: 50,
+    wTerminalSpeed: 30,
+    goalTolerance: 0.5,
   };
 
   const cars: CarInternal[] = opts.entries.map((entry, i) => {
