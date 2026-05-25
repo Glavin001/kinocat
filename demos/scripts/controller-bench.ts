@@ -19,7 +19,7 @@
 //   pnpm run controller-bench --filter=parking
 //   pnpm run controller-bench --json=out.json # machine-readable
 
-import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -28,16 +28,54 @@ import {
   type RaceTuning,
   type RaceEntry,
 } from '../app/lib/race-scenario';
-import { kinematicEntry } from '../app/lib/headless-race';
+import {
+  kinematicEntry,
+  v2Entry,
+  parametricOnlyEntry,
+} from '../app/lib/headless-race';
 import {
   buildParkingScenario,
   parkingLibrary,
   type ParkingScenarioId,
 } from '../app/lib/parking-scenarios';
 import { buildRaceCourse } from '../app/lib/race-primitives-scenarios';
+import { modelFromJson } from '../app/lib/v2-model-file';
+import type { PersistedV2Model } from '../app/lib/v2-model-persistence';
 
-function parkingEntry(name: string): RaceEntry {
-  return { name, lib: parkingLibrary() };
+type EntryKind = 'kinematic' | 'parametric-only' | 'v2-default';
+
+function loadEntry(kind: EntryKind, forScenario: 'race' | 'parking'): RaceEntry {
+  if (forScenario === 'parking') {
+    // Parking uses the parking-specific primitive library regardless
+    // of which planner-side variant we're benching — the parking
+    // library is hand-tuned for slow-maneuver clearance and isn't
+    // the variable under test here. (A future extension would
+    // produce v2-derived parking primitives.)
+    return { name: kind, lib: parkingLibrary() };
+  }
+  // Race scenario varies the library based on the entry kind.
+  switch (kind) {
+    case 'kinematic':
+      return kinematicEntry('kinematic');
+    case 'parametric-only':
+      return parametricOnlyEntry('parametric-only');
+    case 'v2-default': {
+      const modelPath = resolve(
+        dirname(fileURLToPath(import.meta.url)),
+        '..',
+        'public',
+        'models',
+        'v2-default.json',
+      );
+      if (!existsSync(modelPath)) {
+        throw new Error(
+          `v2-default.json not found at ${modelPath}. Run \`pnpm run train:quick\` first.`,
+        );
+      }
+      const payload = JSON.parse(readFileSync(modelPath, 'utf-8')) as PersistedV2Model;
+      return v2Entry('v2-default', modelFromJson(payload));
+    }
+  }
 }
 
 /** Build a race-scenario-compatible course from a parking scenario. The
@@ -63,7 +101,7 @@ function parkingCourse(id: ParkingScenarioId): ReturnType<typeof buildRaceCourse
 interface BenchScenario {
   name: string;
   description: string;
-  run: (tuning: Partial<RaceTuning>) => Promise<BenchResult>;
+  run: (tuning: Partial<RaceTuning>, entryKind: EntryKind) => Promise<BenchResult>;
 }
 
 interface BenchResult {
@@ -96,10 +134,10 @@ function wrapPi(a: number): number {
 const raceScenario: BenchScenario = {
   name: 'race',
   description: '1 lap of the /raceprimitives slalom + corners course',
-  async run(tuning) {
+  async run(tuning, entryKind) {
     const MAX_SIM = 120;
     const scenario = await createRaceScenario({
-      entries: [kinematicEntry('bench')],
+      entries: [loadEntry(entryKind, 'race')],
       targetLaps: 1,
       syncHold: false,
       offTrackRecovery: 'spawn',
@@ -142,11 +180,11 @@ function makeParkingScenario(
   return {
     name: `parking-${id}`,
     description: label,
-    async run(tuning) {
+    async run(tuning, entryKind) {
       const course = parkingCourse(id);
       const goal = course.waypoints[course.waypoints.length - 1]!;
       const scenario = await createRaceScenario({
-        entries: [parkingEntry('bench')],
+        entries: [loadEntry(entryKind, 'parking')],
         targetLaps: 1,
         syncHold: false,
         offTrackRecovery: 'none',
@@ -223,6 +261,7 @@ async function main(): Promise<void> {
   const { values } = parseArgs({
     options: {
       tracker: { type: 'string', default: 'pure-pursuit' },
+      entry: { type: 'string', default: 'kinematic' },
       filter: { type: 'string' },
       json: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
@@ -236,6 +275,10 @@ async function main(): Promise<void> {
     return;
   }
   const tracker = values.tracker as 'pure-pursuit' | 'mpc';
+  const entryKind = values.entry as EntryKind;
+  if (!['kinematic', 'parametric-only', 'v2-default'].includes(entryKind)) {
+    throw new Error(`Invalid --entry=${entryKind}. Use kinematic | parametric-only | v2-default.`);
+  }
   const tuning: Partial<RaceTuning> = { tracker };
   const filter = values.filter
     ? new Set(values.filter.split(',').map((s) => s.trim()))
@@ -244,13 +287,13 @@ async function main(): Promise<void> {
     ? ALL_SCENARIOS.filter((s) => filter.has(s.name))
     : ALL_SCENARIOS;
 
-  process.stdout.write(`controller bench · tracker=${tracker} · ${scenarios.length} scenarios\n\n`);
+  process.stdout.write(`controller bench · tracker=${tracker} · entry=${entryKind} · ${scenarios.length} scenarios\n\n`);
 
   const results: BenchResult[] = [];
   for (const s of scenarios) {
     process.stdout.write(`▶ ${s.name}: ${s.description} ...`);
     const start = performance.now();
-    const result = await s.run(tuning);
+    const result = await s.run(tuning, entryKind);
     const wall = ((performance.now() - start) / 1000).toFixed(1);
     process.stdout.write(`  [${result.passed ? 'PASS' : 'FAIL'}] ${wall}s wall, ${result.note}\n`);
     results.push(result);
