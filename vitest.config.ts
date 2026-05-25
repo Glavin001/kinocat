@@ -15,6 +15,20 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['core/test/**/*.test.ts', 'demos/test/**/*.test.ts'],
+    // Single-fork pool. The default `threads` pool runs tests in
+    // worker threads with RPC-based result reporting; on busy CI
+    // runners that RPC has been observed to time out, producing an
+    // `onTimeoutError` from vitest's internals (intermittent CI
+    // failure on PR #23 that doesn't reproduce locally). A single
+    // forked process eliminates the RPC race entirely. Trade-off:
+    // tests run sequentially (~no slower locally since the bottleneck
+    // is the long-running training-driver test, not parallelism).
+    pool: 'forks',
+    poolOptions: {
+      forks: {
+        singleFork: true,
+      },
+    },
     // 30 s test timeout. `training-driver.test.ts` legitimately runs
     // ~18 s on a warm dev machine; CI runners under load have been
     // observed to push it past the previous 20 s ceiling, surfacing
