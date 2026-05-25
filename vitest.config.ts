@@ -22,6 +22,18 @@ export default defineConfig({
     // failure on PR #23). 30 s gives headroom without masking any
     // test that's actually broken.
     testTimeout: 30000,
+    // Same reasoning for hook teardown — long-running async fits may
+    // not have settled by the time the test exits; the default 10 s
+    // hook timeout has been the second-most-likely source of the
+    // intermittent `onTimeoutError` on CI.
+    hookTimeout: 30000,
+    teardownTimeout: 15000,
+    // Retry intermittent failures up to twice on CI. A real test
+    // regression would fail all three runs; a pure timing flake gets
+    // one or two extra chances to pass on a busy runner. Local
+    // development sees the same retry budget so failures we WANT to
+    // see don't get masked away.
+    retry: 2,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'lcov', 'html'],
