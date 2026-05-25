@@ -25,12 +25,15 @@ import {
   createCarMeshHelper,
   syncCarMesh,
   createGoalMarkerHelper,
+  createAgentFootprintHelper,
 } from 'kinocat/adapters/three';
 import {
   PARKING_BOUNDS,
   PARKING_PALETTE as C,
   PARKING_SCENARIOS,
   PARKING_LABELS,
+  PARKING_AGENT,
+  PARKING_FOOTPRINT_INFLATE,
   buildParkingScenario,
   parkingLibrary,
   type ParkingScenarioId,
@@ -75,6 +78,12 @@ function parkingCourse(s: ParkingScenario): import('../lib/race-scenario').RaceS
   };
 }
 
+// Goal satisfaction thresholds — derived from PARKING_BENCH_TUNING so
+// the HUD reflects the same criteria the runner uses.
+const GOAL_POS_TOL = PARKING_BENCH_TUNING.arriveRadius;          // 0.6 m
+const GOAL_HEADING_TOL_DEG = PARKING_BENCH_TUNING.plannerGoalHeadingTol * (180 / Math.PI); // ~11.5°
+const GOAL_SPEED_TOL = 0.15; // m/s — close enough to stopped
+
 interface ParkingHud {
   speed: number;
   goalDist: number;
@@ -93,6 +102,7 @@ interface ParkingHud {
   activeSegmentIndex: number;
   totalSegments: number;
   activeSegmentGear: 'fwd' | 'rev' | 'unknown';
+  finished: boolean;
 }
 
 function angleDiff(a: number, b: number): number {
@@ -152,8 +162,22 @@ export default function Parking() {
     let carMesh: ReturnType<typeof createCarMeshHelper> | null = null;
     let goalMesh: THREE.Mesh | null = null;
     let raceScenario: RaceScenario | null = null;
+    let cachedGoalWp: { x: number; z: number; heading: number } | null = null;
+    let lastPlanRef: ReadonlyArray<{ x: number; z: number }> | null = null;
     let cancelled = false;
     let buildGeneration = 0;
+    let hudFrameCounter = 0;
+
+    // Debug overlays: ego footprint wireframe + obstacle clearance rings.
+    const footprintLine = createAgentFootprintHelper(PARKING_AGENT.footprint, {
+      color: C.ego,
+    });
+    footprintLine.visible = false;
+    scene.add(footprintLine);
+
+    let clearanceGroup: THREE.Group = new THREE.Group();
+    clearanceGroup.visible = false;
+    scene.add(clearanceGroup);
 
     function clearScenarioMeshes() {
       for (const m of scenarioMeshes) scene.remove(m);
@@ -218,6 +242,35 @@ export default function Parking() {
       outline.position.set(s.targetStall.x, 0.02, s.targetStall.z);
       scene.add(outline);
       scenarioMeshes.push(outline);
+
+      // Rebuild obstacle clearance rings (pink outlines showing the
+      // planner's footprintInflate band around each obstacle polygon).
+      scene.remove(clearanceGroup);
+      clearanceGroup = new THREE.Group();
+      clearanceGroup.visible = debugRef.current;
+      for (const poly of s.obstacles) {
+        let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+        for (const [px, pz] of poly) {
+          if (px < x0) x0 = px;
+          if (px > x1) x1 = px;
+          if (pz < z0) z0 = pz;
+          if (pz > z1) z1 = pz;
+        }
+        const inf = PARKING_FOOTPRINT_INFLATE;
+        const y = 0.12;
+        const ring = [
+          new THREE.Vector3(x0 - inf, y, z0 - inf),
+          new THREE.Vector3(x1 + inf, y, z0 - inf),
+          new THREE.Vector3(x1 + inf, y, z1 + inf),
+          new THREE.Vector3(x0 - inf, y, z1 + inf),
+          new THREE.Vector3(x0 - inf, y, z0 - inf),
+        ];
+        clearanceGroup.add(new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints(ring),
+          new THREE.LineBasicMaterial({ color: 0xff66aa, transparent: true, opacity: 0.6 }),
+        ));
+      }
+      scene.add(clearanceGroup);
     }
 
     async function buildScenario(id: ParkingScenarioId) {
@@ -246,6 +299,7 @@ export default function Parking() {
       // Guard: a newer build may have started while we awaited.
       if (gen !== buildGeneration) { rs.dispose(); return; }
       raceScenario = rs;
+      cachedGoalWp = { x: s.goal.x, z: s.goal.z, heading: s.goal.heading };
       // Car mesh attached to the chassis from the scenario.
       const handle = raceScenario.getCarHandle('ego');
       if (handle) {
@@ -295,30 +349,46 @@ export default function Parking() {
         const s = raceScenario.status()[0];
         if (s && carMesh) {
           syncCarMesh(carMesh.group, s.state);
-          refreshPathLine(s.plan);
-          const course = parkingCourse(buildParkingScenario(scenarioIdRef.current));
-          const wp = course?.waypoints[0];
-          const goalDist = wp ? Math.hypot(s.state.x - wp.x, s.state.z - wp.z) : NaN;
-          const headingError = wp ? angleDiff(s.state.heading, wp.heading) * (180 / Math.PI) : NaN;
-          setHud({
-            speed: s.state.speed,
-            goalDist,
-            headingError,
-            totalReplans: s.diagnostics.totalReplans,
-            lastReplanMs: s.diagnostics.lastReplanMs,
-            steer: s.metrics.liveControls.steer,
-            throttle: s.metrics.liveControls.throttle,
-            brake: s.metrics.liveControls.brake,
-            targetSpeed: s.metrics.liveControls.targetSpeed,
-            trackingErrorRms: s.metrics.trackingErrorRms,
-            planAgeMs: s.diagnostics.planAgeMs,
-            consecutiveFailedReplans: s.diagnostics.consecutiveFailedReplans,
-            predErrorRms: s.diagnostics.predErrorRms,
-            planLength: s.plan?.length ?? 0,
-            activeSegmentIndex: s.activeSegmentIndex,
-            totalSegments: s.totalSegments,
-            activeSegmentGear: s.activeSegmentGear,
-          });
+          // Debug overlays: track ego footprint + toggle clearance rings.
+          footprintLine.visible = debugRef.current;
+          clearanceGroup.visible = debugRef.current;
+          if (debugRef.current) {
+            footprintLine.position.set(s.state.x, 0, s.state.z);
+            footprintLine.rotation.y = -s.state.heading;
+          }
+          // Only rebuild the path line when the plan reference changes.
+          if (s.plan !== lastPlanRef || !showPathRef.current !== !pathLine) {
+            lastPlanRef = s.plan;
+            refreshPathLine(s.plan);
+          }
+          // Throttle React HUD updates to ~10 fps instead of every frame.
+          hudFrameCounter++;
+          if (hudFrameCounter >= 6) {
+            hudFrameCounter = 0;
+            const wp = cachedGoalWp;
+            const goalDist = wp ? Math.hypot(s.state.x - wp.x, s.state.z - wp.z) : NaN;
+            const headingError = wp ? angleDiff(s.state.heading, wp.heading) * (180 / Math.PI) : NaN;
+            setHud({
+              speed: s.state.speed,
+              goalDist,
+              headingError,
+              totalReplans: s.diagnostics.totalReplans,
+              lastReplanMs: s.diagnostics.lastReplanMs,
+              steer: s.metrics.liveControls.steer,
+              throttle: s.metrics.liveControls.throttle,
+              brake: s.metrics.liveControls.brake,
+              targetSpeed: s.metrics.liveControls.targetSpeed,
+              trackingErrorRms: s.metrics.trackingErrorRms,
+              planAgeMs: s.diagnostics.planAgeMs,
+              consecutiveFailedReplans: s.diagnostics.consecutiveFailedReplans,
+              predErrorRms: s.diagnostics.predErrorRms,
+              planLength: s.plan?.length ?? 0,
+              activeSegmentIndex: s.activeSegmentIndex,
+              totalSegments: s.totalSegments,
+              activeSegmentGear: s.activeSegmentGear,
+              finished: s.finished,
+            });
+          }
           if (s.laps.length >= 1 && s.laps[0]) setStatus(`PARKED · ${s.laps[0].duration.toFixed(2)}s`);
         }
       }
@@ -355,6 +425,8 @@ export default function Parking() {
       window.removeEventListener('keydown', onKey);
       window.removeEventListener('resize', onResize);
       clearScenarioMeshes();
+      scene.remove(footprintLine);
+      scene.remove(clearanceGroup);
       if (raceScenario) raceScenario.dispose();
       renderer.dispose();
       host.removeChild(renderer.domElement);
@@ -392,19 +464,44 @@ export default function Parking() {
           tight parking — bench-parity runner
         </div>
         <div>{status}</div>
-        {hud && (
-          <div style={{ opacity: 0.75, marginTop: 4, fontSize: 11 }}>
-            <span>v={hud.speed.toFixed(2)} m/s</span>
-            {' · '}
-            <span>goal={hud.goalDist.toFixed(2)} m</span>
-            {' · '}
-            <span>{'\u0394\u03b8'}={hud.headingError >= 0 ? '+' : ''}{hud.headingError.toFixed(1)}&deg;</span>
-            {' · '}
-            <span>replans={hud.totalReplans}</span>
-            {' · '}
-            <span>plan-ms={hud.lastReplanMs.toFixed(0)}</span>
-          </div>
-        )}
+        {hud && (() => {
+          const posOk = hud.goalDist <= GOAL_POS_TOL;
+          const hdgOk = Math.abs(hud.headingError) <= GOAL_HEADING_TOL_DEG;
+          const spdOk = Math.abs(hud.speed) <= GOAL_SPEED_TOL;
+          const allOk = posOk && hdgOk && spdOk;
+          return (
+            <>
+              <div style={{ marginTop: 6, fontSize: 11, borderTop: '1px solid #1c2840', paddingTop: 5 }}>
+                <div style={{ color: allOk ? '#4ade80' : '#55dcff', fontSize: 10, marginBottom: 3 }}>
+                  GOAL {allOk ? '— ALL MET' : hud.finished ? '— INCOMPLETE' : ''}
+                </div>
+                <div>
+                  <span style={{ color: posOk ? '#4ade80' : '#ff6b6b' }}>{posOk ? '\u2713' : '\u2717'}</span>
+                  {' pos '}
+                  {hud.goalDist.toFixed(2)} m
+                  <span style={{ opacity: 0.5 }}> / {GOAL_POS_TOL} m</span>
+                </div>
+                <div>
+                  <span style={{ color: hdgOk ? '#4ade80' : '#ff6b6b' }}>{hdgOk ? '\u2713' : '\u2717'}</span>
+                  {' hdg '}
+                  {hud.headingError >= 0 ? '+' : ''}{hud.headingError.toFixed(1)}&deg;
+                  <span style={{ opacity: 0.5 }}> / &plusmn;{GOAL_HEADING_TOL_DEG.toFixed(1)}&deg;</span>
+                </div>
+                <div>
+                  <span style={{ color: spdOk ? '#4ade80' : '#ff6b6b' }}>{spdOk ? '\u2713' : '\u2717'}</span>
+                  {' spd '}
+                  {Math.abs(hud.speed).toFixed(2)} m/s
+                  <span style={{ opacity: 0.5 }}> / {GOAL_SPEED_TOL} m/s</span>
+                </div>
+              </div>
+              <div style={{ opacity: 0.75, marginTop: 4, fontSize: 11 }}>
+                <span>replans={hud.totalReplans}</span>
+                {' · '}
+                <span>plan-ms={hud.lastReplanMs.toFixed(0)}</span>
+              </div>
+            </>
+          );
+        })()}
         {debug && hud && (
           <div style={{ marginTop: 6, fontSize: 11, opacity: 0.8, borderTop: '1px solid #1c2840', paddingTop: 6 }}>
             <div style={{ color: '#55dcff', fontSize: 10, marginBottom: 3 }}>CONTROLS</div>
