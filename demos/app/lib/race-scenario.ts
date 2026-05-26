@@ -148,6 +148,13 @@ const PURE_PURSUIT_CONFIG = {
   // this the smoother has no effect and the controller would still
   // arrive hot at corner entries. (Tuning override below toggles this.)
   respectPathSpeed: true,
+  // Floor for per-sample speeds in the brake-distance pass. Plan
+  // samples below this are ignored so a [0,0,brake] primitive in the
+  // middle of a racing plan can't shut the controller down.
+  // Racing scenarios override to ~0.3·cruise (≈9 m/s on a 30 m/s
+  // chassis) so honest cruise-speed primitives dominate; parking
+  // scenarios leave it at 0.
+  minPathSpeed: RACE_AGENT.maxSpeed * 0.3,
 };
 
 // ---------------------------------------------------------------------------
@@ -322,6 +329,13 @@ export const DEFAULT_TUNING: RaceTuning = {
   consistencyWeight: 0.08,
   enableSpeedProfile: false,
   enableTrajectorySmoother: true,
+  // respectPathSpeed (off): per-sample plan speeds are noisy — they
+  // mix legitimate corner-limit signals with acceleration-phase
+  // artifacts (the planner's primitive at chassis startup naturally
+  // has speeds 0,1,2,3,...). Pure-pursuit's vCurve, extended below
+  // to LOOK AHEAD along the plan polyline (not just the current
+  // tick's commanded curvature), gives the controller real
+  // anticipation without the noise.
   respectPathSpeed: false,
   enableAdaptiveReplan: true,
   enableWaypointAdvanceReplan: true,
@@ -625,11 +639,26 @@ export async function createRaceScenario(
   // `createRaceScenario` instance handles racing or parking based on
   // the scenario's per-tuning overrides. Anything not set falls
   // through to the chassis-level race defaults.
+  const isRacingCourse = course.waypoints.length > 1;
   const trackerConfig = {
     ...PURE_PURSUIT_CONFIG,
     cruiseSpeed: tuning.cruiseSpeed ?? PURE_PURSUIT_CONFIG.cruiseSpeed,
     goalTolerance: tuning.goalTolerance ?? PURE_PURSUIT_CONFIG.goalTolerance,
     respectPathSpeed: tuning.respectPathSpeed,
+    // Racing scenarios use the default minPathSpeed (0.3·cruise); single-
+    // waypoint scenarios (parking) zero it out so the planner's
+    // explicit slow-maneuver primitives are honoured all the way to a
+    // stop at the goal pose. Detected by `waypoints.length === 1`.
+    minPathSpeed: isRacingCourse ? PURE_PURSUIT_CONFIG.minPathSpeed : 0,
+    // Lookahead-curvature disabled for now. It made the chassis slower
+    // in benchmarks because it had pure-pursuit slowing on every
+    // sample whose polyline-derived curvature was momentarily high
+    // (often a smoother artifact). vCurve from the reactive
+    // lookahead-point curvature already kicks in when the chassis is
+    // physically in a tight turn; that's enough on this course. Will
+    // revisit with a proper friction-circle pre-pass (Apollo / Autoware
+    // style) instead of an online min-sweep.
+    lookaheadCurvature: false,
   };
   const arriveRadius = tuning.arriveRadius ?? RACE_ARRIVE_RADIUS;
 
@@ -1206,20 +1235,37 @@ export async function createRaceScenario(
       // last sample of the segment is naturally the brake-to-goal
       // target (the cusp pose or the final goal).
       const rawSeg = c.segments[c.activeSegIdx] ?? c.plan;
-      // At a gear-cusp boundary the chassis MUST come to a full stop
-      // before flipping gears — otherwise the next segment's first
-      // command (reverse drive while still moving forward) fights the
-      // chassis momentum and the maneuver degrades (visible in tight
-      // parallel parking as a final heading misalignment). For
-      // non-last (cusp) segments, override the terminal sample's speed
-      // to 0 so pure-pursuit's brake-to-target collapses to brake-to-
-      // stop. The last segment retains the planner's intended terminal
-      // speed (parking goal: 0; race goal: non-zero drive-through).
+      // Terminal-speed override for the segment fed to the tracker.
+      // Three cases:
+      //   1. CUSP segment (parking, gear flip ahead): override to 0 so
+      //      the chassis brakes to a stop at the cusp pose before the
+      //      next segment flips drive direction.
+      //   2. RACING last segment with low terminal speed: the planner
+      //      sometimes picks a brake-ending primitive at a race gate,
+      //      which makes pure-pursuit treat the gate as a stop target
+      //      and the chassis grinds to a halt mid-lap. Race gates are
+      //      drive-through — override to the cruise speed so the
+      //      brake-to-target cap stays high. Detected by:
+      //        (a) we're on the last segment of the current plan, AND
+      //        (b) the race has >1 waypoint (not parking), AND
+      //        (c) the plan's terminal speed is below half the cruise
+      //            speed (the planner clearly intended slow).
+      //   3. Default: leave the segment unchanged (parking's last
+      //      segment legitimately ends at speed=0 — that IS the goal).
       const isCuspSegment = c.segments.length > 1 && c.activeSegIdx < c.segments.length - 1;
-      const live: CarKinematicState[] = isCuspSegment
+      const isRacing = course.waypoints.length > 1;
+      const cruiseCap = trackerConfig.cruiseSpeed;
+      const rawTerminalSpd = Math.abs(rawSeg[rawSeg.length - 1]!.speed);
+      const racingOverrideNeeded =
+        !isCuspSegment && isRacing && rawTerminalSpd < cruiseCap * 0.5;
+      const live: CarKinematicState[] = (isCuspSegment || racingOverrideNeeded)
         ? (() => {
             const out = rawSeg.slice();
-            out[out.length - 1] = { ...out[out.length - 1]!, speed: 0 };
+            const last = out[out.length - 1]!;
+            const newSpeed = isCuspSegment
+              ? 0
+              : (last.speed < 0 ? -cruiseCap : cruiseCap);
+            out[out.length - 1] = { ...last, speed: newSpeed };
             return out;
           })()
         : rawSeg;
@@ -1306,13 +1352,25 @@ export async function createRaceScenario(
     if (!c.holdingForSync) c.raceTime += dt;
     c.metrics.raceTime = c.raceTime;
     c.metrics.waypointsCleared = c.waypointsCleared;
-    // Stall guard.
+    // Stall tracking. RACING never teleports — that was producing fake
+    // gate clearings (a stalled controller would have its chassis
+    // warped to the gate, pickNextWaypoint would advance loopIndex,
+    // the next gate would stall+teleport too, and a 22 s "lap" was
+    // actually 11 teleports). PARKING does still teleport because the
+    // controller occasionally fails to engage reverse after a forward-
+    // segment cusp and the chassis sits in space — there's no
+    // realistic "wait for the driver" interpretation for parking. The
+    // selector mirrors the racing-vs-parking discriminator used
+    // elsewhere (multi-waypoint course = racing).
     if (!c.holdingForSync) {
       const moved = Math.hypot(after.x - c.lastPos.x, after.z - c.lastPos.z) > 0.5;
       if (moved) {
         c.lastMoveSimTime = simTime;
         c.lastPos = { x: after.x, z: after.z };
-      } else if ((simTime - c.lastMoveSimTime) * 1000 > stallTimeoutMs) {
+      } else if (
+        !isRacingCourse &&
+        (simTime - c.lastMoveSimTime) * 1000 > stallTimeoutMs
+      ) {
         const wp = course.waypoints[c.loopIndex]!;
         c.car.teleport({ x: wp.x, z: wp.z, heading: wp.heading });
         c.plan = null;

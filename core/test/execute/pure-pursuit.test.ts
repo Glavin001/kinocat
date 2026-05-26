@@ -85,23 +85,30 @@ describe('purePursuit', () => {
     expect(purePursuit(cur, path, cfg)).toEqual(purePursuit(cur, path, cfg));
   });
 
-  it('respects path speed when respectPathSpeed is enabled', () => {
-    // Straight path with a slow zone in the forward window. Without the
-    // option, the controller targets cruise; with it, the target should
-    // drop to the slow zone's planned speed.
+  it('respects path speed with brake-distance pass when respectPathSpeed is enabled', () => {
+    // Straight path with a slow zone in the forward window. The cap is
+    // the brake-distance-aware target: v_now = sqrt(v_plan² + 2·a·d),
+    // taken as the minimum over the lookahead window. Earlier
+    // implementations took the raw min of plan speeds, which would
+    // make the chassis slam to the slow-zone speed even when 14 m
+    // ahead — that was a stall trap (chassis stopped, scenario stall
+    // guard teleported it to the next gate). The brake-distance
+    // version slows gracefully so the chassis arrives at the slow
+    // zone at the planned speed.
+    const highCruiseCfg = { ...cfg, cruiseSpeed: 20, lookaheadMax: 20 };
     const path: PlanPath = [
-      { x: 0, z: 0, heading: 0, speed: 6, t: 0 },
-      { x: 2, z: 0, heading: 0, speed: 6, t: 0.3 },
-      { x: 4, z: 0, heading: 0, speed: 2, t: 0.9 }, // slow zone
+      { x: 0, z: 0, heading: 0, speed: 12, t: 0 },
+      { x: 2, z: 0, heading: 0, speed: 12, t: 0.3 },
+      { x: 4, z: 0, heading: 0, speed: 2, t: 0.9 }, // slow zone at d=4m
       { x: 6, z: 0, heading: 0, speed: 2, t: 1.5 },
-      { x: 8, z: 0, heading: 0, speed: 6, t: 2.0 },
+      { x: 8, z: 0, heading: 0, speed: 12, t: 2.0 },
     ];
-    const cur: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 6, t: 0 };
-    const without = purePursuit(cur, path, { ...cfg, respectPathSpeed: false });
-    const withCap = purePursuit(cur, path, { ...cfg, respectPathSpeed: true });
+    const cur: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 12, t: 0 };
+    const without = purePursuit(cur, path, { ...highCruiseCfg, respectPathSpeed: false });
+    const withCap = purePursuit(cur, path, { ...highCruiseCfg, respectPathSpeed: true });
     expect(Math.abs(without.targetSpeed)).toBeGreaterThan(Math.abs(withCap.targetSpeed));
-    // The cap should be the slow-zone speed (2 m/s).
-    expect(Math.abs(withCap.targetSpeed)).toBeCloseTo(2, 5);
+    // Brake-distance to 2 m/s over 4 m at maxDecel=8: sqrt(4 + 64) ≈ 8.25 m/s.
+    expect(Math.abs(withCap.targetSpeed)).toBeCloseTo(Math.sqrt(4 + 64), 2);
   });
 
   it('brakes at the goal', () => {

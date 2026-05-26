@@ -73,6 +73,35 @@ export interface RaceResult {
   replanHistory: ReplanSnapshot[];
 }
 
+/** Per-car, per-sampled-tick trace record for offline analysis. The
+ *  captured points are sampled at a fixed sim-time stride to keep file
+ *  size bounded; 0.1 s is fine for visualising trajectories without
+ *  generating multi-MB JSON for a 3-minute race. */
+export interface TickSample {
+  simTime: number;
+  x: number;
+  z: number;
+  heading: number;
+  speed: number;
+  steer: number;
+  throttle: number;
+  brake: number;
+  targetSpeed: number;
+  loopIndex: number;
+  /** Min distance from chassis to plan polyline (m) — quantifies
+   *  the lateral tracking error the chassis is fighting. */
+  lateralErr: number;
+  /** Sample index into the plan that the controller is nearest to. */
+  planNearestIdx: number;
+  /** Plan length when this sample was taken. */
+  planLength: number;
+}
+
+export interface CarTrace {
+  name: string;
+  samples: TickSample[];
+}
+
 export interface RunRaceOptions {
   entries: RaceEntry[];
   targetLaps?: number;
@@ -88,6 +117,16 @@ export interface RunRaceOptions {
   progressEverySec?: number;
   /** Per-feature toggles for ablation studies. Defaults to all-on. */
   tuning?: Partial<RaceTuning>;
+  /** When set, captures one per-car `TickSample` every `traceEverySec`
+   *  simulated seconds. Default off (no capture). At 0.1 s a 180 s race
+   *  produces ~1800 samples per car ≈ 250 KB JSON — small enough to
+   *  inspect in any text editor and big enough to visualise the full
+   *  trajectory in the browser. */
+  traceEverySec?: number;
+  /** Callback invoked once at the end of the race with the captured
+   *  traces (one entry per car). Only called when `traceEverySec` is
+   *  set. */
+  onTrace?: (traces: CarTrace[]) => void;
 }
 
 /** Race every entry against each other in independent Rapier worlds
@@ -107,6 +146,12 @@ export async function runHeadlessRace(
     tuning: opts.tuning,
   });
   let nextProgressAt = progressEvery;
+  const trace = opts.traceEverySec !== undefined;
+  const traceStride = opts.traceEverySec ?? 0;
+  let nextTraceAt = traceStride;
+  const traces: CarTrace[] = trace
+    ? opts.entries.map((e) => ({ name: e.name, samples: [] }))
+    : [];
   while (scenario.simTime() < maxSimTime) {
     const r = scenario.tick();
     if (r.allFinished) break;
@@ -120,7 +165,55 @@ export async function runHeadlessRace(
       opts.onProgress?.(`t=${r.simTime.toFixed(1)}s ${progress}`);
       nextProgressAt += progressEvery;
     }
+    if (trace && r.simTime >= nextTraceAt) {
+      for (let i = 0; i < r.cars.length; i++) {
+        const c = r.cars[i]!;
+        const tr = traces[i]!;
+        // Lateral error: min distance from chassis to plan polyline.
+        let nearest = 0;
+        let lateralErr = Infinity;
+        if (c.plan && c.plan.length >= 2) {
+          for (let j = 0; j < c.plan.length - 1; j++) {
+            const a = c.plan[j]!;
+            const b = c.plan[j + 1]!;
+            const dx = b.x - a.x;
+            const dz = b.z - a.z;
+            const lenSq = dx * dx + dz * dz;
+            let u = 0;
+            if (lenSq > 1e-9) {
+              u = ((c.state.x - a.x) * dx + (c.state.z - a.z) * dz) / lenSq;
+              if (u < 0) u = 0;
+              else if (u > 1) u = 1;
+            }
+            const px = a.x + dx * u;
+            const pz = a.z + dz * u;
+            const d = Math.hypot(c.state.x - px, c.state.z - pz);
+            if (d < lateralErr) { lateralErr = d; nearest = j; }
+          }
+        } else {
+          lateralErr = 0;
+        }
+        const ctrl = c.metrics.liveControls;
+        tr.samples.push({
+          simTime: r.simTime,
+          x: c.state.x,
+          z: c.state.z,
+          heading: c.state.heading,
+          speed: c.state.speed,
+          steer: ctrl?.steer ?? 0,
+          throttle: ctrl?.throttle ?? 0,
+          brake: ctrl?.brake ?? 0,
+          targetSpeed: ctrl?.targetSpeed ?? 0,
+          loopIndex: c.loopIndex,
+          lateralErr,
+          planNearestIdx: nearest,
+          planLength: c.plan?.length ?? 0,
+        });
+      }
+      nextTraceAt += traceStride;
+    }
   }
+  if (trace) opts.onTrace?.(traces);
   const final = scenario.status();
   const finalSimTime = scenario.simTime();
   scenario.dispose();

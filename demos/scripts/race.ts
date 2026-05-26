@@ -17,6 +17,7 @@ import {
   v2Entry,
   type RaceEntry,
   type RaceResult,
+  type CarTrace,
 } from '../app/lib/headless-race';
 import { modelFromJson } from '../app/lib/v2-model-file';
 import type { PersistedV2Model } from '../app/lib/v2-model-persistence';
@@ -50,6 +51,7 @@ async function main(): Promise<void> {
       json: { type: 'string' },
       ledger: { type: 'string' },
       'dump-replans': { type: 'string' },
+      'debug-dir': { type: 'string' },
       quick: { type: 'boolean', default: false },
       'no-kinematic': { type: 'boolean', default: false },
       'no-parametric': { type: 'boolean', default: false },
@@ -64,6 +66,7 @@ async function main(): Promise<void> {
                       [--no-kinematic] [--no-parametric]
                       [--tracker=pure-pursuit|mpc]
                       [--dump-replans=path.json]
+                      [--debug-dir=path] (auto-named timestamped debug bundle)
 `);
     return;
   }
@@ -94,6 +97,18 @@ async function main(): Promise<void> {
   const tracker = (values.tracker === 'mpc' ? 'mpc' : 'pure-pursuit') as 'pure-pursuit' | 'mpc';
   process.stdout.write(`race-primitives benchmark — seed=${values.seed} laps=${targetLaps} tracker=${tracker} dt=1/60\n`);
 
+  // --debug-dir captures per-tick traces (0.1 s stride) plus the
+  // structured replan history; output goes to a timestamped
+  // sub-directory so multiple runs don't overwrite each other.
+  const debugDir = values['debug-dir'] ? String(values['debug-dir']) : null;
+  const debugRoot = debugDir
+    ? (isAbsolute(debugDir) ? debugDir : resolve(repoRoot, debugDir))
+    : null;
+  const runStamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const runDir = debugRoot ? `${debugRoot}/${runStamp}` : null;
+  if (runDir) mkdirSync(runDir, { recursive: true });
+  let capturedTraces: CarTrace[] = [];
+
   const results = await runHeadlessRace({
     entries,
     targetLaps,
@@ -101,6 +116,8 @@ async function main(): Promise<void> {
     onProgress: (msg) => process.stdout.write(`  · ${msg}\n`),
     progressEverySec: 10,
     tuning: { tracker },
+    traceEverySec: runDir ? 0.1 : undefined,
+    onTrace: runDir ? (t) => { capturedTraces = t; } : undefined,
   });
 
   // Print table.
@@ -167,6 +184,51 @@ async function main(): Promise<void> {
     const jsonPath = isAbsolute(arg) ? arg : resolve(repoRoot, arg);
     writeFileSync(jsonPath, JSON.stringify({ seed: Number(values.seed), targetLaps, results }, null, 2), 'utf-8');
     process.stdout.write(`wrote ${jsonPath}\n`);
+  }
+
+  // Auto-named debug bundle.
+  if (runDir) {
+    const summary = {
+      timestamp: runStamp,
+      seed: Number(values.seed),
+      targetLaps,
+      tracker,
+      maxSimTime,
+      results: results.map((r) => ({
+        name: r.name,
+        finished: r.finished,
+        laps: r.laps,
+        best: r.best,
+        avg: r.avg,
+        stddev: r.stddev,
+        offTrackEvents: r.offTrackEvents,
+        predErrorRms: r.predErrorRms,
+        totalReplans: r.totalReplans,
+        successfulReplans: r.successfulReplans,
+        replanReasonCounts: r.replanReasonCounts,
+        plannerMsMean: r.plannerMsMean,
+        plannerMsMax: r.plannerMsMax,
+        plannerDeadlineHits: r.plannerDeadlineHits,
+        sharpSteerTicks: r.sharpSteerTicks,
+      })),
+    };
+    writeFileSync(`${runDir}/summary.json`, JSON.stringify(summary, null, 2), 'utf-8');
+    writeFileSync(
+      `${runDir}/replan-history.json`,
+      JSON.stringify(
+        results.map((r) => ({
+          name: r.name,
+          replanHistory: r.replanHistory,
+        })),
+        null,
+        2,
+      ),
+      'utf-8',
+    );
+    if (capturedTraces.length > 0) {
+      writeFileSync(`${runDir}/traces.json`, JSON.stringify(capturedTraces, null, 2), 'utf-8');
+    }
+    process.stdout.write(`wrote debug bundle to ${runDir}\n`);
   }
 
   // Optional replan-history dump — full per-replan structured records
