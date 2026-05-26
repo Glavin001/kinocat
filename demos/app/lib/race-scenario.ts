@@ -113,6 +113,31 @@ export const COMMIT_WINDOW_MS = 200;
  */
 export const LATERAL_ERROR_REPLAN_M = 2.0;
 export const MIN_TIME_BETWEEN_REPLANS_MS = 150;
+/**
+ * Max steering-wheel rate (rad/s). Slew-rate limit on the tracker's
+ * commanded wheel angle, applied after pure-pursuit / MPC. Without this
+ * the v2-learned model produces high-frequency chatter at the steer
+ * saturation boundary (visible as red "sharp turn" dots on the web
+ * /raceprimitives page) which provokes lateral-error replan storms.
+ *
+ * Tuning notes: max steer angle is ±0.222 rad. At 12 rad/s a full-lock
+ * swing takes ~37 ms (≈2 ticks @60Hz) — fast enough not to interfere
+ * with legitimate emergency steering, slow enough that the worst
+ * single-tick spike (|Δsteer| ≈ 0.4 rad/tick = 24 rad/s observed) gets
+ * cut in half. 4 rad/s was too restrictive: the bench race went DNF
+ * because the controller couldn't react to gates in time.
+ */
+export const MAX_STEER_RATE_RAD_PER_SEC = 12.0;
+/**
+ * Adaptive lateral-error replan trigger requires `dLat > threshold` for
+ * this many CONSECUTIVE ticks before firing. Filters one-tick spikes
+ * caused by controller chatter at sharp-turn moments — those usually
+ * resolve themselves on the next tick rather than indicating the plan is
+ * actually wrong. Without this, a 2.1 m blip fires a replan that costs
+ * 50-130 ms of planner CPU and resets the controller's frame of
+ * reference. Two ticks @60Hz = 33 ms of sustained drift.
+ */
+export const LATERAL_ERROR_REPLAN_MIN_TICKS = 2;
 
 const FORCE_TUNING: CarForceTuning = {
   engineForceN: ENGINE_FORCE_N,
@@ -171,6 +196,14 @@ const PURE_PURSUIT_CONFIG = {
  * Borrowed verbatim from the WIP parking branch
  * (claude/fervent-cori-KXMEy → `splitAtGearCusps` in Parking.tsx).
  */
+/** Clamp `target` so it differs from `prev` by at most `maxDelta`. */
+function clampDelta(target: number, prev: number, maxDelta: number): number {
+  const d = target - prev;
+  if (d > maxDelta) return prev + maxDelta;
+  if (d < -maxDelta) return prev - maxDelta;
+  return target;
+}
+
 export function splitAtGearCusps(plan: CarKinematicState[]): CarKinematicState[][] {
   if (plan.length < 2) return [plan.slice()];
   const out: CarKinematicState[][] = [];
@@ -618,6 +651,10 @@ interface CarInternal {
   // Stall guard.
   lastMoveSimTime: number;
   lastPos: { x: number; z: number };
+  // Consecutive ticks lateral-from-plan has exceeded
+  // `LATERAL_ERROR_REPLAN_M`. Debounce for the adaptive replan trigger
+  // so one-tick chatter spikes don't fire a replan storm.
+  lateralOverCount: number;
   // Spawn pose (for reset / off-track).
   spawn: { x: number; z: number; heading: number };
   // Persistent MPC tracker state (warm-start sequence + RNG seed) when
@@ -808,6 +845,7 @@ export async function createRaceScenario(
       offTrackEvents: 0,
       lastMoveSimTime: 0,
       lastPos: { x: spawn.x, z: spawn.z },
+      lateralOverCount: 0,
       spawn,
       mpcState: null,
       replanHistory: [],
@@ -1127,7 +1165,15 @@ export async function createRaceScenario(
     const sinceLastMs = (simTime - c.lastReplanSimTime) * 1000;
     if (sinceLastMs < MIN_TIME_BETWEEN_REPLANS_MS) return null;
     const dLat = lateralFromPlan(c, state.x, state.z);
-    if (dLat > LATERAL_ERROR_REPLAN_M) return 'lateral-error';
+    if (dLat > LATERAL_ERROR_REPLAN_M) {
+      c.lateralOverCount += 1;
+      if (c.lateralOverCount >= LATERAL_ERROR_REPLAN_MIN_TICKS) {
+        c.lateralOverCount = 0;
+        return 'lateral-error';
+      }
+    } else {
+      c.lateralOverCount = 0;
+    }
     if (c.diagnostics.consecutiveFailedReplans >= 2) return 'failure-retry';
     return null;
   }
@@ -1276,19 +1322,29 @@ export async function createRaceScenario(
           })()
         : rawSeg;
       if (live.length >= 2) {
+        // Slew-rate limit: cap |Δsteer| per tick to filter single-tick
+        // chatter spikes at the steer saturation boundary that provoke
+        // lateral-error replan storms. Applied in the SAME frame as
+        // `c.lastControls.steer` (Rapier-frame, which is the negation of
+        // the planner-frame angle — `wheeledFromNormalized` does the
+        // negation). MPC returns Rapier-frame directly; pure-pursuit's
+        // `steerRaw` is planner-frame and gets negated by
+        // `wheeledFromNormalized`, so we limit against the negated prev.
+        const maxDSteer = MAX_STEER_RATE_RAD_PER_SEC * dt;
         if (tuning.tracker === 'mpc') {
           // Sampling MPC over the v2 parametric model.
           if (!c.mpcState) c.mpcState = createMPCTrackerState(MPC_HORIZON);
           const cmdRaw = mpcTrack(stateBefore, live, mpcForwardSimFor(c.entry), c.mpcState, MPC_CONFIG);
+          const limitedSteer = clampDelta(cmdRaw.steer, c.lastControls.steer, maxDSteer);
           const cmd: WheeledCarControls = {
-            steer: cmdRaw.steer,
+            steer: limitedSteer,
             driveForce: cmdRaw.driveForce,
             brakeForce: cmdRaw.brakeForce,
           };
           c.car.applyWheeledControls(cmd);
           c.lastControls = cmd;
           c.metrics.liveControls = {
-            steer: cmdRaw.steer,
+            steer: limitedSteer,
             throttle: cmd.driveForce >= 0
               ? cmd.driveForce / ENGINE_FORCE_N
               : -cmd.driveForce / ENGINE_FORCE_N,
@@ -1297,7 +1353,9 @@ export async function createRaceScenario(
           };
         } else {
           const trk = purePursuit(stateBefore, live, trackerConfig);
-          const steer = -Math.atan(trk.steering * (2 * WHEEL_BASE));
+          const steerRaw = -Math.atan(trk.steering * (2 * WHEEL_BASE));
+          const prevSteerPlanner = -c.lastControls.steer;
+          const steer = clampDelta(steerRaw, prevSteerPlanner, maxDSteer);
           const cmd = wheeledFromNormalized(
             { steer, throttle: trk.throttle, brake: trk.brake },
             FORCE_TUNING,
@@ -1469,6 +1527,7 @@ export async function createRaceScenario(
       c.offTrackEvents = 0;
       c.lastMoveSimTime = 0;
       c.lastPos = { x: c.spawn.x, z: c.spawn.z };
+      c.lateralOverCount = 0;
       c.replanHistory = [];
     }
   }
