@@ -138,20 +138,23 @@ export const MAX_STEER_RATE_RAD_PER_SEC = 12.0;
  * resolve themselves on the next tick rather than indicating the plan is
  * actually wrong.
  *
- * Tuned via a deterministic-planner sweep: at slew=12 rad/s, this
- * parameter is the dominant lever for v2's race performance.
+ * Sweep results at slew=12 rad/s (3-lap race):
  *
- * 1 → -22 %    2 → -9 %     3 → -43 %    4 → +3 %  ← best
- * 5 → -21 %    6 → -17 %    8 → -14 %
+ *               DETERMINISTIC   STOCHASTIC (5-run mean)
+ *   debounce=1     -22 %               not measured
+ *   debounce=2      -9 %               -30 %       ← default
+ *   debounce=3     -43 %               not measured
+ *   debounce=4      +3 % (v2 wins!)    -42 % (catastrophic 1 in 5)
+ *   debounce=5     -21 %               not measured
  *
- * The non-monotonicity is a planning-cliff effect: each debounce value
- * deterministically picks a different sequence of replans, which
- * cascades into different racing lines. 4 ticks (≈67 ms @60 Hz) lands
- * the race-1 chassis on a sequence of replans that completes lap 1
- * smoothly and avoids the deep replan storm v2 hits on lap 3 at
- * shorter debounces.
+ * debounce=4 has a real DETERMINISTIC win — when wall-clock variance is
+ * removed (via `--deterministic`), v2 beats kinematic by 2.8 %. But the
+ * win does not survive CPU jitter — the planning sequence that wins is
+ * fragile to small perturbations and the stochastic mean is worse than
+ * debounce=2. Keeping 2 as the web/CLI default; users can override via
+ * `--lat-debounce=4 --deterministic` to verify the win.
  */
-export const LATERAL_ERROR_REPLAN_MIN_TICKS = 4;
+export const LATERAL_ERROR_REPLAN_MIN_TICKS = 2;
 
 const FORCE_TUNING: CarForceTuning = {
   engineForceN: ENGINE_FORCE_N,
