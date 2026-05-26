@@ -331,6 +331,10 @@ export interface RaceTuning {
    *  comparisons impossible. Off in the web demo (real-time interactivity
    *  needs the CPU bound). */
   deterministicPlanner?: boolean;
+  /** Override `MAX_STEER_RATE_RAD_PER_SEC`. */
+  maxSteerRateRadPerSec?: number;
+  /** Override `LATERAL_ERROR_REPLAN_MIN_TICKS`. */
+  lateralErrorReplanMinTicks?: number;
 }
 
 /**
@@ -1177,9 +1181,10 @@ export async function createRaceScenario(
     const sinceLastMs = (simTime - c.lastReplanSimTime) * 1000;
     if (sinceLastMs < MIN_TIME_BETWEEN_REPLANS_MS) return null;
     const dLat = lateralFromPlan(c, state.x, state.z);
+    const debounceTicks = tuning.lateralErrorReplanMinTicks ?? LATERAL_ERROR_REPLAN_MIN_TICKS;
     if (dLat > LATERAL_ERROR_REPLAN_M) {
       c.lateralOverCount += 1;
-      if (c.lateralOverCount >= LATERAL_ERROR_REPLAN_MIN_TICKS) {
+      if (c.lateralOverCount >= debounceTicks) {
         c.lateralOverCount = 0;
         return 'lateral-error';
       }
@@ -1338,7 +1343,8 @@ export async function createRaceScenario(
         // chatter spikes at the steer saturation boundary. Applied in
         // the same frame as `c.lastControls.steer` (Rapier-frame —
         // `wheeledFromNormalized` negates the planner-frame angle).
-        const maxDSteer = MAX_STEER_RATE_RAD_PER_SEC * dt;
+        const steerRate = tuning.maxSteerRateRadPerSec ?? MAX_STEER_RATE_RAD_PER_SEC;
+        const maxDSteer = steerRate * dt;
         if (tuning.tracker === 'mpc') {
           // Sampling MPC over the v2 parametric model.
           if (!c.mpcState) c.mpcState = createMPCTrackerState(MPC_HORIZON);
