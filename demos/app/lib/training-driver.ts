@@ -325,6 +325,24 @@ async function collectTrialBatch(
 // ---------------------------------------------------------------------------
 // Loss + evaluation
 
+/**
+ * Per-component weights for the per-sample parametric loss. Choosing
+ * weights so each component contributes a similar amount of loss at
+ * typical error magnitudes. Reference units:
+ *   - position error: typical ~1 m  → contribution dx² ≈ 1
+ *   - heading error : typical ~0.1 rad → contribution dh² ≈ 0.01
+ *   - speed error   : typical ~1 m/s → contribution ds² ≈ 1
+ *
+ * Without a 100× heading weight, Nelder-Mead optimises position +
+ * speed and lets heading drift. The v2 manifest shows the symptom
+ * clearly: position RMS improved 7.5× over the kinematic baseline,
+ * heading only 1.8×. Closed-loop racing needs accurate heading
+ * because primitive endpoints depend on it.
+ */
+export const POS_LOSS_WEIGHT = 1;
+export const HEADING_LOSS_WEIGHT = 100;
+export const SPEED_LOSS_WEIGHT = 1;
+
 function stateDeltaForFit(pred: CarKinematicState, act: CarKinematicState): number {
   const dx = pred.x - act.x;
   const dz = pred.z - act.z;
@@ -332,8 +350,30 @@ function stateDeltaForFit(pred: CarKinematicState, act: CarKinematicState): numb
   while (dh > Math.PI) dh -= 2 * Math.PI;
   while (dh < -Math.PI) dh += 2 * Math.PI;
   const ds = pred.speed - act.speed;
-  return dx * dx + dz * dz + 5 * dh * dh + ds * ds;
+  return (
+    POS_LOSS_WEIGHT * (dx * dx + dz * dz)
+    + HEADING_LOSS_WEIGHT * dh * dh
+    + SPEED_LOSS_WEIGHT * ds * ds
+  );
 }
+
+/**
+ * Per-component weights for the residual MLP loss. The residual
+ * target is `[Δx, Δz, Δheading, Δspeed, Δyaw_rate,
+ * Δlateral_velocity]`. Without weighting, the MSE backpropagation
+ * sees Δheading (rad, typical 0.05) as 100× less important than Δx
+ * (m, typical 0.5), so the MLP undoes whatever heading accuracy the
+ * parametric fit achieved. Weights chosen to bring each component's
+ * loss contribution into the same ballpark at typical magnitudes.
+ */
+export const RESIDUAL_LOSS_WEIGHTS = [
+  POS_LOSS_WEIGHT,             // dx
+  POS_LOSS_WEIGHT,             // dz
+  HEADING_LOSS_WEIGHT,         // dheading
+  SPEED_LOSS_WEIGHT,           // dspeed
+  10,                          // dyaw_rate (rad/s; ~0.3 typical)
+  SPEED_LOSS_WEIGHT,           // dlateral_velocity
+];
 
 function controlsToVec(c: WheeledCarControls): number[] {
   return [c.steer, c.driveForce, c.brakeForce];
@@ -710,6 +750,15 @@ export class CarV2TrainingPipeline
       decode: paramsV2FromVec,
       makeSim: (p, cfg) => parametricForwardV2(p, cfg),
       stateDelta: stateDeltaForFit,
+      // Reseat the rollout to the actual state every 10 samples
+      // (= 1 s sim at sampleDt=0.1 s, which is the planner's longest
+      // primitive horizon). Without this, the loss is dominated by
+      // long-trial drift — fitting all the way to t=18 s lets the
+      // model trade per-primitive accuracy for shape accuracy of the
+      // whole trajectory. Race-time the planner only consumes 0.55–
+      // 1.0 s of model output per primitive, so the loss should focus
+      // there.
+      trajectoryHorizon: 10,
       trials: ctx.store.all(),
       controlsToVec,
       maxIter: ctx.round === 0 ? 200 : 120,
@@ -769,6 +818,11 @@ export class CarV2TrainingPipeline
         learningRate: 1e-3,
         valSplit: 0.2,
         fitSubstepsPerSample: 6,
+        // Per-component weights — see RESIDUAL_LOSS_WEIGHTS above for the
+        // reasoning. Heading is up-weighted ~100× to bring it into the
+        // same numeric scale as position errors so the MLP doesn't
+        // overfit position at the expense of heading.
+        lossWeights: RESIDUAL_LOSS_WEIGHTS,
         onProgress: (e) => {
           // Residual fit's trainLoss is already a per-sample mean (see
           // `meanLoss` in residual-mlp-fit.ts), so it's directly

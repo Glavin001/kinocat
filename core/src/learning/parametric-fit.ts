@@ -42,6 +42,21 @@ export interface ParametricFitOptions<P, S, C, Cfg> {
   /** Sub-steps per recorded-sample interval used for sim integration. Higher
    *  = finer integration, slower fit. Default 6. */
   fitSubstepsPerSample?: number;
+  /**
+   * Trajectory horizon — reseat the simulator's state to the actual
+   * recorded state every `N` samples during the open-loop rollout.
+   * `N=Infinity` (default) is the classic "roll all the way through
+   * the trial and accumulate every sample's error" behaviour, which
+   * heavily weights long-horizon trajectory shape but lets long-trial
+   * drift dominate the loss. `N=1` is single-step (no compounding).
+   *
+   * For racing the planner uses 0.55–1.0 s primitives (5–10 samples at
+   * sampleDt=0.1 s), so a horizon of 5–10 puts the loss focus where
+   * the controller actually consumes the model's predictions. Smaller
+   * horizons also make the loss easier to optimise because there's
+   * less compounding error to fit.
+   */
+  trajectoryHorizon?: number;
   /** Map a single tick's controls. If `Trial.controlsTrace` has one entry per
    *  *physics* tick (60 Hz) but samples are at e.g. 10 Hz, the fitter needs
    *  to know which control to apply at each sub-step. Default: use the
@@ -95,7 +110,13 @@ export interface ParametricFitResult<P> {
 /** Roll the supplied `forwardSim` along a trial from `initialState`,
  *  comparing the predicted state at each recorded sample to the recorded
  *  actual state. Returns the total weighted L2 loss (no regularization).
- *  Exposed so consumers can re-use the same rollout for diagnostics. */
+ *  Exposed so consumers can re-use the same rollout for diagnostics.
+ *
+ *  `trajectoryHorizon` (default `Infinity`) lets the caller reseat the
+ *  simulator's state to the actual recorded state every `N` samples,
+ *  bounding how far prediction errors can compound before the loss is
+ *  re-anchored. Default behaviour (no reseat) matches the original
+ *  implementation. */
 export function rolloutAndScore<S, C, Cfg>(
   sim: ForwardSim<S>,
   trial: Trial<S, C, Cfg>,
@@ -103,10 +124,12 @@ export function rolloutAndScore<S, C, Cfg>(
   controlsToVec: (c: C) => number[],
   fitSubstepsPerSample = 6,
   decompose?: (predicted: S, actual: S) => LossDecomposition,
+  trajectoryHorizon = Infinity,
 ): { loss: number; decomposition?: LossDecomposition; sampleCount: number } {
   let s: S = trial.initialState;
   let loss = 0;
   let count = 0;
+  let stepsInChunk = 0;
   const decomp: LossDecomposition | null = decompose
     ? { pos: 0, heading: 0, speed: 0, yawRate: 0, lateralVelocity: 0 }
     : null;
@@ -133,6 +156,15 @@ export function rolloutAndScore<S, C, Cfg>(
       decomp.lateralVelocity += d.lateralVelocity;
     }
     count++;
+    stepsInChunk++;
+    if (stepsInChunk >= trajectoryHorizon) {
+      // Reseat to the actual state so error doesn't keep compounding
+      // past the chosen horizon. This bounds the multi-step trajectory
+      // loss to N-sample chunks instead of letting drift over a
+      // 30-sample trial dominate the loss.
+      s = b.state;
+      stepsInChunk = 0;
+    }
   }
   if (decomp && count > 0) {
     decomp.pos /= count;
@@ -159,6 +191,8 @@ function fullLoss<P, S, C, Cfg>(
       opts.stateDelta,
       opts.controlsToVec,
       opts.fitSubstepsPerSample ?? 6,
+      undefined,
+      opts.trajectoryHorizon ?? Infinity,
     );
     total += r.loss;
     totalCount += r.sampleCount;
@@ -368,6 +402,7 @@ function finalizeFit<P, S, C, Cfg>(
         opts.controlsToVec,
         opts.fitSubstepsPerSample ?? 6,
         opts.decomposeDelta,
+        opts.trajectoryHorizon ?? Infinity,
       );
       if (r.decomposition) {
         agg.pos += r.decomposition.pos;
@@ -418,6 +453,8 @@ async function fullLossAsync<P, S, C, Cfg>(
       opts.stateDelta,
       opts.controlsToVec,
       opts.fitSubstepsPerSample ?? 6,
+      undefined,
+      opts.trajectoryHorizon ?? Infinity,
     );
     total += r.loss;
     totalCount += r.sampleCount;

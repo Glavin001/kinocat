@@ -107,9 +107,17 @@ describe('car maneuvers', () => {
     expect(bundle.length).toBe(50);
     const ids = new Set(bundle.map((s) => s.id));
     expect(ids.size).toBeGreaterThan(4); // at least 5 distinct factories
-    // OU should be the largest single class (60%).
+    // OU should be the largest single class (40% post race-bundle rework
+    // — was 60% pre-rework, dropped to make room for the 25% racing
+    // slot).
     const ouCount = bundle.filter((s) => s.id === 'ou').length;
-    expect(ouCount).toBeGreaterThanOrEqual(25);
+    expect(ouCount).toBeGreaterThanOrEqual(15);
+    // Racing primitives should account for ~25% of the bundle: the
+    // race-primitives slalom course needs explicit full-lock-at-speed
+    // training data and the OU walk doesn't cover that regime.
+    const raceIds = new Set(['raceSlalom', 'raceBrakeIntoCorner', 'raceSustainedTurn', 'raceThrottleOnApex']);
+    const raceCount = bundle.filter((s) => raceIds.has(s.id)).length;
+    expect(raceCount).toBeGreaterThanOrEqual(10);
   });
 
   it('defaultManeuverBundle is deterministic for same seed', () => {

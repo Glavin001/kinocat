@@ -17,8 +17,15 @@ import type { Trial } from 'kinocat/learning';
 import type { CarKinematicState, WheeledCarControls, LearnableVehicleConfig } from 'kinocat/agent';
 
 /** Bump this when trial-generation logic changes in a way the cache key
- *  inputs can't detect (e.g. new maneuver types, harness physics tweaks). */
-export const CACHE_BUSTER = 1;
+ *  inputs can't detect (e.g. new maneuver types, harness physics tweaks).
+ *
+ *  v2: defaultManeuverBundle rebalanced for racing — 40% OU (was 60%),
+ *      25% racing primitives (raceSlalom / raceBrakeIntoCorner /
+ *      raceSustainedTurn / raceThrottleOnApex; new), 5% named ident
+ *      (was 10%), other shares unchanged. Trial distributions and ids
+ *      are now different for the same seed, so cached trials from
+ *      pre-v2 runs are stale. */
+export const CACHE_BUSTER = 2;
 
 export interface TrialCacheKeyInputs {
   seed: number;
