@@ -379,7 +379,17 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     for (const seg of path.segments) {
       const rev = seg.gear < 0;
       hasReverse ||= rev;
-      cost += (seg.length * (rev ? this.agent.reverseCostMultiplier : 1)) / this.agent.maxSpeed;
+      // Time-honest cost: divide by the gear's actual top speed so a
+      // reverse segment is correctly priced at `length / maxReverseSpeed`
+      // (not `length / maxSpeed`, which under-counts reverse time on
+      // chassis where reverse is meaningfully slower). The
+      // `reverseCostMultiplier` then acts as a clean "extra preference
+      // against reverse" knob on top of the honest time cost, rather
+      // than having to also compensate for the unit mismatch.
+      const segSpeed = rev ? this.agent.maxReverseSpeed : this.agent.maxSpeed;
+      cost +=
+        (seg.length * (rev ? this.agent.reverseCostMultiplier : 1)) /
+        Math.max(segSpeed, 1e-3);
       if (rev !== prevReverse) cost += this.agent.directionChangePenalty;
       prevReverse = rev;
     }

@@ -67,6 +67,22 @@ export interface RaceResult {
   /** Ticks where commanded steering exceeded 75% of `minTurnRadius`
    *  curvature — useful to ask "did the controller wrench the wheel?" */
   sharpSteerTicks: number;
+  /** Plan & execution health metrics — same fields as
+   *  `RaceMetrics.planHealth` + `RaceMetrics.executionHealth` +
+   *  `RaceMetrics.perLap`. Surfaced here so the CLI table can report
+   *  them. See those interfaces in `race-primitives-scenarios.ts` for
+   *  the full descriptions. */
+  cuspsRawTotal: number;
+  cuspsKeptTotal: number;
+  infeasibleCurvatureSamples: number;
+  infeasibleAccelSamples: number;
+  planSamplesTotal: number;
+  speedErrP95: number;
+  lateralErrP95: number;
+  infeasibleNowTicks: number;
+  lapTimeCv: number;
+  perLapOffTrackTicks: number[];
+  perLapReplanCounts: number[];
   /** Most recent replan snapshots (ring buffer; newest last; max 30). Lets
    *  downstream tooling drill into HOW the planner reacted at each point —
    *  reason, expansions, deadline-hit, plan vs prev-plan drift. */
@@ -238,6 +254,9 @@ export async function runHeadlessRace(
     const plannerMsMax = c.diagnostics.plannerMsMax;
     const plannerDeadlineHits = c.diagnostics.plannerDeadlineHitsTotal;
     const sharpSteerTicks = c.diagnostics.sharpSteerTicks;
+    const ph = c.metrics.planHealth;
+    const eh = c.metrics.executionHealth;
+    const pl = c.metrics.perLap;
     return {
       name: c.name,
       laps: c.laps,
@@ -255,6 +274,17 @@ export async function runHeadlessRace(
       plannerMsMax,
       plannerDeadlineHits,
       sharpSteerTicks,
+      cuspsRawTotal: ph.cuspsRawTotal,
+      cuspsKeptTotal: ph.cuspsKeptTotal,
+      infeasibleCurvatureSamples: ph.infeasibleCurvatureSamples,
+      infeasibleAccelSamples: ph.infeasibleAccelSamples,
+      planSamplesTotal: ph.planSamplesTotal,
+      speedErrP95: eh.speedErrP95,
+      lateralErrP95: eh.lateralErrP95,
+      infeasibleNowTicks: eh.infeasibleNowTicks,
+      lapTimeCv: pl.cv,
+      perLapOffTrackTicks: [...pl.offTrackTicks],
+      perLapReplanCounts: [...pl.replanCounts],
       replanHistory: c.replanHistory,
     };
   });

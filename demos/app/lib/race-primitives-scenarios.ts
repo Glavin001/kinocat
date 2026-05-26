@@ -146,8 +146,22 @@ export const RACE_AGENT: VehicleAgent = defaultVehicleAgent({
     [-2.4, -1.0],
     [2.4, -1.0],
   ],
-  reverseCostMultiplier: 1.4,
-  directionChangePenalty: 0.4,
+  // Time-honest reverse cost. Both planner cost formulas
+  // (`vehicle-environment.ts`) are now expressed in seconds: primitive
+  // edges use `prim.duration` directly, and Reeds-Shepp segments use
+  // `seg.length / (reverse ? maxReverseSpeed : maxSpeed)`. With that,
+  // `reverseCostMultiplier=1.0` is the HONEST value (reverse already
+  // costs more time because it's slower), and a value > 1.0 is an
+  // extra preference against reverse on top of the honest cost. The
+  // chosen 1.5 adds a 50 % nudge against reverse — enough that a
+  // racing-line shortcut via reverse needs to save real driving time
+  // to win, but small enough that necessary parking reverses still
+  // beat geometrically infeasible forward alternatives. The
+  // `directionChangePenalty` of 1.0 s approximates the real chassis's
+  // gear-shift time (brake to zero + engage opposite direction).
+  // Domain-agnostic — encodes chassis physics, not "racing vs parking."
+  reverseCostMultiplier: 1.5,
+  directionChangePenalty: 1.0,
 });
 
 /** Race-tuned control set spanning the full speed envelope to chassis
@@ -711,6 +725,60 @@ export interface RaceMetrics {
     /** Total replan attempts this race. */
     totalReplans: number;
   };
+  /** Per-plan health, accumulated over every committed plan in this race.
+   *  Domain-agnostic: same numbers apply to racing, parking, obstacle
+   *  course. They answer two distinct questions: (a) is the planner
+   *  emitting clean plans? (b) is the tracker executing them faithfully? */
+  planHealth: {
+    /** Sum across all committed plans of `splitAtGearCusps`'s raw
+     *  sign-flip count (BEFORE the sustained-motion absorption). Counts
+     *  smoother artifacts + planner-chosen brake-overshoot transitions
+     *  the way they used to be counted by the legacy 1e-3 m/s
+     *  threshold. Healthy racing plans should sum to a small number. */
+    cuspsRawTotal: number;
+    /** Sum of real (sustained) cusps actually acted on by the tracker. */
+    cuspsKeptTotal: number;
+    /** Sum across all committed plans of plan samples whose
+     *  `|κ|·v² > maxLateralAccel` — the planner asked the chassis for
+     *  more lateral grip than pure-pursuit's `maxLateralAccel`. */
+    infeasibleCurvatureSamples: number;
+    /** Sum of plan samples where adjacent-sample |Δspeed|/Δt exceeds
+     *  the tracker's accel/decel limits. Plan asks for an
+     *  instantaneous speed jump. */
+    infeasibleAccelSamples: number;
+    /** Sum of plan-sample counts. Use as denominator for the two
+     *  infeasibility counts above to compute a percentage. */
+    planSamplesTotal: number;
+  };
+  /** Per-tick execution faithfulness, running RMS+P95 across the race. */
+  executionHealth: {
+    /** Sum of `(targetSpeed - actualSpeed)²` across all ticks. */
+    speedErrSumSq: number;
+    /** Sum of |targetSpeed - actualSpeed| across all ticks (for mean). */
+    speedErrAbsSum: number;
+    /** Tick count for the two running sums above. */
+    speedErrCount: number;
+    /** P95 of |speed error| computed via a reservoir-style ring buffer
+     *  (capacity 256, sorted on read). */
+    speedErrP95: number;
+    /** P95 of |lateral error| computed the same way. */
+    lateralErrP95: number;
+    /** Ticks where `|κ|·v²` at the lookahead point exceeded
+     *  maxLateralAccel — controller was being asked to do the
+     *  impossible RIGHT NOW. */
+    infeasibleNowTicks: number;
+  };
+  /** Per-lap stats accumulated as each lap completes. */
+  perLap: {
+    /** Lap times (s) in completion order. */
+    times: number[];
+    /** Coefficient of variation of `times` (std / mean). 0 with < 2 laps. */
+    cv: number;
+    /** Off-track ticks attributed to each completed lap. */
+    offTrackTicks: number[];
+    /** Successful-replan counts attributed to each completed lap. */
+    replanCounts: number[];
+  };
 }
 
 export function emptyMetrics(): RaceMetrics {
@@ -731,6 +799,27 @@ export function emptyMetrics(): RaceMetrics {
       planAgeMs: 0,
       successfulReplans: 0,
       totalReplans: 0,
+    },
+    planHealth: {
+      cuspsRawTotal: 0,
+      cuspsKeptTotal: 0,
+      infeasibleCurvatureSamples: 0,
+      infeasibleAccelSamples: 0,
+      planSamplesTotal: 0,
+    },
+    executionHealth: {
+      speedErrSumSq: 0,
+      speedErrAbsSum: 0,
+      speedErrCount: 0,
+      speedErrP95: 0,
+      lateralErrP95: 0,
+      infeasibleNowTicks: 0,
+    },
+    perLap: {
+      times: [],
+      cv: 0,
+      offTrackTicks: [],
+      replanCounts: [],
     },
   };
 }

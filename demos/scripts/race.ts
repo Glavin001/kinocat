@@ -179,6 +179,53 @@ async function main(): Promise<void> {
   }
   process.stdout.write('\n');
 
+  // Plan & execution health table. Domain-agnostic metrics that answer
+  // "is the planner emitting clean plans?" and "is the tracker
+  // executing them faithfully?" — works for racing, parking, anything.
+  // cuspsKept = real gear changes the tracker acted on (forward↔reverse
+  //   transitions in the plan).
+  // cuspsRaw  = pre-filter sign-flip count (smoother artifacts +
+  //   real cusps). cuspsRaw ≫ cuspsKept means the smoother is
+  //   manufacturing fake cusps that the detector then absorbs.
+  // infCurv% = fraction of plan samples whose |κ|·v² exceeds the
+  //   tracker's lateral-accel cap. Planner asking for impossible
+  //   cornering grip.
+  // infAcc%  = fraction of plan samples where |Δv|/Δt exceeds accel
+  //   caps. Planner asking for an instantaneous speed jump.
+  // spdErrP95 = p95 of |targetSpeed - actualSpeed| (m/s). Tracker
+  //   following the plan's speed channel.
+  // latErrP95 = p95 of lateral error to plan (m). Tracker following
+  //   plan geometry.
+  // infNowTk  = tick count where the controller was asked to do
+  //   the impossible (|κ|·v² > cap) right at execution time.
+  // lapCv     = std/mean of completed lap times — direct measure of
+  //   race-to-race lap consistency.
+  const hwidths = [22, 9, 9, 8, 8, 10, 10, 8, 6];
+  const hheader = ['model', 'cuspsRaw', 'cuspsKept', 'infCurv%', 'infAcc%', 'spdErrP95', 'latErrP95', 'infNowTk', 'lapCv'];
+  process.stdout.write(tableLine(hheader, hwidths) + '\n');
+  for (const r of results) {
+    const total = Math.max(1, r.planSamplesTotal);
+    const infCurvPct = (100 * r.infeasibleCurvatureSamples / total).toFixed(1);
+    const infAccPct = (100 * r.infeasibleAccelSamples / total).toFixed(1);
+    process.stdout.write(
+      tableLine(
+        [
+          r.name,
+          String(r.cuspsRawTotal),
+          String(r.cuspsKeptTotal),
+          infCurvPct,
+          infAccPct,
+          r.speedErrP95.toFixed(2),
+          r.lateralErrP95.toFixed(2),
+          String(r.infeasibleNowTicks),
+          r.lapTimeCv.toFixed(3),
+        ],
+        hwidths,
+      ) + '\n',
+    );
+  }
+  process.stdout.write('\n');
+
   // Comparison commentary.
   const v2 = results.find((r) => r.name.includes('v2') || modelPaths.some((p) => r.name === basename(p).replace(/\.json$/, '')));
   const kin = results.find((r) => r.name === 'kinematic');
@@ -223,6 +270,17 @@ async function main(): Promise<void> {
         plannerMsMax: r.plannerMsMax,
         plannerDeadlineHits: r.plannerDeadlineHits,
         sharpSteerTicks: r.sharpSteerTicks,
+        cuspsRawTotal: r.cuspsRawTotal,
+        cuspsKeptTotal: r.cuspsKeptTotal,
+        infeasibleCurvatureSamples: r.infeasibleCurvatureSamples,
+        infeasibleAccelSamples: r.infeasibleAccelSamples,
+        planSamplesTotal: r.planSamplesTotal,
+        speedErrP95: r.speedErrP95,
+        lateralErrP95: r.lateralErrP95,
+        infeasibleNowTicks: r.infeasibleNowTicks,
+        lapTimeCv: r.lapTimeCv,
+        perLapOffTrackTicks: r.perLapOffTrackTicks,
+        perLapReplanCounts: r.perLapReplanCounts,
       })),
     };
     writeFileSync(`${runDir}/summary.json`, JSON.stringify(summary, null, 2), 'utf-8');

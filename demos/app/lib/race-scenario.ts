@@ -221,25 +221,290 @@ function clampDelta(target: number, prev: number, maxDelta: number): number {
   return target;
 }
 
+/** Per-sample |speed| (m/s) for a sample to count as "in a gear" rather
+ *  than "in transition through zero." Below this is treated as
+ *  signless — the run extends through it. Tuned BELOW the slowest
+ *  reverse primitive in any library (parking's smallest reverse
+ *  primitive commands |v| ≥ 0.5 m/s) so real motion always anchors,
+ *  but ABOVE the smoother's worst-case phantom amplitude (interp-near-
+ *  zero values are bounded by the sample spacing × dv/ds ≈ 0.4 ×
+ *  small ≈ 0.05 m/s). 0.15 splits the difference safely. */
+const SIGN_FLOOR_SPEED = 0.15;
+/** Minimum PEAK |speed| (m/s) the run must contain for it to count as
+ *  a real gear claim. Phantom smoother artifacts at primitive
+ *  boundaries cap out around 0.05 m/s — they never reach a real
+ *  primitive's command speed. A run whose peak fails this bar is
+ *  treated as noise and absorbed into the surrounding gear. */
+const MIN_RUN_PEAK_SPEED = 0.5;
+/** Minimum arc length (m) backstop for a sustained run. Even at the
+ *  slowest reverse primitive (parking, command speed 0.5-1 m/s over
+ *  0.4 s ≈ 0.2-0.4 m), a real primitive's full sweep occupies multiple
+ *  smoother-resampled positions (smoother spacing 0.4 m). 0.3 m
+ *  excludes 1-sample artifacts but admits real primitives. */
+const MIN_RUN_ARC = 0.3;
+
+/** Number of cusps detected in the most recent call to
+ *  `splitAtGearCusps` BEFORE the sustained-motion filter (i.e. raw
+ *  sign-flips, including smoother artifacts) and AFTER (real gear
+ *  changes the tracker will act on). Module-level so the planner
+ *  diagnostics path can surface them without changing the public
+ *  signature. Reads happen on the same tick as the call from a single
+ *  scenario instance, so the global is race-free in practice. */
+let lastSplitDiagnostics = { rawSignFlips: 0, keptCusps: 0 };
+export function getLastCuspSplitDiagnostics(): {
+  rawSignFlips: number;
+  keptCusps: number;
+} {
+  return { ...lastSplitDiagnostics };
+}
+
 export function splitAtGearCusps(plan: CarKinematicState[]): CarKinematicState[][] {
-  if (plan.length < 2) return [plan.slice()];
-  const out: CarKinematicState[][] = [];
-  let cur: CarKinematicState[] = [plan[0]!];
+  if (plan.length < 2) {
+    lastSplitDiagnostics = { rawSignFlips: 0, keptCusps: 0 };
+    return [plan.slice()];
+  }
+  // Pass 1: build monotone-sign runs. Each run is a maximal contiguous
+  // sequence of samples whose speed (when above SIGN_FLOOR_SPEED) is
+  // single-signed. Samples below the floor are "in transition" and
+  // extend whichever run they're in. The run carries arc length and
+  // peak |speed| so Pass 2 can decide which runs are real gears vs
+  // noise.
+  type Run = {
+    startIdx: number;
+    endIdx: number; // exclusive
+    sign: -1 | 0 | 1; // 0 only if the entire run is below the floor
+    arcLength: number;
+    peakSpeed: number;
+    sustained: boolean;
+  };
+  const signOf = (v: number): -1 | 0 | 1 =>
+    v > SIGN_FLOOR_SPEED ? 1 : v < -SIGN_FLOOR_SPEED ? -1 : 0;
+  const distBetween = (a: CarKinematicState, b: CarKinematicState): number =>
+    Math.hypot(b.x - a.x, b.z - a.z);
+
+  const runs: Run[] = [];
+  let runStart = 0;
+  let runSign: -1 | 0 | 1 = signOf(plan[0]!.speed);
+  let runArc = 0;
+  let runPeak = Math.abs(plan[0]!.speed);
+  let rawSignFlips = 0;
   for (let i = 1; i < plan.length; i++) {
     const s = plan[i]!;
-    const prev = cur[cur.length - 1]!;
-    const flipped =
-      (prev.speed > 1e-3 && s.speed < -1e-3) ||
-      (prev.speed < -1e-3 && s.speed > 1e-3);
-    if (flipped) {
-      if (cur.length >= 2) out.push(cur);
-      cur = [s];
+    const prev = plan[i - 1]!;
+    const sSign = signOf(s.speed);
+    const arc = distBetween(prev, s);
+    // Diagnostic: raw sign-flip count uses the legacy 1e-3 m/s threshold
+    // so the metric is comparable to the original `splitAtGearCusps`
+    // behavior (what would have been a split before this rewrite).
+    const prevAbs = Math.abs(prev.speed);
+    const sAbs = Math.abs(s.speed);
+    if (prevAbs > 1e-3 && sAbs > 1e-3 && Math.sign(prev.speed) !== Math.sign(s.speed)) {
+      rawSignFlips++;
+    }
+    // Extend the current run if the new sample is either in the same
+    // gear or below the sign floor (transition); otherwise close run
+    // and open a new one.
+    if (sSign === runSign || sSign === 0 || runSign === 0) {
+      if (runSign === 0 && sSign !== 0) runSign = sSign;
+      runArc += arc;
+      if (sAbs > runPeak) runPeak = sAbs;
     } else {
-      cur.push(s);
+      runs.push({
+        startIdx: runStart,
+        endIdx: i,
+        sign: runSign,
+        arcLength: runArc,
+        peakSpeed: runPeak,
+        sustained: runPeak >= MIN_RUN_PEAK_SPEED && runArc >= MIN_RUN_ARC,
+      });
+      runStart = i;
+      runSign = sSign;
+      runArc = 0;
+      runPeak = sAbs;
     }
   }
-  if (cur.length >= 2) out.push(cur);
-  return out.length > 0 ? out : [plan.slice()];
+  runs.push({
+    startIdx: runStart,
+    endIdx: plan.length,
+    sign: runSign,
+    arcLength: runArc,
+    peakSpeed: runPeak,
+    sustained: runPeak >= MIN_RUN_PEAK_SPEED && runArc >= MIN_RUN_ARC,
+  });
+
+  // Pass 2: walk runs left-to-right and only emit a split between two
+  // ADJACENT sustained runs of opposite sign. Short runs are absorbed
+  // into the surrounding same-sign run; their samples have their speed
+  // clamped to a magnitude consistent with the surrounding gear (sign
+  // matches surrounding sign, magnitude min(|original|, MIN_SUSTAINED))
+  // so pure-pursuit doesn't see a phantom near-zero crossing.
+  const cleaned: CarKinematicState[] = plan.map((s) => ({ ...s }));
+  // Determine each run's "effective sign" — the sign of the nearest
+  // sustained run (this run if it's sustained; else the previous
+  // sustained run; else the next; else 0).
+  const effSign: Array<-1 | 0 | 1> = new Array(runs.length).fill(0);
+  let lastSustained: -1 | 0 | 1 = 0;
+  for (let r = 0; r < runs.length; r++) {
+    if (runs[r]!.sustained) {
+      effSign[r] = runs[r]!.sign;
+      lastSustained = runs[r]!.sign;
+    } else {
+      effSign[r] = lastSustained;
+    }
+  }
+  // Forward-fill: any leading non-sustained runs get the first sustained
+  // sign.
+  let firstSustainedSign: -1 | 0 | 1 = 0;
+  for (let r = 0; r < runs.length; r++) {
+    if (runs[r]!.sustained) {
+      firstSustainedSign = runs[r]!.sign;
+      break;
+    }
+  }
+  for (let r = 0; r < runs.length; r++) {
+    if (!runs[r]!.sustained && effSign[r] === 0) effSign[r] = firstSustainedSign;
+  }
+  // Apply absorption to non-sustained runs whose sign disagrees with
+  // their effective sign.
+  for (let r = 0; r < runs.length; r++) {
+    if (runs[r]!.sustained) continue;
+    const eSign = effSign[r]!;
+    if (eSign === 0) continue;
+    for (let i = runs[r]!.startIdx; i < runs[r]!.endIdx; i++) {
+      const s = cleaned[i]!;
+      if (Math.sign(s.speed) !== eSign && s.speed !== 0) {
+        // Flip sign and cap magnitude so the absorbed sample reads as a
+        // slow same-gear sample, never a phantom reverse blip.
+        s.speed = eSign * Math.min(Math.abs(s.speed), SIGN_FLOOR_SPEED);
+      }
+    }
+  }
+  // Identify which adjacent sustained-run boundaries are real cusps.
+  const splits: number[] = []; // indices in `cleaned` to split AT (exclusive end of prior segment, start of next).
+  let prevEffSign: -1 | 0 | 1 = 0;
+  for (let r = 0; r < runs.length; r++) {
+    const eSign = effSign[r]!;
+    if (eSign === 0) continue;
+    if (prevEffSign !== 0 && eSign !== prevEffSign && runs[r]!.sustained) {
+      splits.push(runs[r]!.startIdx);
+    }
+    if (runs[r]!.sustained) prevEffSign = eSign;
+  }
+  // Emit segments.
+  const out: CarKinematicState[][] = [];
+  let segStart = 0;
+  for (const sp of splits) {
+    // Slice is [segStart, sp): the prior segment ends just BEFORE the
+    // sign flip, so its last sample still has the old gear's speed
+    // sign. The new segment then starts at `sp` (first sample with the
+    // new gear). Matches the legacy splitter so the tracker never sees
+    // a forward-segment sample with reverse speed (which would make
+    // pure-pursuit aim the chassis backward at the boundary).
+    if (sp - segStart >= 2) out.push(cleaned.slice(segStart, sp));
+    segStart = sp;
+  }
+  if (cleaned.length - segStart >= 2) out.push(cleaned.slice(segStart));
+  lastSplitDiagnostics = { rawSignFlips, keptCusps: splits.length };
+  return out.length > 0 ? out : [cleaned.slice()];
+}
+
+/**
+ * Per-plan kinematic feasibility audit. Returns counts that tell us
+ * whether the plan we just committed is achievable by the chassis — the
+ * specific failure modes are:
+ *
+ *  - `infeasibleCurvatureSamples`: samples where `|κ|·v² > maxLatAccel`.
+ *    Polyline curvature × commanded speed² exceeds the lateral-accel
+ *    cap the tracker can deliver. Pure-pursuit will brake at corners to
+ *    respect this cap, but the planner is asking for grip that the
+ *    chassis doesn't have — root-cause "racing line is wrong" signal.
+ *  - `infeasibleAccelSamples`: samples where adjacent-pair |Δspeed|/Δt
+ *    exceeds the tracker's accel or decel cap. Plan asks for an
+ *    impossible speed jump.
+ *  - `totalSamples`: denominator for the percentages.
+ *
+ * Domain-agnostic — applies equally to racing, parking, any course.
+ */
+export function auditPlanFeasibility(
+  plan: CarKinematicState[],
+  caps: { maxLateralAccel: number; maxAccel: number; maxDecel: number },
+): {
+  infeasibleCurvatureSamples: number;
+  infeasibleAccelSamples: number;
+  totalSamples: number;
+} {
+  if (plan.length < 3) {
+    return {
+      infeasibleCurvatureSamples: 0,
+      infeasibleAccelSamples: 0,
+      totalSamples: plan.length,
+    };
+  }
+  let infeasibleK = 0;
+  let infeasibleA = 0;
+  for (let i = 1; i < plan.length - 1; i++) {
+    const a = plan[i - 1]!;
+    const b = plan[i]!;
+    const c = plan[i + 1]!;
+    // Three-point curvature (κ = 1/R via signed triangle area).
+    const ax = a.x;
+    const az = a.z;
+    const bx = b.x;
+    const bz = b.z;
+    const cx = c.x;
+    const cz = c.z;
+    const ab = Math.hypot(bx - ax, bz - az);
+    const bc = Math.hypot(cx - bx, cz - bz);
+    const ac = Math.hypot(cx - ax, cz - az);
+    const area2 = Math.abs((bx - ax) * (cz - az) - (bz - az) * (cx - ax));
+    const denom = ab * bc * ac;
+    const k = denom > 1e-9 ? (2 * area2) / denom : 0;
+    const v = Math.abs(b.speed);
+    if (k * v * v > caps.maxLateralAccel) infeasibleK++;
+    // Acceleration feasibility: estimate dt from arc-length and average
+    // speed at the midpoint. Only check pairs where both magnitudes >
+    // 0.3 (skip parking near-zero samples where dt → infinity).
+    const v0 = Math.abs(a.speed);
+    const v1 = Math.abs(b.speed);
+    const meanV = 0.5 * (v0 + v1);
+    if (meanV > 0.3) {
+      const dt = ab / meanV;
+      if (dt > 1e-3) {
+        const accel = (v1 - v0) / dt;
+        const cap = accel >= 0 ? caps.maxAccel : caps.maxDecel;
+        if (Math.abs(accel) > cap * 1.5) infeasibleA++;
+      }
+    }
+  }
+  return {
+    infeasibleCurvatureSamples: infeasibleK,
+    infeasibleAccelSamples: infeasibleA,
+    totalSamples: plan.length,
+  };
+}
+
+/** Compact P95-tracker for streaming |error| samples. Stores last
+ *  CAPACITY samples in a ring buffer; reads sort a copy. Cheap enough
+ *  per-tick (256 doubles, no allocation in the hot path). */
+class P95Tracker {
+  private readonly buf: Float64Array;
+  private idx = 0;
+  private filled = 0;
+  constructor(capacity = 256) {
+    this.buf = new Float64Array(capacity);
+  }
+  push(absValue: number): void {
+    this.buf[this.idx] = absValue;
+    this.idx = (this.idx + 1) % this.buf.length;
+    if (this.filled < this.buf.length) this.filled++;
+  }
+  p95(): number {
+    if (this.filled === 0) return 0;
+    const arr = Array.from(this.buf.subarray(0, this.filled));
+    arr.sort((a, b) => a - b);
+    const i = Math.floor(0.95 * (arr.length - 1));
+    return arr[i] ?? 0;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -698,6 +963,13 @@ interface CarInternal {
   mpcState: MPCTrackerState | null;
   /** Recent replan snapshots (ring buffer, newest last). */
   replanHistory: ReplanSnapshot[];
+  /** Streaming P95 trackers for execution-faithfulness metrics. */
+  speedErrP95Tracker: P95Tracker;
+  lateralErrP95Tracker: P95Tracker;
+  /** Counters scoped to the current lap; flushed into `perLap` arrays
+   *  when the lap completes. */
+  currentLapOffTrackTicks: number;
+  currentLapReplanCount: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -885,6 +1157,10 @@ export async function createRaceScenario(
       spawn,
       mpcState: null,
       replanHistory: [],
+      speedErrP95Tracker: new P95Tracker(),
+      lateralErrP95Tracker: new P95Tracker(),
+      currentLapOffTrackTicks: 0,
+      currentLapReplanCount: 0,
     };
   });
 
@@ -1083,6 +1359,7 @@ export async function createRaceScenario(
         c.segments = splitAtGearCusps(smoothed);
         c.activeSegIdx = 0;
         c.activeSegStartSimTime = simTime;
+        recordPlanHealth(c, smoothed);
       }
       const firstEnd = smoothed.find((p) => p.t > 0.05) ?? smoothed[smoothed.length - 1]!;
       c.predictedEnd = { state: firstEnd, dueSimTime: planStartSimTime + firstEnd.t };
@@ -1155,7 +1432,28 @@ export async function createRaceScenario(
       c.segments = splitAtGearCusps(c.plan);
       c.activeSegIdx = 0;
       c.activeSegStartSimTime = simTime;
+      recordPlanHealth(c, c.plan);
     }
+  }
+
+  /** Compute and accumulate per-plan health metrics (cusp counts +
+   *  kinematic feasibility). Called once per plan commit so each plan
+   *  contributes to the lifetime sums in `metrics.planHealth`. The
+   *  caller must invoke `splitAtGearCusps` BEFORE this (its diagnostics
+   *  are read from `getLastCuspSplitDiagnostics`). */
+  function recordPlanHealth(c: CarInternal, plan: CarKinematicState[]): void {
+    const { rawSignFlips, keptCusps } = getLastCuspSplitDiagnostics();
+    c.metrics.planHealth.cuspsRawTotal += rawSignFlips;
+    c.metrics.planHealth.cuspsKeptTotal += keptCusps;
+    const audit = auditPlanFeasibility(plan, {
+      maxLateralAccel: trackerConfig.maxLateralAccel,
+      maxAccel: trackerConfig.maxAccel,
+      maxDecel: trackerConfig.maxDecel,
+    });
+    c.metrics.planHealth.infeasibleCurvatureSamples += audit.infeasibleCurvatureSamples;
+    c.metrics.planHealth.infeasibleAccelSamples += audit.infeasibleAccelSamples;
+    c.metrics.planHealth.planSamplesTotal += audit.totalSamples;
+    c.currentLapReplanCount += 1;
   }
 
   /** Perpendicular distance from a point to the unexecuted future of the
@@ -1278,6 +1576,24 @@ export async function createRaceScenario(
             : dur;
           c.lapStartSimTime = lapEnd;
           c.currentLapSectors = [];
+          // Per-lap stats: append + recompute CV. CV is the canonical
+          // "are laps consistent?" measurement the user asked for.
+          c.metrics.perLap.times.push(dur);
+          c.metrics.perLap.offTrackTicks.push(c.currentLapOffTrackTicks);
+          c.metrics.perLap.replanCounts.push(c.currentLapReplanCount);
+          c.currentLapOffTrackTicks = 0;
+          c.currentLapReplanCount = 0;
+          const times = c.metrics.perLap.times;
+          if (times.length >= 2) {
+            const mean = times.reduce((a, b) => a + b, 0) / times.length;
+            const variance =
+              times.reduce((a, b) => a + (b - mean) * (b - mean), 0) /
+              times.length;
+            c.metrics.perLap.cv = mean > 1e-9 ? Math.sqrt(variance) / mean : 0;
+          }
+          // Final P95 refresh on lap completion (cheap, only N laps).
+          c.metrics.executionHealth.speedErrP95 = c.speedErrP95Tracker.p95();
+          c.metrics.executionHealth.lateralErrP95 = c.lateralErrP95Tracker.p95();
           if (targetLaps !== undefined && c.laps.length >= targetLaps) {
             c.finished = true;
           } else if (syncHold) {
@@ -1440,6 +1756,35 @@ export async function createRaceScenario(
       c.metrics.trackingErrorRms = c.diagnostics.predErrorRms;
       c.predictedEnd = null;
     }
+    // Execution-faithfulness metrics: target-vs-actual speed and
+    // lateral-error P95s, plus an "is the controller being asked to do
+    // the impossible RIGHT NOW" tick counter. Domain-agnostic — only
+    // updated when a plan is active and not in sync-hold.
+    if (!c.holdingForSync && c.plan && c.plan.length > 1) {
+      const tgt = Math.abs(c.metrics.liveControls.targetSpeed);
+      const cur = Math.abs(after.speed);
+      const speedErr = Math.abs(tgt - cur);
+      c.metrics.executionHealth.speedErrSumSq += speedErr * speedErr;
+      c.metrics.executionHealth.speedErrAbsSum += speedErr;
+      c.metrics.executionHealth.speedErrCount += 1;
+      c.speedErrP95Tracker.push(speedErr);
+      const lat = lateralFromPlan(c, after.x, after.z);
+      if (Number.isFinite(lat)) {
+        c.lateralErrP95Tracker.push(lat);
+      }
+      // Infeasibility now: commanded curvature × actual speed².
+      const k = Math.abs(c.metrics.liveControls.steer);
+      const aLatNow = k * cur * cur;
+      if (aLatNow > trackerConfig.maxLateralAccel) {
+        c.metrics.executionHealth.infeasibleNowTicks += 1;
+      }
+      // Cheap P95 refresh — sort once every few ticks instead of every
+      // tick; reads only matter at lap completion / race end anyway.
+      if (c.metrics.executionHealth.speedErrCount % 32 === 0) {
+        c.metrics.executionHealth.speedErrP95 = c.speedErrP95Tracker.p95();
+        c.metrics.executionHealth.lateralErrP95 = c.lateralErrP95Tracker.p95();
+      }
+    }
     // Metrics.
     c.metrics.peakSpeed = Math.max(c.metrics.peakSpeed, Math.abs(after.speed));
     c.diagnostics.planAgeMs = (simTime - c.planStartSimTime) * 1000;
@@ -1487,6 +1832,7 @@ export async function createRaceScenario(
       const z1 = course.bounds.z1 + 15;
       if (after.x < x0 || after.x > x1 || after.z < z0 || after.z > z1 || !Number.isFinite(after.x)) {
         c.offTrackEvents++;
+        c.currentLapOffTrackTicks++;
         const target = offTrackRecovery === 'waypoint' ? course.waypoints[c.loopIndex]! : c.spawn;
         c.car.teleport({ x: target.x, z: target.z, heading: target.heading });
         c.plan = null;
@@ -1565,6 +1911,10 @@ export async function createRaceScenario(
       c.lastPos = { x: c.spawn.x, z: c.spawn.z };
       c.lateralOverCount = 0;
       c.replanHistory = [];
+      c.speedErrP95Tracker = new P95Tracker();
+      c.lateralErrP95Tracker = new P95Tracker();
+      c.currentLapOffTrackTicks = 0;
+      c.currentLapReplanCount = 0;
     }
   }
 
