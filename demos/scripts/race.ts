@@ -122,9 +122,12 @@ async function main(): Promise<void> {
     tuning: {
       tracker,
       deterministicPlanner: Boolean(values.deterministic),
-      maxSteerRateRadPerSec: values['steer-rate'] !== undefined ? Number(values['steer-rate']) : undefined,
-      lateralErrorReplanMinTicks: values['lat-debounce'] !== undefined ? Number(values['lat-debounce']) : undefined,
-      consistencyWeight: values['consistency'] !== undefined ? Number(values['consistency']) : undefined,
+      // Only set when the flag is provided, otherwise the spread leaves
+      // an `undefined` value that OVERRIDES the default in
+      // `DEFAULT_TUNING` instead of falling back to it.
+      ...(values['steer-rate'] !== undefined ? { maxSteerRateRadPerSec: Number(values['steer-rate']) } : {}),
+      ...(values['lat-debounce'] !== undefined ? { lateralErrorReplanMinTicks: Number(values['lat-debounce']) } : {}),
+      ...(values['consistency'] !== undefined ? { consistencyWeight: Number(values['consistency']) } : {}),
     },
     traceEverySec: runDir ? 0.1 : undefined,
     onTrace: runDir ? (t) => { capturedTraces = t; } : undefined,
