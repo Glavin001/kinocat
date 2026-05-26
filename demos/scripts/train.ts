@@ -6,16 +6,21 @@
 // `PersistedV2Model` payload the demos load on first visit) +
 // `demos/public/models/v2-default.manifest.json` (provenance sidecar).
 
-import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname, resolve, isAbsolute } from 'node:path';
+import { writeFileSync, mkdirSync, readFileSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, resolve, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import {
   runManeuverTraining,
   type TrainingEvent,
   DEFAULT_VEHICLE_OPTS,
+  type PythonFitRequest,
+  type PythonFitResult,
 } from '../app/lib/training-driver';
+import { writeTrialsNpz } from './lib/trial-npz';
+import { readResidualEnsembleNpz } from './lib/residual-npz';
 import { modelToJson } from '../app/lib/v2-model-file';
 import {
   computeCacheKey,
@@ -120,6 +125,12 @@ async function main(): Promise<void> {
       'mine-from-trace': { type: 'string' },
       'cache-dir': { type: 'string' },
       'no-cache': { type: 'boolean', default: false },
+      trainer: { type: 'string', default: 'js' },          // 'js' | 'python'
+      python: { type: 'string', default: 'python3' },      // python interpreter for --trainer=python
+      'max-iter': { type: 'string', default: '50' },       // LM iters for python trainer
+      'mlp-shape': { type: 'string', default: '64,64' },
+      'ensemble-size': { type: 'string', default: '3' },
+      epochs: { type: 'string', default: '200' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -128,6 +139,12 @@ async function main(): Promise<void> {
                        [--seed=N] [--rounds=N] [--trials=N] [--ticks=N]
                        [--out=path/to/v2-default.json]
                        [--cache-dir=path] [--no-cache]
+                       [--trainer=js|python]  [--python=python3]
+                       [--max-iter=N] [--mlp-shape=64,64] [--ensemble-size=3] [--epochs=200]
+
+Trainer modes:
+  js (default)  legacy Nelder-Mead + SGD path
+  python        JAX-based LM + Adam (see demos/scripts/python/README.md)
 
 Profiles:
 ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds} trials/round=${v.trialsPerRound} ticks=${v.trialTicks}`).join('\n')}
@@ -229,6 +246,77 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
     process.stdout.write(`  · Mined ${added} trial${added === 1 ? '' : 's'} from trace ${tracePath}\n`);
   }
 
+  // --trainer=python: replace the JS Nelder-Mead + SGD fits with a
+  // JAX-based pipeline via `demos/scripts/python/train_fit.py`. The hook
+  // runs once per round; on the final round it also fits the residual
+  // MLP ensemble and ships it back as an npz.
+  const trainerMode = String(values.trainer);
+  if (trainerMode !== 'js' && trainerMode !== 'python') {
+    throw new Error(`Unknown --trainer=${trainerMode}. Use 'js' or 'python'.`);
+  }
+  let pythonFitHook: ((req: PythonFitRequest) => Promise<PythonFitResult>) | undefined;
+  if (trainerMode === 'python') {
+    const pythonInterp = String(values.python);
+    const pyDir = resolve(repoRoot, 'demos/scripts/python');
+    const maxIter = Number(values['max-iter']);
+    const mlpShape = String(values['mlp-shape']);
+    const ensembleSize = Number(values['ensemble-size']);
+    const epochs = Number(values.epochs);
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'kinocat-jax-'));
+    process.stdout.write(`  · trainer: python (JAX) interp=${pythonInterp} tmp=${tmpRoot}\n`);
+
+    pythonFitHook = async (req) => {
+      const roundDir = join(tmpRoot, `round-${req.round}`);
+      mkdirSync(roundDir, { recursive: true });
+      const trialsPath = join(roundDir, 'trials.npz');
+      const inParamsPath = join(roundDir, 'params-in.json');
+      const outParamsPath = join(roundDir, 'params-out.json');
+      const outResidualPath = req.isFinalRound ? join(roundDir, 'mlp.npz') : null;
+
+      writeTrialsNpz(trialsPath, req.trials);
+      writeFileSync(inParamsPath, JSON.stringify(req.currentParams, null, 2));
+
+      const args = [
+        '-m', 'train_fit',
+        '--trials', trialsPath,
+        '--init-params', inParamsPath,
+        '--out-params', outParamsPath,
+        '--max-iter', String(maxIter),
+        '--mlp-shape', mlpShape,
+        '--ensemble-size', String(ensembleSize),
+        '--epochs', String(epochs),
+      ];
+      if (outResidualPath) {
+        args.push('--out-residual', outResidualPath);
+      } else {
+        args.push('--no-residual');
+      }
+
+      process.stdout.write(`    [python] round ${req.round + 1} (${req.trials.length} trials)\n`);
+      const t0 = Date.now();
+      const res = spawnSync(pythonInterp, args, {
+        cwd: pyDir,
+        stdio: ['ignore', 'inherit', 'inherit'],
+        env: { ...process.env, PYTHONPATH: pyDir },
+      });
+      if (res.status !== 0) {
+        throw new Error(`python trainer failed with status ${res.status}`);
+      }
+      process.stdout.write(`    [python] round ${req.round + 1} done in ${fmtMs(Date.now() - t0)}\n`);
+
+      const fittedParams = JSON.parse(readFileSync(outParamsPath, 'utf-8'));
+      let residualEnsemble;
+      if (outResidualPath) {
+        residualEnsemble = readResidualEnsembleNpz(outResidualPath);
+      }
+      return {
+        params: fittedParams,
+        residualEnsemble,
+        residualReferenceDt: req.sampleDt,
+      };
+    };
+  }
+
   const result = await runManeuverTraining({
     rounds,
     trialsPerRound,
@@ -239,6 +327,9 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
     minedTrials: minedTrials.length > 0 ? (minedTrials as never) : undefined,
     bundle,
     trialCache: cacheDir ? buildTrialCache({ cacheDir, seed, trialsPerRound, trialTicks, sampleEveryNTicks, bundle }) : undefined,
+    pythonFit: pythonFitHook,
+    // Node runs without a UI to keep responsive — drop the per-iter setTimeout(0).
+    cooperativeYield: () => {},
     onEvent: (e: TrainingEvent) => {
       switch (e.type) {
         case 'round-start':

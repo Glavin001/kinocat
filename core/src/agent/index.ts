@@ -56,6 +56,7 @@ export {
   paramsV2ToVec,
   paramsV2FromVec,
   parametricForwardV2,
+  parametricForwardV2Smooth,
   learnedForwardSimV2,
   predictWithUncertainty,
   buildParametricOnlyModel,

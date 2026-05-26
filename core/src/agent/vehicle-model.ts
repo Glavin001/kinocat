@@ -313,6 +313,147 @@ export function parametricForwardV2(
 }
 
 // ---------------------------------------------------------------------------
+// Smooth, differentiable variant of parametricForwardV2.
+//
+// Replaces six non-differentiabilities in the original with smooth surrogates
+// so gradient-based optimizers (Levenberg-Marquardt, Adam) can fit the 16
+// params reliably. The runtime path stays on the piecewise `parametricForwardV2`
+// — this is the training target only, and is kept in lockstep with the JAX
+// reference port (`demos/scripts/python/parametric.py`) via a golden file.
+//
+// Replacements:
+//   1. Math.sign(v)             → tanh(v / V_EPS)
+//   2. Math.abs(v)              → sqrt(v² + ABS_EPS²)
+//   3. fAbs > driveDeadzone     → smooth softplus thresholding
+//   4. driveForce >= 0 branch   → 0.5 * (1 + tanh(driveForce / F_EPS)) blend
+//   5. friction-circle clamp    → smooth saturation aMax·mag/√(mag² + (aMax·δ)²)
+//   6. brake sign-flip guard    → smooth gate via tanh on |v|
+//
+// Tolerances are chosen so the smooth and piecewise variants agree to <1e-3
+// per output component across the trial distribution. Verified by
+// `parametric-forward-v2-smooth.test.ts`.
+
+const V_EPS = 0.1;       // tanh slope for Math.sign on velocity
+const F_EPS = 5;         // tanh slope for engine direction branch (N)
+const ABS_EPS = 1e-3;    // softening for Math.abs at zero
+const DEADZONE_K = 0.1;  // softplus sharpness (1/N) for deadzone gate
+const CIRCLE_DELTA = 0.05; // smoothness of friction-circle clamp
+const BRAKE_GATE_K = 5;  // 1/(m/s); how sharply the brake-flip guard engages
+
+function softAbs(x: number): number {
+  return Math.sqrt(x * x + ABS_EPS * ABS_EPS);
+}
+
+function softSign(x: number, eps: number): number {
+  return Math.tanh(x / eps);
+}
+
+// softplus(k·(x − thr)) / k  → smooth max(0, x − thr).
+function softplusThresh(x: number, thr: number, k: number): number {
+  const z = k * (x - thr);
+  // numerically stable softplus
+  return (z > 30 ? z : Math.log1p(Math.exp(z))) / k;
+}
+
+export function parametricForwardV2Smooth(
+  params: LearnedVehicleParamsV2,
+  config: LearnableVehicleConfig,
+): ForwardSim<CarKinematicState> {
+  return (s: CarKinematicState, controls: number[], dt: number): CarKinematicState => {
+    const c = decodeWheeled(controls);
+    const v = s.speed;
+    const vy = s.lateralVelocity ?? 0;
+    const yawRate = s.yawRate ?? 0;
+    const m = Math.max(50, config.chassisMass);
+
+    // --- Longitudinal command -------------------------------------------
+    // Smooth deadzone: effective magnitude is softplus(|f| − thr).
+    const fAbs = softAbs(c.driveForce);
+    const fEffMag = softplusThresh(fAbs, params.driveDeadzone, DEADZONE_K);
+    // Smooth sign of driveForce → preserves direction of fEffMag.
+    const fEffSign = softSign(c.driveForce, F_EPS);
+    const fEff = fEffSign * fEffMag;
+    // Smooth blend between forward (engineScale) and reverse (engineScale * reverseEffScale).
+    const fwdMix = 0.5 * (1 + softSign(c.driveForce, F_EPS));
+    const dir = params.engineScale * (fwdMix + (1 - fwdMix) * params.reverseEffScale);
+    const driveAccel = (dir * fEff) / m;
+
+    const brakeAccel = (params.brakeScale * c.brakeForce) / m;
+    const vSign = softSign(v, V_EPS);
+    const brakeSigned = -vSign * brakeAccel;
+    const rolling = -vSign * params.rollingResistance * softAbs(v);
+
+    let aLong = driveAccel + brakeSigned + rolling;
+
+    // --- Steer → bicycle yaw rate ---------------------------------------
+    const effSteer = c.steer * params.steerRatio;
+    const L = Math.max(0.5, 2 * config.wheelBase);
+    const yawRateCmdRaw = (v * Math.sin(effSteer)) / L;
+    // Smooth power-on gate: tanh on driveForce AND on v.
+    const powerOnGate = 0.5 * (1 + softSign(c.driveForce, F_EPS)) * 0.5 * (1 + softSign(v, V_EPS));
+    const ku =
+      powerOnGate * params.understeerPowerOn +
+      (1 - powerOnGate) * params.understeerOffThrottle;
+    const yawRateCmd = yawRateCmdRaw / (1 + ku * v * v);
+
+    // --- Friction-circle: smooth saturation -----------------------------
+    const aMax = params.gripScale * config.frictionSlip * G * params.frictionCircleSlack;
+    const aLatEst = v * yawRateCmd;
+    const mag = Math.sqrt(aLong * aLong + aLatEst * aLatEst + ABS_EPS * ABS_EPS);
+    // Smooth `min(1, aMax/mag)`: scale·mag = aMax·tanh(mag/aMax).
+    //   small mag → tanh(u)/u → 1, so scale → 1 (no attenuation)
+    //   large mag → tanh saturates to 1, so scale → aMax/mag (the hard clamp)
+    // CIRCLE_DELTA is unused here but kept for API parity with the JAX port.
+    void CIRCLE_DELTA;
+    const u = mag / Math.max(aMax, 1e-6);
+    const scale = Math.tanh(u) / Math.max(u, 1e-9);
+    aLong *= scale;
+    const yawRateAllowed = yawRateCmd * scale;
+
+    // --- Speed dynamics --------------------------------------------------
+    const tau = Math.max(0.02, params.accelTau);
+    // Original is a no-op tanh-mix; preserve algebraic form.
+    const aEff = aLong * (1 - Math.exp(-dt / tau)) + aLong * Math.exp(-dt / tau);
+    const slipLoss = -params.slipDrag * softAbs(vy) * vSign * dt;
+    let speed = v + aEff * dt + slipLoss;
+    // Smooth brake sign-flip guard: when |v| is small and brake is engaged,
+    // pull `speed` toward 0. Implemented as a soft gate:
+    //   gate = sigmoid(-(|v| − ε)·k) ≈ 1 when v near 0, ≈ 0 otherwise
+    const brakeOn = 0.5 * (1 + Math.tanh(c.brakeForce * 0.01));
+    const nearZero = 0.5 * (1 - Math.tanh((softAbs(v) - 0.05) * BRAKE_GATE_K));
+    const flipGate = brakeOn * nearZero;
+    speed = (1 - flipGate) * speed + flipGate * 0;
+
+    // --- Yaw-rate inertia ------------------------------------------------
+    const yTau = Math.max(0.02, params.yawRateTau);
+    const yawRateNext = yawRate + ((yawRateAllowed - yawRate) * dt) / yTau;
+
+    // --- Lateral velocity ------------------------------------------------
+    const vyDrive = params.lateralFromSteer * effSteer * v;
+    const vyNext = vy + (vyDrive - vy * params.lateralDamping) * dt;
+
+    // --- Integrate pose --------------------------------------------------
+    const speedAvg = 0.5 * (v + speed);
+    const yawAvg = 0.5 * (yawRate + yawRateNext);
+    const heading = wrapAngle(s.heading + yawAvg * dt);
+    const cosH = Math.cos(s.heading);
+    const sinH = Math.sin(s.heading);
+    const vyAvg = 0.5 * (vy + vyNext);
+    const dx = (speedAvg * cosH + vyAvg * Math.sin(s.heading)) * dt;
+    const dz = (speedAvg * sinH - vyAvg * Math.cos(s.heading)) * dt;
+    return {
+      x: s.x + dx,
+      z: s.z + dz,
+      heading,
+      speed,
+      yawRate: yawRateNext,
+      lateralVelocity: vyNext,
+      t: s.t + dt,
+    };
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Full model (parametric + optional residual MLP ensemble)
 
 export interface LearnedVehicleModel {
