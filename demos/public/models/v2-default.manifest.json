@@ -23,7 +23,7 @@
     "maxSteerAngle": 0.6,
     "driveTrain": "rwd"
   },
-  "git": "4660f7c",
+  "git": "cb7545c",
   "diagnostics": {
     "openLoopDivergence": [
       {
@@ -126,6 +126,6 @@
       ]
     }
   },
-  "runtimeMs": 603493,
-  "createdAt": 1779765674605
+  "runtimeMs": 607631,
+  "createdAt": 1779766785689
 }
