@@ -49,6 +49,7 @@ async function main(): Promise<void> {
       'max-sim': { type: 'string', default: '180' },
       json: { type: 'string' },
       ledger: { type: 'string' },
+      'dump-replans': { type: 'string' },
       quick: { type: 'boolean', default: false },
       'no-kinematic': { type: 'boolean', default: false },
       'no-parametric': { type: 'boolean', default: false },
@@ -62,6 +63,7 @@ async function main(): Promise<void> {
                       [--json=path] [--ledger=dir] [--quick]
                       [--no-kinematic] [--no-parametric]
                       [--tracker=pure-pursuit|mpc]
+                      [--dump-replans=path.json]
 `);
     return;
   }
@@ -165,6 +167,25 @@ async function main(): Promise<void> {
     const jsonPath = isAbsolute(arg) ? arg : resolve(repoRoot, arg);
     writeFileSync(jsonPath, JSON.stringify({ seed: Number(values.seed), targetLaps, results }, null, 2), 'utf-8');
     process.stdout.write(`wrote ${jsonPath}\n`);
+  }
+
+  // Optional replan-history dump — full per-replan structured records
+  // (ring buffer, max 30 most recent per car) for offline analysis of
+  // "what was the planner thinking at this point in the race?".
+  if (values['dump-replans']) {
+    const arg = String(values['dump-replans']);
+    const dumpPath = isAbsolute(arg) ? arg : resolve(repoRoot, arg);
+    const dump = results.map((r) => ({
+      name: r.name,
+      replanReasonCounts: r.replanReasonCounts,
+      plannerMsMean: r.plannerMsMean,
+      plannerMsMax: r.plannerMsMax,
+      plannerDeadlineHits: r.plannerDeadlineHits,
+      sharpSteerTicks: r.sharpSteerTicks,
+      replanHistory: r.replanHistory,
+    }));
+    writeFileSync(dumpPath, JSON.stringify(dump, null, 2), 'utf-8');
+    process.stdout.write(`wrote ${dumpPath} (replan history)\n`);
   }
 
   // Optional ledger append.
