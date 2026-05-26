@@ -393,7 +393,15 @@ export const DEFAULT_TUNING: RaceTuning = {
   // chassis keeps swinging between two slightly different racing
   // lines") which manifests on the web demo as flickering plan
   // visuals and on the controller as oscillating steer commands.
-  consistencyWeight: 0.2,
+  //
+  // Tuned via deterministic-planner sweep (3-lap race vs kinematic):
+  //   0    -47 %       0.4  +11 %
+  //   0.1  +14 %  ←    0.6   -2 %
+  //   0.2   -9 %       1.0  +10 %
+  //
+  // 0.1 also has the best stochastic 5-run mean (-30 % vs -38 % at
+  // 0.2) and zero DNFs (0.2 had a DNF in 1 of 5).
+  consistencyWeight: 0.1,
   enableSpeedProfile: false,
   enableTrajectorySmoother: true,
   // respectPathSpeed (off): per-sample plan speeds are noisy — they
