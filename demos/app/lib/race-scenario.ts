@@ -115,17 +115,20 @@ export const LATERAL_ERROR_REPLAN_M = 2.0;
 export const MIN_TIME_BETWEEN_REPLANS_MS = 150;
 /**
  * Max steering-wheel rate (rad/s). Slew-rate limit on the tracker's
- * commanded wheel angle, applied after pure-pursuit / MPC. Without this
- * the v2-learned model produces high-frequency chatter at the steer
- * saturation boundary (visible as red "sharp turn" dots on the web
- * /raceprimitives page) which provokes lateral-error replan storms.
+ * commanded wheel angle, applied after pure-pursuit / MPC. Filters
+ * single-tick chatter at the steer saturation boundary that provokes
+ * lateral-error replan storms.
  *
- * Tuning notes: max steer angle is ±0.222 rad. At 12 rad/s a full-lock
- * swing takes ~37 ms (≈2 ticks @60Hz) — fast enough not to interfere
- * with legitimate emergency steering, slow enough that the worst
- * single-tick spike (|Δsteer| ≈ 0.4 rad/tick = 24 rad/s observed) gets
- * cut in half. 4 rad/s was too restrictive: the bench race went DNF
- * because the controller couldn't react to gates in time.
+ * 12 rad/s: max steer angle is ±0.222 rad, so full-lock swing takes
+ * ~37 ms (≈2 ticks @60Hz) — fast enough not to interfere with
+ * legitimate emergency steering, slow enough that the worst single-tick
+ * spike (|Δsteer| ≈ 0.4 rad/tick = 24 rad/s observed) gets cut in half.
+ *
+ * Tuned empirically:
+ *  - 4 rad/s: too restrictive, race went DNF
+ *  - speed-aware (24 low → 8 high): worse than constant; chatter
+ *    spikes through during low-speed corner entries
+ *  - 12 rad/s: 5-run mean loss to kinematic dropped from -50 % to -17 %
  */
 export const MAX_STEER_RATE_RAD_PER_SEC = 12.0;
 /**
@@ -1323,13 +1326,9 @@ export async function createRaceScenario(
         : rawSeg;
       if (live.length >= 2) {
         // Slew-rate limit: cap |Δsteer| per tick to filter single-tick
-        // chatter spikes at the steer saturation boundary that provoke
-        // lateral-error replan storms. Applied in the SAME frame as
-        // `c.lastControls.steer` (Rapier-frame, which is the negation of
-        // the planner-frame angle — `wheeledFromNormalized` does the
-        // negation). MPC returns Rapier-frame directly; pure-pursuit's
-        // `steerRaw` is planner-frame and gets negated by
-        // `wheeledFromNormalized`, so we limit against the negated prev.
+        // chatter spikes at the steer saturation boundary. Applied in
+        // the same frame as `c.lastControls.steer` (Rapier-frame —
+        // `wheeledFromNormalized` negates the planner-frame angle).
         const maxDSteer = MAX_STEER_RATE_RAD_PER_SEC * dt;
         if (tuning.tracker === 'mpc') {
           // Sampling MPC over the v2 parametric model.
