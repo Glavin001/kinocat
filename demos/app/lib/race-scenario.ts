@@ -51,9 +51,12 @@ import {
 } from 'kinocat/execute';
 import {
   parametricForwardV2,
+  learnedForwardSimV2,
   DEFAULT_LEARNED_PARAMS_V2,
   DEFAULT_LEARNABLE_CONFIG,
+  type LearnedVehicleModel,
 } from 'kinocat/agent';
+import type { ForwardSim } from 'kinocat/primitives';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavWorld } from 'kinocat/environment';
 import type { MotionPrimitiveLibrary } from 'kinocat/primitives';
@@ -354,6 +357,11 @@ export interface RaceEntry {
   name: string;
   /** Motion-primitive library this entry's planner uses. */
   lib: MotionPrimitiveLibrary;
+  /** Optional learned dynamics model. When present AND the tracker is
+   *  `'mpc'`, the MPC controller uses this model's forward sim instead of
+   *  the default parametric model — aligning the tracker's dynamics with
+   *  the planner's primitives so there is no planning-execution mismatch. */
+  model?: LearnedVehicleModel;
 }
 
 export interface RaceLap {
@@ -593,17 +601,29 @@ export async function createRaceScenario(
   };
   const arriveRadius = tuning.arriveRadius ?? RACE_ARRIVE_RADIUS;
 
-  // MPC tracker shared config + forward simulator (constant per scenario).
-  // The dynamics model is the v2 parametric model with default coefficients
-  // — captures the Rapier chassis well enough for the controller to plan
-  // accurate short-horizon rollouts even on cars that don't ship their own
-  // learned model. Per-car: a `MPCTrackerState` holds the warm-start
-  // sequence + deterministic RNG seed.
+  // MPC tracker config + forward simulator. When an entry supplies a
+  // `model`, the MPC controller uses that model's forward sim — aligning
+  // the tracker's dynamics with the planner's primitives. Without a model,
+  // falls back to the default parametric model (still reasonable for
+  // kinematic-library entries). Per-car forward sims are built lazily in
+  // `mpcForwardSimFor` so the shared config block stays constant.
   const MPC_HORIZON = 10;
-  const mpcForwardSim = parametricForwardV2(
+  const defaultMpcForwardSim = parametricForwardV2(
     DEFAULT_LEARNED_PARAMS_V2,
     DEFAULT_LEARNABLE_CONFIG,
   );
+  const perCarMpcForwardSim = new Map<string, ForwardSim<CarKinematicState>>();
+  function mpcForwardSimFor(entry: RaceEntry): ForwardSim<CarKinematicState> {
+    let sim = perCarMpcForwardSim.get(entry.name);
+    if (sim) return sim;
+    if (entry.model) {
+      sim = parametricForwardV2(entry.model.params, entry.model.config);
+    } else {
+      sim = defaultMpcForwardSim;
+    }
+    perCarMpcForwardSim.set(entry.name, sim);
+    return sim;
+  }
   // MPPI tracker config. The cost weights work across the entire
   // racing-to-parking spectrum because the tracker auto-activates the
   // terminal-pose cost when the plan asks the chassis to stop near a
@@ -627,19 +647,26 @@ export async function createRaceScenario(
     maxSteer: VEHICLE_TUNING.maxSteerAngle ?? 0.6,
     maxDriveForce: ENGINE_FORCE_N,
     maxBrakeForce: BRAKE_FORCE_N,
-    allowReverse: true,
+    allowReverse: tuning.mpcWTerminalPosition > 0,
     lambda: 0.5,
-    steerStd: 0.10,
-    driveStd: 0.5 * ENGINE_FORCE_N,
-    brakeStd: 0.10 * BRAKE_FORCE_N,
-    wLateral: 2,
+    samples: 128,
+    steerStd: 0.08,
+    driveStd: 0.3 * ENGINE_FORCE_N,
+    brakeStd: 0.15 * BRAKE_FORCE_N,
+    wLateral: 8,
     wHeading: 3,
-    wSpeed: 10,
-    wControlRate: 0.15,
-    wSteerRate: 25,
+    wSpeed: 0.5,
+    wControlRate: 0.1,
+    wSteerRate: 5,
     wTerminalPosition: tuning.mpcWTerminalPosition,
     wTerminalSpeed: tuning.mpcWTerminalSpeed,
     goalTolerance: 0.5,
+    // Racing: the reference trajectory should advance at the car's
+    // actual speed (or faster), not the plan's endpoint speed. Without
+    // this, the MPC brakes to match low plan speeds near waypoint
+    // endpoints. The min floor of 5 prevents near-zero advance rates
+    // when the car is stopped. Parking scenarios leave this at 0.
+    minReferenceSpeed: tuning.mpcWTerminalPosition > 0 ? 0 : 5,
   };
 
   const cars: CarInternal[] = opts.entries.map((entry, i) => {
@@ -1138,7 +1165,7 @@ export async function createRaceScenario(
         if (tuning.tracker === 'mpc') {
           // Sampling MPC over the v2 parametric model.
           if (!c.mpcState) c.mpcState = createMPCTrackerState(MPC_HORIZON);
-          const cmdRaw = mpcTrack(stateBefore, live, mpcForwardSim, c.mpcState, MPC_CONFIG);
+          const cmdRaw = mpcTrack(stateBefore, live, mpcForwardSimFor(c.entry), c.mpcState, MPC_CONFIG);
           const cmd: WheeledCarControls = {
             steer: cmdRaw.steer,
             driveForce: cmdRaw.driveForce,

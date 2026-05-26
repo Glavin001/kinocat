@@ -52,6 +52,7 @@ async function main(): Promise<void> {
       quick: { type: 'boolean', default: false },
       'no-kinematic': { type: 'boolean', default: false },
       'no-parametric': { type: 'boolean', default: false },
+      tracker: { type: 'string', default: 'pure-pursuit' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -60,6 +61,7 @@ async function main(): Promise<void> {
                       [--laps=N] [--seed=N] [--max-sim=N]
                       [--json=path] [--ledger=dir] [--quick]
                       [--no-kinematic] [--no-parametric]
+                      [--tracker=pure-pursuit|mpc]
 `);
     return;
   }
@@ -87,7 +89,8 @@ async function main(): Promise<void> {
   }
 
   const targetLaps = quick ? 1 : laps;
-  process.stdout.write(`race-primitives benchmark — seed=${values.seed} laps=${targetLaps} dt=1/60\n`);
+  const tracker = (values.tracker === 'mpc' ? 'mpc' : 'pure-pursuit') as 'pure-pursuit' | 'mpc';
+  process.stdout.write(`race-primitives benchmark — seed=${values.seed} laps=${targetLaps} tracker=${tracker} dt=1/60\n`);
 
   const results = await runHeadlessRace({
     entries,
@@ -95,6 +98,7 @@ async function main(): Promise<void> {
     maxSimTime,
     onProgress: (msg) => process.stdout.write(`  · ${msg}\n`),
     progressEverySec: 10,
+    tuning: { tracker },
   });
 
   // Print table.

@@ -385,6 +385,7 @@ export default function RacePrimitives() {
         const learnedLibraryOverride = v2Active
           ? buildLearnedRaceLibraryV2(v2Model!)
           : undefined;
+        const learnedModel = v2Active ? v2Model! : undefined;
         const setup = await setupScene(mount, params, {
           onMetrics: (km, lm) => setMetrics({ kinematic: km, learned: lm }),
           onLearner: (snap) => setLearner(snap),
@@ -392,7 +393,7 @@ export default function RacePrimitives() {
             setWinner(w);
             setPhase('finished');
           },
-        }, { learnedLibraryOverride });
+        }, { learnedLibraryOverride, learnedModel });
         sceneRef.current = setup;
         cleanup = setup.cleanup;
       } catch (e) {
@@ -783,6 +784,10 @@ interface SceneOptions {
    *  refits of the legacy 5-param model would race a stale v1 library while
    *  the v2-derived primitive library is what the planner is searching). */
   learnedLibraryOverride?: MotionPrimitiveLibrary;
+  /** When supplied alongside learnedLibraryOverride, the learned car's
+   *  RaceEntry carries this model so the MPC tracker can use the trained
+   *  dynamics for plan-following. */
+  learnedModel?: LearnedVehicleModel;
 }
 
 async function setupScene(
@@ -836,10 +841,10 @@ async function setupScene(
   const scenario = await createRaceScenario({
     entries: [
       { name: 'kinematic', lib: kinematicLib },
-      { name: 'learned', lib: initialLearnedLib },
+      { name: 'learned', lib: initialLearnedLib, model: options.learnedModel },
     ],
-    syncHold: true,
-    offTrackRecovery: 'waypoint',
+    syncHold: false,
+    offTrackRecovery: 'spawn',
   });
 
   // ---- Per-car setup ----

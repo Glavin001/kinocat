@@ -92,9 +92,12 @@ export async function runHeadlessRace(
     const r = scenario.tick();
     if (r.allFinished) break;
     if (r.simTime >= nextProgressAt) {
-      const progress = r.cars.map((c) =>
-        `${c.name}:lap${c.laps.length}/${targetLaps}@wp${c.loopIndex},pos=(${c.state.x.toFixed(1)},${c.state.z.toFixed(1)}),spd=${c.state.speed.toFixed(1)}`,
-      ).join(' | ');
+      const progress = r.cars.map((c) => {
+        const ctrl = c.metrics.liveControls;
+        const thr = ctrl ? `thr=${(ctrl.throttle * 100).toFixed(0)}%` : '';
+        const brk = ctrl ? `brk=${(ctrl.brake * 100).toFixed(0)}%` : '';
+        return `${c.name}:lap${c.laps.length}/${targetLaps}@wp${c.loopIndex},spd=${c.state.speed.toFixed(1)},peak=${c.metrics.peakSpeed.toFixed(1)},${thr},${brk}`;
+      }).join(' | ');
       opts.onProgress?.(`t=${r.simTime.toFixed(1)}s ${progress}`);
       nextProgressAt += progressEvery;
     }
@@ -133,14 +136,16 @@ export function kinematicEntry(name = 'kinematic'): RaceEntry {
   return { name, lib: buildKinematicLibrary() };
 }
 
-/** Build a v2 `RaceEntry` from a `LearnedVehicleModel`. */
+/** Build a v2 `RaceEntry` from a `LearnedVehicleModel`. The model is
+ *  stored on the entry so the MPC tracker can use its dynamics for
+ *  plan-following (aligning execution with planning). */
 export function v2Entry(name: string, model: LearnedVehicleModel): RaceEntry {
-  return { name, lib: buildLearnedRaceLibraryV2(model) };
+  return { name, lib: buildLearnedRaceLibraryV2(model), model };
 }
 
 /** Build a parametric-only baseline (no residual ensemble) from the
  *  default params + config. */
 export function parametricOnlyEntry(name = 'parametric-only'): RaceEntry {
   const m = buildParametricOnlyModel(DEFAULT_LEARNED_PARAMS_V2);
-  return { name, lib: buildLearnedRaceLibraryV2(m) };
+  return { name, lib: buildLearnedRaceLibraryV2(m), model: m };
 }
