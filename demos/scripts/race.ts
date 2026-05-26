@@ -59,6 +59,7 @@ async function main(): Promise<void> {
       deterministic: { type: 'boolean', default: false },
       'steer-rate': { type: 'string' },
       'lat-debounce': { type: 'string' },
+      'consistency': { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -123,6 +124,7 @@ async function main(): Promise<void> {
       deterministicPlanner: Boolean(values.deterministic),
       maxSteerRateRadPerSec: values['steer-rate'] !== undefined ? Number(values['steer-rate']) : undefined,
       lateralErrorReplanMinTicks: values['lat-debounce'] !== undefined ? Number(values['lat-debounce']) : undefined,
+      consistencyWeight: values['consistency'] !== undefined ? Number(values['consistency']) : undefined,
     },
     traceEverySec: runDir ? 0.1 : undefined,
     onTrace: runDir ? (t) => { capturedTraces = t; } : undefined,
