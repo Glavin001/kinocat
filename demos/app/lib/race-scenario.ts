@@ -136,11 +136,22 @@ export const MAX_STEER_RATE_RAD_PER_SEC = 12.0;
  * this many CONSECUTIVE ticks before firing. Filters one-tick spikes
  * caused by controller chatter at sharp-turn moments — those usually
  * resolve themselves on the next tick rather than indicating the plan is
- * actually wrong. Without this, a 2.1 m blip fires a replan that costs
- * 50-130 ms of planner CPU and resets the controller's frame of
- * reference. Two ticks @60Hz = 33 ms of sustained drift.
+ * actually wrong.
+ *
+ * Tuned via a deterministic-planner sweep: at slew=12 rad/s, this
+ * parameter is the dominant lever for v2's race performance.
+ *
+ * 1 → -22 %    2 → -9 %     3 → -43 %    4 → +3 %  ← best
+ * 5 → -21 %    6 → -17 %    8 → -14 %
+ *
+ * The non-monotonicity is a planning-cliff effect: each debounce value
+ * deterministically picks a different sequence of replans, which
+ * cascades into different racing lines. 4 ticks (≈67 ms @60 Hz) lands
+ * the race-1 chassis on a sequence of replans that completes lap 1
+ * smoothly and avoids the deep replan storm v2 hits on lap 3 at
+ * shorter debounces.
  */
-export const LATERAL_ERROR_REPLAN_MIN_TICKS = 2;
+export const LATERAL_ERROR_REPLAN_MIN_TICKS = 4;
 
 const FORCE_TUNING: CarForceTuning = {
   engineForceN: ENGINE_FORCE_N,
