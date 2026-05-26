@@ -56,6 +56,7 @@ async function main(): Promise<void> {
       'no-kinematic': { type: 'boolean', default: false },
       'no-parametric': { type: 'boolean', default: false },
       tracker: { type: 'string', default: 'pure-pursuit' },
+      deterministic: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -115,7 +116,7 @@ async function main(): Promise<void> {
     maxSimTime,
     onProgress: (msg) => process.stdout.write(`  · ${msg}\n`),
     progressEverySec: 10,
-    tuning: { tracker },
+    tuning: { tracker, deterministicPlanner: Boolean(values.deterministic) },
     traceEverySec: runDir ? 0.1 : undefined,
     onTrace: runDir ? (t) => { capturedTraces = t; } : undefined,
   });

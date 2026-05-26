@@ -130,7 +130,7 @@ export const MIN_TIME_BETWEEN_REPLANS_MS = 150;
  *    spikes through during low-speed corner entries
  *  - 12 rad/s: 5-run mean loss to kinematic dropped from -50 % to -17 %
  */
-export const MAX_STEER_RATE_RAD_PER_SEC = 12.0;
+export const MAX_STEER_RATE_RAD_PER_SEC = 18.0;
 /**
  * Adaptive lateral-error replan trigger requires `dLat > threshold` for
  * this many CONSECUTIVE ticks before firing. Filters one-tick spikes
@@ -324,6 +324,13 @@ export interface RaceTuning {
   plannerBudgetMs?: number;
   /** Planner expansion cap. Race=30k; parking=80k. */
   plannerMaxExpansions?: number;
+  /** Force a deterministic planner: ignore the wall-clock deadline,
+   *  use only `plannerMaxExpansions` (defaults to 50k from the multi-goal
+   *  planner) as the budget. Trades guaranteed CPU bound for repeatability
+   *  — useful in benches/tests where wall-clock variance makes A/B
+   *  comparisons impossible. Off in the web demo (real-time interactivity
+   *  needs the CPU bound). */
+  deterministicPlanner?: boolean;
 }
 
 /**
@@ -948,7 +955,9 @@ export async function createRaceScenario(
     // waypoint (the goal pose), so this branch is the natural
     // discriminator — no extra config flag needed.
     const isParking = course.waypoints.length === 1;
-    const plannerBudget = tuning.plannerBudgetMs ?? RACE_REPLAN_BUDGET_MS;
+    const plannerBudget = tuning.deterministicPlanner
+      ? Number.POSITIVE_INFINITY
+      : (tuning.plannerBudgetMs ?? RACE_REPLAN_BUDGET_MS);
     const plannerMaxExp = tuning.plannerMaxExpansions ?? RACE_MAX_EXPANSIONS;
     const res = isParking
       ? planRace({
