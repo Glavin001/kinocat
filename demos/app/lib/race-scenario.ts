@@ -130,7 +130,7 @@ export const MIN_TIME_BETWEEN_REPLANS_MS = 150;
  *    spikes through during low-speed corner entries
  *  - 12 rad/s: 5-run mean loss to kinematic dropped from -50 % to -17 %
  */
-export const MAX_STEER_RATE_RAD_PER_SEC = 18.0;
+export const MAX_STEER_RATE_RAD_PER_SEC = 12.0;
 /**
  * Adaptive lateral-error replan trigger requires `dLat > threshold` for
  * this many CONSECUTIVE ticks before firing. Filters one-tick spikes
