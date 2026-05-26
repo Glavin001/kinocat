@@ -119,6 +119,34 @@ async function main(): Promise<void> {
   }
   process.stdout.write('\n');
 
+  // Per-car diagnostics — surface the planner / replan / off-track signals
+  // the harness collected, so debugging "why is car X slow?" doesn't need
+  // a second run. Replan reasons isolate which trigger dominates (mostly
+  // cadence is healthy; mostly lateral-error or failure-retry means the
+  // controller and planner are fighting).
+  const dwidths = [22, 9, 12, 18, 11, 9, 11, 24];
+  const dheader = ['model', 'off-track', 'replan(ok/total)', 'planner ms (mean/max)', 'deadlineHit', 'predErrRMS', 'sharpSteer', 'reasons (cad/lat/wp/fail)'];
+  process.stdout.write(tableLine(dheader, dwidths) + '\n');
+  for (const r of results) {
+    const reasons = `${r.replanReasonCounts.cadence}/${r.replanReasonCounts['lateral-error']}/${r.replanReasonCounts['waypoint-advance']}/${r.replanReasonCounts['failure-retry']}`;
+    process.stdout.write(
+      tableLine(
+        [
+          r.name,
+          String(r.offTrackEvents),
+          `${r.successfulReplans}/${r.totalReplans}`,
+          `${r.plannerMsMean.toFixed(1)}/${r.plannerMsMax.toFixed(1)}`,
+          String(r.plannerDeadlineHits),
+          r.predErrorRms.toFixed(2),
+          String(r.sharpSteerTicks),
+          reasons,
+        ],
+        dwidths,
+      ) + '\n',
+    );
+  }
+  process.stdout.write('\n');
+
   // Comparison commentary.
   const v2 = results.find((r) => r.name.includes('v2') || modelPaths.some((p) => r.name === basename(p).replace(/\.json$/, '')));
   const kin = results.find((r) => r.name === 'kinematic');

@@ -384,12 +384,44 @@ export interface RaceCarDiagnostics {
   totalReplans: number;
   /** RMS prediction error at primitive boundary (planned vs actual pose). */
   predErrorRms: number;
+  /** Cumulative per-trigger replan counts since the scenario started.
+   *  Unlike `replanHistory` (capped at 30), these are TOTAL counts —
+   *  use them to ask "what fraction of replans were triggered by lateral-
+   *  error events vs the cadence timer?" across an entire run. */
+  replanReasonTotals: {
+    cadence: number;
+    'lateral-error': number;
+    'waypoint-advance': number;
+    'failure-retry': number;
+    manual: number;
+  };
+  /** Cumulative planner search-time stats across the entire run. */
+  plannerMsTotal: number;
+  plannerMsMax: number;
+  plannerDeadlineHitsTotal: number;
+  /** Ticks where the commanded steering exceeded 75% of `minTurnRadius`
+   *  curvature — surfaces sharp-turn behaviour for debugging "where did
+   *  the controller wrench the wheel?". */
+  sharpSteerTicks: number;
 }
+
+/** Why was the replan triggered? `cadence` is the periodic timer, the
+ *  rest are adaptive triggers (see `shouldEarlyReplan` and the
+ *  waypoint-advance branch). `manual` is a sync-hold release or a
+ *  scenario-initiated kick (`scenario.tick()` doesn't trigger this). */
+export type ReplanReason =
+  | 'cadence'
+  | 'lateral-error'
+  | 'waypoint-advance'
+  | 'failure-retry'
+  | 'manual';
 
 /** Per-replan snapshot for diagnosing plan instability. */
 export interface ReplanSnapshot {
   /** Sim time when replanCar() was called. */
   simTime: number;
+  /** Which trigger fired this replan. */
+  reason: ReplanReason;
   /** Wall-clock ms the planner search took. */
   searchMs: number;
   /** Whether a valid path was found. */
@@ -643,13 +675,12 @@ export async function createRaceScenario(
   const MPC_CONFIG = {
     horizonSteps: MPC_HORIZON,
     stepDt: 0.05,
-    samples: 64,
+    samples: 128,
     maxSteer: VEHICLE_TUNING.maxSteerAngle ?? 0.6,
     maxDriveForce: ENGINE_FORCE_N,
     maxBrakeForce: BRAKE_FORCE_N,
     allowReverse: tuning.mpcWTerminalPosition > 0,
     lambda: 0.5,
-    samples: 128,
     steerStd: 0.08,
     driveStd: 0.3 * ENGINE_FORCE_N,
     brakeStd: 0.15 * BRAKE_FORCE_N,
@@ -722,6 +753,17 @@ export async function createRaceScenario(
         successfulReplans: 0,
         totalReplans: 0,
         predErrorRms: 0,
+        replanReasonTotals: {
+          cadence: 0,
+          'lateral-error': 0,
+          'waypoint-advance': 0,
+          'failure-retry': 0,
+          manual: 0,
+        },
+        plannerMsTotal: 0,
+        plannerMsMax: 0,
+        plannerDeadlineHitsTotal: 0,
+        sharpSteerTicks: 0,
       },
       metrics: emptyMetrics(),
       lastReplanSimTime: -Infinity,
@@ -752,7 +794,7 @@ export async function createRaceScenario(
   let simTime = 0;
   const replanIntervalSec = REPLAN_INTERVAL_MS / 1000;
 
-  function replanCar(c: CarInternal): void {
+  function replanCar(c: CarInternal, reason: ReplanReason = 'manual'): void {
     if (c.holdingForSync || c.finished) return;
     // Snapshot the previous plan before it's replaced (for drift comparison).
     const prevPlan = c.plan;
@@ -865,6 +907,10 @@ export async function createRaceScenario(
     c.diagnostics.lastReplanMs = replanMs;
     c.diagnostics.lastReplanFound = res.found && res.path.length > 1;
     c.diagnostics.totalReplans += 1;
+    c.diagnostics.replanReasonTotals[reason] += 1;
+    c.diagnostics.plannerMsTotal += replanMs;
+    if (replanMs > c.diagnostics.plannerMsMax) c.diagnostics.plannerMsMax = replanMs;
+    if (res.stats.deadlineHit) c.diagnostics.plannerDeadlineHitsTotal += 1;
     if (c.diagnostics.lastReplanFound) {
       // Two-stage post-process pipeline (Apollo / Autoware shape), each
       // stage individually toggleable for ablation:
@@ -967,6 +1013,7 @@ export async function createRaceScenario(
     }
     c.replanHistory.push({
       simTime,
+      reason,
       searchMs: replanMs,
       found: c.diagnostics.lastReplanFound,
       expansions: res.stats.expansions,
@@ -1039,18 +1086,15 @@ export async function createRaceScenario(
    *  planner can re-aim at the new horizon immediately), and
    *  consecutive failures (back off — keep retrying until something
    *  takes). */
-  function shouldEarlyReplan(c: CarInternal, state: CarKinematicState): boolean {
-    if (!tuning.enableAdaptiveReplan) return false;
-    if (c.holdingForSync || c.finished) return false;
+  function shouldEarlyReplan(c: CarInternal, state: CarKinematicState): ReplanReason | null {
+    if (!tuning.enableAdaptiveReplan) return null;
+    if (c.holdingForSync || c.finished) return null;
     const sinceLastMs = (simTime - c.lastReplanSimTime) * 1000;
-    if (sinceLastMs < MIN_TIME_BETWEEN_REPLANS_MS) return false;
-    // Trigger: large lateral error from the plan.
+    if (sinceLastMs < MIN_TIME_BETWEEN_REPLANS_MS) return null;
     const dLat = lateralFromPlan(c, state.x, state.z);
-    if (dLat > LATERAL_ERROR_REPLAN_M) return true;
-    // Trigger: consecutive failures — keep trying. Cadence already
-    // does this every 300ms but events let us retry earlier.
-    if (c.diagnostics.consecutiveFailedReplans >= 2) return true;
-    return false;
+    if (dLat > LATERAL_ERROR_REPLAN_M) return 'lateral-error';
+    if (c.diagnostics.consecutiveFailedReplans >= 2) return 'failure-retry';
+    return null;
   }
 
   function stepOne(c: CarInternal, dt: number): void {
@@ -1069,8 +1113,9 @@ export async function createRaceScenario(
     // trigger checks rate-limit themselves so a degenerate state can't
     // thrash the planner.
     const cadenceDue = simTime - c.lastReplanSimTime >= replanIntervalSec;
-    if (cadenceDue || shouldEarlyReplan(c, stateBefore)) {
-      replanCar(c);
+    const adaptiveReason = shouldEarlyReplan(c, stateBefore);
+    if (cadenceDue || adaptiveReason) {
+      replanCar(c, cadenceDue ? 'cadence' : (adaptiveReason ?? 'cadence'));
     }
     // Waypoint advance + lap detection (60Hz so lap times aren't quantized
     // to the replan cadence).
@@ -1094,7 +1139,7 @@ export async function createRaceScenario(
         if (tuning.enableWaypointAdvanceReplan) {
           const sinceLastMs = (simTime - c.lastReplanSimTime) * 1000;
           if (sinceLastMs >= MIN_TIME_BETWEEN_REPLANS_MS) {
-            replanCar(c);
+            replanCar(c, 'waypoint-advance');
           }
         }
         if (c.waypointsCleared % course.waypoints.length === 0) {
@@ -1160,7 +1205,24 @@ export async function createRaceScenario(
       // this segment" so we don't need to trim by elapsed time — the
       // last sample of the segment is naturally the brake-to-goal
       // target (the cusp pose or the final goal).
-      const live = c.segments[c.activeSegIdx] ?? c.plan;
+      const rawSeg = c.segments[c.activeSegIdx] ?? c.plan;
+      // At a gear-cusp boundary the chassis MUST come to a full stop
+      // before flipping gears — otherwise the next segment's first
+      // command (reverse drive while still moving forward) fights the
+      // chassis momentum and the maneuver degrades (visible in tight
+      // parallel parking as a final heading misalignment). For
+      // non-last (cusp) segments, override the terminal sample's speed
+      // to 0 so pure-pursuit's brake-to-target collapses to brake-to-
+      // stop. The last segment retains the planner's intended terminal
+      // speed (parking goal: 0; race goal: non-zero drive-through).
+      const isCuspSegment = c.segments.length > 1 && c.activeSegIdx < c.segments.length - 1;
+      const live: CarKinematicState[] = isCuspSegment
+        ? (() => {
+            const out = rawSeg.slice();
+            out[out.length - 1] = { ...out[out.length - 1]!, speed: 0 };
+            return out;
+          })()
+        : rawSeg;
       if (live.length >= 2) {
         if (tuning.tracker === 'mpc') {
           // Sampling MPC over the v2 parametric model.
@@ -1194,6 +1256,12 @@ export async function createRaceScenario(
             steer: trk.steering, throttle: trk.throttle, brake: trk.brake,
             targetSpeed: trk.targetSpeed,
           };
+          // Sharp-steer accounting: |κ| > 0.75 × (1/minTurnRadius) means
+          // the controller is commanding near-max-lock — useful signal
+          // for spotting "the plan went weird here" moments without
+          // staring at the raw history.
+          const kMax = 1 / RACE_AGENT.minTurnRadius;
+          if (Math.abs(trk.steering) > 0.75 * kMax) c.diagnostics.sharpSteerTicks += 1;
         }
       } else {
         // Short plan — apply stronger throttle if stalled to escape zero-speed deadzone.
@@ -1317,6 +1385,17 @@ export async function createRaceScenario(
       c.diagnostics = {
         lastReplanMs: 0, lastReplanFound: false, consecutiveFailedReplans: 0,
         planAgeMs: 0, successfulReplans: 0, totalReplans: 0, predErrorRms: 0,
+        replanReasonTotals: {
+          cadence: 0,
+          'lateral-error': 0,
+          'waypoint-advance': 0,
+          'failure-retry': 0,
+          manual: 0,
+        },
+        plannerMsTotal: 0,
+        plannerMsMax: 0,
+        plannerDeadlineHitsTotal: 0,
+        sharpSteerTicks: 0,
       };
       c.metrics = emptyMetrics();
       c.lastReplanSimTime = -Infinity;

@@ -17,6 +17,8 @@ import {
   type RaceEntry,
   type RaceLap,
   type RaceTuning,
+  type ReplanReason,
+  type ReplanSnapshot,
 } from './race-scenario';
 import {
   buildLearnedRaceLibraryV2,
@@ -28,7 +30,7 @@ import {
   type LearnedVehicleModel,
 } from 'kinocat/agent';
 
-export type { RaceEntry, RaceLap, RaceTuning } from './race-scenario';
+export type { RaceEntry, RaceLap, RaceTuning, ReplanReason, ReplanSnapshot } from './race-scenario';
 export { DEFAULT_TUNING, LEGACY_TUNING } from './race-scenario';
 
 export interface RaceResult {
@@ -52,6 +54,23 @@ export interface RaceResult {
   /** Total successful + failed replans (planner-quality proxy). */
   totalReplans: number;
   successfulReplans: number;
+  /** Per-trigger replan counts (`cadence` | `lateral-error` | `waypoint-advance`
+   *  | `failure-retry` | `manual`). Sum equals the size of the per-car
+   *  replanHistory ring buffer (capped at 30 — older replans are dropped). */
+  replanReasonCounts: Record<ReplanReason, number>;
+  /** Mean planner search time across the captured replanHistory window (ms). */
+  plannerMsMean: number;
+  /** Max planner search time across the captured replanHistory window (ms). */
+  plannerMsMax: number;
+  /** Number of replans where the planner hit its deadline (cumulative). */
+  plannerDeadlineHits: number;
+  /** Ticks where commanded steering exceeded 75% of `minTurnRadius`
+   *  curvature — useful to ask "did the controller wrench the wheel?" */
+  sharpSteerTicks: number;
+  /** Most recent replan snapshots (ring buffer; newest last; max 30). Lets
+   *  downstream tooling drill into HOW the planner reacted at each point —
+   *  reason, expansions, deadline-hit, plan vs prev-plan drift. */
+  replanHistory: ReplanSnapshot[];
 }
 
 export interface RunRaceOptions {
@@ -115,6 +134,17 @@ export async function runHeadlessRace(
         durations.reduce((s, d) => s + (d - avg) * (d - avg), 0) / (durations.length - 1);
       stddev = Math.sqrt(variance);
     }
+    // Pull TOTAL counts from the per-car diagnostics (not the
+    // replanHistory ring buffer — that one is capped at 30 entries and
+    // would under-report on long runs). Ring buffer is still surfaced
+    // separately for replan-by-replan drill-down.
+    const replanReasonCounts = { ...c.diagnostics.replanReasonTotals };
+    const plannerMsMean = c.diagnostics.totalReplans > 0
+      ? c.diagnostics.plannerMsTotal / c.diagnostics.totalReplans
+      : 0;
+    const plannerMsMax = c.diagnostics.plannerMsMax;
+    const plannerDeadlineHits = c.diagnostics.plannerDeadlineHitsTotal;
+    const sharpSteerTicks = c.diagnostics.sharpSteerTicks;
     return {
       name: c.name,
       laps: c.laps,
@@ -127,6 +157,12 @@ export async function runHeadlessRace(
       predErrorRms: c.diagnostics.predErrorRms,
       totalReplans: c.diagnostics.totalReplans,
       successfulReplans: c.diagnostics.successfulReplans,
+      replanReasonCounts,
+      plannerMsMean,
+      plannerMsMax,
+      plannerDeadlineHits,
+      sharpSteerTicks,
+      replanHistory: c.replanHistory,
     };
   });
 }

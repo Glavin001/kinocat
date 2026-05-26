@@ -50,6 +50,14 @@ export function purePursuit(
   const goal = path[path.length - 1]!;
   const distToGoal = dist(current.x, current.z, goal.x, goal.z);
   const atGoal = distToGoal <= config.goalTolerance;
+  // The plan's terminal speed encodes intent: near-zero means the plan
+  // asks the chassis to STOP at this pose (parking, terminal maneuver);
+  // non-zero means DRIVE THROUGH (racing — the plan endpoint is just
+  // where the planner's horizon stops, and a fresh replan will extend it
+  // before the chassis arrives). The brake-to-goal cap and full-brake-on-
+  // arrival only fire for stop-intent plans — applying them to drive-
+  // through plans makes the chassis brake at every gate.
+  const terminalIsStop = Math.abs(goal.speed) < 0.5;
 
   const ni = nearestIndex(path, current.x, current.z);
   // gear from the planned speed sign just ahead on the path
@@ -77,8 +85,22 @@ export function purePursuit(
   }
 
   const vCurve = Math.sqrt(config.maxLateralAccel / Math.max(Math.abs(kappa), 1e-3));
+  // Brake-to-goal targets the plan's TERMINAL speed (planner intent),
+  // not zero. Solves v² = v_term² + 2·a·d for the entry speed needed to
+  // reach the plan endpoint at the planned terminal speed. Cases:
+  //   parking (v_term=0): collapses to sqrt(2·a·d) — classic brake-to-
+  //     stop.
+  //   racing (v_term≈cruise): vGoal stays at or above cruise, so the
+  //     cap doesn't fire — the chassis flows through the gate at race
+  //     pace.
+  //   slow gate (v_term=6): the cap kicks in within ~5–10 m of the
+  //     gate, slowing the chassis to the planner's intended entry speed
+  //     — the planner's per-primitive speed choice becomes actionable
+  //     execution guidance instead of a number that gets ignored.
+  const terminalSpeedMag = Math.abs(goal.speed);
+  const brakeDist = Math.max(distToGoal - config.goalTolerance, 0);
   const vGoal = Math.sqrt(
-    2 * config.maxDecel * Math.max(distToGoal - config.goalTolerance, 0),
+    terminalSpeedMag * terminalSpeedMag + 2 * config.maxDecel * brakeDist,
   );
 
   // Optional path-speed cap: when the upstream planner attached a
@@ -100,7 +122,8 @@ export function purePursuit(
     if (!Number.isFinite(vPath)) vPath = Infinity;
   }
 
-  const speedMag = atGoal
+  const stopAtGoal = atGoal && terminalIsStop;
+  const speedMag = stopAtGoal
     ? 0
     : Math.min(
         config.cruiseSpeed,
@@ -112,7 +135,7 @@ export function purePursuit(
 
   let throttle = 0;
   let brake = 0;
-  if (atGoal) {
+  if (stopAtGoal) {
     brake = 1;
   } else if (Math.abs(targetSpeed) > Math.abs(current.speed) + 1e-6) {
     throttle = clamp(
