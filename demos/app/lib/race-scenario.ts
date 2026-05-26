@@ -326,7 +326,13 @@ export interface RaceTuning {
  */
 export const DEFAULT_TUNING: RaceTuning = {
   commitWindowMs: 0,
-  consistencyWeight: 0.08,
+  // Heavier consistency weight makes the planner prefer paths close
+  // to the previously-committed one, so a freshly-searched plan only
+  // wins when meaningfully better. Reduces plan-to-plan jitter ("the
+  // chassis keeps swinging between two slightly different racing
+  // lines") which manifests on the web demo as flickering plan
+  // visuals and on the controller as oscillating steer commands.
+  consistencyWeight: 0.2,
   enableSpeedProfile: false,
   enableTrajectorySmoother: true,
   // respectPathSpeed (off): per-sample plan speeds are noisy — they
