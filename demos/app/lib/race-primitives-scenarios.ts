@@ -146,21 +146,19 @@ export const RACE_AGENT: VehicleAgent = defaultVehicleAgent({
     [-2.4, -1.0],
     [2.4, -1.0],
   ],
-  // Time-honest reverse cost. Both planner cost formulas
-  // (`vehicle-environment.ts`) are now expressed in seconds: primitive
-  // edges use `prim.duration` directly, and Reeds-Shepp segments use
+  // Time-honest costs. Both planner cost formulas (`vehicle-environment.ts`)
+  // are now expressed in seconds: primitive edges use `prim.duration`
+  // directly, and Reeds-Shepp segments use
   // `seg.length / (reverse ? maxReverseSpeed : maxSpeed)`. With that,
-  // `reverseCostMultiplier=1.0` is the HONEST value (reverse already
-  // costs more time because it's slower), and a value > 1.0 is an
-  // extra preference against reverse on top of the honest cost. The
-  // chosen 1.5 adds a 50 % nudge against reverse — enough that a
-  // racing-line shortcut via reverse needs to save real driving time
-  // to win, but small enough that necessary parking reverses still
-  // beat geometrically infeasible forward alternatives. The
-  // `directionChangePenalty` of 1.0 s approximates the real chassis's
-  // gear-shift time (brake to zero + engage opposite direction).
+  // `reverseCostMultiplier=1.0` is the HONEST value — no preference
+  // bias, reverse already costs more time because the chassis is slower
+  // in reverse. The `directionChangePenalty=1.0` s approximates the
+  // real chassis's gear-shift time (brake to zero + engage opposite
+  // direction). Values > 1.0 would add an aesthetic preference on top
+  // of physics; we deliberately don't, so the planner picks reverse
+  // exactly when it's faster in real wall-clock time.
   // Domain-agnostic — encodes chassis physics, not "racing vs parking."
-  reverseCostMultiplier: 1.5,
+  reverseCostMultiplier: 1.0,
   directionChangePenalty: 1.0,
 });
 
