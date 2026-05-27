@@ -364,19 +364,23 @@ export function splitAtGearCusps(plan: CarKinematicState[]): CarKinematicState[]
   for (let r = 0; r < runs.length; r++) {
     if (!runs[r]!.sustained && effSign[r] === 0) effSign[r] = firstSustainedSign;
   }
-  // Apply absorption to non-sustained runs whose sign disagrees with
-  // their effective sign.
+  // Clamp every sample's speed so its sign matches the OWNING run's
+  // effective sign. Without this, a "transition" sample (|speed| <
+  // SIGN_FLOOR_SPEED but with opposite sign of the surrounding run)
+  // stays inside the run and confuses pure-pursuit's gear inference
+  // (`gear = aheadSpeed < 0 ? -1 : 1`). Concretely: a forward parking
+  // segment whose final samples ramp through speed=-0.1 (still |<floor|
+  // so the run extended through it) would have pure-pursuit pick gear=-1
+  // near the segment end, steering the chassis backwards.
   for (let r = 0; r < runs.length; r++) {
-    if (runs[r]!.sustained) continue;
-    const eSign = effSign[r]!;
+    const eSign = runs[r]!.sustained ? runs[r]!.sign : effSign[r]!;
     if (eSign === 0) continue;
     for (let i = runs[r]!.startIdx; i < runs[r]!.endIdx; i++) {
       const s = cleaned[i]!;
-      if (Math.sign(s.speed) !== eSign && s.speed !== 0) {
-        // Flip sign and cap magnitude so the absorbed sample reads as a
-        // slow same-gear sample, never a phantom reverse blip.
-        s.speed = eSign * Math.min(Math.abs(s.speed), SIGN_FLOOR_SPEED);
-      }
+      if (Math.sign(s.speed) === eSign || s.speed === 0) continue;
+      // Sample's sign is opposite to its owning run. Clamp magnitude
+      // and flip sign so the sample reads as a slow same-gear sample.
+      s.speed = eSign * Math.min(Math.abs(s.speed), SIGN_FLOOR_SPEED);
     }
   }
   // Identify which adjacent sustained-run boundaries are real cusps.
