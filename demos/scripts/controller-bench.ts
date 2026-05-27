@@ -36,6 +36,8 @@ import {
 import {
   buildParkingScenario,
   parkingLibrary,
+  checkParkingGoal,
+  PARKING_GOAL_TOL,
   type ParkingScenarioId,
 } from '../app/lib/parking-scenarios';
 import { buildRaceCourse } from '../app/lib/race-primitives-scenarios';
@@ -122,13 +124,6 @@ interface BenchResult {
   note: string;
 }
 
-function wrapPi(a: number): number {
-  let r = a;
-  while (r > Math.PI) r -= 2 * Math.PI;
-  while (r < -Math.PI) r += 2 * Math.PI;
-  return r;
-}
-
 /** Race scenario: lap the existing /raceprimitives course once.
  *  PASS criteria: complete 1 lap in ≤ 90 s sim, zero off-tracks. */
 const raceScenario: BenchScenario = {
@@ -174,7 +169,6 @@ const raceScenario: BenchScenario = {
 function makeParkingScenario(
   id: ParkingScenarioId,
   maxSim: number,
-  posTolM: number,
   label: string,
 ): BenchScenario {
   return {
@@ -197,7 +191,7 @@ function makeParkingScenario(
           ...tuning,
           cruiseSpeed: 2,
           goalTolerance: 0.4,
-          arriveRadius: 0.6,
+          arriveRadius: PARKING_GOAL_TOL.posM,
           // Sub-meter planner discretisation + terminal-heading
           // constraint — the parking branch's tuning, ported via
           // `RaceTuning` so pure-pursuit + MPPI use the same
@@ -215,29 +209,41 @@ function makeParkingScenario(
         },
         course,
       });
+      // Tick the scenario until either time runs out OR the shared
+      // goal-check (same one the web demo uses for its `GOAL — ALL MET`
+      // HUD badge) reports `passed`. Early-out so a quick park doesn't
+      // sit in the loop for the full sim budget.
       while (scenario.simTime() < maxSim) {
         scenario.tick();
         const status = scenario.status()[0]!;
-        const dist = Math.hypot(status.state.x - goal.x, status.state.z - goal.z);
-        if (dist < posTolM * 0.7 && Math.abs(status.state.speed) < 0.5) break;
+        if (checkParkingGoal(status.state, goal).passed) break;
       }
       const status = scenario.status()[0]!;
       const simTime = scenario.simTime();
       scenario.dispose();
-      const dist = Math.hypot(status.state.x - goal.x, status.state.z - goal.z);
-      const headingErr = Math.abs(wrapPi(status.state.heading - goal.heading));
-      const stopped = Math.abs(status.state.speed) < 1.0;
-      const passed = dist <= posTolM && stopped && simTime < maxSim;
+      // Single source of truth for "did we park?" — exactly what the
+      // browser HUD shows. If this fails but the position alone was
+      // OK, that's the heading or speed component that needs work,
+      // and the report's per-axis fields will say which.
+      const check = checkParkingGoal(status.state, goal);
+      const passed = check.passed && simTime < maxSim;
+      const failPart = !check.posOk
+        ? `pos off by ${check.posM.toFixed(2)}m`
+        : !check.hdgOk
+          ? `hdg off by ${(check.hdgRad * 180 / Math.PI).toFixed(1)}°`
+          : !check.spdOk
+            ? `not stopped (|v|=${check.spdMS.toFixed(2)})`
+            : 'sim timeout';
       return {
         scenario: `parking-${id}`,
         passed,
         simTime,
-        terminalErrorM: dist,
-        terminalHeadingErr: headingErr,
-        terminalSpeed: Math.abs(status.state.speed),
+        terminalErrorM: check.posM,
+        terminalHeadingErr: check.hdgRad,
+        terminalSpeed: check.spdMS,
         offTrackEvents: status.offTrackEvents,
         totalReplans: status.diagnostics.totalReplans,
-        note: passed ? 'parked' : `off by ${dist.toFixed(2)}m, |v|=${status.state.speed.toFixed(2)}`,
+        note: passed ? 'parked' : failPart,
       };
     },
   };
@@ -245,9 +251,9 @@ function makeParkingScenario(
 
 const ALL_SCENARIOS: BenchScenario[] = [
   raceScenario,
-  makeParkingScenario('forward-pullin', 25, 1.5, 'forward pull-in (easy)'),
-  makeParkingScenario('reverse-perp', 40, 1.5, 'reverse perpendicular (medium)'),
-  makeParkingScenario('parallel', 40, 1.5, 'parallel parking (hard)'),
+  makeParkingScenario('forward-pullin', 25, 'forward pull-in (easy)'),
+  makeParkingScenario('reverse-perp', 40, 'reverse perpendicular (medium)'),
+  makeParkingScenario('parallel', 40, 'parallel parking (hard)'),
 ];
 
 // ---------------------------------------------------------------------------

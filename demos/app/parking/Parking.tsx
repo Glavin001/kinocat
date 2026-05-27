@@ -34,7 +34,9 @@ import {
   PARKING_LABELS,
   PARKING_AGENT,
   PARKING_FOOTPRINT_INFLATE,
+  PARKING_GOAL_TOL,
   buildParkingScenario,
+  checkParkingGoal,
   parkingLibrary,
   type ParkingScenarioId,
   type ParkingScenario,
@@ -50,7 +52,7 @@ const PARKING_BENCH_TUNING = {
   // behaviour browser↔CLI by construction.
   cruiseSpeed: 2,
   goalTolerance: 0.4,
-  arriveRadius: 0.6,
+  arriveRadius: PARKING_GOAL_TOL.posM,
   plannerPosCell: 0.3,
   plannerHeadingBuckets: 36,
   plannerGoalRadius: 0.35,
@@ -78,11 +80,15 @@ function parkingCourse(s: ParkingScenario): import('../lib/race-scenario').RaceS
   };
 }
 
-// Goal satisfaction thresholds — derived from PARKING_BENCH_TUNING so
-// the HUD reflects the same criteria the runner uses.
-const GOAL_POS_TOL = PARKING_BENCH_TUNING.arriveRadius;          // 0.6 m
-const GOAL_HEADING_TOL_DEG = PARKING_BENCH_TUNING.plannerGoalHeadingTol * (180 / Math.PI); // ~11.5°
-const GOAL_SPEED_TOL = 0.15; // m/s — close enough to stopped
+// Goal satisfaction display thresholds — same `PARKING_GOAL_TOL`
+// constants the bench's pass criterion uses (via `checkParkingGoal`).
+// The HUD just renders the per-axis result in degrees for human-
+// readable headings. Diverging here would mean the CLI claims success
+// while the demo shows failure (or vice versa) — exactly the bug we
+// solved by centralising the criterion.
+const GOAL_POS_TOL = PARKING_GOAL_TOL.posM;
+const GOAL_HEADING_TOL_DEG = PARKING_GOAL_TOL.hdgRad * (180 / Math.PI);
+const GOAL_SPEED_TOL = PARKING_GOAL_TOL.speedMS;
 
 interface ParkingHud {
   speed: number;
@@ -103,13 +109,13 @@ interface ParkingHud {
   totalSegments: number;
   activeSegmentGear: 'fwd' | 'rev' | 'unknown';
   finished: boolean;
-}
-
-function angleDiff(a: number, b: number): number {
-  let d = a - b;
-  while (d > Math.PI) d -= 2 * Math.PI;
-  while (d < -Math.PI) d += 2 * Math.PI;
-  return d;
+  /** Per-axis pass flags from `checkParkingGoal` — the SAME criterion
+   *  the headless bench's pass condition uses. The HUD shows ✓/✗
+   *  badges driven directly by these so browser↔CLI agree. */
+  posOk: boolean;
+  hdgOk: boolean;
+  spdOk: boolean;
+  allOk: boolean;
 }
 
 export default function Parking() {
@@ -366,12 +372,23 @@ export default function Parking() {
           if (hudFrameCounter >= 6) {
             hudFrameCounter = 0;
             const wp = cachedGoalWp;
-            const goalDist = wp ? Math.hypot(s.state.x - wp.x, s.state.z - wp.z) : NaN;
-            const headingError = wp ? angleDiff(s.state.heading, wp.heading) * (180 / Math.PI) : NaN;
+            const check = wp
+              ? checkParkingGoal(s.state, { x: wp.x, z: wp.z, heading: wp.heading })
+              : null;
+            // Signed heading delta (degrees) for the HUD's "+/-12.3°"
+            // readout. The pass flag itself comes from `check.hdgOk`
+            // (above) which uses the unsigned tolerance.
+            const headingErrorSigned = wp
+              ? ((s.state.heading - wp.heading + Math.PI * 3) % (Math.PI * 2) - Math.PI) * (180 / Math.PI)
+              : NaN;
             setHud({
               speed: s.state.speed,
-              goalDist,
-              headingError,
+              goalDist: check ? check.posM : NaN,
+              headingError: headingErrorSigned,
+              posOk: check?.posOk ?? false,
+              hdgOk: check?.hdgOk ?? false,
+              spdOk: check?.spdOk ?? false,
+              allOk: check?.passed ?? false,
               totalReplans: s.diagnostics.totalReplans,
               lastReplanMs: s.diagnostics.lastReplanMs,
               steer: s.metrics.liveControls.steer,
@@ -465,10 +482,10 @@ export default function Parking() {
         </div>
         <div>{status}</div>
         {hud && (() => {
-          const posOk = hud.goalDist <= GOAL_POS_TOL;
-          const hdgOk = Math.abs(hud.headingError) <= GOAL_HEADING_TOL_DEG;
-          const spdOk = Math.abs(hud.speed) <= GOAL_SPEED_TOL;
-          const allOk = posOk && hdgOk && spdOk;
+          // Pass flags come straight from `checkParkingGoal` (computed
+          // when the HUD snapshot was taken). The constants below are
+          // only used to label the tolerance side of each readout.
+          const { posOk, hdgOk, spdOk, allOk } = hud;
           return (
             <>
               <div style={{ marginTop: 6, fontSize: 11, borderTop: '1px solid #1c2840', paddingTop: 5 }}>
