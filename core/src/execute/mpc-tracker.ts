@@ -99,6 +99,12 @@ export interface MPCTrackerConfig {
   wTerminalSpeed?: number;
   /** Distance below which `atGoal` is reported true. Default 0.5 m. */
   goalTolerance?: number;
+  /** Minimum speed (m/s) for the reference trajectory's arc-length
+   *  advance rate. Prevents the MPC from braking to match low plan
+   *  speeds near waypoint endpoints. Default 0 (no floor). Racing
+   *  scenarios set this to the cruise speed so the reference always
+   *  advances at race pace, regardless of plan endpoint speeds. */
+  minReferenceSpeed?: number;
 }
 
 export interface MPCTrackerState {
@@ -150,6 +156,7 @@ function buildReference(
   horizon: number,
   cruiseSpeed: number,
   stepDt: number,
+  minRefSpeed = 0,
 ): { ref: CarKinematicState[]; bestI: number } {
   if (plan.length === 0) {
     const ref: CarKinematicState[] = [];
@@ -172,8 +179,9 @@ function buildReference(
   }
   const ref: CarKinematicState[] = [];
   for (let k = 1; k <= horizon; k++) {
-    const localSpeed =
+    let localSpeed =
       Math.abs(plan[bestI]!.speed) > 0.5 ? Math.abs(plan[bestI]!.speed) : cruiseSpeed;
+    if (localSpeed < minRefSpeed) localSpeed = minRefSpeed;
     const targetArc = k * stepDt * localSpeed;
     let j = 0;
     while (j < cum.length - 1 && cum[j + 1]! < targetArc) j++;
@@ -271,13 +279,14 @@ export function mpcTrack(
     wTerminalSpeed: config.wTerminalSpeed ?? 20,
   };
   const tol = config.goalTolerance ?? 0.5;
+  const minRefSpeed = config.minReferenceSpeed ?? 0;
 
   if (state.prev.length !== H * 3) state.prev = new Float64Array(H * 3);
 
   // Build the reference + decide whether to activate terminal cost.
   const goal = plan.length > 0 ? plan[plan.length - 1]! : undefined;
   const cruiseSpeed = goal ? Math.max(Math.abs(goal.speed), 1) : 5;
-  const { ref } = buildReference(current, plan, H, cruiseSpeed, dt);
+  const { ref } = buildReference(current, plan, H, cruiseSpeed, dt, minRefSpeed);
 
   // Terminal-cost activation. Requires:
   //   (a) caller opted in via non-zero `wTerminalPosition` or
@@ -376,11 +385,25 @@ export function mpcTrack(
   // Re-clamp the weighted-average controls (the average of valid
   // controls is always valid for box constraints, but float roundoff
   // can put us microscopically out).
+  // Also resolve drive/brake conflict: MPPI's importance-weighted
+  // average of samples can blend "accelerate" and "brake" samples,
+  // producing controls where both driveForce>0 and brakeForce>0.
+  // The car fights itself (throttle+brake simultaneously). Make them
+  // mutually exclusive: keep whichever has stronger normalised intent.
   for (let i = 0; i < H; i++) {
     optimal[i * 3]! = clamp(optimal[i * 3]!, -config.maxSteer, config.maxSteer);
     const minDrive = allowReverse ? -config.maxDriveForce : 0;
-    optimal[i * 3 + 1]! = clamp(optimal[i * 3 + 1]!, minDrive, config.maxDriveForce);
-    optimal[i * 3 + 2]! = clamp(optimal[i * 3 + 2]!, 0, config.maxBrakeForce);
+    let drive = clamp(optimal[i * 3 + 1]!, minDrive, config.maxDriveForce);
+    let brake = clamp(optimal[i * 3 + 2]!, 0, config.maxBrakeForce);
+    if (drive > 0 && brake > 0) {
+      if (drive / config.maxDriveForce >= brake / config.maxBrakeForce) {
+        brake = 0;
+      } else {
+        drive = 0;
+      }
+    }
+    optimal[i * 3 + 1] = drive;
+    optimal[i * 3 + 2] = brake;
   }
 
   state.prev = optimal;

@@ -197,7 +197,26 @@ export function smoothTrajectory(
     while (j < path.length - 2 && inputCum[j + 1]! < sInput) j++;
     const segLen = inputCum[j + 1]! - inputCum[j]!;
     const u = segLen > 1e-9 ? (sInput - inputCum[j]!) / segLen : 0;
-    const speed = path[j]!.speed + (path[j + 1]!.speed - path[j]!.speed) * u;
+    // Speed-sign preservation: when the bracket samples have opposite
+    // signs AND both magnitudes are non-trivial, do NOT linearly
+    // interpolate across the zero crossing — snap to whichever side is
+    // closer. Linear interp would manufacture a brief opposite-sign
+    // value at primitive boundaries (e.g. a forward primitive ending at
+    // +9.5 m/s adjacent to a primitive ending at 0 or briefly negative
+    // from brake-overshoot), which `splitAtGearCusps` would then
+    // misinterpret as a real gear change. Same-sign brackets behave
+    // exactly as before.
+    const loSpd = path[j]!.speed;
+    const hiSpd = path[j + 1]!.speed;
+    const SIGN_PRESERVE = 0.05;
+    const sameSign =
+      (loSpd >= 0 && hiSpd >= 0) ||
+      (loSpd <= 0 && hiSpd <= 0) ||
+      Math.abs(loSpd) < SIGN_PRESERVE ||
+      Math.abs(hiSpd) < SIGN_PRESERVE;
+    const speed = sameSign
+      ? loSpd + (hiSpd - loSpd) * u
+      : (u < 0.5 ? loSpd : hiSpd);
     const t = path[j]!.t + (path[j + 1]!.t - path[j]!.t) * u;
     out[i] = { x: sx[i]!, z: sz[i]!, heading, speed, t };
   }

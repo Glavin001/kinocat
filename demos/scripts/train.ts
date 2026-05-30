@@ -17,6 +17,55 @@ import {
   DEFAULT_VEHICLE_OPTS,
 } from '../app/lib/training-driver';
 import { modelToJson } from '../app/lib/v2-model-file';
+import {
+  computeCacheKey,
+  tryReadRoundCache,
+  writeRoundCache,
+  getRapierVersionTag,
+  CACHE_BUSTER,
+  type TrialCacheKeyInputs,
+} from '../app/lib/trial-cache';
+
+interface TrialCacheOpts {
+  cacheDir: string;
+  seed: number;
+  trialsPerRound: number;
+  trialTicks: number;
+  sampleEveryNTicks: number;
+  bundle: 'default' | 'universal';
+}
+
+function buildTrialCache(opts: TrialCacheOpts) {
+  const rapierVersion = getRapierVersionTag();
+  const makeKey = (round: number): TrialCacheKeyInputs => ({
+    seed: opts.seed,
+    round,
+    trialsPerRound: opts.trialsPerRound,
+    trialTicks: opts.trialTicks,
+    sampleEveryNTicks: opts.sampleEveryNTicks,
+    bundle: opts.bundle,
+    startSpeedSchedule: [0, 4, 8, 12, 16, 20, 24, 28],
+    vehicleOptions: DEFAULT_VEHICLE_OPTS as Record<string, unknown>,
+    rapierVersion,
+    cacheBuster: CACHE_BUSTER,
+  });
+  return {
+    tryRead(round: number) {
+      const key = computeCacheKey(makeKey(round));
+      const result = tryReadRoundCache(opts.cacheDir, key);
+      if (result) {
+        process.stdout.write(`    (cache hit: round ${round + 1}, key=${key})\n`);
+      }
+      return result;
+    },
+    write(round: number, trials: unknown[]) {
+      const inputs = makeKey(round);
+      const key = computeCacheKey(inputs);
+      writeRoundCache(opts.cacheDir, key, trials as never, inputs);
+      process.stdout.write(`    (cache write: round ${round + 1}, key=${key})\n`);
+    },
+  };
+}
 
 interface Profile {
   rounds: number;
@@ -29,7 +78,7 @@ const PROFILES: Record<string, Profile & { bundle?: 'default' | 'universal' }> =
   // Smoke profile for CI / refactor sanity checks — ~30 s.
   quick: { rounds: 1, trialsPerRound: 30, trialTicks: 60, sampleEveryNTicks: 6 },
   // Default: ~5-10 min on a laptop.
-  default: { rounds: 3, trialsPerRound: 120, trialTicks: 120, sampleEveryNTicks: 6 },
+  default: { rounds: 4, trialsPerRound: 200, trialTicks: 150, sampleEveryNTicks: 6 },
   // Sweep profile: Phase 4 multi-config (reserved for the future).
   sweep: { rounds: 5, trialsPerRound: 200, trialTicks: 150, sampleEveryNTicks: 6 },
   // Overnight: max rounds till val plateau (single config for now).
@@ -69,6 +118,8 @@ async function main(): Promise<void> {
       'import-mined': { type: 'string' },
       bundle: { type: 'string' },
       'mine-from-trace': { type: 'string' },
+      'cache-dir': { type: 'string' },
+      'no-cache': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -76,6 +127,7 @@ async function main(): Promise<void> {
     process.stdout.write(`Usage: pnpm run train -- [--profile=quick|default|sweep|overnight]
                        [--seed=N] [--rounds=N] [--trials=N] [--ticks=N]
                        [--out=path/to/v2-default.json]
+                       [--cache-dir=path] [--no-cache]
 
 Profiles:
 ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds} trials/round=${v.trialsPerRound} ticks=${v.trialTicks}`).join('\n')}
@@ -100,10 +152,24 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
   const outArg = values.out ? String(values.out) : 'demos/public/models/v2-default.json';
   const outPath = isAbsolute(outArg) ? outArg : resolve(repoRoot, outArg);
 
+  // Trial cache: enabled by default, disabled with --no-cache.
+  const cacheDir = values['no-cache']
+    ? undefined
+    : (() => {
+        const arg = values['cache-dir'] ? String(values['cache-dir']) : 'demos/.cache/training';
+        return isAbsolute(arg) ? arg : resolve(repoRoot, arg);
+      })();
+
   process.stdout.write(`kinocat train — profile=${profileName} seed=${seed} rounds=${rounds} trials/round=${trialsPerRound} ticks=${trialTicks}\n`);
+  if (cacheDir) {
+    process.stdout.write(`  · trial cache: ${cacheDir}\n`);
+  } else {
+    process.stdout.write(`  · trial cache: disabled\n`);
+  }
 
   const t0 = Date.now();
   let lastRoundT = t0;
+  let phaseT = t0;
 
   const daggerStartRound = values.dagger !== undefined ? Number(values.dagger) : undefined;
   if (daggerStartRound !== undefined) {
@@ -172,6 +238,7 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
     daggerStartRound,
     minedTrials: minedTrials.length > 0 ? (minedTrials as never) : undefined,
     bundle,
+    trialCache: cacheDir ? buildTrialCache({ cacheDir, seed, trialsPerRound, trialTicks, sampleEveryNTicks, bundle }) : undefined,
     onEvent: (e: TrainingEvent) => {
       switch (e.type) {
         case 'round-start':
@@ -180,6 +247,33 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
         case 'trial-batch':
           process.stdout.write(`    + ${e.collected} trials (${e.discarded} discarded)\n`);
           break;
+        case 'phase': {
+          // 'collecting' is redundant with round-start; skip it
+          if (e.phase === 'collecting') break;
+          const elapsed = Date.now() - phaseT;
+          // Only show elapsed if a meaningful phase just finished (not first event)
+          const suffix = phaseT !== t0 && elapsed > 500 ? ` (prev phase ${fmtMs(elapsed)})` : '';
+          phaseT = Date.now();
+          process.stdout.write(`    [${e.phase}]${suffix}\n`);
+          break;
+        }
+        case 'fit-progress': {
+          const i = e.iterIndex ?? e.event.iter;
+          const n = e.iterTotal ?? 0;
+          // Log every 20th iteration (or first/last) to avoid flooding stdout
+          if (n === 0) break;
+          const isFirst = i === 0;
+          const isLast = i === n - 1;
+          const isPeriodic = (i + 1) % 20 === 0;
+          if (isFirst || isLast || isPeriodic) {
+            const normLoss = e.event.lossNormalized !== undefined
+              ? ` loss/sample=${e.event.lossNormalized.toFixed(6)}`
+              : ` loss=${e.event.loss.toFixed(6)}`;
+            const pct = Math.round(((i + 1) / n) * 100);
+            process.stdout.write(`    [${e.phase}] ${i + 1}/${n} (${pct}%)${normLoss}\n`);
+          }
+          break;
+        }
         case 'evaluation': {
           const rms = e.diagnostics.openLoopDivergence.find((r) => Math.abs(r.tSec - 1.0) < 0.05)?.posRms ?? NaN;
           const blKin = e.diagnostics.baselines['kinematic']?.find((r) => Math.abs(r.tSec - 1.0) < 0.05)?.posRms ?? NaN;
@@ -213,8 +307,9 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
   };
 
   const payload = modelToJson(result.model, meta);
+  const payloadStr = JSON.stringify(payload, null, 2);
   mkdirSync(dirname(outPath), { recursive: true });
-  writeFileSync(outPath, JSON.stringify(payload, null, 2), 'utf-8');
+  writeFileSync(outPath, payloadStr, 'utf-8');
   process.stdout.write(`wrote ${outPath}\n`);
 
   // Manifest sidecar.
@@ -239,8 +334,24 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
     runtimeMs: Date.now() - t0,
     createdAt: Date.now(),
   };
-  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf-8');
+  const manifestStr = JSON.stringify(manifest, null, 2);
+  writeFileSync(manifestPath, manifestStr, 'utf-8');
   process.stdout.write(`wrote ${manifestPath}\n`);
+
+  // Timestamped snapshot for rollback — e.g. v2-20260525T143012-abc1234.json
+  const now = new Date();
+  const ts = now.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, '').replace('T', 'T');
+  const sha = gitSha();
+  const tag = `${ts}-${sha}`;
+  const historyDir = resolve(dirname(outPath), 'history');
+  mkdirSync(historyDir, { recursive: true });
+  const baseName = outPath.replace(/.*\//, '').replace(/\.json$/, '');
+  const snapPath = resolve(historyDir, `${baseName}-${tag}.json`);
+  const snapManifest = resolve(historyDir, `${baseName}-${tag}.manifest.json`);
+  writeFileSync(snapPath, payloadStr, 'utf-8');
+  writeFileSync(snapManifest, manifestStr, 'utf-8');
+  process.stdout.write(`wrote ${snapPath}\n`);
+  process.stdout.write(`wrote ${snapManifest}\n`);
 }
 
 main().then(

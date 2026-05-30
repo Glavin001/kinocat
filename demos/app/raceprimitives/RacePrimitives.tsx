@@ -100,6 +100,7 @@ import {
   PLAN_LOOKAHEAD_COUNT as SCENARIO_PLAN_LOOKAHEAD_COUNT,
   createRaceScenario,
   type RaceCarStatus,
+  type ReplanSnapshot,
 } from '../lib/race-scenario';
 
 const RACE_FORCE_TUNING: CarForceTuning = {
@@ -127,6 +128,26 @@ const REFIT_DEFER_MS = 0;
 const PARAMS_KEY = 'kinocat:learned-params:v2';
 const LIBRARY_KEY = 'kinocat:learned-library:v2';
 
+/** Map a normalized speed (0–1) to an RGB triple: blue → green → red. */
+function speedToRGB(u: number): [number, number, number] {
+  // 0 = blue (0,0.4,1), 0.5 = green (0,1,0.2), 1 = red (1,0.2,0)
+  if (u < 0.5) {
+    const t = u * 2;
+    return [0, 0.4 + 0.6 * t, 1 - 0.8 * t];
+  }
+  const t = (u - 0.5) * 2;
+  return [t, 1 - 0.8 * t, 0.2 - 0.2 * t];
+}
+
+/** Shared geometries for plan annotations (reused across frames). */
+const _arrowGeo = new THREE.ConeGeometry(0.18, 0.5, 4);
+_arrowGeo.rotateX(Math.PI / 2); // point along +Z
+const _curvDotGeo = new THREE.SphereGeometry(0.2, 6, 4);
+const _arrowMatWhite = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.75 });
+const _arrowMatMagenta = new THREE.MeshBasicMaterial({ color: 0xe619e6, transparent: true, opacity: 0.75 });
+const _curvMatOrange = new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 0.85 });
+const _curvMatRed = new THREE.MeshBasicMaterial({ color: 0xff3333, transparent: true, opacity: 0.85 });
+
 type Phase = 'loading' | 'learning' | 'ready' | 'racing' | 'finished';
 
 interface CarRuntime {
@@ -137,6 +158,8 @@ interface CarRuntime {
   car: CarHandle;
   carMesh: ReturnType<typeof createCarMeshHelper>;
   pathLine: THREE.Line | null;
+  /** Heading arrows + curvature markers overlaid on the plan path. */
+  planAnnotations: THREE.Group;
   /** Dashed straight reference line from chassis to the next-uncleared
    *  waypoint — lets the viewer compare the planner's actual curve to the
    *  naïve "drive in a straight line to the cone" trajectory. */
@@ -287,6 +310,7 @@ export default function RacePrimitives() {
     start: () => void;
     stop: () => void;
     reset: () => void;
+    getReplanHistory: () => { kinematic: import('../lib/race-scenario').ReplanSnapshot[]; learned: import('../lib/race-scenario').ReplanSnapshot[] };
   } | null>(null);
 
   // On mount: try to load cached pre-trained params as a warm start for the
@@ -361,6 +385,7 @@ export default function RacePrimitives() {
         const learnedLibraryOverride = v2Active
           ? buildLearnedRaceLibraryV2(v2Model!)
           : undefined;
+        const learnedModel = v2Active ? v2Model! : undefined;
         const setup = await setupScene(mount, params, {
           onMetrics: (km, lm) => setMetrics({ kinematic: km, learned: lm }),
           onLearner: (snap) => setLearner(snap),
@@ -368,7 +393,7 @@ export default function RacePrimitives() {
             setWinner(w);
             setPhase('finished');
           },
-        }, { learnedLibraryOverride });
+        }, { learnedLibraryOverride, learnedModel });
         sceneRef.current = setup;
         cleanup = setup.cleanup;
       } catch (e) {
@@ -521,6 +546,7 @@ export default function RacePrimitives() {
       ? (await import('../lib/race-primitives-scenarios')).buildLearnedRaceLibraryV2(v2Model)
       : null;
     const course = (await import('../lib/race-primitives-scenarios')).buildRaceCourse();
+    const rh = sceneRef.current?.getReplanHistory();
     const md = buildDebugReport({
       phase,
       useV2,
@@ -546,6 +572,8 @@ export default function RacePrimitives() {
         advanceRadius: 2.5,
         trackerMaxLateralAccel: TRACKER_MAX_LATERAL_ACCEL,
       },
+      kinematicReplanHistory: rh?.kinematic,
+      learnedReplanHistory: rh?.learned,
     });
     const filename = `kinocat-raceprimitives-debug-${new Date().toISOString().replace(/[:.]/g, '-')}.md`;
     // Always download; also try to copy so the user can paste straight
@@ -756,6 +784,10 @@ interface SceneOptions {
    *  refits of the legacy 5-param model would race a stale v1 library while
    *  the v2-derived primitive library is what the planner is searching). */
   learnedLibraryOverride?: MotionPrimitiveLibrary;
+  /** When supplied alongside learnedLibraryOverride, the learned car's
+   *  RaceEntry carries this model so the MPC tracker can use the trained
+   *  dynamics for plan-following. */
+  learnedModel?: LearnedVehicleModel;
 }
 
 async function setupScene(
@@ -768,6 +800,7 @@ async function setupScene(
   start: () => void;
   stop: () => void;
   reset: () => void;
+  getReplanHistory: () => { kinematic: ReplanSnapshot[]; learned: ReplanSnapshot[] };
 }> {
   const W = mount.clientWidth;
   const H = mount.clientHeight;
@@ -808,10 +841,10 @@ async function setupScene(
   const scenario = await createRaceScenario({
     entries: [
       { name: 'kinematic', lib: kinematicLib },
-      { name: 'learned', lib: initialLearnedLib },
+      { name: 'learned', lib: initialLearnedLib, model: options.learnedModel },
     ],
-    syncHold: true,
-    offTrackRecovery: 'waypoint',
+    syncHold: false,
+    offTrackRecovery: 'spawn',
   });
 
   // ---- Per-car setup ----
@@ -903,6 +936,8 @@ async function setupScene(
     );
     lookaheadMarker.position.set(course.spawn.x, 0.5, course.spawn.z);
     scene.add(lookaheadMarker);
+    const planAnnotations = new THREE.Group();
+    scene.add(planAnnotations);
     return {
       id,
       color,
@@ -911,6 +946,7 @@ async function setupScene(
       car,
       carMesh,
       pathLine: null,
+      planAnnotations,
       idealLine: ideal,
       lookaheadMarker,
       trailLine: trail,
@@ -999,6 +1035,10 @@ async function setupScene(
     car.trailPts = [new THREE.Vector3(course.spawn.x, 0.15, course.spawn.z)];
     car.trailLine.geometry.dispose();
     car.trailLine.geometry = new THREE.BufferGeometry().setFromPoints(car.trailPts);
+    // Remove annotation meshes (shared geometries/materials — don't dispose).
+    while (car.planAnnotations.children.length > 0) {
+      car.planAnnotations.remove(car.planAnnotations.children[0]!);
+    }
     if (car.pathLine) {
       car.scene.remove(car.pathLine);
       car.pathLine.geometry.dispose();
@@ -1038,6 +1078,11 @@ async function setupScene(
     // prepended chassis point bridges that small gap so the rendered
     // line is "from where I am, along what I plan to do" rather than
     // including a stale tail or a phantom future-start segment.
+    // Clear previous plan annotations.
+    // Remove annotation meshes (shared geometries/materials — don't dispose).
+    while (car.planAnnotations.children.length > 0) {
+      car.planAnnotations.remove(car.planAnnotations.children[0]!);
+    }
     if (status.plan && status.plan.length >= 2) {
       if (car.pathLine) {
         car.scene.remove(car.pathLine);
@@ -1046,13 +1091,96 @@ async function setupScene(
       }
       const elapsed = Math.max(0, scenario.simTime() - status.planStartSimTime);
       const tail = trimPlan(status.plan, elapsed);
-      const pl: THREE.Vector3[] = [new THREE.Vector3(after.x, 0.4, after.z)];
-      for (const p of tail) pl.push(new THREE.Vector3(p.x, 0.4, p.z));
+      // Build vertex-colored line: speed → blue (slow) → green → red (fast).
+      // Reverse segments are shown in magenta instead.
+      const positions: number[] = [after.x, 0.4, after.z];
+      const colors: number[] = [];
+      const maxSpeed = 30; // approximate max for color normalization
+      const REVERSE_RGB: [number, number, number] = [0.9, 0.1, 0.9]; // magenta
+      // First vertex: use current state speed for color.
+      {
+        const spd = after.speed ?? 0;
+        if (spd < -0.1) {
+          colors.push(...REVERSE_RGB);
+        } else {
+          const u = Math.min(Math.abs(spd) / maxSpeed, 1);
+          colors.push(...speedToRGB(u));
+        }
+      }
+      // Build the full path with heading/speed annotations.
+      // We'll collect heading arrows and curvature markers in a second pass.
+      const pathHeadings: number[] = [after.heading];
+      for (const p of tail) {
+        positions.push(p.x, 0.4, p.z);
+        const spd = p.speed ?? 0;
+        if (spd < -0.1) {
+          colors.push(...REVERSE_RGB);
+        } else {
+          const u = Math.min(Math.abs(spd) / maxSpeed, 1);
+          colors.push(...speedToRGB(u));
+        }
+        pathHeadings.push(p.heading);
+      }
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
       car.pathLine = new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints(pl),
-        new THREE.LineBasicMaterial({ color: car.pathColor, transparent: true, opacity: 0.85 }),
+        geom,
+        new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.85 }),
       );
       car.scene.add(car.pathLine);
+
+      // --- Plan annotations: heading arrows + curvature markers ---
+      const totalVerts = positions.length / 3;
+      // Place a heading arrow every ~6 vertices (but at least 3 arrows).
+      const arrowStride = Math.max(2, Math.floor(totalVerts / 12));
+      for (let vi = arrowStride; vi < totalVerts; vi += arrowStride) {
+        const px = positions[vi * 3]!;
+        const py = positions[vi * 3 + 1]!;
+        const pz = positions[vi * 3 + 2]!;
+        const h = pathHeadings[vi] ?? 0;
+        const spd = vi === 0 ? (after.speed ?? 0) : (tail[vi - 1]?.speed ?? 0);
+        const isReverse = spd < -0.1;
+        const arrow = new THREE.Mesh(
+          _arrowGeo,
+          isReverse ? _arrowMatMagenta : _arrowMatWhite,
+        );
+        arrow.position.set(px, py + 0.15, pz);
+        // heading is the yaw angle in the XZ plane (0 = +X).
+        // THREE.js cone after rotateX(PI/2) points along +Z; we rotate
+        // around Y so heading=0 → +X direction.
+        arrow.rotation.set(0, -h + Math.PI / 2, 0);
+        // Flip the arrow when reversing so it visually points backward.
+        if (isReverse) arrow.rotateY(Math.PI);
+        car.planAnnotations.add(arrow);
+      }
+      // Curvature markers: place a dot where heading changes sharply.
+      // Use a sliding window (3 vertices) to smooth out noise from dense
+      // sweep samples that are very close together at low speeds.
+      for (let vi = 2; vi < totalVerts; vi++) {
+        const ax = positions[(vi - 2) * 3]!;
+        const az = positions[(vi - 2) * 3 + 2]!;
+        const bx = positions[vi * 3]!;
+        const bz = positions[vi * 3 + 2]!;
+        const ds = Math.hypot(bx - ax, bz - az);
+        // Need at least 0.3m arc to compute meaningful curvature.
+        if (ds < 0.3) continue;
+        let dh = pathHeadings[vi]! - pathHeadings[vi - 2]!;
+        while (dh > Math.PI) dh -= 2 * Math.PI;
+        while (dh < -Math.PI) dh += 2 * Math.PI;
+        const curvature = Math.abs(dh) / ds; // rad/m
+        // ~0.6 rad/m ≈ 1.7m turn radius (tight); ~1.0 ≈ 1m (near lock).
+        if (curvature > 0.6) {
+          const mx = positions[(vi - 1) * 3]!;
+          const mz = positions[(vi - 1) * 3 + 2]!;
+          const dot = new THREE.Mesh(
+            _curvDotGeo,
+            curvature > 1.0 ? _curvMatRed : _curvMatOrange,
+          );
+          dot.position.set(mx, 0.55, mz);
+          car.planAnnotations.add(dot);
+        }
+      }
     }
     // Lookahead marker is hidden in the scenario-driven path — the
     // scenario doesn't expose it (it's an internal pure-pursuit detail).
@@ -1298,6 +1426,13 @@ async function setupScene(
         learned.learner.lastMeanError = 0;
         learned.lib = initialLearnedLib;
       }
+    },
+    getReplanHistory() {
+      const statuses = scenario.status();
+      return {
+        kinematic: statuses[0]?.replanHistory ?? [],
+        learned: statuses[1]?.replanHistory ?? [],
+      };
     },
   };
 }

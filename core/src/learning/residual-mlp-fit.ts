@@ -49,6 +49,19 @@ export interface ResidualMLPFitOptions<S, C, Cfg> {
    *  inside the residual-target computation. Default 6 (matches
    *  parametric-fit default). */
   fitSubstepsPerSample?: number;
+  /**
+   * Per-output-component weights for the loss. Length must equal the MLP
+   * output dim. Default: uniform 1s (plain MSE).
+   *
+   * Why: the residual vector mixes units of wildly different magnitudes
+   * — Δheading (rad) is ~10× smaller numerically than Δposition (m).
+   * Plain MSE makes the MLP prioritise position and ignore heading,
+   * which compounds the parametric fit's heading under-weighting. For
+   * racing precision, heading weight should be ≈ (positionScale /
+   * headingScale)² ≈ 100 so each dimension contributes equally to the
+   * loss budget.
+   */
+  lossWeights?: ReadonlyArray<number>;
 }
 
 export interface ResidualFitProgressEvent {
@@ -102,14 +115,19 @@ function buildSamples<S, C, Cfg>(
   return out;
 }
 
-function meanLoss(mlp: MLP, samples: { input: number[]; target: number[] }[]): number {
+function meanLoss(
+  mlp: MLP,
+  samples: { input: number[]; target: number[] }[],
+  weights?: ReadonlyArray<number>,
+): number {
   let total = 0;
   for (const s of samples) {
     const cache = forward(mlp, s.input);
     let l = 0;
     for (let o = 0; o < cache.output.length; o++) {
       const d = cache.output[o]! - (s.target[o] ?? 0);
-      l += 0.5 * d * d;
+      const w = weights ? (weights[o] ?? 1) : 1;
+      l += 0.5 * w * d * d;
     }
     total += l;
   }
@@ -131,6 +149,7 @@ export function runResidualMLPFit<S, C, Cfg>(
   const epochs = opts.epochs ?? 200;
   const batchSize = opts.batchSize ?? 64;
   const lr = opts.learningRate ?? 1e-3;
+  const weights = opts.lossWeights;
 
   const ensemble: MLP[] = [];
   const adams: AdamState[] = [];
@@ -155,22 +174,22 @@ export function runResidualMLPFit<S, C, Cfg>(
         for (let j = b; j < end; j++) {
           const s = trainSamples[order[j]!]!;
           const cache = forward(mlp, s.input);
-          const g = backward(mlp, cache, s.target);
+          const g = backward(mlp, cache, s.target, weights);
           accumulateGradients(grads, g, inv);
         }
         adamStep(mlp, grads, adam);
       }
     }
     if (ep % Math.max(1, Math.floor(epochs / 50)) === 0 || ep === epochs - 1) {
-      const trainL = ensemble.reduce((a, m) => a + meanLoss(m, trainSamples), 0) / ensemble.length;
-      const valL = ensemble.reduce((a, m) => a + meanLoss(m, valSamples), 0) / Math.max(1, ensemble.length);
+      const trainL = ensemble.reduce((a, m) => a + meanLoss(m, trainSamples, weights), 0) / ensemble.length;
+      const valL = ensemble.reduce((a, m) => a + meanLoss(m, valSamples, weights), 0) / Math.max(1, ensemble.length);
       const evt: ResidualFitProgressEvent = { epoch: ep, trainLoss: trainL, valLoss: valL };
       history.push(evt);
       opts.onProgress?.(evt);
     }
   }
-  const finalTrain = ensemble.reduce((a, m) => a + meanLoss(m, trainSamples), 0) / ensemble.length;
-  const finalVal = ensemble.reduce((a, m) => a + meanLoss(m, valSamples), 0) / Math.max(1, ensemble.length);
+  const finalTrain = ensemble.reduce((a, m) => a + meanLoss(m, trainSamples, weights), 0) / ensemble.length;
+  const finalVal = ensemble.reduce((a, m) => a + meanLoss(m, valSamples, weights), 0) / Math.max(1, ensemble.length);
   return { ensemble, finalTrainLoss: finalTrain, finalValLoss: finalVal, history };
 }
 
@@ -211,6 +230,7 @@ export async function runResidualMLPFitAsync<S, C, Cfg>(
   const coop = opts.cooperativeYield ?? defaultMlpYield;
   const yieldEveryNEpochs = Math.max(1, opts.yieldEveryNEpochs ?? 1);
   const yieldEveryNBatches = Math.max(0, opts.yieldEveryNBatches ?? 8);
+  const weights = opts.lossWeights;
 
   const ensemble: MLP[] = [];
   const adams: AdamState[] = [];
@@ -234,7 +254,7 @@ export async function runResidualMLPFitAsync<S, C, Cfg>(
         for (let j = b; j < end; j++) {
           const s = trainSamples[order[j]!]!;
           const cache = forward(mlp, s.input);
-          const g = backward(mlp, cache, s.target);
+          const g = backward(mlp, cache, s.target, weights);
           accumulateGradients(grads, g, inv);
         }
         adamStep(mlp, grads, adam);
@@ -245,8 +265,8 @@ export async function runResidualMLPFitAsync<S, C, Cfg>(
       }
     }
     if (ep % Math.max(1, Math.floor(epochs / 50)) === 0 || ep === epochs - 1) {
-      const trainL = ensemble.reduce((a, m) => a + meanLoss(m, trainSamples), 0) / ensemble.length;
-      const valL = ensemble.reduce((a, m) => a + meanLoss(m, valSamples), 0) / Math.max(1, ensemble.length);
+      const trainL = ensemble.reduce((a, m) => a + meanLoss(m, trainSamples, weights), 0) / ensemble.length;
+      const valL = ensemble.reduce((a, m) => a + meanLoss(m, valSamples, weights), 0) / Math.max(1, ensemble.length);
       const evt: ResidualFitProgressEvent = { epoch: ep, trainLoss: trainL, valLoss: valL };
       history.push(evt);
       opts.onProgress?.(evt);
@@ -255,8 +275,8 @@ export async function runResidualMLPFitAsync<S, C, Cfg>(
       await coop();
     }
   }
-  const finalTrain = ensemble.reduce((a, m) => a + meanLoss(m, trainSamples), 0) / ensemble.length;
-  const finalVal = ensemble.reduce((a, m) => a + meanLoss(m, valSamples), 0) / Math.max(1, ensemble.length);
+  const finalTrain = ensemble.reduce((a, m) => a + meanLoss(m, trainSamples, weights), 0) / ensemble.length;
+  const finalVal = ensemble.reduce((a, m) => a + meanLoss(m, valSamples, weights), 0) / Math.max(1, ensemble.length);
   return { ensemble, finalTrainLoss: finalTrain, finalValLoss: finalVal, history };
 }
 

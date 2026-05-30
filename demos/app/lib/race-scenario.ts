@@ -34,6 +34,7 @@ import {
   wheeledFromNormalized,
   trimPlan,
   samplePlanAt,
+  expandPlanSweeps,
   type CarForceTuning,
   type CarKinematicState,
   type WheeledCarControls,
@@ -50,9 +51,12 @@ import {
 } from 'kinocat/execute';
 import {
   parametricForwardV2,
+  learnedForwardSimV2,
   DEFAULT_LEARNED_PARAMS_V2,
   DEFAULT_LEARNABLE_CONFIG,
+  type LearnedVehicleModel,
 } from 'kinocat/agent';
+import type { ForwardSim } from 'kinocat/primitives';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavWorld } from 'kinocat/environment';
 import type { MotionPrimitiveLibrary } from 'kinocat/primitives';
@@ -78,9 +82,9 @@ import {
 export const PHYSICS_DT = 1 / 60;
 export const VEHICLE_SUBSTEPS = 4;
 export const REPLAN_INTERVAL_MS = 300;
-export const PLAN_LOOKAHEAD_COUNT = 2;
+export const PLAN_LOOKAHEAD_COUNT = 3;
 export const TRACKER_MAX_LATERAL_ACCEL = 12;
-export const STALL_TIMEOUT_MS = 4000;
+export const STALL_TIMEOUT_MS = 2000;
 export const ENGINE_FORCE_N = 4000;
 export const BRAKE_FORCE_N = 2000;
 export const WHEEL_BASE = 1.6;
@@ -109,6 +113,48 @@ export const COMMIT_WINDOW_MS = 200;
  */
 export const LATERAL_ERROR_REPLAN_M = 2.0;
 export const MIN_TIME_BETWEEN_REPLANS_MS = 150;
+/**
+ * Max steering-wheel rate (rad/s). Slew-rate limit on the tracker's
+ * commanded wheel angle, applied after pure-pursuit / MPC. Filters
+ * single-tick chatter at the steer saturation boundary that provokes
+ * lateral-error replan storms.
+ *
+ * 12 rad/s: max steer angle is ±0.222 rad, so full-lock swing takes
+ * ~37 ms (≈2 ticks @60Hz) — fast enough not to interfere with
+ * legitimate emergency steering, slow enough that the worst single-tick
+ * spike (|Δsteer| ≈ 0.4 rad/tick = 24 rad/s observed) gets cut in half.
+ *
+ * Tuned empirically:
+ *  - 4 rad/s: too restrictive, race went DNF
+ *  - speed-aware (24 low → 8 high): worse than constant; chatter
+ *    spikes through during low-speed corner entries
+ *  - 12 rad/s: 5-run mean loss to kinematic dropped from -50 % to -17 %
+ */
+export const MAX_STEER_RATE_RAD_PER_SEC = 12.0;
+/**
+ * Adaptive lateral-error replan trigger requires `dLat > threshold` for
+ * this many CONSECUTIVE ticks before firing. Filters one-tick spikes
+ * caused by controller chatter at sharp-turn moments — those usually
+ * resolve themselves on the next tick rather than indicating the plan is
+ * actually wrong.
+ *
+ * Sweep results at slew=12 rad/s (3-lap race):
+ *
+ *               DETERMINISTIC   STOCHASTIC (5-run mean)
+ *   debounce=1     -22 %               not measured
+ *   debounce=2      -9 %               -30 %       ← default
+ *   debounce=3     -43 %               not measured
+ *   debounce=4      +3 % (v2 wins!)    -42 % (catastrophic 1 in 5)
+ *   debounce=5     -21 %               not measured
+ *
+ * debounce=4 has a real DETERMINISTIC win — when wall-clock variance is
+ * removed (via `--deterministic`), v2 beats kinematic by 2.8 %. But the
+ * win does not survive CPU jitter — the planning sequence that wins is
+ * fragile to small perturbations and the stochastic mean is worse than
+ * debounce=2. Keeping 2 as the web/CLI default; users can override via
+ * `--lat-debounce=4 --deterministic` to verify the win.
+ */
+export const LATERAL_ERROR_REPLAN_MIN_TICKS = 2;
 
 const FORCE_TUNING: CarForceTuning = {
   engineForceN: ENGINE_FORCE_N,
@@ -144,6 +190,13 @@ const PURE_PURSUIT_CONFIG = {
   // this the smoother has no effect and the controller would still
   // arrive hot at corner entries. (Tuning override below toggles this.)
   respectPathSpeed: true,
+  // Floor for per-sample speeds in the brake-distance pass. Plan
+  // samples below this are ignored so a [0,0,brake] primitive in the
+  // middle of a racing plan can't shut the controller down.
+  // Racing scenarios override to ~0.3·cruise (≈9 m/s on a 30 m/s
+  // chassis) so honest cruise-speed primitives dominate; parking
+  // scenarios leave it at 0.
+  minPathSpeed: RACE_AGENT.maxSpeed * 0.3,
 };
 
 // ---------------------------------------------------------------------------
@@ -160,25 +213,302 @@ const PURE_PURSUIT_CONFIG = {
  * Borrowed verbatim from the WIP parking branch
  * (claude/fervent-cori-KXMEy → `splitAtGearCusps` in Parking.tsx).
  */
+/** Clamp `target` so it differs from `prev` by at most `maxDelta`. */
+function clampDelta(target: number, prev: number, maxDelta: number): number {
+  const d = target - prev;
+  if (d > maxDelta) return prev + maxDelta;
+  if (d < -maxDelta) return prev - maxDelta;
+  return target;
+}
+
+/** Per-sample |speed| (m/s) for a sample to count as "in a gear" rather
+ *  than "in transition through zero." Below this is treated as
+ *  signless — the run extends through it. Tuned BELOW the slowest
+ *  reverse primitive in any library (parking's smallest reverse
+ *  primitive commands |v| ≥ 0.5 m/s) so real motion always anchors,
+ *  but ABOVE the smoother's worst-case phantom amplitude (interp-near-
+ *  zero values are bounded by the sample spacing × dv/ds ≈ 0.4 ×
+ *  small ≈ 0.05 m/s). 0.15 splits the difference safely. */
+const SIGN_FLOOR_SPEED = 0.15;
+/** Minimum PEAK |speed| (m/s) the run must contain for it to count as
+ *  a real gear claim. Phantom smoother artifacts at primitive
+ *  boundaries cap out around 0.05 m/s — they never reach a real
+ *  primitive's command speed. A run whose peak fails this bar is
+ *  treated as noise and absorbed into the surrounding gear. */
+const MIN_RUN_PEAK_SPEED = 0.5;
+/** Minimum arc length (m) backstop for a sustained run. Even at the
+ *  slowest reverse primitive (parking, command speed 0.5-1 m/s over
+ *  0.4 s ≈ 0.2-0.4 m), a real primitive's full sweep occupies multiple
+ *  smoother-resampled positions (smoother spacing 0.4 m). 0.3 m
+ *  excludes 1-sample artifacts but admits real primitives. */
+const MIN_RUN_ARC = 0.3;
+
+/** Number of cusps detected in the most recent call to
+ *  `splitAtGearCusps` BEFORE the sustained-motion filter (i.e. raw
+ *  sign-flips, including smoother artifacts) and AFTER (real gear
+ *  changes the tracker will act on). Module-level so the planner
+ *  diagnostics path can surface them without changing the public
+ *  signature. Reads happen on the same tick as the call from a single
+ *  scenario instance, so the global is race-free in practice. */
+let lastSplitDiagnostics = { rawSignFlips: 0, keptCusps: 0 };
+export function getLastCuspSplitDiagnostics(): {
+  rawSignFlips: number;
+  keptCusps: number;
+} {
+  return { ...lastSplitDiagnostics };
+}
+
 export function splitAtGearCusps(plan: CarKinematicState[]): CarKinematicState[][] {
-  if (plan.length < 2) return [plan.slice()];
-  const out: CarKinematicState[][] = [];
-  let cur: CarKinematicState[] = [plan[0]!];
+  if (plan.length < 2) {
+    lastSplitDiagnostics = { rawSignFlips: 0, keptCusps: 0 };
+    return [plan.slice()];
+  }
+  // Pass 1: build monotone-sign runs. Each run is a maximal contiguous
+  // sequence of samples whose speed (when above SIGN_FLOOR_SPEED) is
+  // single-signed. Samples below the floor are "in transition" and
+  // extend whichever run they're in. The run carries arc length and
+  // peak |speed| so Pass 2 can decide which runs are real gears vs
+  // noise.
+  type Run = {
+    startIdx: number;
+    endIdx: number; // exclusive
+    sign: -1 | 0 | 1; // 0 only if the entire run is below the floor
+    arcLength: number;
+    peakSpeed: number;
+    sustained: boolean;
+  };
+  const signOf = (v: number): -1 | 0 | 1 =>
+    v > SIGN_FLOOR_SPEED ? 1 : v < -SIGN_FLOOR_SPEED ? -1 : 0;
+  const distBetween = (a: CarKinematicState, b: CarKinematicState): number =>
+    Math.hypot(b.x - a.x, b.z - a.z);
+
+  const runs: Run[] = [];
+  let runStart = 0;
+  let runSign: -1 | 0 | 1 = signOf(plan[0]!.speed);
+  let runArc = 0;
+  let runPeak = Math.abs(plan[0]!.speed);
+  let rawSignFlips = 0;
   for (let i = 1; i < plan.length; i++) {
     const s = plan[i]!;
-    const prev = cur[cur.length - 1]!;
-    const flipped =
-      (prev.speed > 1e-3 && s.speed < -1e-3) ||
-      (prev.speed < -1e-3 && s.speed > 1e-3);
-    if (flipped) {
-      if (cur.length >= 2) out.push(cur);
-      cur = [s];
+    const prev = plan[i - 1]!;
+    const sSign = signOf(s.speed);
+    const arc = distBetween(prev, s);
+    // Diagnostic: raw sign-flip count uses the legacy 1e-3 m/s threshold
+    // so the metric is comparable to the original `splitAtGearCusps`
+    // behavior (what would have been a split before this rewrite).
+    const prevAbs = Math.abs(prev.speed);
+    const sAbs = Math.abs(s.speed);
+    if (prevAbs > 1e-3 && sAbs > 1e-3 && Math.sign(prev.speed) !== Math.sign(s.speed)) {
+      rawSignFlips++;
+    }
+    // Extend the current run if the new sample is either in the same
+    // gear or below the sign floor (transition); otherwise close run
+    // and open a new one.
+    if (sSign === runSign || sSign === 0 || runSign === 0) {
+      if (runSign === 0 && sSign !== 0) runSign = sSign;
+      runArc += arc;
+      if (sAbs > runPeak) runPeak = sAbs;
     } else {
-      cur.push(s);
+      runs.push({
+        startIdx: runStart,
+        endIdx: i,
+        sign: runSign,
+        arcLength: runArc,
+        peakSpeed: runPeak,
+        sustained: runPeak >= MIN_RUN_PEAK_SPEED && runArc >= MIN_RUN_ARC,
+      });
+      runStart = i;
+      runSign = sSign;
+      runArc = 0;
+      runPeak = sAbs;
     }
   }
-  if (cur.length >= 2) out.push(cur);
-  return out.length > 0 ? out : [plan.slice()];
+  runs.push({
+    startIdx: runStart,
+    endIdx: plan.length,
+    sign: runSign,
+    arcLength: runArc,
+    peakSpeed: runPeak,
+    sustained: runPeak >= MIN_RUN_PEAK_SPEED && runArc >= MIN_RUN_ARC,
+  });
+
+  // Pass 2: walk runs left-to-right and only emit a split between two
+  // ADJACENT sustained runs of opposite sign. Short runs are absorbed
+  // into the surrounding same-sign run; their samples have their speed
+  // clamped to a magnitude consistent with the surrounding gear (sign
+  // matches surrounding sign, magnitude min(|original|, MIN_SUSTAINED))
+  // so pure-pursuit doesn't see a phantom near-zero crossing.
+  const cleaned: CarKinematicState[] = plan.map((s) => ({ ...s }));
+  // Determine each run's "effective sign" — the sign of the nearest
+  // sustained run (this run if it's sustained; else the previous
+  // sustained run; else the next; else 0).
+  const effSign: Array<-1 | 0 | 1> = new Array(runs.length).fill(0);
+  let lastSustained: -1 | 0 | 1 = 0;
+  for (let r = 0; r < runs.length; r++) {
+    if (runs[r]!.sustained) {
+      effSign[r] = runs[r]!.sign;
+      lastSustained = runs[r]!.sign;
+    } else {
+      effSign[r] = lastSustained;
+    }
+  }
+  // Forward-fill: any leading non-sustained runs get the first sustained
+  // sign.
+  let firstSustainedSign: -1 | 0 | 1 = 0;
+  for (let r = 0; r < runs.length; r++) {
+    if (runs[r]!.sustained) {
+      firstSustainedSign = runs[r]!.sign;
+      break;
+    }
+  }
+  for (let r = 0; r < runs.length; r++) {
+    if (!runs[r]!.sustained && effSign[r] === 0) effSign[r] = firstSustainedSign;
+  }
+  // Clamp every sample's speed so its sign matches the OWNING run's
+  // effective sign. Without this, a "transition" sample (|speed| <
+  // SIGN_FLOOR_SPEED but with opposite sign of the surrounding run)
+  // stays inside the run and confuses pure-pursuit's gear inference
+  // (`gear = aheadSpeed < 0 ? -1 : 1`). Concretely: a forward parking
+  // segment whose final samples ramp through speed=-0.1 (still |<floor|
+  // so the run extended through it) would have pure-pursuit pick gear=-1
+  // near the segment end, steering the chassis backwards.
+  for (let r = 0; r < runs.length; r++) {
+    const eSign = runs[r]!.sustained ? runs[r]!.sign : effSign[r]!;
+    if (eSign === 0) continue;
+    for (let i = runs[r]!.startIdx; i < runs[r]!.endIdx; i++) {
+      const s = cleaned[i]!;
+      if (Math.sign(s.speed) === eSign || s.speed === 0) continue;
+      // Sample's sign is opposite to its owning run. Clamp magnitude
+      // and flip sign so the sample reads as a slow same-gear sample.
+      s.speed = eSign * Math.min(Math.abs(s.speed), SIGN_FLOOR_SPEED);
+    }
+  }
+  // Identify which adjacent sustained-run boundaries are real cusps.
+  const splits: number[] = []; // indices in `cleaned` to split AT (exclusive end of prior segment, start of next).
+  let prevEffSign: -1 | 0 | 1 = 0;
+  for (let r = 0; r < runs.length; r++) {
+    const eSign = effSign[r]!;
+    if (eSign === 0) continue;
+    if (prevEffSign !== 0 && eSign !== prevEffSign && runs[r]!.sustained) {
+      splits.push(runs[r]!.startIdx);
+    }
+    if (runs[r]!.sustained) prevEffSign = eSign;
+  }
+  // Emit segments.
+  const out: CarKinematicState[][] = [];
+  let segStart = 0;
+  for (const sp of splits) {
+    // Slice is [segStart, sp): the prior segment ends just BEFORE the
+    // sign flip, so its last sample still has the old gear's speed
+    // sign. The new segment then starts at `sp` (first sample with the
+    // new gear). Matches the legacy splitter so the tracker never sees
+    // a forward-segment sample with reverse speed (which would make
+    // pure-pursuit aim the chassis backward at the boundary).
+    if (sp - segStart >= 2) out.push(cleaned.slice(segStart, sp));
+    segStart = sp;
+  }
+  if (cleaned.length - segStart >= 2) out.push(cleaned.slice(segStart));
+  lastSplitDiagnostics = { rawSignFlips, keptCusps: splits.length };
+  return out.length > 0 ? out : [cleaned.slice()];
+}
+
+/**
+ * Per-plan kinematic feasibility audit. Returns counts that tell us
+ * whether the plan we just committed is achievable by the chassis — the
+ * specific failure modes are:
+ *
+ *  - `infeasibleCurvatureSamples`: samples where `|κ|·v² > maxLatAccel`.
+ *    Polyline curvature × commanded speed² exceeds the lateral-accel
+ *    cap the tracker can deliver. Pure-pursuit will brake at corners to
+ *    respect this cap, but the planner is asking for grip that the
+ *    chassis doesn't have — root-cause "racing line is wrong" signal.
+ *  - `infeasibleAccelSamples`: samples where adjacent-pair |Δspeed|/Δt
+ *    exceeds the tracker's accel or decel cap. Plan asks for an
+ *    impossible speed jump.
+ *  - `totalSamples`: denominator for the percentages.
+ *
+ * Domain-agnostic — applies equally to racing, parking, any course.
+ */
+export function auditPlanFeasibility(
+  plan: CarKinematicState[],
+  caps: { maxLateralAccel: number; maxAccel: number; maxDecel: number },
+): {
+  infeasibleCurvatureSamples: number;
+  infeasibleAccelSamples: number;
+  totalSamples: number;
+} {
+  if (plan.length < 3) {
+    return {
+      infeasibleCurvatureSamples: 0,
+      infeasibleAccelSamples: 0,
+      totalSamples: plan.length,
+    };
+  }
+  let infeasibleK = 0;
+  let infeasibleA = 0;
+  for (let i = 1; i < plan.length - 1; i++) {
+    const a = plan[i - 1]!;
+    const b = plan[i]!;
+    const c = plan[i + 1]!;
+    // Three-point curvature (κ = 1/R via signed triangle area).
+    const ax = a.x;
+    const az = a.z;
+    const bx = b.x;
+    const bz = b.z;
+    const cx = c.x;
+    const cz = c.z;
+    const ab = Math.hypot(bx - ax, bz - az);
+    const bc = Math.hypot(cx - bx, cz - bz);
+    const ac = Math.hypot(cx - ax, cz - az);
+    const area2 = Math.abs((bx - ax) * (cz - az) - (bz - az) * (cx - ax));
+    const denom = ab * bc * ac;
+    const k = denom > 1e-9 ? (2 * area2) / denom : 0;
+    const v = Math.abs(b.speed);
+    if (k * v * v > caps.maxLateralAccel) infeasibleK++;
+    // Acceleration feasibility: estimate dt from arc-length and average
+    // speed at the midpoint. Only check pairs where both magnitudes >
+    // 0.3 (skip parking near-zero samples where dt → infinity).
+    const v0 = Math.abs(a.speed);
+    const v1 = Math.abs(b.speed);
+    const meanV = 0.5 * (v0 + v1);
+    if (meanV > 0.3) {
+      const dt = ab / meanV;
+      if (dt > 1e-3) {
+        const accel = (v1 - v0) / dt;
+        const cap = accel >= 0 ? caps.maxAccel : caps.maxDecel;
+        if (Math.abs(accel) > cap * 1.5) infeasibleA++;
+      }
+    }
+  }
+  return {
+    infeasibleCurvatureSamples: infeasibleK,
+    infeasibleAccelSamples: infeasibleA,
+    totalSamples: plan.length,
+  };
+}
+
+/** Compact P95-tracker for streaming |error| samples. Stores last
+ *  CAPACITY samples in a ring buffer; reads sort a copy. Cheap enough
+ *  per-tick (256 doubles, no allocation in the hot path). */
+class P95Tracker {
+  private readonly buf: Float64Array;
+  private idx = 0;
+  private filled = 0;
+  constructor(capacity = 256) {
+    this.buf = new Float64Array(capacity);
+  }
+  push(absValue: number): void {
+    this.buf[this.idx] = absValue;
+    this.idx = (this.idx + 1) % this.buf.length;
+    if (this.filled < this.buf.length) this.filled++;
+  }
+  p95(): number {
+    if (this.filled === 0) return 0;
+    const arr = Array.from(this.buf.subarray(0, this.filled));
+    arr.sort((a, b) => a - b);
+    const i = Math.floor(0.95 * (arr.length - 1));
+    return arr[i] ?? 0;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +607,17 @@ export interface RaceTuning {
   plannerBudgetMs?: number;
   /** Planner expansion cap. Race=30k; parking=80k. */
   plannerMaxExpansions?: number;
+  /** Force a deterministic planner: ignore the wall-clock deadline,
+   *  use only `plannerMaxExpansions` (defaults to 50k from the multi-goal
+   *  planner) as the budget. Trades guaranteed CPU bound for repeatability
+   *  — useful in benches/tests where wall-clock variance makes A/B
+   *  comparisons impossible. Off in the web demo (real-time interactivity
+   *  needs the CPU bound). */
+  deterministicPlanner?: boolean;
+  /** Override `MAX_STEER_RATE_RAD_PER_SEC`. */
+  maxSteerRateRadPerSec?: number;
+  /** Override `LATERAL_ERROR_REPLAN_MIN_TICKS`. */
+  lateralErrorReplanMinTicks?: number;
 }
 
 /**
@@ -315,9 +656,30 @@ export interface RaceTuning {
  */
 export const DEFAULT_TUNING: RaceTuning = {
   commitWindowMs: 0,
-  consistencyWeight: 0.08,
+  // Heavier consistency weight makes the planner prefer paths close
+  // to the previously-committed one, so a freshly-searched plan only
+  // wins when meaningfully better. Reduces plan-to-plan jitter ("the
+  // chassis keeps swinging between two slightly different racing
+  // lines") which manifests on the web demo as flickering plan
+  // visuals and on the controller as oscillating steer commands.
+  //
+  // Tuned via deterministic-planner sweep (3-lap race vs kinematic):
+  //   0    -47 %       0.4  +11 %
+  //   0.1  +14 %  ←    0.6   -2 %
+  //   0.2   -9 %       1.0  +10 %
+  //
+  // 0.1 also has the best stochastic 5-run mean (-30 % vs -38 % at
+  // 0.2) and zero DNFs (0.2 had a DNF in 1 of 5).
+  consistencyWeight: 0.1,
   enableSpeedProfile: false,
   enableTrajectorySmoother: true,
+  // respectPathSpeed (off): per-sample plan speeds are noisy — they
+  // mix legitimate corner-limit signals with acceleration-phase
+  // artifacts (the planner's primitive at chassis startup naturally
+  // has speeds 0,1,2,3,...). Pure-pursuit's vCurve, extended below
+  // to LOOK AHEAD along the plan polyline (not just the current
+  // tick's commanded curvature), gives the controller real
+  // anticipation without the noise.
   respectPathSpeed: false,
   enableAdaptiveReplan: true,
   enableWaypointAdvanceReplan: true,
@@ -353,6 +715,11 @@ export interface RaceEntry {
   name: string;
   /** Motion-primitive library this entry's planner uses. */
   lib: MotionPrimitiveLibrary;
+  /** Optional learned dynamics model. When present AND the tracker is
+   *  `'mpc'`, the MPC controller uses this model's forward sim instead of
+   *  the default parametric model — aligning the tracker's dynamics with
+   *  the planner's primitives so there is no planning-execution mismatch. */
+  model?: LearnedVehicleModel;
 }
 
 export interface RaceLap {
@@ -375,6 +742,73 @@ export interface RaceCarDiagnostics {
   totalReplans: number;
   /** RMS prediction error at primitive boundary (planned vs actual pose). */
   predErrorRms: number;
+  /** Cumulative per-trigger replan counts since the scenario started.
+   *  Unlike `replanHistory` (capped at 30), these are TOTAL counts —
+   *  use them to ask "what fraction of replans were triggered by lateral-
+   *  error events vs the cadence timer?" across an entire run. */
+  replanReasonTotals: {
+    cadence: number;
+    'lateral-error': number;
+    'waypoint-advance': number;
+    'failure-retry': number;
+    manual: number;
+  };
+  /** Cumulative planner search-time stats across the entire run. */
+  plannerMsTotal: number;
+  plannerMsMax: number;
+  plannerDeadlineHitsTotal: number;
+  /** Ticks where the commanded steering exceeded 75% of `minTurnRadius`
+   *  curvature — surfaces sharp-turn behaviour for debugging "where did
+   *  the controller wrench the wheel?". */
+  sharpSteerTicks: number;
+}
+
+/** Why was the replan triggered? `cadence` is the periodic timer, the
+ *  rest are adaptive triggers (see `shouldEarlyReplan` and the
+ *  waypoint-advance branch). `manual` is a sync-hold release or a
+ *  scenario-initiated kick (`scenario.tick()` doesn't trigger this). */
+export type ReplanReason =
+  | 'cadence'
+  | 'lateral-error'
+  | 'waypoint-advance'
+  | 'failure-retry'
+  | 'manual';
+
+/** Per-replan snapshot for diagnosing plan instability. */
+export interface ReplanSnapshot {
+  /** Sim time when replanCar() was called. */
+  simTime: number;
+  /** Which trigger fired this replan. */
+  reason: ReplanReason;
+  /** Wall-clock ms the planner search took. */
+  searchMs: number;
+  /** Whether a valid path was found. */
+  found: boolean;
+  /** A* expansion count. */
+  expansions: number;
+  /** Total nodes generated. */
+  generated: number;
+  /** Whether the deadline was hit. */
+  deadlineHit: boolean;
+  /** Plan cost (Infinity if not found). */
+  cost: number;
+  /** Number of anytime improvements found. */
+  improvements: number;
+  /** Start state the planner used (may differ from chassis if commit-window). */
+  startState: CarKinematicState;
+  /** Actual chassis state at replan time. */
+  chassisState: CarKinematicState;
+  /** Gate sequence the planner targeted. */
+  gates: Array<{ x: number; z: number }>;
+  /** loopIndex at replan time. */
+  loopIndex: number;
+  /** Planned path endpoint count (after expansion/smoothing). */
+  planLength: number;
+  /** First 3 + last 3 plan waypoints (compact summary). */
+  planEndpoints: CarKinematicState[];
+  /** Path displacement vs previous plan: mean + max distance (m) between
+   *  corresponding arc-length-sampled points. -1 if no previous plan. */
+  vsLastPlan: { meanDist: number; maxDist: number };
 }
 
 export interface RaceCarStatus {
@@ -396,6 +830,14 @@ export interface RaceCarStatus {
   predictedEnd: { state: CarKinematicState; dueSimTime: number } | null;
   /** Sim time the most recent waypoint advance happened. */
   lastAdvanceSimTime: number;
+  /** Index of the currently executing gear-segment (0-based). */
+  activeSegmentIndex: number;
+  /** Total number of gear-segments in the current plan. */
+  totalSegments: number;
+  /** Gear of the active segment: 'fwd' | 'rev' | 'unknown'. */
+  activeSegmentGear: 'fwd' | 'rev' | 'unknown';
+  /** Recent replan snapshots (ring buffer, newest last, max 30). */
+  replanHistory: ReplanSnapshot[];
 }
 
 export interface RaceTickResult {
@@ -514,11 +956,24 @@ interface CarInternal {
   // Stall guard.
   lastMoveSimTime: number;
   lastPos: { x: number; z: number };
+  // Consecutive ticks lateral-from-plan has exceeded
+  // `LATERAL_ERROR_REPLAN_M`. Debounce for the adaptive replan trigger
+  // so one-tick chatter spikes don't fire a replan storm.
+  lateralOverCount: number;
   // Spawn pose (for reset / off-track).
   spawn: { x: number; z: number; heading: number };
   // Persistent MPC tracker state (warm-start sequence + RNG seed) when
   // the tracker is `'mpc'`. Lazily initialised on first MPC tick.
   mpcState: MPCTrackerState | null;
+  /** Recent replan snapshots (ring buffer, newest last). */
+  replanHistory: ReplanSnapshot[];
+  /** Streaming P95 trackers for execution-faithfulness metrics. */
+  speedErrP95Tracker: P95Tracker;
+  lateralErrP95Tracker: P95Tracker;
+  /** Counters scoped to the current lap; flushed into `perLap` arrays
+   *  when the lap completes. */
+  currentLapOffTrackTicks: number;
+  currentLapReplanCount: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -539,25 +994,52 @@ export async function createRaceScenario(
   // `createRaceScenario` instance handles racing or parking based on
   // the scenario's per-tuning overrides. Anything not set falls
   // through to the chassis-level race defaults.
+  const isRacingCourse = course.waypoints.length > 1;
   const trackerConfig = {
     ...PURE_PURSUIT_CONFIG,
     cruiseSpeed: tuning.cruiseSpeed ?? PURE_PURSUIT_CONFIG.cruiseSpeed,
     goalTolerance: tuning.goalTolerance ?? PURE_PURSUIT_CONFIG.goalTolerance,
     respectPathSpeed: tuning.respectPathSpeed,
+    // Racing scenarios use the default minPathSpeed (0.3·cruise); single-
+    // waypoint scenarios (parking) zero it out so the planner's
+    // explicit slow-maneuver primitives are honoured all the way to a
+    // stop at the goal pose. Detected by `waypoints.length === 1`.
+    minPathSpeed: isRacingCourse ? PURE_PURSUIT_CONFIG.minPathSpeed : 0,
+    // Lookahead-curvature disabled for now. It made the chassis slower
+    // in benchmarks because it had pure-pursuit slowing on every
+    // sample whose polyline-derived curvature was momentarily high
+    // (often a smoother artifact). vCurve from the reactive
+    // lookahead-point curvature already kicks in when the chassis is
+    // physically in a tight turn; that's enough on this course. Will
+    // revisit with a proper friction-circle pre-pass (Apollo / Autoware
+    // style) instead of an online min-sweep.
+    lookaheadCurvature: false,
   };
   const arriveRadius = tuning.arriveRadius ?? RACE_ARRIVE_RADIUS;
 
-  // MPC tracker shared config + forward simulator (constant per scenario).
-  // The dynamics model is the v2 parametric model with default coefficients
-  // — captures the Rapier chassis well enough for the controller to plan
-  // accurate short-horizon rollouts even on cars that don't ship their own
-  // learned model. Per-car: a `MPCTrackerState` holds the warm-start
-  // sequence + deterministic RNG seed.
+  // MPC tracker config + forward simulator. When an entry supplies a
+  // `model`, the MPC controller uses that model's forward sim — aligning
+  // the tracker's dynamics with the planner's primitives. Without a model,
+  // falls back to the default parametric model (still reasonable for
+  // kinematic-library entries). Per-car forward sims are built lazily in
+  // `mpcForwardSimFor` so the shared config block stays constant.
   const MPC_HORIZON = 10;
-  const mpcForwardSim = parametricForwardV2(
+  const defaultMpcForwardSim = parametricForwardV2(
     DEFAULT_LEARNED_PARAMS_V2,
     DEFAULT_LEARNABLE_CONFIG,
   );
+  const perCarMpcForwardSim = new Map<string, ForwardSim<CarKinematicState>>();
+  function mpcForwardSimFor(entry: RaceEntry): ForwardSim<CarKinematicState> {
+    let sim = perCarMpcForwardSim.get(entry.name);
+    if (sim) return sim;
+    if (entry.model) {
+      sim = parametricForwardV2(entry.model.params, entry.model.config);
+    } else {
+      sim = defaultMpcForwardSim;
+    }
+    perCarMpcForwardSim.set(entry.name, sim);
+    return sim;
+  }
   // MPPI tracker config. The cost weights work across the entire
   // racing-to-parking spectrum because the tracker auto-activates the
   // terminal-pose cost when the plan asks the chassis to stop near a
@@ -577,23 +1059,29 @@ export async function createRaceScenario(
   const MPC_CONFIG = {
     horizonSteps: MPC_HORIZON,
     stepDt: 0.05,
-    samples: 64,
+    samples: 128,
     maxSteer: VEHICLE_TUNING.maxSteerAngle ?? 0.6,
     maxDriveForce: ENGINE_FORCE_N,
     maxBrakeForce: BRAKE_FORCE_N,
-    allowReverse: true,
+    allowReverse: tuning.mpcWTerminalPosition > 0,
     lambda: 0.5,
-    steerStd: 0.10,
-    driveStd: 0.5 * ENGINE_FORCE_N,
-    brakeStd: 0.10 * BRAKE_FORCE_N,
-    wLateral: 2,
+    steerStd: 0.08,
+    driveStd: 0.3 * ENGINE_FORCE_N,
+    brakeStd: 0.15 * BRAKE_FORCE_N,
+    wLateral: 8,
     wHeading: 3,
-    wSpeed: 10,
-    wControlRate: 0.15,
-    wSteerRate: 25,
+    wSpeed: 0.5,
+    wControlRate: 0.1,
+    wSteerRate: 5,
     wTerminalPosition: tuning.mpcWTerminalPosition,
     wTerminalSpeed: tuning.mpcWTerminalSpeed,
     goalTolerance: 0.5,
+    // Racing: the reference trajectory should advance at the car's
+    // actual speed (or faster), not the plan's endpoint speed. Without
+    // this, the MPC brakes to match low plan speeds near waypoint
+    // endpoints. The min floor of 5 prevents near-zero advance rates
+    // when the car is stopped. Parking scenarios leave this at 0.
+    minReferenceSpeed: tuning.mpcWTerminalPosition > 0 ? 0 : 5,
   };
 
   const cars: CarInternal[] = opts.entries.map((entry, i) => {
@@ -649,6 +1137,17 @@ export async function createRaceScenario(
         successfulReplans: 0,
         totalReplans: 0,
         predErrorRms: 0,
+        replanReasonTotals: {
+          cadence: 0,
+          'lateral-error': 0,
+          'waypoint-advance': 0,
+          'failure-retry': 0,
+          manual: 0,
+        },
+        plannerMsTotal: 0,
+        plannerMsMax: 0,
+        plannerDeadlineHitsTotal: 0,
+        sharpSteerTicks: 0,
       },
       metrics: emptyMetrics(),
       lastReplanSimTime: -Infinity,
@@ -658,8 +1157,14 @@ export async function createRaceScenario(
       offTrackEvents: 0,
       lastMoveSimTime: 0,
       lastPos: { x: spawn.x, z: spawn.z },
+      lateralOverCount: 0,
       spawn,
       mpcState: null,
+      replanHistory: [],
+      speedErrP95Tracker: new P95Tracker(),
+      lateralErrP95Tracker: new P95Tracker(),
+      currentLapOffTrackTicks: 0,
+      currentLapReplanCount: 0,
     };
   });
 
@@ -678,8 +1183,10 @@ export async function createRaceScenario(
   let simTime = 0;
   const replanIntervalSec = REPLAN_INTERVAL_MS / 1000;
 
-  function replanCar(c: CarInternal): void {
+  function replanCar(c: CarInternal, reason: ReplanReason = 'manual'): void {
     if (c.holdingForSync || c.finished) return;
+    // Snapshot the previous plan before it's replaced (for drift comparison).
+    const prevPlan = c.plan;
     // Commit-window plan stitching. If a plan is already committed, we
     // plan from the predicted state at `simTime + COMMIT_WINDOW_MS`, not
     // from the current state — guaranteeing the controller can keep
@@ -754,7 +1261,9 @@ export async function createRaceScenario(
     // waypoint (the goal pose), so this branch is the natural
     // discriminator — no extra config flag needed.
     const isParking = course.waypoints.length === 1;
-    const plannerBudget = tuning.plannerBudgetMs ?? RACE_REPLAN_BUDGET_MS;
+    const plannerBudget = tuning.deterministicPlanner
+      ? Number.POSITIVE_INFINITY
+      : (tuning.plannerBudgetMs ?? RACE_REPLAN_BUDGET_MS);
     const plannerMaxExp = tuning.plannerMaxExpansions ?? RACE_MAX_EXPANSIONS;
     const res = isParking
       ? planRace({
@@ -789,6 +1298,10 @@ export async function createRaceScenario(
     c.diagnostics.lastReplanMs = replanMs;
     c.diagnostics.lastReplanFound = res.found && res.path.length > 1;
     c.diagnostics.totalReplans += 1;
+    c.diagnostics.replanReasonTotals[reason] += 1;
+    c.diagnostics.plannerMsTotal += replanMs;
+    if (replanMs > c.diagnostics.plannerMsMax) c.diagnostics.plannerMsMax = replanMs;
+    if (res.stats.deadlineHit) c.diagnostics.plannerDeadlineHitsTotal += 1;
     if (c.diagnostics.lastReplanFound) {
       // Two-stage post-process pipeline (Apollo / Autoware shape), each
       // stage individually toggleable for ablation:
@@ -805,8 +1318,14 @@ export async function createRaceScenario(
       // curvature, resampled onto the smoothed samples by arc-length,
       // so the smoother's geometric rounding doesn't fool the speed
       // pass into commanding impossible speeds.
-      let smoothed = res.path;
-      const kRaw = tuning.enableSpeedProfile ? curvaturePerSample(res.path) : null;
+      // Expand sparse primitive endpoints → dense sweep-sampled path.
+      // This gives the smoother and visualisation a much more faithful
+      // representation of the actual curved trajectories the planner chose.
+      const densePath = res.nodes.length > 1
+        ? expandPlanSweeps(res.nodes, c.entry.lib.primitives)
+        : res.path;
+      let smoothed = densePath;
+      const kRaw = tuning.enableSpeedProfile ? curvaturePerSample(densePath) : null;
       if (tuning.enableTrajectorySmoother) {
         smoothed = smoothTrajectory(smoothed, {
           sampleSpacing: 0.4,
@@ -817,7 +1336,7 @@ export async function createRaceScenario(
         });
       }
       if (tuning.enableSpeedProfile && kRaw) {
-        const kForProfile = resampleScalarByArcLength(res.path, kRaw, smoothed);
+        const kForProfile = resampleScalarByArcLength(densePath, kRaw, smoothed);
         smoothed = smoothSpeedProfile(smoothed, {
           aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel * 0.85,
           aLonMaxAccel: PURE_PURSUIT_CONFIG.maxAccel,
@@ -844,11 +1363,66 @@ export async function createRaceScenario(
         c.segments = splitAtGearCusps(smoothed);
         c.activeSegIdx = 0;
         c.activeSegStartSimTime = simTime;
+        recordPlanHealth(c, smoothed);
       }
       const firstEnd = smoothed.find((p) => p.t > 0.05) ?? smoothed[smoothed.length - 1]!;
       c.predictedEnd = { state: firstEnd, dueSimTime: planStartSimTime + firstEnd.t };
     } else {
       c.diagnostics.consecutiveFailedReplans += 1;
+    }
+    // --- Capture replan snapshot for debugging plan instability ---
+    const MAX_REPLAN_HISTORY = 30;
+    const chassisNow = c.car.readState(simTime);
+    const finalPlan = c.diagnostics.lastReplanFound ? (c.plan ?? []) : [];
+    // Compact plan summary: first 3 + last 3 samples.
+    const planEndpoints: CarKinematicState[] = [];
+    if (finalPlan.length > 0) {
+      for (let i = 0; i < Math.min(3, finalPlan.length); i++) planEndpoints.push(finalPlan[i]!);
+      for (let i = Math.max(finalPlan.length - 3, 3); i < finalPlan.length; i++) planEndpoints.push(finalPlan[i]!);
+    }
+    // Compare vs previous plan: sample both at evenly-spaced arc lengths
+    // and compute displacement stats.
+    let vsLastPlan = { meanDist: -1, maxDist: -1 };
+    if (prevPlan && prevPlan.length >= 2 && finalPlan.length >= 2) {
+      // Sample 10 evenly-spaced points along each plan by index-fraction
+      // and measure positional difference between old and new plan.
+      {
+        const N = 10;
+        let sumDist = 0;
+        let maxDist = 0;
+        for (let i = 0; i < N; i++) {
+          const u = i / (N - 1);
+          const ai = Math.min(Math.floor(u * (finalPlan.length - 1)), finalPlan.length - 1);
+          const bi = Math.min(Math.floor(u * (prevPlan.length - 1)), prevPlan.length - 1);
+          const a = finalPlan[ai]!;
+          const b = prevPlan[bi]!;
+          const d = Math.hypot(a.x - b.x, a.z - b.z);
+          sumDist += d;
+          if (d > maxDist) maxDist = d;
+        }
+        vsLastPlan = { meanDist: sumDist / N, maxDist };
+      }
+    }
+    c.replanHistory.push({
+      simTime,
+      reason,
+      searchMs: replanMs,
+      found: c.diagnostics.lastReplanFound,
+      expansions: res.stats.expansions,
+      generated: res.stats.generated,
+      deadlineHit: res.stats.deadlineHit,
+      cost: res.cost,
+      improvements: res.stats.improvements,
+      startState: { ...startState },
+      chassisState: { ...chassisNow, t: 0 },
+      gates: gates.map((g) => ({ x: g.x, z: g.z })),
+      loopIndex: planLoopIndex,
+      planLength: finalPlan.length,
+      planEndpoints,
+      vsLastPlan,
+    });
+    if (c.replanHistory.length > MAX_REPLAN_HISTORY) {
+      c.replanHistory.shift();
     }
     c.lastReplanSimTime = simTime;
   }
@@ -862,7 +1436,28 @@ export async function createRaceScenario(
       c.segments = splitAtGearCusps(c.plan);
       c.activeSegIdx = 0;
       c.activeSegStartSimTime = simTime;
+      recordPlanHealth(c, c.plan);
     }
+  }
+
+  /** Compute and accumulate per-plan health metrics (cusp counts +
+   *  kinematic feasibility). Called once per plan commit so each plan
+   *  contributes to the lifetime sums in `metrics.planHealth`. The
+   *  caller must invoke `splitAtGearCusps` BEFORE this (its diagnostics
+   *  are read from `getLastCuspSplitDiagnostics`). */
+  function recordPlanHealth(c: CarInternal, plan: CarKinematicState[]): void {
+    const { rawSignFlips, keptCusps } = getLastCuspSplitDiagnostics();
+    c.metrics.planHealth.cuspsRawTotal += rawSignFlips;
+    c.metrics.planHealth.cuspsKeptTotal += keptCusps;
+    const audit = auditPlanFeasibility(plan, {
+      maxLateralAccel: trackerConfig.maxLateralAccel,
+      maxAccel: trackerConfig.maxAccel,
+      maxDecel: trackerConfig.maxDecel,
+    });
+    c.metrics.planHealth.infeasibleCurvatureSamples += audit.infeasibleCurvatureSamples;
+    c.metrics.planHealth.infeasibleAccelSamples += audit.infeasibleAccelSamples;
+    c.metrics.planHealth.planSamplesTotal += audit.totalSamples;
+    c.currentLapReplanCount += 1;
   }
 
   /** Perpendicular distance from a point to the unexecuted future of the
@@ -904,18 +1499,24 @@ export async function createRaceScenario(
    *  planner can re-aim at the new horizon immediately), and
    *  consecutive failures (back off — keep retrying until something
    *  takes). */
-  function shouldEarlyReplan(c: CarInternal, state: CarKinematicState): boolean {
-    if (!tuning.enableAdaptiveReplan) return false;
-    if (c.holdingForSync || c.finished) return false;
+  function shouldEarlyReplan(c: CarInternal, state: CarKinematicState): ReplanReason | null {
+    if (!tuning.enableAdaptiveReplan) return null;
+    if (c.holdingForSync || c.finished) return null;
     const sinceLastMs = (simTime - c.lastReplanSimTime) * 1000;
-    if (sinceLastMs < MIN_TIME_BETWEEN_REPLANS_MS) return false;
-    // Trigger: large lateral error from the plan.
+    if (sinceLastMs < MIN_TIME_BETWEEN_REPLANS_MS) return null;
     const dLat = lateralFromPlan(c, state.x, state.z);
-    if (dLat > LATERAL_ERROR_REPLAN_M) return true;
-    // Trigger: consecutive failures — keep trying. Cadence already
-    // does this every 300ms but events let us retry earlier.
-    if (c.diagnostics.consecutiveFailedReplans >= 2) return true;
-    return false;
+    const debounceTicks = tuning.lateralErrorReplanMinTicks ?? LATERAL_ERROR_REPLAN_MIN_TICKS;
+    if (dLat > LATERAL_ERROR_REPLAN_M) {
+      c.lateralOverCount += 1;
+      if (c.lateralOverCount >= debounceTicks) {
+        c.lateralOverCount = 0;
+        return 'lateral-error';
+      }
+    } else {
+      c.lateralOverCount = 0;
+    }
+    if (c.diagnostics.consecutiveFailedReplans >= 2) return 'failure-retry';
+    return null;
   }
 
   function stepOne(c: CarInternal, dt: number): void {
@@ -934,8 +1535,9 @@ export async function createRaceScenario(
     // trigger checks rate-limit themselves so a degenerate state can't
     // thrash the planner.
     const cadenceDue = simTime - c.lastReplanSimTime >= replanIntervalSec;
-    if (cadenceDue || shouldEarlyReplan(c, stateBefore)) {
-      replanCar(c);
+    const adaptiveReason = shouldEarlyReplan(c, stateBefore);
+    if (cadenceDue || adaptiveReason) {
+      replanCar(c, cadenceDue ? 'cadence' : (adaptiveReason ?? 'cadence'));
     }
     // Waypoint advance + lap detection (60Hz so lap times aren't quantized
     // to the replan cadence).
@@ -959,7 +1561,7 @@ export async function createRaceScenario(
         if (tuning.enableWaypointAdvanceReplan) {
           const sinceLastMs = (simTime - c.lastReplanSimTime) * 1000;
           if (sinceLastMs >= MIN_TIME_BETWEEN_REPLANS_MS) {
-            replanCar(c);
+            replanCar(c, 'waypoint-advance');
           }
         }
         if (c.waypointsCleared % course.waypoints.length === 0) {
@@ -978,6 +1580,24 @@ export async function createRaceScenario(
             : dur;
           c.lapStartSimTime = lapEnd;
           c.currentLapSectors = [];
+          // Per-lap stats: append + recompute CV. CV is the canonical
+          // "are laps consistent?" measurement the user asked for.
+          c.metrics.perLap.times.push(dur);
+          c.metrics.perLap.offTrackTicks.push(c.currentLapOffTrackTicks);
+          c.metrics.perLap.replanCounts.push(c.currentLapReplanCount);
+          c.currentLapOffTrackTicks = 0;
+          c.currentLapReplanCount = 0;
+          const times = c.metrics.perLap.times;
+          if (times.length >= 2) {
+            const mean = times.reduce((a, b) => a + b, 0) / times.length;
+            const variance =
+              times.reduce((a, b) => a + (b - mean) * (b - mean), 0) /
+              times.length;
+            c.metrics.perLap.cv = mean > 1e-9 ? Math.sqrt(variance) / mean : 0;
+          }
+          // Final P95 refresh on lap completion (cheap, only N laps).
+          c.metrics.executionHealth.speedErrP95 = c.speedErrP95Tracker.p95();
+          c.metrics.executionHealth.lateralErrP95 = c.lateralErrP95Tracker.p95();
           if (targetLaps !== undefined && c.laps.length >= targetLaps) {
             c.finished = true;
           } else if (syncHold) {
@@ -1025,21 +1645,62 @@ export async function createRaceScenario(
       // this segment" so we don't need to trim by elapsed time — the
       // last sample of the segment is naturally the brake-to-goal
       // target (the cusp pose or the final goal).
-      const live = c.segments[c.activeSegIdx] ?? c.plan;
+      const rawSeg = c.segments[c.activeSegIdx] ?? c.plan;
+      // Terminal-speed override for the segment fed to the tracker.
+      // Three cases:
+      //   1. CUSP segment (parking, gear flip ahead): override to 0 so
+      //      the chassis brakes to a stop at the cusp pose before the
+      //      next segment flips drive direction.
+      //   2. RACING last segment with low terminal speed: the planner
+      //      sometimes picks a brake-ending primitive at a race gate,
+      //      which makes pure-pursuit treat the gate as a stop target
+      //      and the chassis grinds to a halt mid-lap. Race gates are
+      //      drive-through — override to the cruise speed so the
+      //      brake-to-target cap stays high. Detected by:
+      //        (a) we're on the last segment of the current plan, AND
+      //        (b) the race has >1 waypoint (not parking), AND
+      //        (c) the plan's terminal speed is below half the cruise
+      //            speed (the planner clearly intended slow).
+      //   3. Default: leave the segment unchanged (parking's last
+      //      segment legitimately ends at speed=0 — that IS the goal).
+      const isCuspSegment = c.segments.length > 1 && c.activeSegIdx < c.segments.length - 1;
+      const isRacing = course.waypoints.length > 1;
+      const cruiseCap = trackerConfig.cruiseSpeed;
+      const rawTerminalSpd = Math.abs(rawSeg[rawSeg.length - 1]!.speed);
+      const racingOverrideNeeded =
+        !isCuspSegment && isRacing && rawTerminalSpd < cruiseCap * 0.5;
+      const live: CarKinematicState[] = (isCuspSegment || racingOverrideNeeded)
+        ? (() => {
+            const out = rawSeg.slice();
+            const last = out[out.length - 1]!;
+            const newSpeed = isCuspSegment
+              ? 0
+              : (last.speed < 0 ? -cruiseCap : cruiseCap);
+            out[out.length - 1] = { ...last, speed: newSpeed };
+            return out;
+          })()
+        : rawSeg;
       if (live.length >= 2) {
+        // Slew-rate limit: cap |Δsteer| per tick to filter single-tick
+        // chatter spikes at the steer saturation boundary. Applied in
+        // the same frame as `c.lastControls.steer` (Rapier-frame —
+        // `wheeledFromNormalized` negates the planner-frame angle).
+        const steerRate = tuning.maxSteerRateRadPerSec ?? MAX_STEER_RATE_RAD_PER_SEC;
+        const maxDSteer = steerRate * dt;
         if (tuning.tracker === 'mpc') {
           // Sampling MPC over the v2 parametric model.
           if (!c.mpcState) c.mpcState = createMPCTrackerState(MPC_HORIZON);
-          const cmdRaw = mpcTrack(stateBefore, live, mpcForwardSim, c.mpcState, MPC_CONFIG);
+          const cmdRaw = mpcTrack(stateBefore, live, mpcForwardSimFor(c.entry), c.mpcState, MPC_CONFIG);
+          const limitedSteer = clampDelta(cmdRaw.steer, c.lastControls.steer, maxDSteer);
           const cmd: WheeledCarControls = {
-            steer: cmdRaw.steer,
+            steer: limitedSteer,
             driveForce: cmdRaw.driveForce,
             brakeForce: cmdRaw.brakeForce,
           };
           c.car.applyWheeledControls(cmd);
           c.lastControls = cmd;
           c.metrics.liveControls = {
-            steer: cmdRaw.steer,
+            steer: limitedSteer,
             throttle: cmd.driveForce >= 0
               ? cmd.driveForce / ENGINE_FORCE_N
               : -cmd.driveForce / ENGINE_FORCE_N,
@@ -1048,7 +1709,9 @@ export async function createRaceScenario(
           };
         } else {
           const trk = purePursuit(stateBefore, live, trackerConfig);
-          const steer = -Math.atan(trk.steering * (2 * WHEEL_BASE));
+          const steerRaw = -Math.atan(trk.steering * (2 * WHEEL_BASE));
+          const prevSteerPlanner = -c.lastControls.steer;
+          const steer = clampDelta(steerRaw, prevSteerPlanner, maxDSteer);
           const cmd = wheeledFromNormalized(
             { steer, throttle: trk.throttle, brake: trk.brake },
             FORCE_TUNING,
@@ -1059,18 +1722,30 @@ export async function createRaceScenario(
             steer: trk.steering, throttle: trk.throttle, brake: trk.brake,
             targetSpeed: trk.targetSpeed,
           };
+          // Sharp-steer accounting: |κ| > 0.75 × (1/minTurnRadius) means
+          // the controller is commanding near-max-lock — useful signal
+          // for spotting "the plan went weird here" moments without
+          // staring at the raw history.
+          const kMax = 1 / RACE_AGENT.minTurnRadius;
+          if (Math.abs(trk.steering) > 0.75 * kMax) c.diagnostics.sharpSteerTicks += 1;
         }
       } else {
-        const cmd = wheeledFromNormalized({ steer: 0, throttle: 0.2, brake: 0 }, FORCE_TUNING);
+        // Short plan — apply stronger throttle if stalled to escape zero-speed deadzone.
+        const stalled = Math.abs(stateBefore.speed) < 0.5;
+        const thr = stalled ? 0.6 : 0.2;
+        const cmd = wheeledFromNormalized({ steer: 0, throttle: thr, brake: 0 }, FORCE_TUNING);
         c.car.applyWheeledControls(cmd);
         c.lastControls = cmd;
-        c.metrics.liveControls = { steer: 0, throttle: 0.2, brake: 0, targetSpeed: 5 };
+        c.metrics.liveControls = { steer: 0, throttle: thr, brake: 0, targetSpeed: 5 };
       }
     } else {
-      const cmd = wheeledFromNormalized({ steer: 0, throttle: 0.2, brake: 0 }, FORCE_TUNING);
+      // No plan yet — apply stronger throttle if stalled.
+      const stalled = Math.abs(stateBefore.speed) < 0.5;
+      const thr = stalled ? 0.6 : 0.2;
+      const cmd = wheeledFromNormalized({ steer: 0, throttle: thr, brake: 0 }, FORCE_TUNING);
       c.car.applyWheeledControls(cmd);
       c.lastControls = cmd;
-      c.metrics.liveControls = { steer: 0, throttle: 0.2, brake: 0, targetSpeed: 5 };
+      c.metrics.liveControls = { steer: 0, throttle: thr, brake: 0, targetSpeed: 5 };
     }
     stepRaycastVehicle(c.world, [c.car], { dt, substeps: VEHICLE_SUBSTEPS });
     const after = c.car.readState(simTime + dt);
@@ -1085,6 +1760,35 @@ export async function createRaceScenario(
       c.metrics.trackingErrorRms = c.diagnostics.predErrorRms;
       c.predictedEnd = null;
     }
+    // Execution-faithfulness metrics: target-vs-actual speed and
+    // lateral-error P95s, plus an "is the controller being asked to do
+    // the impossible RIGHT NOW" tick counter. Domain-agnostic — only
+    // updated when a plan is active and not in sync-hold.
+    if (!c.holdingForSync && c.plan && c.plan.length > 1) {
+      const tgt = Math.abs(c.metrics.liveControls.targetSpeed);
+      const cur = Math.abs(after.speed);
+      const speedErr = Math.abs(tgt - cur);
+      c.metrics.executionHealth.speedErrSumSq += speedErr * speedErr;
+      c.metrics.executionHealth.speedErrAbsSum += speedErr;
+      c.metrics.executionHealth.speedErrCount += 1;
+      c.speedErrP95Tracker.push(speedErr);
+      const lat = lateralFromPlan(c, after.x, after.z);
+      if (Number.isFinite(lat)) {
+        c.lateralErrP95Tracker.push(lat);
+      }
+      // Infeasibility now: commanded curvature × actual speed².
+      const k = Math.abs(c.metrics.liveControls.steer);
+      const aLatNow = k * cur * cur;
+      if (aLatNow > trackerConfig.maxLateralAccel) {
+        c.metrics.executionHealth.infeasibleNowTicks += 1;
+      }
+      // Cheap P95 refresh — sort once every few ticks instead of every
+      // tick; reads only matter at lap completion / race end anyway.
+      if (c.metrics.executionHealth.speedErrCount % 32 === 0) {
+        c.metrics.executionHealth.speedErrP95 = c.speedErrP95Tracker.p95();
+        c.metrics.executionHealth.lateralErrP95 = c.lateralErrP95Tracker.p95();
+      }
+    }
     // Metrics.
     c.metrics.peakSpeed = Math.max(c.metrics.peakSpeed, Math.abs(after.speed));
     c.diagnostics.planAgeMs = (simTime - c.planStartSimTime) * 1000;
@@ -1097,13 +1801,25 @@ export async function createRaceScenario(
     if (!c.holdingForSync) c.raceTime += dt;
     c.metrics.raceTime = c.raceTime;
     c.metrics.waypointsCleared = c.waypointsCleared;
-    // Stall guard.
+    // Stall tracking. RACING never teleports — that was producing fake
+    // gate clearings (a stalled controller would have its chassis
+    // warped to the gate, pickNextWaypoint would advance loopIndex,
+    // the next gate would stall+teleport too, and a 22 s "lap" was
+    // actually 11 teleports). PARKING does still teleport because the
+    // controller occasionally fails to engage reverse after a forward-
+    // segment cusp and the chassis sits in space — there's no
+    // realistic "wait for the driver" interpretation for parking. The
+    // selector mirrors the racing-vs-parking discriminator used
+    // elsewhere (multi-waypoint course = racing).
     if (!c.holdingForSync) {
       const moved = Math.hypot(after.x - c.lastPos.x, after.z - c.lastPos.z) > 0.5;
       if (moved) {
         c.lastMoveSimTime = simTime;
         c.lastPos = { x: after.x, z: after.z };
-      } else if ((simTime - c.lastMoveSimTime) * 1000 > stallTimeoutMs) {
+      } else if (
+        !isRacingCourse &&
+        (simTime - c.lastMoveSimTime) * 1000 > stallTimeoutMs
+      ) {
         const wp = course.waypoints[c.loopIndex]!;
         c.car.teleport({ x: wp.x, z: wp.z, heading: wp.heading });
         c.plan = null;
@@ -1120,6 +1836,7 @@ export async function createRaceScenario(
       const z1 = course.bounds.z1 + 15;
       if (after.x < x0 || after.x > x1 || after.z < z0 || after.z > z1 || !Number.isFinite(after.x)) {
         c.offTrackEvents++;
+        c.currentLapOffTrackTicks++;
         const target = offTrackRecovery === 'waypoint' ? course.waypoints[c.loopIndex]! : c.spawn;
         c.car.teleport({ x: target.x, z: target.z, heading: target.heading });
         c.plan = null;
@@ -1144,6 +1861,15 @@ export async function createRaceScenario(
       planStartSimTime: c.planStartSimTime,
       predictedEnd: c.predictedEnd,
       lastAdvanceSimTime: c.lastMoveSimTime,
+      activeSegmentIndex: c.activeSegIdx,
+      totalSegments: c.segments.length,
+      activeSegmentGear: (() => {
+        const seg = c.segments[c.activeSegIdx];
+        if (!seg || seg.length < 2) return 'unknown' as const;
+        const sample = seg[1];
+        return sample && sample.speed >= 0 ? 'fwd' as const : 'rev' as const;
+      })(),
+      replanHistory: c.replanHistory,
     };
   }
 
@@ -1167,6 +1893,17 @@ export async function createRaceScenario(
       c.diagnostics = {
         lastReplanMs: 0, lastReplanFound: false, consecutiveFailedReplans: 0,
         planAgeMs: 0, successfulReplans: 0, totalReplans: 0, predErrorRms: 0,
+        replanReasonTotals: {
+          cadence: 0,
+          'lateral-error': 0,
+          'waypoint-advance': 0,
+          'failure-retry': 0,
+          manual: 0,
+        },
+        plannerMsTotal: 0,
+        plannerMsMax: 0,
+        plannerDeadlineHitsTotal: 0,
+        sharpSteerTicks: 0,
       };
       c.metrics = emptyMetrics();
       c.lastReplanSimTime = -Infinity;
@@ -1176,6 +1913,12 @@ export async function createRaceScenario(
       c.offTrackEvents = 0;
       c.lastMoveSimTime = 0;
       c.lastPos = { x: c.spawn.x, z: c.spawn.z };
+      c.lateralOverCount = 0;
+      c.replanHistory = [];
+      c.speedErrP95Tracker = new P95Tracker();
+      c.lateralErrP95Tracker = new P95Tracker();
+      c.currentLapOffTrackTicks = 0;
+      c.currentLapReplanCount = 0;
     }
   }
 

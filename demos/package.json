@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit",
     "e2e:carchase": "node test/carchase-e2e.mjs",
     "train": "tsx scripts/train.ts",
+    "train:clean": "rm -rf .cache/training",
     "train:quick": "tsx scripts/train.ts --profile=quick --out=demos/public/models/v2-ci.json",
     "train:sweep": "tsx scripts/train.ts --profile=sweep",
     "train:overnight": "tsx scripts/train.ts --profile=overnight",

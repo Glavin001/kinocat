@@ -493,7 +493,29 @@ export interface ManeuverSpec {
 
 /** Build a budget-weighted bundle of maneuver specs. Each call returns
  *  deterministic outputs for the same seed. Useful as the default
- *  recipe the training driver consumes. */
+ *  recipe the training driver consumes.
+ *
+ *  Coverage mix (race-oriented as of v2-default):
+ *   - 40 % OU random walk (was 60 %) — general low-to-mid steer
+ *           coverage.
+ *   - 25 % racing maneuvers (full-lock slaloms, brake-into-corner,
+ *           sustained high-speed turns, throttle-on-apex at speed) —
+ *           previously ~1.4 % via the named-identification slot.
+ *           The race-primitives course has slalom gates that
+ *           demand the chassis run at full 0.6 rad lock; without
+ *           explicit training data in that regime the trained
+ *           model under-predicts curvature and the chassis drifts
+ *           off the plan.
+ *   - 15 % transition probes — throttle/brake/steer step changes.
+ *   - 10 % saturation/panic — full-lock-and-recover trajectories.
+ *   -  5 % named identification (slalom / fishhook / jTurn etc) —
+ *           moderate-amplitude classical maneuvers.
+ *   -  5 % constant-hold baseline.
+ *
+ *  Net effect: training samples now cover full-lock-at-speed
+ *  trajectories explicitly. Heading + lateral-velocity RMS should
+ *  drop because the model gets to see those regimes during fit.
+ */
 export function defaultManeuverBundle(args: {
   limits: ManeuverLimits;
   count: number;
@@ -503,8 +525,8 @@ export function defaultManeuverBundle(args: {
   const { limits } = args;
   const specs: ManeuverSpec[] = [];
 
-  // 60 % OU random walk — three sub-flavors so per-spec params have variety.
-  const ouCount = Math.round(args.count * 0.60);
+  // 40 % OU random walk — three sub-flavors so per-spec params have variety.
+  const ouCount = Math.round(args.count * 0.40);
   for (let i = 0; i < ouCount; i++) {
     const sigSteer = 0.10 + 0.30 * rng();
     const sigDrive = 0.20 * limits.maxDriveForce + 0.50 * limits.maxDriveForce * rng();
@@ -575,8 +597,74 @@ export function defaultManeuverBundle(args: {
     });
   }
 
-  // 10 % named identification maneuvers.
-  const identCount = Math.round(args.count * 0.10);
+  // 25 % racing maneuvers — full-lock-at-speed regime the
+  // race-primitives slalom course needs but the OU random walk
+  // doesn't cover. Each slot uses one of four high-amplitude
+  // primitives at race-relevant speeds.
+  const raceCount = Math.round(args.count * 0.25);
+  for (let i = 0; i < raceCount; i++) {
+    const kind = i % 4;
+    // Bias the amplitude toward the upper steer range so the model
+    // sees full-lock trajectories. 0.7–1.0 × maxSteerAngle (= 0.42–
+    // 0.60 rad on the race chassis).
+    const amp = limits.maxSteerAngle * (0.7 + 0.3 * rng());
+    const drv = limits.maxDriveForce * (0.6 + 0.4 * rng());
+    if (kind === 0) {
+      // Fast slalom — short period (0.6–1.0 s) at high amplitude
+      // mirrors the race-primitives slalom gates (8 m spacing, ±8 m
+      // throw). The OU walk caps out at sigSteer = 0.4; this
+      // primitive specifically exercises 0.42–0.6 rad lock-to-lock.
+      const periodSec = 0.6 + 0.4 * rng();
+      specs.push({
+        id: 'raceSlalom', params: { amp, drv, periodSec, idx: i },
+        build: () => slalom({ amplitude: amp, periodSec, driveForce: drv }),
+      });
+    } else if (kind === 1) {
+      // Brake-into-corner at speed — release throttle, hard brake,
+      // then sharp steer. Trail-braking the model needs to nail to
+      // avoid overshooting tight gates in the race course.
+      specs.push({
+        id: 'raceBrakeIntoCorner', params: { amp, drv, idx: i },
+        build: (lim) => trailBrake({
+          brakeForce: lim.maxBrakeForce * 0.9,
+          releaseTime: 0.5,
+          steerRamp: amp * 2,
+          steerHold: amp,
+          totalDuration: 2.0,
+        }),
+      });
+    } else if (kind === 2) {
+      // Sustained high-speed power-on turn — constant amplitude lock
+      // with full throttle. Trains the friction-circle / understeer
+      // regime the model uses to predict gentle race-line arcs.
+      specs.push({
+        id: 'raceSustainedTurn', params: { amp, drv, idx: i },
+        build: () => constantSegment({
+          steer: i % 2 === 0 ? amp : -amp,
+          driveForce: drv,
+          brakeForce: 0,
+        }),
+      });
+    } else {
+      // Throttle-on-apex at race speed — initial brake, release,
+      // ramp throttle through a held-steer corner. Captures the
+      // race-line "trail-brake then power out" trajectory.
+      specs.push({
+        id: 'raceThrottleOnApex', params: { amp, drv, idx: i },
+        build: (lim) => throttleOnApex({
+          initialBrake: lim.maxBrakeForce * 0.7,
+          brakeReleaseAt: 0.5,
+          throttleRamp: drv * 2,
+          steer: i % 2 === 0 ? amp : -amp,
+          maxDrive: drv,
+        }),
+      });
+    }
+  }
+
+  // 5 % named identification maneuvers (reduced from 10 % — most of
+  // their coverage shifted into the racing slot above).
+  const identCount = Math.round(args.count * 0.05);
   for (let i = 0; i < identCount; i++) {
     const kind = i % 7;
     const amp = limits.maxSteerAngle * (0.3 + 0.5 * rng());

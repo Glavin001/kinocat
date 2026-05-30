@@ -146,8 +146,20 @@ export const RACE_AGENT: VehicleAgent = defaultVehicleAgent({
     [-2.4, -1.0],
     [2.4, -1.0],
   ],
-  reverseCostMultiplier: 1.4,
-  directionChangePenalty: 0.4,
+  // Time-honest costs. Both planner cost formulas (`vehicle-environment.ts`)
+  // are now expressed in seconds: primitive edges use `prim.duration`
+  // directly, and Reeds-Shepp segments use
+  // `seg.length / (reverse ? maxReverseSpeed : maxSpeed)`. With that,
+  // `reverseCostMultiplier=1.0` is the HONEST value — no preference
+  // bias, reverse already costs more time because the chassis is slower
+  // in reverse. The `directionChangePenalty=1.0` s approximates the
+  // real chassis's gear-shift time (brake to zero + engage opposite
+  // direction). Values > 1.0 would add an aesthetic preference on top
+  // of physics; we deliberately don't, so the planner picks reverse
+  // exactly when it's faster in real wall-clock time.
+  // Domain-agnostic — encodes chassis physics, not "racing vs parking."
+  reverseCostMultiplier: 1.0,
+  directionChangePenalty: 1.0,
 });
 
 /** Race-tuned control set spanning the full speed envelope to chassis
@@ -255,11 +267,11 @@ export function buildLearnedRaceLibraryV2(
     // Duration tuned per-bucket: enough time for control differences to
     // produce DISTINGUISHABLE endpoints (so the planner has real choices)
     // but not so long that the planner can't react to nearby gates.
-    // At v=0 the chassis needs ~1.5 s to accelerate to a speed where turn
-    // dynamics differentiate. At v=28 brake-into-corner trajectories need
-    // ~0.8 s to develop (5.5 m/s² brake decel × 0.8 s = 4.4 m/s of speed
-    // change, enough to discriminate plans).
-    { startSpeed: 0,  duration: 1.5,  controls: lowSpeedV2Controls(cfg) },
+    // At v=0, 1.0 s balances endpoint differentiation vs plan granularity
+    // (1.5 s was too long — the car committed to 15 m before re-evaluating).
+    // At v=28 brake-into-corner trajectories need ~0.8 s to develop
+    // (5.5 m/s² brake decel × 0.8 s = 4.4 m/s of speed change).
+    { startSpeed: 0,  duration: 1.0,  controls: lowSpeedV2Controls(cfg) },
     { startSpeed: 10, duration: 0.8,  controls: midSpeedV2Controls(cfg) },
     { startSpeed: 20, duration: 0.8,  controls: highSpeedV2Controls(cfg) },
     { startSpeed: 28, duration: 0.8,  controls: topSpeedV2Controls(cfg) },
@@ -283,50 +295,66 @@ export function buildLearnedRaceLibraryV2(
 
 type CfgLike = import('kinocat/agent').LearnableVehicleConfig;
 
-/** v=0 controls. From rest, controls only differentiate based on how the
- *  chassis accelerates over the 1.5 s primitive — straight vs turning,
- *  full vs partial throttle, reverse. */
+/** v=0 controls. From rest, controls differentiate based on how the
+ *  chassis accelerates over the 1.0 s primitive — straight vs turning,
+ *  full vs partial throttle, reverse. Denser steer angles fill the
+ *  reachability fan so the planner has smooth heading coverage. */
 function lowSpeedV2Controls(cfg: CfgLike): number[][] {
   const drv = cfg.maxDriveForce;
   const brk = cfg.maxBrakeForce;
   const st = cfg.maxSteerAngle;
   return [
-    [0, drv, 0],                  // 0: full-throttle straight
-    [0, 0.5 * drv, 0],            // 1: half-throttle straight
-    [+st * 0.5, drv, 0],          // 2: half-left + full throttle
-    [-st * 0.5, drv, 0],          // 3: half-right + full throttle
-    [+st, 0.7 * drv, 0],          // 4: full-left + ¾ throttle
-    [-st, 0.7 * drv, 0],          // 5: full-right + ¾ throttle
-    [0, -0.4 * drv, 0],           // 6: reverse
-    [0, 0, brk * 0.5],            // 7: brake (no-op at v=0; valid for grid coherence)
+    [0, drv, 0],                  // full-throttle straight
+    [0, 0.5 * drv, 0],            // half-throttle straight
+    [+st * 0.3, drv, 0],          // gentle-left + full throttle
+    [-st * 0.3, drv, 0],          // gentle-right + full throttle
+    [+st * 0.5, drv, 0],          // half-left + full throttle
+    [-st * 0.5, drv, 0],          // half-right + full throttle
+    [+st * 0.7, 0.7 * drv, 0],    // moderate-left + ¾ throttle
+    [-st * 0.7, 0.7 * drv, 0],    // moderate-right + ¾ throttle
+    [+st, 0.7 * drv, 0],          // full-left + ¾ throttle
+    [-st, 0.7 * drv, 0],          // full-right + ¾ throttle
+    [+st, drv, 0],                // full-left + full throttle
+    [-st, drv, 0],                // full-right + full throttle
+    [0, -0.4 * drv, 0],           // reverse
+    [0, 0, brk * 0.5],            // brake (no-op at v=0; valid for grid coherence)
   ];
 }
 
 /** v=10 controls. Mid-range: tight turns become physically possible;
- *  brake becomes meaningful; trail-brake variants for cornering. */
+ *  brake becomes meaningful; trail-brake variants for cornering.
+ *  Denser steer angles + powered full-lock turns for angular coverage. */
 function midSpeedV2Controls(cfg: CfgLike): number[][] {
   const drv = cfg.maxDriveForce;
   const brk = cfg.maxBrakeForce;
   const st = cfg.maxSteerAngle;
   return [
-    [0, drv, 0],                  // 0: accelerate
-    [0, 0.5 * drv, 0],            // 1: maintain
-    [0, 0, 0],                    // 2: coast
-    [0, 0, 0.4 * brk],            // 3: brake gently
-    [0, 0, brk],                  // 4: brake hard
-    [+st * 0.5, 0.5 * drv, 0],    // 5: moderate-left at speed
-    [-st * 0.5, 0.5 * drv, 0],    // 6: moderate-right at speed
-    [+st, 0.2 * drv, 0],          // 7: tight-left, low throttle
-    [-st, 0.2 * drv, 0],          // 8: tight-right, low throttle
-    [+st * 0.5, 0, 0.3 * brk],    // 9: trail-brake left
-    [-st * 0.5, 0, 0.3 * brk],    // 10: trail-brake right
+    [0, drv, 0],                  // accelerate
+    [0, 0.5 * drv, 0],            // maintain
+    [0, 0, 0],                    // coast
+    [0, 0, 0.4 * brk],            // brake gently
+    [0, 0, brk],                  // brake hard
+    [+st * 0.3, 0.5 * drv, 0],    // gentle-left + half throttle
+    [-st * 0.3, 0.5 * drv, 0],    // gentle-right + half throttle
+    [+st * 0.5, 0.5 * drv, 0],    // moderate-left at speed
+    [-st * 0.5, 0.5 * drv, 0],    // moderate-right at speed
+    [+st * 0.7, drv, 0],          // sharp-left + full throttle
+    [-st * 0.7, drv, 0],          // sharp-right + full throttle
+    [+st, 0.5 * drv, 0],          // full-lock left + half throttle
+    [-st, 0.5 * drv, 0],          // full-lock right + half throttle
+    [+st, 0.2 * drv, 0],          // full-lock left, low throttle
+    [-st, 0.2 * drv, 0],          // full-lock right, low throttle
+    [+st * 0.5, 0, 0.3 * brk],    // trail-brake moderate-left
+    [-st * 0.5, 0, 0.3 * brk],    // trail-brake moderate-right
+    [+st, 0, 0.5 * brk],          // trail-brake full-lock left
+    [-st, 0, 0.5 * brk],          // trail-brake full-lock right
   ];
 }
 
 /** v=20 controls. High-speed regime where friction circle starts to
- *  bite on tight turns. The widest action spread comes from BRAKE-INTO-
- *  CORNER trajectories that drop speed to a turn-friendly regime within
- *  the primitive. */
+ *  bite on tight turns. Mix of powered turns (maintain speed through
+ *  moderate corners) and brake-into-corner trajectories (drop speed for
+ *  tight turns). Denser steer angles fill the reachability fan. */
 function highSpeedV2Controls(cfg: CfgLike): number[][] {
   const drv = cfg.maxDriveForce;
   const brk = cfg.maxBrakeForce;
@@ -337,11 +365,21 @@ function highSpeedV2Controls(cfg: CfgLike): number[][] {
     [0, 0, 0],                    // coast
     [0, 0, 0.4 * brk],            // brake light
     [0, 0, brk],                  // brake hard
-    [+st * 0.3, 0.4 * drv, 0],    // gentle-right + power
+    // Powered turns — maintain speed through moderate corners.
+    [+st * 0.15, 0.4 * drv, 0],   // very gentle left + power
+    [-st * 0.15, 0.4 * drv, 0],
+    [+st * 0.3, 0.4 * drv, 0],    // gentle left + power
     [-st * 0.3, 0.4 * drv, 0],
-    [+st * 0.5, 0, 0.3 * brk],    // brake + moderate-right
+    [+st * 0.5, 0.2 * drv, 0],    // moderate left + light throttle
+    [-st * 0.5, 0.2 * drv, 0],
+    [+st, 0.2 * drv, 0],          // full-lock left + light throttle
+    [-st, 0.2 * drv, 0],
+    // Brake-into-corner — decelerate through the turn.
+    [+st * 0.3, 0, 0.3 * brk],    // gentle trail-brake left
+    [-st * 0.3, 0, 0.3 * brk],
+    [+st * 0.5, 0, 0.3 * brk],    // moderate trail-brake left
     [-st * 0.5, 0, 0.3 * brk],
-    [+st * 0.8, 0, 0.6 * brk],    // hard brake + sharp-right (decel-into-corner)
+    [+st * 0.8, 0, 0.6 * brk],    // hard brake + sharp left (decel-into-corner)
     [-st * 0.8, 0, 0.6 * brk],
     [+st, 0, brk],                // full lock + hard brake (extreme racing entry)
     [-st, 0, brk],
@@ -351,9 +389,8 @@ function highSpeedV2Controls(cfg: CfgLike): number[][] {
 /** v=28 controls (top speed). Friction circle limits gentle-radius
  *  turns to a tight band; meaningful spread comes from BRAKE-INTO-CORNER
  *  trajectories (decelerating to a regime where wider turns become
- *  feasible). Includes hard-brake-with-steer combinations that
- *  effectively transition the chassis to mid-speed by the end of the
- *  primitive. */
+ *  feasible). Denser steer angles + powered gentle turns give the
+ *  planner smooth heading coverage at high speed. */
 function topSpeedV2Controls(cfg: CfgLike): number[][] {
   const drv = cfg.maxDriveForce;
   const brk = cfg.maxBrakeForce;
@@ -364,12 +401,22 @@ function topSpeedV2Controls(cfg: CfgLike): number[][] {
     [0, 0, 0.3 * brk],            // light brake straight
     [0, 0, 0.7 * brk],            // mid brake straight
     [0, 0, brk],                  // hard brake straight
-    [+st * 0.15, 0, 0],           // gentle right coast
-    [-st * 0.15, 0, 0],           // gentle left coast
-    [+st * 0.3, 0, 0.5 * brk],    // moderate right + brake (decel through turn)
-    [-st * 0.3, 0, 0.5 * brk],    // moderate left + brake
-    [+st * 0.5, 0, brk],          // sharp right + hard brake (race-line entry)
-    [-st * 0.5, 0, brk],          // sharp left + hard brake
+    // Powered gentle turns — maintain speed through wide corners.
+    [+st * 0.1, 0.2 * drv, 0],    // very gentle left + light power
+    [-st * 0.1, 0.2 * drv, 0],
+    [+st * 0.15, 0, 0],           // gentle left coast
+    [-st * 0.15, 0, 0],
+    [+st * 0.3, 0, 0],            // moderate left coast
+    [-st * 0.3, 0, 0],
+    // Brake-into-corner — decelerate through the turn.
+    [+st * 0.2, 0, 0.3 * brk],    // gentle left + light brake
+    [-st * 0.2, 0, 0.3 * brk],
+    [+st * 0.3, 0, 0.5 * brk],    // moderate left + mid brake
+    [-st * 0.3, 0, 0.5 * brk],
+    [+st * 0.5, 0, 0.7 * brk],    // sharp left + hard brake (race-line entry)
+    [-st * 0.5, 0, 0.7 * brk],
+    [+st * 0.5, 0, brk],          // sharp left + max brake
+    [-st * 0.5, 0, brk],
     [+st, 0, brk],                // full lock + hard brake (extreme entry)
     [-st, 0, brk],
   ];
@@ -676,6 +723,60 @@ export interface RaceMetrics {
     /** Total replan attempts this race. */
     totalReplans: number;
   };
+  /** Per-plan health, accumulated over every committed plan in this race.
+   *  Domain-agnostic: same numbers apply to racing, parking, obstacle
+   *  course. They answer two distinct questions: (a) is the planner
+   *  emitting clean plans? (b) is the tracker executing them faithfully? */
+  planHealth: {
+    /** Sum across all committed plans of `splitAtGearCusps`'s raw
+     *  sign-flip count (BEFORE the sustained-motion absorption). Counts
+     *  smoother artifacts + planner-chosen brake-overshoot transitions
+     *  the way they used to be counted by the legacy 1e-3 m/s
+     *  threshold. Healthy racing plans should sum to a small number. */
+    cuspsRawTotal: number;
+    /** Sum of real (sustained) cusps actually acted on by the tracker. */
+    cuspsKeptTotal: number;
+    /** Sum across all committed plans of plan samples whose
+     *  `|κ|·v² > maxLateralAccel` — the planner asked the chassis for
+     *  more lateral grip than pure-pursuit's `maxLateralAccel`. */
+    infeasibleCurvatureSamples: number;
+    /** Sum of plan samples where adjacent-sample |Δspeed|/Δt exceeds
+     *  the tracker's accel/decel limits. Plan asks for an
+     *  instantaneous speed jump. */
+    infeasibleAccelSamples: number;
+    /** Sum of plan-sample counts. Use as denominator for the two
+     *  infeasibility counts above to compute a percentage. */
+    planSamplesTotal: number;
+  };
+  /** Per-tick execution faithfulness, running RMS+P95 across the race. */
+  executionHealth: {
+    /** Sum of `(targetSpeed - actualSpeed)²` across all ticks. */
+    speedErrSumSq: number;
+    /** Sum of |targetSpeed - actualSpeed| across all ticks (for mean). */
+    speedErrAbsSum: number;
+    /** Tick count for the two running sums above. */
+    speedErrCount: number;
+    /** P95 of |speed error| computed via a reservoir-style ring buffer
+     *  (capacity 256, sorted on read). */
+    speedErrP95: number;
+    /** P95 of |lateral error| computed the same way. */
+    lateralErrP95: number;
+    /** Ticks where `|κ|·v²` at the lookahead point exceeded
+     *  maxLateralAccel — controller was being asked to do the
+     *  impossible RIGHT NOW. */
+    infeasibleNowTicks: number;
+  };
+  /** Per-lap stats accumulated as each lap completes. */
+  perLap: {
+    /** Lap times (s) in completion order. */
+    times: number[];
+    /** Coefficient of variation of `times` (std / mean). 0 with < 2 laps. */
+    cv: number;
+    /** Off-track ticks attributed to each completed lap. */
+    offTrackTicks: number[];
+    /** Successful-replan counts attributed to each completed lap. */
+    replanCounts: number[];
+  };
 }
 
 export function emptyMetrics(): RaceMetrics {
@@ -696,6 +797,27 @@ export function emptyMetrics(): RaceMetrics {
       planAgeMs: 0,
       successfulReplans: 0,
       totalReplans: 0,
+    },
+    planHealth: {
+      cuspsRawTotal: 0,
+      cuspsKeptTotal: 0,
+      infeasibleCurvatureSamples: 0,
+      infeasibleAccelSamples: 0,
+      planSamplesTotal: 0,
+    },
+    executionHealth: {
+      speedErrSumSq: 0,
+      speedErrAbsSum: 0,
+      speedErrCount: 0,
+      speedErrP95: 0,
+      lateralErrP95: 0,
+      infeasibleNowTicks: 0,
+    },
+    perLap: {
+      times: [],
+      cv: 0,
+      offTrackTicks: [],
+      replanCounts: [],
     },
   };
 }

@@ -117,14 +117,20 @@ export function backward(
   mlp: MLP,
   cache: ForwardCache,
   target: ReadonlyArray<number> | Float64Array,
+  weights?: ReadonlyArray<number> | Float64Array,
 ): Gradients {
   const tgt = target instanceof Float64Array ? target : Float64Array.from(target);
   const L = mlp.layers.length;
   const gradW: Float64Array[] = new Array(L);
   const gradB: Float64Array[] = new Array(L);
-  // delta at output: dL/dz_out = (a_out - target) for MSE with linear out.
+  // delta at output: dL/dz_out = w[o] * (a_out - target) for weighted MSE
+  // with linear out. Default to uniform weights (plain MSE) when no
+  // `weights` is supplied — preserves the original behaviour.
   let delta = new Float64Array(mlp.layers[L - 1]!.outDim);
-  for (let o = 0; o < delta.length; o++) delta[o] = cache.output[o]! - tgt[o]!;
+  for (let o = 0; o < delta.length; o++) {
+    const w = weights ? (weights[o] ?? 1) : 1;
+    delta[o] = w * (cache.output[o]! - tgt[o]!);
+  }
   for (let li = L - 1; li >= 0; li--) {
     const layer = mlp.layers[li]!;
     const prevAct = li === 0 ? cache.inputs : cache.postActs[li - 1]!;
