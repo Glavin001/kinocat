@@ -39,6 +39,14 @@ import {
   parkingScenarioOptions,
   type ParkingScenarioId,
 } from '../app/lib/parking-scenarios';
+import {
+  createObstacleCourseScenario,
+  PHYSICS_DT as PHYSICS_DT_OBS,
+} from '../app/lib/obstaclecourse-scenario';
+import { OBS_AGENT, OBS_BLOCKS_ALL, buildObstacleCourse } from '../app/lib/obstaclecourse-scenarios';
+import { createRampScenario, PHYSICS_DT as PHYSICS_DT_RAMP } from '../app/lib/ramp-scenario';
+import { RAMP_AGENT } from '../app/lib/ramp-scenarios';
+import { createSimMonitor } from '../app/lib/sim-monitor';
 import { modelFromJson } from '../app/lib/v2-model-file';
 import type { PersistedV2Model } from '../app/lib/v2-model-persistence';
 
@@ -108,6 +116,12 @@ interface BenchResult {
   offTrackEvents: number;
   /** Total planner replans. */
   totalReplans: number;
+  /** Safety-invariant summary from the telemetry monitor (when collected). */
+  collided?: boolean;
+  minClearance?: number;
+  maxJerk?: number;
+  /** Teleports observed — must be 0 (we removed all teleportation). */
+  teleports?: number;
   /** Scenario-specific notes. */
   note: string;
 }
@@ -207,11 +221,112 @@ function makeParkingScenario(
   };
 }
 
+/** Obstacle-course scenario: drive the waypoint loop on the heightfield course
+ *  past the buildings. PASS: progresses around the loop, never physically hits
+ *  a building, no teleport. Uses the SAME createObstacleCourseScenario the web
+ *  page drives. */
+const obstacleCourseScenario: BenchScenario = {
+  name: 'obstaclecourse',
+  description: 'waypoint loop over heightfield terrain + buildings',
+  async run() {
+    const MAX_TICKS = 480; // 8 s sim
+    const scenario = await createObstacleCourseScenario();
+    const course = buildObstacleCourse(OBS_BLOCKS_ALL);
+    const monitor = createSimMonitor({
+      footprint: OBS_AGENT.footprint,
+      obstacles: course.buildings.map((b) => [
+        [b.x - b.hx, b.z - b.hz],
+        [b.x + b.hx, b.z - b.hz],
+        [b.x + b.hx, b.z + b.hz],
+        [b.x - b.hx, b.z + b.hz],
+      ]),
+      dt: PHYSICS_DT_OBS,
+    });
+    let maxLoopIndex = 0;
+    for (let i = 0; i < MAX_TICKS; i++) {
+      scenario.tick();
+      const st = scenario.status();
+      monitor.sample(st);
+      maxLoopIndex = Math.max(maxLoopIndex, st.loopIndex);
+    }
+    const r = monitor.summary();
+    scenario.dispose();
+    const passed = maxLoopIndex > 0 && !r.collided && r.teleports === 0;
+    return {
+      scenario: 'obstaclecourse',
+      passed,
+      simTime: r.durationSec,
+      terminalErrorM: 0,
+      terminalHeadingErr: 0,
+      terminalSpeed: r.terminalSpeed,
+      offTrackEvents: 0,
+      totalReplans: r.totalReplans,
+      collided: r.collided,
+      minClearance: r.minClearance,
+      maxJerk: r.maxJerk,
+      teleports: r.teleports,
+      note: `wp=${maxLoopIndex} clear=${fmt(r.minClearance)}m`,
+    };
+  },
+};
+
+/** Ramp scenario: drive over the heightfield ramp to the goal, taking the jump
+ *  affordance. PASS: reaches the goal, no teleport. Uses the SAME
+ *  createRampScenario the web page drives. */
+const rampScenario: BenchScenario = {
+  name: 'ramp',
+  description: 'drive over the heightfield ramp to the goal (jump affordance)',
+  async run() {
+    const MAX_TICKS = 900; // 15 s sim
+    const scenario = await createRampScenario({ affordance: true });
+    const goal = scenario.status().goal;
+    const monitor = createSimMonitor({
+      footprint: RAMP_AGENT.footprint,
+      obstacles: [],
+      dt: PHYSICS_DT_RAMP,
+      goal: { x: goal.x, z: goal.z, heading: goal.heading },
+      success: { posTol: 3, headingTol: Math.PI, speedTol: 100 },
+    });
+    let reached = false;
+    let usedAffordance = false;
+    for (let i = 0; i < MAX_TICKS; i++) {
+      scenario.tick();
+      const st = scenario.status();
+      monitor.sample(st);
+      if (st.diagnostics.usedAffordance) usedAffordance = true;
+      if (Math.hypot(st.state.x - goal.x, st.state.z - goal.z) < 3) {
+        reached = true;
+        break;
+      }
+    }
+    const r = monitor.summary();
+    scenario.dispose();
+    const passed = reached && r.teleports === 0;
+    return {
+      scenario: 'ramp',
+      passed,
+      simTime: r.durationSec,
+      terminalErrorM: r.terminalPosError,
+      terminalHeadingErr: 0,
+      terminalSpeed: r.terminalSpeed,
+      offTrackEvents: 0,
+      totalReplans: r.totalReplans,
+      collided: r.collided,
+      minClearance: r.minClearance,
+      maxJerk: r.maxJerk,
+      teleports: r.teleports,
+      note: reached ? `reached${usedAffordance ? ' (jumped)' : ''}` : 'did not reach goal',
+    };
+  },
+};
+
 const ALL_SCENARIOS: BenchScenario[] = [
   raceScenario,
   makeParkingScenario('forward-pullin', 25, 1.5, 'forward pull-in (easy)'),
   makeParkingScenario('reverse-perp', 40, 1.5, 'reverse perpendicular (medium)'),
   makeParkingScenario('parallel', 40, 1.5, 'parallel parking (hard)'),
+  obstacleCourseScenario,
+  rampScenario,
 ];
 
 // ---------------------------------------------------------------------------
@@ -264,8 +379,8 @@ async function main(): Promise<void> {
   }
 
   process.stdout.write('\n');
-  const headers = ['scenario', 'pass', 'sim(s)', 'goalErr(m)', 'hdgErr', '|v|', 'off-tr', 'note'];
-  const widths = [22, 6, 8, 11, 8, 7, 7, 30];
+  const headers = ['scenario', 'pass', 'sim(s)', 'goalErr(m)', 'hdgErr', '|v|', 'collide', 'teleport', 'note'];
+  const widths = [22, 6, 8, 11, 8, 7, 8, 9, 30];
   const sep = '─'.repeat(widths.reduce((a, b) => a + b + 2, 0));
   process.stdout.write(headers.map((h, i) => h.padEnd(widths[i] ?? 0)).join('  ') + '\n' + sep + '\n');
   for (const r of results) {
@@ -276,7 +391,8 @@ async function main(): Promise<void> {
       fmt(r.terminalErrorM),
       fmt(r.terminalHeadingErr),
       fmt(r.terminalSpeed),
-      String(r.offTrackEvents),
+      r.collided === undefined ? '—' : r.collided ? 'HIT' : 'no',
+      r.teleports === undefined ? '—' : String(r.teleports),
       r.note,
     ];
     process.stdout.write(row.map((c, i) => String(c).padEnd(widths[i] ?? 0)).join('  ') + '\n');
