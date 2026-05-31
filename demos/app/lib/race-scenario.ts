@@ -511,9 +511,12 @@ interface CarInternal {
   holdingForSync: boolean;
   finished: boolean;
   offTrackEvents: number;
-  // Stall guard.
+  // Stall guard (diagnostics only — no teleport rescue).
   lastMoveSimTime: number;
   lastPos: { x: number; z: number };
+  // Whether the chassis was within arena bounds on the previous tick (used to
+  // count off-track excursions on the in→out edge — diagnostics only).
+  lastInBounds: boolean;
   // Spawn pose (for reset / off-track).
   spawn: { x: number; z: number; heading: number };
   // Persistent MPC tracker state (warm-start sequence + RNG seed) when
@@ -531,8 +534,13 @@ export async function createRaceScenario(
   const course = opts.course ?? buildRaceCourse();
   const targetLaps = opts.targetLaps;
   const syncHold = opts.syncHold ?? false;
-  const offTrackRecovery = opts.offTrackRecovery ?? 'spawn';
-  const stallTimeoutMs = opts.stallTimeoutMs ?? STALL_TIMEOUT_MS;
+  // NOTE: `offTrackRecovery` and `stallTimeoutMs` are retained on the options
+  // for backward compatibility but are now INERT — the runner performs no
+  // teleportation under any setting. A stuck or off-track chassis fails
+  // honestly (see the stall/off-track tracking in stepOne). They are read here
+  // only to avoid "unknown option" surprises and may be removed later.
+  void opts.offTrackRecovery;
+  void opts.stallTimeoutMs;
   const spacing = opts.spawnSpacingZ ?? 3;
   const tuning: RaceTuning = { ...DEFAULT_TUNING, ...(opts.tuning ?? {}) };
   // Tracker config derives from the tuning bundle so a single
@@ -658,6 +666,7 @@ export async function createRaceScenario(
       offTrackEvents: 0,
       lastMoveSimTime: 0,
       lastPos: { x: spawn.x, z: spawn.z },
+      lastInBounds: true,
       spawn,
       mpcState: null,
     };
@@ -1097,34 +1106,32 @@ export async function createRaceScenario(
     if (!c.holdingForSync) c.raceTime += dt;
     c.metrics.raceTime = c.raceTime;
     c.metrics.waypointsCleared = c.waypointsCleared;
-    // Stall guard.
+    // Stall tracking — diagnostics ONLY. There is NO teleport rescue: real
+    // vehicles don't teleport, and snapping a stuck chassis back onto a
+    // waypoint masks the failure (it's how the reverse-perp parking bug stayed
+    // hidden). A stuck car simply stays stuck and the run fails honestly.
     if (!c.holdingForSync) {
       const moved = Math.hypot(after.x - c.lastPos.x, after.z - c.lastPos.z) > 0.5;
       if (moved) {
         c.lastMoveSimTime = simTime;
         c.lastPos = { x: after.x, z: after.z };
-      } else if ((simTime - c.lastMoveSimTime) * 1000 > stallTimeoutMs) {
-        const wp = course.waypoints[c.loopIndex]!;
-        c.car.teleport({ x: wp.x, z: wp.z, heading: wp.heading });
-        c.plan = null;
-        c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
-        c.lastMoveSimTime = simTime;
-        c.lastPos = { x: wp.x, z: wp.z };
       }
     }
-    // Off-track recovery.
-    if (offTrackRecovery !== 'none') {
+    // Off-track tracking — diagnostics ONLY, no teleport rescue. We still count
+    // excursions (and NaN blow-ups) so they surface as an honest failure
+    // signal in `offTrackEvents`; the chassis is never snapped back.
+    {
       const x0 = course.bounds.x0 - 15;
       const x1 = course.bounds.x1 + 15;
       const z0 = course.bounds.z0 - 15;
       const z1 = course.bounds.z1 + 15;
-      if (after.x < x0 || after.x > x1 || after.z < z0 || after.z > z1 || !Number.isFinite(after.x)) {
-        c.offTrackEvents++;
-        const target = offTrackRecovery === 'waypoint' ? course.waypoints[c.loopIndex]! : c.spawn;
-        c.car.teleport({ x: target.x, z: target.z, heading: target.heading });
-        c.plan = null;
-        c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
-      }
+      const wasInBounds = c.lastInBounds;
+      const inBounds =
+        Number.isFinite(after.x) &&
+        after.x >= x0 && after.x <= x1 && after.z >= z0 && after.z <= z1;
+      // Count a new excursion on the in→out transition (edge, not per-tick).
+      if (wasInBounds && !inBounds) c.offTrackEvents++;
+      c.lastInBounds = inBounds;
     }
   }
 
@@ -1176,6 +1183,7 @@ export async function createRaceScenario(
       c.offTrackEvents = 0;
       c.lastMoveSimTime = 0;
       c.lastPos = { x: c.spawn.x, z: c.spawn.z };
+      c.lastInBounds = true;
     }
   }
 
