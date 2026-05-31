@@ -9,4 +9,5 @@ export type {
 } from './types';
 export { dubinsShortestPath } from './dubins';
 export { reedsSheppShortestPath } from './reeds-shepp';
-export { sampleCurve, curveEndpoint } from './sample';
+export { sampleCurve, sampleCurveWithGear, curveEndpoint } from './sample';
+export type { GearedPose } from './sample';

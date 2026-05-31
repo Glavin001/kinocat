@@ -5,6 +5,12 @@
 // CLI uses. Web demo ↔ CLI parity: a scenario that passes the bench
 // works in the browser exactly the same way.
 //
+// [f] toggles a footprint overlay — the green box is the ego's collision
+// footprint (matches the car mesh + the chassis the planner reserves clearance
+// for) and the red boxes are the obstacle polygons the planner avoids. Use it
+// to confirm the car isn't clipping (the boxes never overlap). Playback runs at
+// SIM_SPEED× so the slow 2 m/s precision maneuver is watchable.
+//
 // Three scenarios cycle via the [1] / [2] / [3] keys (or HUD buttons):
 //   1. forward pull-in (easy)
 //   2. reverse perpendicular (medium)
@@ -31,6 +37,7 @@ import {
   PARKING_PALETTE as C,
   PARKING_SCENARIOS,
   PARKING_LABELS,
+  PARKING_AGENT,
   buildParkingScenario,
   parkingLibrary,
   parkingCourse,
@@ -48,20 +55,44 @@ function parkingEntry(name: string): RaceEntry {
   return { name, lib: parkingLibrary() };
 }
 
+// Playback rate. Parking cruises at the planner's 2 m/s precision speed, so
+// realtime (1×) reads as a glacial creep — a 25 s reverse-S takes 25 s of
+// wall-clock to watch. Step the fixed-rate physics this many sim ticks per
+// rendered frame so the maneuver plays at a brisk pace. Physics is still the
+// same deterministic 1/60 s tick; we just run several per frame.
+const SIM_SPEED = 4;
+
+/** World-XZ corners of the agent footprint placed at a pose (heading 0 = +x). */
+function placeFootprintXZ(
+  footprint: ReadonlyArray<readonly [number, number]>,
+  x: number,
+  z: number,
+  heading: number,
+): THREE.Vector3[] {
+  const c = Math.cos(heading);
+  const s = Math.sin(heading);
+  return footprint.map(
+    ([fx, fz]) => new THREE.Vector3(x + fx * c - fz * s, 0.4, z + fx * s + fz * c),
+  );
+}
+
 export default function Parking() {
   const mountRef = useRef<HTMLDivElement>(null);
   const [scenarioId, setScenarioId] = useState<ParkingScenarioId>('forward-pullin');
   const [paused, setPaused] = useState(false);
   const [showPath, setShowPath] = useState(true);
+  const [showFootprints, setShowFootprints] = useState(false);
   const [hud, setHud] = useState('');
   const [status, setStatus] = useState('initialising...');
 
   const scenarioIdRef = useRef(scenarioId);
   const pausedRef = useRef(paused);
   const showPathRef = useRef(showPath);
+  const showFootprintsRef = useRef(showFootprints);
   scenarioIdRef.current = scenarioId;
   pausedRef.current = paused;
   showPathRef.current = showPath;
+  showFootprintsRef.current = showFootprints;
 
   useEffect(() => {
     if (!mountRef.current) return;
@@ -96,6 +127,51 @@ export default function Parking() {
     let goalMesh: THREE.Mesh | null = null;
     let raceScenario: RaceScenario | null = null;
     let cancelled = false;
+
+    // Footprint-overlay group: the polygons the PLANNER actually reasons about
+    // — the ego's collision footprint (so you can see it matches the car mesh)
+    // and every obstacle polygon (the parked cars + walls as the planner sees
+    // them). Toggled with [f]; the obstacle outlines are rebuilt per scenario,
+    // the ego outline is re-placed every frame from the chassis pose.
+    const fpGroup = new THREE.Group();
+    fpGroup.visible = showFootprintsRef.current;
+    scene.add(fpGroup);
+    const fpObstacleLines: THREE.Line[] = [];
+    let egoFpLine: THREE.LineLoop | null = null;
+    const fpEgoMat = new THREE.LineBasicMaterial({ color: 0x55ff88 });
+    const fpObsMat = new THREE.LineBasicMaterial({ color: 0xff6688, transparent: true, opacity: 0.8 });
+
+    function clearFootprintOverlay() {
+      for (const l of fpObstacleLines) {
+        fpGroup.remove(l);
+        l.geometry.dispose();
+      }
+      fpObstacleLines.length = 0;
+      if (egoFpLine) {
+        fpGroup.remove(egoFpLine);
+        egoFpLine.geometry.dispose();
+        egoFpLine = null;
+      }
+    }
+
+    function buildFootprintOverlay(id: ParkingScenarioId) {
+      clearFootprintOverlay();
+      // Obstacle polygons exactly as passed to the planner.
+      const course = parkingCourse(id);
+      for (const poly of course.obstacles) {
+        const pts = poly.map(([x, z]) => new THREE.Vector3(x, 0.42, z));
+        const geo = new THREE.BufferGeometry().setFromPoints(pts);
+        const line = new THREE.LineLoop(geo, fpObsMat);
+        fpGroup.add(line);
+        fpObstacleLines.push(line);
+      }
+      // Ego footprint outline (placed each frame).
+      const egoGeo = new THREE.BufferGeometry().setFromPoints(
+        placeFootprintXZ(PARKING_AGENT.footprint, 0, 0, 0),
+      );
+      egoFpLine = new THREE.LineLoop(egoGeo, fpEgoMat);
+      fpGroup.add(egoFpLine);
+    }
 
     function clearScenarioMeshes() {
       for (const m of scenarioMeshes) scene.remove(m);
@@ -170,6 +246,7 @@ export default function Parking() {
       }
       const s = buildParkingScenario(id);
       renderObstacles(s);
+      buildFootprintOverlay(id);
       // Goal marker.
       goalMesh = createGoalMarkerHelper({ color: C.goal, size: 1.5 });
       goalMesh.position.set(s.goal.x, 0.3, s.goal.z);
@@ -217,16 +294,26 @@ export default function Parking() {
       const now = performance.now();
       const dt = Math.min((now - prev) / 1000, 1 / 30);
       prev = now;
+      // Footprint overlay visibility follows the toggle every frame (so it
+      // responds even while paused).
+      fpGroup.visible = showFootprintsRef.current;
       if (!pausedRef.current && raceScenario) {
-        // The shared runner uses a fixed-step physics tick (1/60s);
-        // accumulate wall-time deltas into discrete sim ticks.
-        const stepsThisFrame = Math.max(1, Math.min(8, Math.round(dt / (1 / 60))));
+        // The shared runner uses a fixed-step physics tick (1/60s); accumulate
+        // wall-time deltas into discrete sim ticks, scaled by SIM_SPEED so the
+        // slow 2 m/s parking maneuver plays back at a watchable pace.
+        const baseSteps = Math.max(1, Math.round(dt / (1 / 60)));
+        const stepsThisFrame = Math.min(8 * SIM_SPEED, baseSteps * SIM_SPEED);
         for (let i = 0; i < stepsThisFrame; i++) {
           raceScenario.tick();
         }
         const s = raceScenario.status()[0];
         if (s && carMesh) {
           syncCarMesh(carMesh.group, s.state);
+          if (egoFpLine && showFootprintsRef.current) {
+            egoFpLine.geometry.setFromPoints(
+              placeFootprintXZ(PARKING_AGENT.footprint, s.state.x, s.state.z, s.state.heading),
+            );
+          }
           refreshPathLine(s.plan);
           const goalDist = (() => {
             const c = parkingCourse(scenarioIdRef.current);
@@ -256,6 +343,7 @@ export default function Parking() {
       else if (e.key === 'r' || e.key === 'R') rebuildRef.current?.(scenarioIdRef.current);
       else if (e.key === 'p' || e.key === 'P') setPaused((p) => !p);
       else if (e.key === 'l' || e.key === 'L') setShowPath((s) => !s);
+      else if (e.key === 'f' || e.key === 'F') setShowFootprints((s) => !s);
     }
     window.addEventListener('keydown', onKey);
 
@@ -272,6 +360,8 @@ export default function Parking() {
       window.removeEventListener('keydown', onKey);
       window.removeEventListener('resize', onResize);
       clearScenarioMeshes();
+      clearFootprintOverlay();
+      scene.remove(fpGroup);
       if (raceScenario) raceScenario.dispose();
       renderer.dispose();
       host.removeChild(renderer.domElement);
@@ -339,13 +429,18 @@ export default function Parking() {
             </button>
           ))}
         </div>
-        <div style={{ marginTop: 8, display: 'flex', gap: 6, fontSize: 11 }}>
+        <div style={{ marginTop: 8, display: 'flex', gap: 6, flexWrap: 'wrap', fontSize: 11 }}>
           <button onClick={() => setPaused((p) => !p)}>{`[p] ${paused ? 'paused' : 'running'}`}</button>
           <button onClick={() => setShowPath((s) => !s)}>{`[l] path ${showPath ? 'on' : 'off'}`}</button>
+          <button onClick={() => setShowFootprints((s) => !s)}>{`[f] footprints ${showFootprints ? 'on' : 'off'}`}</button>
           <button onClick={() => rebuildRef.current?.(scenarioId)}>[r] reset</button>
         </div>
         <div style={{ marginTop: 6, opacity: 0.5, fontSize: 10 }}>
-          [1] [2] [3] scenarios · [r] reset · [p] pause · [l] path
+          [1] [2] [3] scenarios · [r] reset · [p] pause · [l] path · [f] footprints
+        </div>
+        <div style={{ marginTop: 4, opacity: 0.5, fontSize: 10 }}>
+          footprints: <span style={{ color: '#55ff88' }}>green</span> = car collision box ·{' '}
+          <span style={{ color: '#ff6688' }}>red</span> = obstacle boxes the planner avoids
         </div>
       </div>
     </div>
