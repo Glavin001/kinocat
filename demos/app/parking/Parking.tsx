@@ -33,6 +33,8 @@ import {
   PARKING_LABELS,
   buildParkingScenario,
   parkingLibrary,
+  parkingCourse,
+  parkingScenarioOptions,
   type ParkingScenarioId,
   type ParkingScenario,
 } from '../lib/parking-scenarios';
@@ -42,37 +44,8 @@ import {
   type RaceEntry,
 } from '../lib/race-scenario';
 
-const PARKING_BENCH_TUNING = {
-  // Same knobs the CLI bench uses for parking entries — identical
-  // behaviour browser↔CLI by construction.
-  cruiseSpeed: 2,
-  goalTolerance: 0.4,
-  arriveRadius: 0.6,
-  plannerPosCell: 0.3,
-  plannerHeadingBuckets: 36,
-  plannerGoalRadius: 0.35,
-  plannerGoalHeadingTol: 0.2,
-  plannerBudgetMs: 500,
-  plannerMaxExpansions: 80_000,
-  mpcWTerminalPosition: 50,
-  mpcWTerminalSpeed: 30,
-};
-
 function parkingEntry(name: string): RaceEntry {
   return { name, lib: parkingLibrary() };
-}
-
-/** Convert a parking scenario to the `createRaceScenario` course shape
- *  — single goal pose at speed=0 signals "terminal pose intent" to the
- *  planner. */
-function parkingCourse(s: ParkingScenario): import('../lib/race-scenario').RaceScenarioOptions['course'] {
-  return {
-    bounds: { x0: s.bounds.x0, x1: s.bounds.x1, z0: s.bounds.z0, z1: s.bounds.z1 },
-    polygons: s.polygons,
-    obstacles: s.obstacles,
-    waypoints: [{ ...s.goal, speed: 0, t: 0 }],
-    spawn: { ...s.spawn, speed: 0, t: 0 },
-  };
 }
 
 export default function Parking() {
@@ -203,14 +176,10 @@ export default function Parking() {
       scene.add(goalMesh);
       // Build the shared scenario runner — same code path as the
       // controller-bench CLI.
-      raceScenario = await createRaceScenario({
-        entries: [parkingEntry('ego')],
-        targetLaps: 1,
-        syncHold: false,
-        offTrackRecovery: 'none',
-        tuning: PARKING_BENCH_TUNING,
-        course: parkingCourse(s),
-      });
+      // Canonical parking options shared with the CLI bench + Vitest tests
+      // (incl. zero teleportation — no stall/off-track rescue masking a stuck
+      // maneuver). The page is a thin view over the exact same config.
+      raceScenario = await createRaceScenario(parkingScenarioOptions(id, [parkingEntry('ego')]));
       // Car mesh attached to the chassis from the scenario.
       const handle = raceScenario.getCarHandle('ego');
       if (handle) {
@@ -260,7 +229,7 @@ export default function Parking() {
           syncCarMesh(carMesh.group, s.state);
           refreshPathLine(s.plan);
           const goalDist = (() => {
-            const c = parkingCourse(buildParkingScenario(scenarioIdRef.current));
+            const c = parkingCourse(scenarioIdRef.current);
             const wp = c?.waypoints[0];
             if (!wp) return NaN;
             return Math.hypot(s.state.x - wp.x, s.state.z - wp.z);

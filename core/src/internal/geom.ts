@@ -81,3 +81,60 @@ export function placeFootprint(
   const s = Math.sin(heading);
   return local.map(([lx, lz]) => [ox + lx * c - lz * s, oz + lx * s + lz * c] as Pt);
 }
+
+/** Distance from point (px,pz) to segment a-b. The projection parameter is
+ *  clamped to [0,1] so the nearest point is an endpoint when the foot of the
+ *  perpendicular falls outside the segment. Degenerate (zero-length) segments
+ *  reduce to point-to-point distance. Mirrors the inline math in
+ *  `race-scenario.ts` `lateralFromPlan`. */
+export function pointSegmentDistance(
+  px: number, pz: number,
+  ax: number, az: number, bx: number, bz: number,
+): number {
+  const dx = bx - ax;
+  const dz = bz - az;
+  const lenSq = dx * dx + dz * dz;
+  let u = 0;
+  if (lenSq > 1e-9) {
+    u = ((px - ax) * dx + (pz - az) * dz) / lenSq;
+    if (u < 0) u = 0;
+    else if (u > 1) u = 1;
+  }
+  const fx = ax + dx * u;
+  const fz = az + dz * u;
+  return Math.hypot(px - fx, pz - fz);
+}
+
+/** Minimum gap between two polygons. Returns 0 when they intersect or touch
+ *  (delegates to `polygonsIntersect`), otherwise the smallest vertex-to-edge
+ *  distance taken in both directions (a's vertices against b's edges and b's
+ *  vertices against a's edges).
+ *
+ *  This is a conservative lower bound on the true polygon distance: it is
+ *  exact whenever the closest pair involves a vertex (the common case for the
+ *  rectangular footprints and obstacles here) and never *over*-reports the gap
+ *  for the rare edge-edge-nearest case — so it is safe to use as a clearance
+ *  threshold check. */
+export function polygonDistance(a: ReadonlyArray<Pt>, b: ReadonlyArray<Pt>): number {
+  if (polygonsIntersect(a, b)) return 0;
+  let best = Infinity;
+  for (let i = 0; i < a.length; i++) {
+    const p = a[i]!;
+    for (let j = 0; j < b.length; j++) {
+      const e0 = b[j]!;
+      const e1 = b[(j + 1) % b.length]!;
+      const d = pointSegmentDistance(p[0], p[1], e0[0], e0[1], e1[0], e1[1]);
+      if (d < best) best = d;
+    }
+  }
+  for (let i = 0; i < b.length; i++) {
+    const p = b[i]!;
+    for (let j = 0; j < a.length; j++) {
+      const e0 = a[j]!;
+      const e1 = a[(j + 1) % a.length]!;
+      const d = pointSegmentDistance(p[0], p[1], e0[0], e0[1], e1[0], e1[1]);
+      if (d < best) best = d;
+    }
+  }
+  return best;
+}
