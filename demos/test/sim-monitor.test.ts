@@ -115,6 +115,22 @@ describe('sim-monitor: safety invariants', () => {
   });
 });
 
+describe('sim-monitor: teleport detection', () => {
+  it('counts a teleport and excludes it from accel and away-progress', () => {
+    const m = createSimMonitor({ ...baseCfg, goal: { x: 0, z: 0, heading: 0 } });
+    // Approach the goal smoothly, then a single-tick 30 m jump (stall rescue
+    // back onto the goal), then sit still.
+    m.sample(mk({ x: 5, speed: 2 }));
+    m.sample(mk({ x: 4.9, speed: 2 }));
+    m.sample(mk({ x: 35, speed: 2 })); // teleport: +30 m in one tick
+    m.sample(mk({ x: 0, z: 0, speed: 0 })); // teleport back to goal
+    const r = m.summary();
+    expect(r.teleports).toBe(2);
+    // The 30 m/tick jump would be ~1800 m/s^2 if counted — it must not be.
+    expect(r.maxAccel).toBeLessThan(50);
+  });
+});
+
 describe('sim-monitor: jitter', () => {
   it('counts steering reversals and nonzero steer-rate RMS for a zig-zag trace', () => {
     const m = createSimMonitor(baseCfg);

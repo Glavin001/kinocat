@@ -34,11 +34,11 @@ import {
   parametricOnlyEntry,
 } from '../app/lib/headless-race';
 import {
-  buildParkingScenario,
   parkingLibrary,
+  parkingCourse,
+  PARKING_RACE_TUNING,
   type ParkingScenarioId,
 } from '../app/lib/parking-scenarios';
-import { buildRaceCourse } from '../app/lib/race-primitives-scenarios';
 import { modelFromJson } from '../app/lib/v2-model-file';
 import type { PersistedV2Model } from '../app/lib/v2-model-persistence';
 
@@ -78,19 +78,9 @@ function loadEntry(kind: EntryKind, forScenario: 'race' | 'parking'): RaceEntry 
   }
 }
 
-/** Build a race-scenario-compatible course from a parking scenario. The
- *  parking scenario's single goal pose becomes the sole "waypoint",
- *  and its obstacles + bounds carry over directly. */
-function parkingCourse(id: ParkingScenarioId): ReturnType<typeof buildRaceCourse> {
-  const s = buildParkingScenario(id);
-  return {
-    bounds: { x0: s.bounds.x0, x1: s.bounds.x1, z0: s.bounds.z0, z1: s.bounds.z1 },
-    polygons: s.polygons,
-    obstacles: s.obstacles,
-    waypoints: [{ ...s.goal, speed: 0, t: 0 }],
-    spawn: { ...s.spawn, speed: 0, t: 0 },
-  };
-}
+// `parkingCourse` + `PARKING_RACE_TUNING` are imported from
+// `parking-scenarios.ts` — the single source of truth shared with the web page
+// and the Vitest invariant tests.
 
 // ---------------------------------------------------------------------------
 // Scenario definitions. Each scenario is a closure that returns a
@@ -193,26 +183,11 @@ function makeParkingScenario(
         // both pure-pursuit AND MPPI obey, PLUS MPC terminal-pose
         // weights for MPPI's parking mode. Race scenarios leave these
         // at defaults / 0 so the same controller code runs both.
-        tuning: {
-          ...tuning,
-          cruiseSpeed: 2,
-          goalTolerance: 0.4,
-          arriveRadius: 0.6,
-          // Sub-meter planner discretisation + terminal-heading
-          // constraint — the parking branch's tuning, ported via
-          // `RaceTuning` so pure-pursuit + MPPI use the same
-          // planner-side knobs. Single-waypoint courses (parking)
-          // auto-route through `planRace` (planVehicleOnce with
-          // heading constraint).
-          plannerPosCell: 0.3,
-          plannerHeadingBuckets: 36,
-          plannerGoalRadius: 0.35,
-          plannerGoalHeadingTol: 0.2,
-          plannerBudgetMs: 500,
-          plannerMaxExpansions: 80_000,
-          mpcWTerminalPosition: 50,
-          mpcWTerminalSpeed: 30,
-        },
+        // Parking-specific knobs (low cruise speed, tight goal + terminal
+        // heading tolerance, sub-meter planner discretisation, MPC terminal
+        // weights) come from the shared `PARKING_RACE_TUNING`; `tuning` carries
+        // the tracker selection. Single source of truth with the web page.
+        tuning: { ...tuning, ...PARKING_RACE_TUNING },
         course,
       });
       while (scenario.simTime() < maxSim) {

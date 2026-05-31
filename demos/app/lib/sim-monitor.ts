@@ -74,6 +74,12 @@ export interface MonitorConfig {
   /** Deadband (rad/s) below which a steering-rate change is treated as noise
    *  and does not count as a reversal. Defaults to 0.05. */
   steerRateDeadband?: number;
+  /** Position jump (m) in a single tick above which the move is treated as a
+   *  teleport (stall-guard / off-track recovery), not real motion. Such ticks
+   *  are counted separately and excluded from accel/jerk/progress so a single
+   *  teleport doesn't masquerade as a huge acceleration or as "driving away".
+   *  Defaults to 2.0 m (a real chassis would need ~120 m/s to exceed it). */
+  teleportDist?: number;
 }
 
 /** One recorded telemetry row — the full run is reconstructable from these. */
@@ -142,6 +148,11 @@ export interface RunReport {
   /** Times a new plan flipped the aim from left↔right vs the previous plan —
    *  the signature of an oscillating replanner. */
   planDirectionFlips: number;
+  /** Number of teleports (single-tick position jumps) — stall-guard or
+   *  off-track recovery firing. A "clean" run that genuinely drives to its
+   *  goal has 0; a nonzero count means the chassis was rescued, so a terminal
+   *  pose at the goal does NOT prove the controller drove there. */
+  teleports: number;
 }
 
 export interface SimMonitor {
@@ -191,6 +202,7 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
   const dt = cfg.dt;
   const success = cfg.success ?? DEFAULT_SUCCESS;
   const deadband = cfg.steerRateDeadband ?? 0.05;
+  const teleportDist = cfg.teleportDist ?? 2.0;
   const hasObstacles = cfg.obstacles.length > 0;
 
   const rows: TelemetryRow[] = [];
@@ -218,6 +230,7 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
   let consecMax = 0;
   let planUpdates = 0;
   let planDirectionFlips = 0;
+  let teleports = 0;
 
   // previous-tick state for finite differences
   let prev: MonitorSample | null = null;
@@ -233,6 +246,15 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
     const t = ticks * dt;
     const sp = Math.abs(s.state.speed);
     peakSpeed = Math.max(peakSpeed, sp);
+
+    // Teleport detection: a single-tick position jump beyond what any real
+    // chassis could travel. Excludes the tick from finite differences and
+    // progress so a stall-guard/off-track rescue can't masquerade as a huge
+    // acceleration or as legitimate "driving away".
+    const teleported =
+      prev !== null &&
+      Math.hypot(s.state.x - prev.state.x, s.state.z - prev.state.z) > teleportDist;
+    if (teleported) teleports++;
 
     // --- clearance / collision ---
     let clearanceThisTick = Infinity;
@@ -256,7 +278,7 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
     if (cfg.goal) {
       distToGoal = Math.hypot(s.state.x - cfg.goal.x, s.state.z - cfg.goal.z);
       if (Number.isNaN(initialDist)) initialDist = distToGoal;
-      if (prev) {
+      if (prev && !teleported) {
         const prevDist = Math.hypot(prev.state.x - cfg.goal.x, prev.state.z - cfg.goal.z);
         // Receding from the goal beyond a small noise band.
         if (distToGoal - prevDist > 1e-3) movedAwayTicks++;
@@ -269,12 +291,18 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
         }
       }
       if (distToGoal < minDistSoFar) minDistSoFar = distToGoal;
-      const retreat = distToGoal - minDistSoFar;
-      if (retreat > maxRetreat) maxRetreat = retreat;
+      // Only count backslide from real driving, not a teleport rescue.
+      if (!teleported) {
+        const retreat = distToGoal - minDistSoFar;
+        if (retreat > maxRetreat) maxRetreat = retreat;
+      }
     }
 
     // --- finite differences: accel, jerk, steer rate, lateral accel ---
-    if (prev) {
+    if (teleported) {
+      // Discontinuity: drop the cross-teleport differences entirely.
+      prevAccel = NaN;
+    } else if (prev) {
       const accel = (s.state.speed - prev.state.speed) / dt;
       // Skip the first finite-difference (settle/teleport from spawn).
       if (diffCount >= 1) {
@@ -380,6 +408,7 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
       consecutiveFailedReplansMax: consecMax,
       planUpdates,
       planDirectionFlips,
+      teleports,
     };
   }
 
@@ -397,7 +426,7 @@ export function formatReport(r: RunReport): string {
   return [
     `ticks=${r.ticks} (${f(r.durationSec, 1)}s)`,
     `parkedOk=${r.parkedOk} posErr=${f(r.terminalPosError)}m hdgErr=${f(r.terminalHeadingError)}rad |v|=${f(r.terminalSpeed)}`,
-    `progress: net=${f(r.netProgress)}m awayTicks=${r.movedAwayFromGoalTicks} maxRetreat=${f(r.maxRetreat)}m awayHeading=${r.awayHeadingTicks}`,
+    `progress: net=${f(r.netProgress)}m awayTicks=${r.movedAwayFromGoalTicks} maxRetreat=${f(r.maxRetreat)}m awayHeading=${r.awayHeadingTicks} teleports=${r.teleports}`,
     `safety: minClear=${f(r.minClearance)}m collided=${r.collided} maxAccel=${f(r.maxAccel)} maxJerk=${f(r.maxJerk)} peakSpd=${f(r.peakSpeed)}`,
     `jitter: steerReversals=${r.steerReversals} steerRateRms=${f(r.steerRateRms)} latAccRms=${f(r.lateralAccelRms)}`,
     `replan: total=${r.totalReplans} ok=${r.successfulReplans} /s=${f(r.replansPerSec)} failRatio=${f(r.failedReplanRatio)} consecMax=${r.consecutiveFailedReplansMax} updates=${r.planUpdates} dirFlips=${r.planDirectionFlips}`,

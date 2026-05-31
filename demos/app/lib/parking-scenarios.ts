@@ -23,6 +23,9 @@ import {
   characterizeVehicle,
   type MotionPrimitiveLibrary,
 } from 'kinocat/primitives';
+// Type-only: the runner's tuning + course-shape types. Erased at runtime, so
+// this introduces no module cycle (race-scenario does not import this file).
+import type { RaceTuning, RaceScenarioOptions } from './race-scenario';
 
 export type ParkingScenarioId =
   | 'forward-pullin'
@@ -455,4 +458,44 @@ export function buildParkingSnapshot(id: ParkingScenarioId): ParkingSnapshot {
     maxExpansions: PARKING_TEST_MAX_EXPANSIONS,
   });
   return { scenario, result };
+}
+
+// ---------------------------------------------------------------------------
+// Shared parking driving config — the SINGLE source of truth for how parking
+// runs on the `createRaceScenario` engine. The web page (`Parking.tsx`), the
+// `controller-bench` CLI, and the Vitest invariant tests all import these so
+// the page renders exactly what the headless runs test — no duplicated tuning
+// to drift. (Type-only import of the runner types keeps this module free of any
+// runtime dependency on `race-scenario`.)
+
+/** Parking-specific `RaceTuning` overrides: low cruise speed, tight goal +
+ *  terminal-heading tolerance, sub-meter planner discretisation, and MPC
+ *  terminal-pose weights. Everything else falls through to race defaults so
+ *  the same controller code drives both racing and parking. */
+export const PARKING_RACE_TUNING: Partial<RaceTuning> = {
+  cruiseSpeed: 2,
+  goalTolerance: 0.4,
+  arriveRadius: 0.6,
+  plannerPosCell: 0.3,
+  plannerHeadingBuckets: 36,
+  plannerGoalRadius: 0.35,
+  plannerGoalHeadingTol: 0.2,
+  plannerBudgetMs: 500,
+  plannerMaxExpansions: 80_000,
+  mpcWTerminalPosition: 50,
+  mpcWTerminalSpeed: 30,
+};
+
+/** Convert a parking scenario to the `createRaceScenario` course shape: the
+ *  single goal pose (speed 0 ⇒ "terminal pose intent" to the planner) becomes
+ *  the sole waypoint; obstacles + bounds carry over directly. */
+export function parkingCourse(id: ParkingScenarioId): NonNullable<RaceScenarioOptions['course']> {
+  const s = buildParkingScenario(id);
+  return {
+    bounds: { x0: s.bounds.x0, x1: s.bounds.x1, z0: s.bounds.z0, z1: s.bounds.z1 },
+    polygons: s.polygons,
+    obstacles: s.obstacles,
+    waypoints: [{ ...s.goal, speed: 0, t: 0 }],
+    spawn: { ...s.spawn, speed: 0, t: 0 },
+  };
 }
