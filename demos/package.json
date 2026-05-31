@@ -11,13 +11,16 @@
     "typecheck": "tsc --noEmit",
     "e2e:carchase": "node test/carchase-e2e.mjs",
     "train": "tsx scripts/train.ts",
+    "train:clean": "rm -rf .cache/training public/models/history",
     "train:quick": "tsx scripts/train.ts --profile=quick --out=demos/public/models/v2-ci.json",
     "train:sweep": "tsx scripts/train.ts --profile=sweep",
     "train:overnight": "tsx scripts/train.ts --profile=overnight",
     "race": "tsx scripts/race.ts",
     "race:quick": "tsx scripts/race.ts --quick --no-parametric --ledger=docs/race-results",
     "ablation": "tsx scripts/ablation.ts",
-    "ablation:quick": "tsx scripts/ablation.ts --laps=3 --max-sim=180"
+    "ablation:quick": "tsx scripts/ablation.ts --laps=3 --max-sim=180",
+    "analyze:race-debug": "tsx scripts/analyze-race-debug.ts",
+    "compare:manifests": "tsx scripts/compare-manifests.ts"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.14.0",
