@@ -33,7 +33,10 @@ describe.skipIf(!RAPIER_OK)('race invariants', () => {
       scenario: {
         entries: [{ name: 'kin', lib: buildKinematicLibrary() }],
         syncHold: false,
-        offTrackRecovery: 'spawn',
+        // No teleport rescue: if the car spins off-track it must fail honestly,
+        // not get snapped back. In a clean 7 s run it never leaves the track.
+        offTrackRecovery: 'none',
+        stallTimeoutMs: Number.POSITIVE_INFINITY,
       },
       footprint: RACE_AGENT.footprint,
       obstacles: course.obstacles, // empty for the race course

@@ -19,7 +19,7 @@ import { runMonitored } from './_sim-harness';
 import { formatReport, type SuccessTolerances } from '../app/lib/sim-monitor';
 import {
   parkingCourse,
-  PARKING_RACE_TUNING,
+  parkingScenarioOptions,
   parkingLibrary,
   PARKING_AGENT,
   type ParkingScenarioId,
@@ -40,15 +40,11 @@ async function park(id: ParkingScenarioId, maxTicks: number) {
   const course = parkingCourse(id);
   const goal = course.waypoints[course.waypoints.length - 1]!;
   return runMonitored({
-    scenario: {
-      entries: [{ name: id, lib: parkingLibrary() }],
-      targetLaps: 1,
-      syncHold: false,
-      // No off-track recovery: the chassis must stay in bounds on its own.
-      offTrackRecovery: 'none',
-      tuning: PARKING_RACE_TUNING,
-      course,
-    },
+    // The SAME canonical options the /parking page and the controller-bench
+    // CLI use — including ZERO teleportation (no stall/off-track rescue), so a
+    // maneuver that doesn't reach the goal fails honestly by timeout instead of
+    // being snapped onto it.
+    scenario: parkingScenarioOptions(id, [{ name: id, lib: parkingLibrary() }]),
     footprint: PARKING_AGENT.footprint,
     obstacles: course.obstacles,
     goal: { x: goal.x, z: goal.z, heading: goal.heading },
@@ -84,12 +80,12 @@ describe.skipIf(!RAPIER_OK)('parking invariants', () => {
   });
 
   // KNOWN BROKEN — reverse perpendicular. The root cause is a planner-failure
-  // storm: measured failedReplanRatio≈0.99 (141 consecutive failures) at full
-  // budget. Downstream, the chassis drives ~35 m AWAY from the goal
-  // (maxRetreat≈35) and only "reaches" it via a stall-guard teleport
-  // (teleports≥1) — so the terminal pose looks perfect while the drive was a
-  // failure. We assert the root-cause signal on a SHORT budget (it manifests
-  // immediately and a long run of 500 ms failing replans is needlessly slow).
+  // storm: measured failedReplanRatio≈0.99 (141 consecutive failures). With
+  // teleportation now disabled, this is no longer masked — the chassis drives
+  // away, never reaches the goal, and the run times out as an honest failure
+  // (parkedOk=false). We assert the root-cause signal on a SHORT budget (it
+  // manifests immediately; a long run of 500 ms failing replans is needlessly
+  // slow).
   it.fails('reverse-perp: planner is healthy (no replan-failure storm)', OPTS, async () => {
     const { report } = await park('reverse-perp', 300);
     const ctx = `\n${formatReport(report)}`;

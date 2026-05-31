@@ -25,7 +25,7 @@ import {
 } from 'kinocat/primitives';
 // Type-only: the runner's tuning + course-shape types. Erased at runtime, so
 // this introduces no module cycle (race-scenario does not import this file).
-import type { RaceTuning, RaceScenarioOptions } from './race-scenario';
+import type { RaceTuning, RaceScenarioOptions, RaceEntry } from './race-scenario';
 
 export type ParkingScenarioId =
   | 'forward-pullin'
@@ -497,5 +497,30 @@ export function parkingCourse(id: ParkingScenarioId): NonNullable<RaceScenarioOp
     obstacles: s.obstacles,
     waypoints: [{ ...s.goal, speed: 0, t: 0 }],
     spawn: { ...s.spawn, speed: 0, t: 0 },
+  };
+}
+
+/** The COMPLETE, canonical `createRaceScenario` options for a parking scenario
+ *  — the one definition the web page, the controller-bench CLI, and the Vitest
+ *  tests all build from, so they cannot diverge.
+ *
+ *  Critically this bakes in ZERO teleportation: `offTrackRecovery: 'none'` and
+ *  an infinite stall timeout. Real vehicles don't teleport; a maneuver that
+ *  fails to reach the goal must run out the clock and fail honestly rather than
+ *  be snapped onto the goal/waypoint (which masks the failure — exactly how the
+ *  reverse-perp planner bug stayed hidden). */
+export function parkingScenarioOptions(
+  id: ParkingScenarioId,
+  entries: RaceEntry[],
+  tuningOverride?: Partial<RaceTuning>,
+): RaceScenarioOptions {
+  return {
+    entries,
+    targetLaps: 1,
+    syncHold: false,
+    offTrackRecovery: 'none',
+    stallTimeoutMs: Number.POSITIVE_INFINITY,
+    tuning: { ...PARKING_RACE_TUNING, ...tuningOverride },
+    course: parkingCourse(id),
   };
 }

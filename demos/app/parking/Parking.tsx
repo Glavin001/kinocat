@@ -34,7 +34,7 @@ import {
   buildParkingScenario,
   parkingLibrary,
   parkingCourse,
-  PARKING_RACE_TUNING,
+  parkingScenarioOptions,
   type ParkingScenarioId,
   type ParkingScenario,
 } from '../lib/parking-scenarios';
@@ -176,14 +176,10 @@ export default function Parking() {
       scene.add(goalMesh);
       // Build the shared scenario runner — same code path as the
       // controller-bench CLI.
-      raceScenario = await createRaceScenario({
-        entries: [parkingEntry('ego')],
-        targetLaps: 1,
-        syncHold: false,
-        offTrackRecovery: 'none',
-        tuning: PARKING_RACE_TUNING,
-        course: parkingCourse(id),
-      });
+      // Canonical parking options shared with the CLI bench + Vitest tests
+      // (incl. zero teleportation — no stall/off-track rescue masking a stuck
+      // maneuver). The page is a thin view over the exact same config.
+      raceScenario = await createRaceScenario(parkingScenarioOptions(id, [parkingEntry('ego')]));
       // Car mesh attached to the chassis from the scenario.
       const handle = raceScenario.getCarHandle('ego');
       if (handle) {

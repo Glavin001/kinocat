@@ -36,7 +36,7 @@ import {
 import {
   parkingLibrary,
   parkingCourse,
-  PARKING_RACE_TUNING,
+  parkingScenarioOptions,
   type ParkingScenarioId,
 } from '../app/lib/parking-scenarios';
 import { modelFromJson } from '../app/lib/v2-model-file';
@@ -173,23 +173,12 @@ function makeParkingScenario(
     async run(tuning, entryKind) {
       const course = parkingCourse(id);
       const goal = course.waypoints[course.waypoints.length - 1]!;
-      const scenario = await createRaceScenario({
-        entries: [loadEntry(entryKind, 'parking')],
-        targetLaps: 1,
-        syncHold: false,
-        offTrackRecovery: 'none',
-        // Parking-specific tuning: tracker-agnostic knobs (low cruise
-        // speed, tight goal tolerance, sub-meter arrive radius) that
-        // both pure-pursuit AND MPPI obey, PLUS MPC terminal-pose
-        // weights for MPPI's parking mode. Race scenarios leave these
-        // at defaults / 0 so the same controller code runs both.
-        // Parking-specific knobs (low cruise speed, tight goal + terminal
-        // heading tolerance, sub-meter planner discretisation, MPC terminal
-        // weights) come from the shared `PARKING_RACE_TUNING`; `tuning` carries
-        // the tracker selection. Single source of truth with the web page.
-        tuning: { ...tuning, ...PARKING_RACE_TUNING },
-        course,
-      });
+      // The complete, canonical parking options (incl. zero teleportation) —
+      // the SAME definition the web page and the Vitest tests use. `tuning`
+      // here carries only the tracker selection.
+      const scenario = await createRaceScenario(
+        parkingScenarioOptions(id, [loadEntry(entryKind, 'parking')], tuning),
+      );
       while (scenario.simTime() < maxSim) {
         scenario.tick();
         const status = scenario.status()[0]!;
