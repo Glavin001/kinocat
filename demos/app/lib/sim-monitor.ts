@@ -42,7 +42,8 @@ export interface MonitorSample {
     consecutiveFailedReplans: number;
   };
   plan: ReadonlyArray<{ x: number; z: number; heading: number }> | null;
-  loopIndex: number;
+  /** Waypoint index for loop scenarios; omit for single-goal scenarios. */
+  loopIndex?: number;
 }
 
 export interface MonitorGoal {
@@ -349,7 +350,7 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
       throttle: s.metrics.liveControls.throttle,
       brake: s.metrics.liveControls.brake,
       targetSpeed: s.metrics.liveControls.targetSpeed,
-      loopIndex: s.loopIndex,
+      loopIndex: s.loopIndex ?? 0,
       planLen: s.plan?.length ?? 0,
       replanCount: s.diagnostics.totalReplans,
       distToGoal,
