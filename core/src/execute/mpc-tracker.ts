@@ -99,6 +99,16 @@ export interface MPCTrackerConfig {
   wTerminalSpeed?: number;
   /** Distance below which `atGoal` is reported true. Default 0.5 m. */
   goalTolerance?: number;
+  /**
+   * Cruise speed (m/s) the reference advances at where the plan itself
+   * doesn't dictate a speed (samples with |speed| ≤ 0.5, e.g. the rest state
+   * at the start of a drive-through plan). Without this the tracker derives a
+   * cruise from the plan's TERMINAL speed — which the planner leaves ≈ 0 even
+   * for race gates — so the reference barely extends ahead and the chassis
+   * crawls/stalls instead of accelerating to racing speed. Pass the scenario's
+   * cruise (race: agent max speed; parking: the slow parking cap). Defaults to
+   * `max(|goal.speed|, 1)` for backward compatibility. */
+  cruiseSpeed?: number;
 }
 
 export interface MPCTrackerState {
@@ -170,10 +180,14 @@ function buildReference(
     const b = plan[i]!;
     cum.push(cum[cum.length - 1]! + Math.hypot(b.x - a.x, b.z - a.z));
   }
+  // Speed the reference advances along the plan. Use the plan's local speed
+  // where it dictates one; otherwise (rest state, or a plan that left speed
+  // unset) fall back to the scenario cruise so the reference reaches a full
+  // horizon ahead rather than bunching up at the chassis.
+  const localSpeed =
+    Math.abs(plan[bestI]!.speed) > 0.5 ? Math.abs(plan[bestI]!.speed) : cruiseSpeed;
   const ref: CarKinematicState[] = [];
   for (let k = 1; k <= horizon; k++) {
-    const localSpeed =
-      Math.abs(plan[bestI]!.speed) > 0.5 ? Math.abs(plan[bestI]!.speed) : cruiseSpeed;
     const targetArc = k * stepDt * localSpeed;
     let j = 0;
     while (j < cum.length - 1 && cum[j + 1]! < targetArc) j++;
@@ -185,7 +199,13 @@ function buildReference(
       x: a.x + (b.x - a.x) * u,
       z: a.z + (b.z - a.z) * u,
       heading: a.heading + (b.heading - a.heading) * u,
-      speed: a.speed + (b.speed - a.speed) * u,
+      // Reference speed = the advance speed, NOT the plan's stored per-sample
+      // speed. The two must agree or the speed-tracking cost fights the
+      // position-tracking cost: a plan that starts at rest (speed ≈ 0) but
+      // whose positions are advanced at cruise would otherwise ask the chassis
+      // to be both 15 m ahead AND stopped, so MPPI blends full throttle with
+      // full brake and the car never leaves the line (the race DNF).
+      speed: localSpeed,
       t: 0,
     });
   }
@@ -276,7 +296,8 @@ export function mpcTrack(
 
   // Build the reference + decide whether to activate terminal cost.
   const goal = plan.length > 0 ? plan[plan.length - 1]! : undefined;
-  const cruiseSpeed = goal ? Math.max(Math.abs(goal.speed), 1) : 5;
+  const cruiseSpeed =
+    config.cruiseSpeed ?? (goal ? Math.max(Math.abs(goal.speed), 1) : 5);
   const { ref } = buildReference(current, plan, H, cruiseSpeed, dt);
 
   // Terminal-cost activation. Requires:

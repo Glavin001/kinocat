@@ -136,10 +136,12 @@ export const PARKING_AGENT: VehicleAgent = defaultVehicleAgent({
   // though the plan itself was collision-free.
   maxSpeed: 2,
   maxReverseSpeed: 1.5,
-  // The default footprint (2.55 × 1.15) already encloses the Rapier
-  // chassis with a 0.15 m baseline buffer; the demo additionally passes
-  // `footprintInflate: 0.25` to the planner so the planned curve stays
-  // ~0.4 m off any parked-car edge, leaving execution room.
+  // Footprint is `defaultVehicleAgent`'s 1.6 × 0.9 half-extents (3.2 × 1.8 m
+  // car). The parking scenario geometry (3.0 m stall spacing, ~5.7 m aisle)
+  // was tuned around this footprint — it's the agent the original
+  // `planParking` reasoned about — so a back-in / parallel maneuver is
+  // findable through the sub-meter clearances. (The footprint feeds only the
+  // planner's collision checks, not the kinematic primitive library.)
   reverseCostMultiplier: 1.05,
   directionChangePenalty: 0.15,
 });
@@ -484,6 +486,20 @@ export const PARKING_RACE_TUNING: Partial<RaceTuning> = {
   plannerMaxExpansions: 80_000,
   mpcWTerminalPosition: 50,
   mpcWTerminalSpeed: 30,
+  // Parking maneuvers are committed multi-cusp sequences (reverse → forward
+  // → …), not a per-tick chase. Replan slowly so the segment-advance logic
+  // carries the chassis through each forward↔reverse cusp instead of
+  // re-deciding the whole maneuver every 300 ms (which leaves it oscillating
+  // at the cusp). The adaptive lateral-drift trigger still forces an early
+  // replan if the chassis genuinely diverges from the committed plan.
+  replanIntervalMs: 800,
+  // Don't re-smooth the plan. The runner expands the planner's analytic
+  // Reeds-Shepp shot-to-goal into its dense (0.15 m) curve samples already;
+  // running the Laplacian trajectory smoother over that re-rounds the tight
+  // back-in curve and cuts its corner INTO the adjacent parked car. Parking
+  // needs the planner's collision-checked geometry tracked faithfully, not
+  // geometrically prettified.
+  enableTrajectorySmoother: false,
 };
 
 /** Convert a parking scenario to the `createRaceScenario` course shape: the
@@ -515,7 +531,15 @@ export function parkingScenarioOptions(
   tuningOverride?: Partial<RaceTuning>,
 ): RaceScenarioOptions {
   return {
-    entries,
+    // Pin every parking entry to PARKING_AGENT so the planner's heuristic +
+    // footprint + turn radius match the parking primitive library. Without
+    // this the runner planned parking with RACE_AGENT (30 m/s, 4.5 m turn
+    // radius, larger footprint), whose 15×-faster maxSpeed rescaled the
+    // time-cost heuristic so far below the 2 m/s primitives' real progress
+    // that A* degenerated into near-breadth-first search — the reverse-perp /
+    // parallel replan-failure storm. Callers don't need to know the agent;
+    // they just pass `{ name, lib: parkingLibrary() }`.
+    entries: entries.map((e) => ({ ...e, agent: PARKING_AGENT })),
     targetLaps: 1,
     syncHold: false,
     offTrackRecovery: 'none',

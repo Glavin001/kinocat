@@ -420,6 +420,23 @@ export interface RacePlanRequest {
   goalHeadingTol?: number;
   /** Enable Reeds-Shepp heuristic LUT (default on). */
   enableHeuristicTable?: boolean;
+  /** Agent the planner reasons about (footprint, minTurnRadius, maxSpeed,
+   *  reverse/direction-change costs). MUST match the agent the supplied
+   *  primitive `lib` was characterised from — a mismatch (e.g. RACE_AGENT's
+   *  30 m/s maxSpeed driving the heuristic for a 2 m/s parking library)
+   *  rescales the time-cost heuristic away from the primitives' real
+   *  progress and collapses A* into near-breadth-first search. Defaults to
+   *  `RACE_AGENT` for the race course. */
+  agent?: VehicleAgent;
+  /** Optional reference polyline (XZ) to stay close to — a soft hysteresis
+   *  term (`referenceWeight * perpDist`) that keeps successive replans
+   *  consistent. Without it, single-goal parking plans flip between
+   *  near-equal-cost multi-cusp alternatives ("reverse more" vs "pull
+   *  forward") every replan, so the chassis never commits to one back-in
+   *  maneuver. Typically the previously-committed plan's unexecuted tail. */
+  referencePath?: ReadonlyArray<{ x: number; z: number }>;
+  /** Weight per metre of deviation from `referencePath`. Default 0.1 (s/m). */
+  referenceWeight?: number;
 }
 
 export function planRace(req: RacePlanRequest): PlanResult<CarKinematicState> {
@@ -435,12 +452,15 @@ export function planRace(req: RacePlanRequest): PlanResult<CarKinematicState> {
     ...(req.posCell !== undefined && req.posCell < 1.0
       ? { sweepSegmentCheck: true, analyticExpansion: { everyN: 3, step: 0.15 } }
       : {}),
+    ...(req.referencePath && req.referencePath.length >= 2
+      ? { referencePath: req.referencePath, referenceWeight: req.referenceWeight }
+      : {}),
   };
   return planVehicleOnce({
     start: req.state,
     goal: req.goal,
     world,
-    agent: RACE_AGENT,
+    agent: req.agent ?? RACE_AGENT,
     lib: req.lib,
     deadlineMs: req.deadlineMs ?? RACE_REPLAN_BUDGET_MS,
     maxExpansions: req.maxExpansions ?? RACE_MAX_EXPANSIONS,
@@ -474,6 +494,10 @@ export interface RaceMultiGoalRequest {
    *  by default in `planVehicleMultiGoal`). Used by ablation harnesses
    *  to measure the cache's contribution. */
   disableHeuristicTable?: boolean;
+  /** Agent the planner reasons about — must match the agent the supplied
+   *  `lib` was characterised from (see `RacePlanRequest.agent`). Defaults to
+   *  `RACE_AGENT`. */
+  agent?: VehicleAgent;
 }
 
 /** Single A* through an ordered SEQUENCE of gates. Unlike `planRace`
@@ -504,7 +528,7 @@ export function planRaceMultiGoal(req: RaceMultiGoalRequest): PlanResult<CarKine
     start: req.state,
     gates: req.gates,
     world,
-    agent: RACE_AGENT,
+    agent: req.agent ?? RACE_AGENT,
     lib: req.lib,
     deadlineMs: req.deadlineMs ?? RACE_REPLAN_BUDGET_MS,
     // Larger budget than single-goal because the search space is N× larger

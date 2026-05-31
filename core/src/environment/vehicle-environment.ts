@@ -7,7 +7,7 @@ import { pack3 } from '../planner/resolution';
 import { placeFootprint } from '../internal/geom';
 import { angleDiff, dist, wrapAngle } from '../internal/math';
 import { reedsSheppShortestPath } from '../curves/reeds-shepp';
-import { sampleCurve } from '../curves/sample';
+import { sampleCurveWithGear } from '../curves/sample';
 import { NULL_RECORDER, type PerfRecorder } from '../planner/perf';
 
 export interface VehicleEnvOptions {
@@ -91,6 +91,11 @@ export interface AnalyticEdgeData {
   reverse: boolean;
   /** Sampled world-space (x,z) of the curve, for tracking / drawing. */
   samples: [number, number][];
+  /** Per-sample pose (heading) + gear of the curve. Lets a consumer rebuild
+   *  an executable trajectory through the analytic shot instead of the bare
+   *  node sequence's straight chord (which discards the curve geometry and
+   *  the forward/reverse gear). Same length + order as `samples`. */
+  poses: Array<{ x: number; z: number; heading: number; reverse: boolean }>;
 }
 
 export class VehicleEnvironment implements Environment<CarKinematicState> {
@@ -343,13 +348,14 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     );
     if (path.segments.length === 0) return null;
 
-    const poses = sampleCurve(
+    const poses = sampleCurveWithGear(
       { x: a.x, y: a.z, theta: a.heading },
       path,
       this.agent.minTurnRadius,
       this.analyticStep,
     );
     const samples: [number, number][] = [];
+    const posePath: AnalyticEdgeData['poses'] = [];
     let px = a.x;
     let pz = a.z;
     for (const p of poses) {
@@ -367,6 +373,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
         }
       }
       samples.push([p.x, p.y]);
+      posePath.push({ x: p.x, z: p.y, heading: p.theta, reverse: p.reverse });
       px = p.x;
       pz = p.y;
     }
@@ -394,7 +401,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     const edge: EdgeRef = {
       cost,
       kind: 'reeds-shepp',
-      data: { reedsShepp: true, reverse: hasReverse, samples } satisfies AnalyticEdgeData,
+      data: { reedsShepp: true, reverse: hasReverse, samples, poses: posePath } satisfies AnalyticEdgeData,
     };
     const n = this.createNode(next, node, edge);
     n.g = node.g + cost;

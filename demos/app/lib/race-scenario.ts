@@ -52,9 +52,11 @@ import {
   parametricForwardV2,
   DEFAULT_LEARNED_PARAMS_V2,
   DEFAULT_LEARNABLE_CONFIG,
+  type VehicleAgent,
 } from 'kinocat/agent';
 import { InMemoryNavWorld } from 'kinocat/environment';
-import type { NavWorld } from 'kinocat/environment';
+import type { NavWorld, AnalyticEdgeData } from 'kinocat/environment';
+import type { PlanResult } from 'kinocat/planner';
 import type { MotionPrimitiveLibrary } from 'kinocat/primitives';
 import {
   buildRaceCourse,
@@ -181,6 +183,70 @@ export function splitAtGearCusps(plan: CarKinematicState[]): CarKinematicState[]
   return out.length > 0 ? out : [plan.slice()];
 }
 
+/**
+ * Lift a plan result's node sequence into a dense, gear-correct trajectory,
+ * expanding every Reeds-Shepp analytic "shot to goal" edge into its sampled
+ * curve poses.
+ *
+ * Why this exists: the planner's `result.path` is just `nodes.map(n =>
+ * n.state)`. For a motion-primitive edge that's fine (endpoints ~0.75 m apart;
+ * the smoother densifies). But the final analytic shot collapses a multi-metre
+ * CURVED Reeds-Shepp maneuver — the actual back-in / parallel-park swing — into
+ * a single STRAIGHT chord from the last grid node to the goal pose, discarding
+ * both the curve geometry and the forward/reverse gear along it. The tracker
+ * then chases a straight diagonal that the chassis can't follow at the planned
+ * heading, so it clips a neighbour or stalls short with a large heading error.
+ *
+ * Expanding the stored `poses` restores the true geometry and the per-sample
+ * gear sign, so pure-pursuit reads the correct gear and the smoother rounds the
+ * real curve instead of a chord. Race plans rarely include an analytic shot and
+ * never a reverse one, so this is a no-op for racing.
+ */
+export function liftAnalyticPath(
+  res: PlanResult<CarKinematicState>,
+  speedMag: number,
+): CarKinematicState[] {
+  const nodes = res.nodes;
+  if (!nodes || nodes.length === 0) return res.path;
+  const out: CarKinematicState[] = [];
+  for (let i = 0; i < nodes.length; i++) {
+    const st = nodes[i]!.state;
+    if (i === 0) {
+      out.push({ ...st });
+      continue;
+    }
+    const edge = nodes[i]!.edge;
+    const data = edge?.kind === 'reeds-shepp'
+      ? (edge.data as AnalyticEdgeData | undefined)
+      : undefined;
+    if (data?.poses && data.poses.length >= 2) {
+      // poses[0] is the shot's start pose (== previous node state, already
+      // emitted); interpolate t linearly across the curve so downstream
+      // time-based sampling (commit window, predicted-end) stays monotonic.
+      const startT = out[out.length - 1]!.t;
+      const endT = st.t;
+      const m = data.poses.length;
+      for (let j = 1; j < m; j++) {
+        const p = data.poses[j]!;
+        const frac = j / (m - 1);
+        out.push({
+          x: p.x,
+          z: p.z,
+          heading: p.heading,
+          // Last sample lands on the goal pose — adopt its (zero) speed so the
+          // tracker brakes to rest there; interior samples carry the gear sign
+          // so reverse segments are driven in reverse.
+          speed: j === m - 1 ? st.speed : (p.reverse ? -speedMag : speedMag),
+          t: startT + (endT - startT) * frac,
+        });
+      }
+    } else {
+      out.push({ ...st });
+    }
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Feature flags — for ablation studies.
 //
@@ -277,6 +343,18 @@ export interface RaceTuning {
   plannerBudgetMs?: number;
   /** Planner expansion cap. Race=30k; parking=80k. */
   plannerMaxExpansions?: number;
+  /**
+   * Fixed replan cadence (ms). Defaults to `REPLAN_INTERVAL_MS` (300).
+   * Racing wants a brisk cadence so the line stays fresh against the
+   * moving horizon. A multi-cusp PARKING maneuver is the opposite: it must
+   * be executed as a COMMITTED sequence (reverse segment → forward segment →
+   * …). Replanning from scratch mid-maneuver resets the segment cursor and
+   * leaves the chassis oscillating at a forward↔reverse cusp (each replan
+   * re-picks "reverse more" vs "pull in" from near-equal cost). A long
+   * cadence lets the segment-advance logic carry the chassis through the
+   * cusps; the adaptive lateral-drift trigger still forces a replan if the
+   * chassis genuinely diverges from the plan. */
+  replanIntervalMs?: number;
 }
 
 /**
@@ -353,6 +431,14 @@ export interface RaceEntry {
   name: string;
   /** Motion-primitive library this entry's planner uses. */
   lib: MotionPrimitiveLibrary;
+  /** Agent the planner reasons about for this entry — footprint, turn
+   *  radius, maxSpeed, reverse/direction-change costs. MUST match the agent
+   *  `lib` was characterised from; a mismatch rescales the planner's
+   *  time-cost heuristic away from the primitives' real progress and
+   *  collapses A* into near-breadth-first search (the parking replan storm).
+   *  Defaults to `RACE_AGENT` (race course). Parking entries set
+   *  `PARKING_AGENT`. */
+  agent?: VehicleAgent;
 }
 
 export interface RaceLap {
@@ -602,6 +688,11 @@ export async function createRaceScenario(
     wTerminalPosition: tuning.mpcWTerminalPosition,
     wTerminalSpeed: tuning.mpcWTerminalSpeed,
     goalTolerance: 0.5,
+    // Cruise the reference at the SAME speed pure-pursuit uses, so the MPC
+    // reference extends a full horizon ahead and the chassis accelerates to
+    // racing speed. Without this the tracker inferred cruise from the plan's
+    // terminal speed (≈ 0 even on race gates) and crawled to a stall (DNF).
+    cruiseSpeed: trackerConfig.cruiseSpeed,
   };
 
   const cars: CarInternal[] = opts.entries.map((entry, i) => {
@@ -685,7 +776,7 @@ export async function createRaceScenario(
   for (const c of cars) c.car.teleport(c.spawn);
 
   let simTime = 0;
-  const replanIntervalSec = REPLAN_INTERVAL_MS / 1000;
+  const replanIntervalSec = (tuning.replanIntervalMs ?? REPLAN_INTERVAL_MS) / 1000;
 
   function replanCar(c: CarInternal): void {
     if (c.holdingForSync || c.finished) return;
@@ -770,6 +861,7 @@ export async function createRaceScenario(
           state: startState,
           goal: gates[0]!,
           lib: c.entry.lib,
+          agent: c.entry.agent,
           polygons: course.polygons,
           obstacles: course.obstacles,
           world: c.navWorld,
@@ -780,11 +872,17 @@ export async function createRaceScenario(
           goalRadius: tuning.plannerGoalRadius,
           goalHeadingTol: tuning.plannerGoalHeadingTol,
           enableHeuristicTable: tuning.enableHeuristicTable,
+          // Soft hysteresis toward the last committed plan so the multi-cusp
+          // parking maneuver stays stable across replans instead of flipping
+          // between near-equal-cost back-in alternatives every 300 ms.
+          referencePath,
+          referenceWeight: tuning.consistencyWeight,
         })
       : planRaceMultiGoal({
           state: startState,
           gates,
           lib: c.entry.lib,
+          agent: c.entry.agent,
           polygons: course.polygons,
           obstacles: course.obstacles,
           world: c.navWorld,
@@ -814,8 +912,19 @@ export async function createRaceScenario(
       // curvature, resampled onto the smoothed samples by arc-length,
       // so the smoother's geometric rounding doesn't fool the speed
       // pass into commanding impossible speeds.
-      let smoothed = res.path;
-      const kRaw = tuning.enableSpeedProfile ? curvaturePerSample(res.path) : null;
+      // Expand any analytic Reeds-Shepp shot-to-goal into its real curved,
+      // gear-tagged samples BEFORE smoothing — otherwise the multi-cusp
+      // back-in / parallel-park swing is a straight chord the chassis can't
+      // track at the planned heading. Only the terminal-pose (parking) branch
+      // needs this: race plans are driven through gates forward-only, and an
+      // analytic shot there may include a reverse sub-segment that the
+      // forward-only race controller can't execute — collapsing it to the
+      // straight chord (res.path) is what keeps racing flowing.
+      const liftedPath = isParking
+        ? liftAnalyticPath(res, (c.entry.agent ?? RACE_AGENT).maxSpeed)
+        : res.path;
+      let smoothed = liftedPath;
+      const kRaw = tuning.enableSpeedProfile ? curvaturePerSample(liftedPath) : null;
       if (tuning.enableTrajectorySmoother) {
         smoothed = smoothTrajectory(smoothed, {
           sampleSpacing: 0.4,
@@ -826,7 +935,7 @@ export async function createRaceScenario(
         });
       }
       if (tuning.enableSpeedProfile && kRaw) {
-        const kForProfile = resampleScalarByArcLength(res.path, kRaw, smoothed);
+        const kForProfile = resampleScalarByArcLength(liftedPath, kRaw, smoothed);
         smoothed = smoothSpeedProfile(smoothed, {
           aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel * 0.85,
           aLonMaxAccel: PURE_PURSUIT_CONFIG.maxAccel,
@@ -1057,15 +1166,39 @@ export async function createRaceScenario(
           };
         } else {
           const trk = purePursuit(stateBefore, live, trackerConfig);
-          const steer = -Math.atan(trk.steering * (2 * WHEEL_BASE));
+          // pure-pursuit returns `throttle` as a non-negative MAGNITUDE and
+          // encodes the drive direction in the SIGN of `targetSpeed` (it also
+          // flips the steering body-frame for reverse, so `trk.steering` is the
+          // curvature in the direction of travel). Two corrections are needed
+          // before this drives a raycast vehicle:
+          //
+          //  1. SIGNED THROTTLE. `wheeledFromNormalized` takes throttle in
+          //     [-1,1] (negative = reverse drive force). Without re-applying
+          //     the gear sign the chassis always drives forward and silently
+          //     ignores any planned reverse maneuver (reverse-perp back-in,
+          //     parallel-park shunts) — it just coasts forward off the plan.
+          //
+          //  2. STEER SIGN FLIP IN REVERSE. For an Ackermann/bicycle chassis a
+          //     given front-wheel angle produces OPPOSITE world-frame curvature
+          //     depending on travel direction. pure-pursuit's curvature is for
+          //     the travel direction, so when backing up the applied steer
+          //     angle must be negated — otherwise the car steers the wrong way
+          //     while reversing and curls away from the plan (it backed out of
+          //     the stall and stalled at the wrong heading).
+          //
+          // Race plans are forward-only (targetSpeed ≥ 0 ⇒ gear = +1), so both
+          // corrections are no-ops for racing.
+          const gear = trk.targetSpeed < 0 ? -1 : 1;
+          const signedThrottle = gear * trk.throttle;
+          const steer = -gear * Math.atan(trk.steering * (2 * WHEEL_BASE));
           const cmd = wheeledFromNormalized(
-            { steer, throttle: trk.throttle, brake: trk.brake },
+            { steer, throttle: signedThrottle, brake: trk.brake },
             FORCE_TUNING,
           );
           c.car.applyWheeledControls(cmd);
           c.lastControls = cmd;
           c.metrics.liveControls = {
-            steer: trk.steering, throttle: trk.throttle, brake: trk.brake,
+            steer: trk.steering, throttle: signedThrottle, brake: trk.brake,
             targetSpeed: trk.targetSpeed,
           };
         }
