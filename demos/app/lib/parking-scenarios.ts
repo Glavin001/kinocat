@@ -136,12 +136,22 @@ export const PARKING_AGENT: VehicleAgent = defaultVehicleAgent({
   // though the plan itself was collision-free.
   maxSpeed: 2,
   maxReverseSpeed: 1.5,
-  // Footprint is `defaultVehicleAgent`'s 1.6 × 0.9 half-extents (3.2 × 1.8 m
-  // car). The parking scenario geometry (3.0 m stall spacing, ~5.7 m aisle)
-  // was tuned around this footprint — it's the agent the original
-  // `planParking` reasoned about — so a back-in / parallel maneuver is
-  // findable through the sub-meter clearances. (The footprint feeds only the
-  // planner's collision checks, not the kinematic primitive library.)
+  // Footprint matches the physical Rapier chassis the runner drives and the
+  // three.js car mesh renders (both 4.8 × 2.0 m ⇒ 2.4 × 1.0 half-extents).
+  // `defaultVehicleAgent` ships a much smaller 3.2 × 1.8 m box (1.6 × 0.9
+  // half); planning with that under-sized footprint reserved no clearance for
+  // the car's 0.8 m front/rear overhangs, so collision-free plans drove the
+  // real bumpers straight into the parked cars (the visible clipping). With the
+  // true footprint the planner reserves clearance for the car that actually
+  // exists, and the widened scenario geometry below keeps the maneuvers
+  // findable. (Footprint feeds only the planner/monitor collision checks, not
+  // the kinematic primitive library.)
+  footprint: [
+    [2.4, 1.0],
+    [-2.4, 1.0],
+    [-2.4, -1.0],
+    [2.4, -1.0],
+  ],
   reverseCostMultiplier: 1.05,
   directionChangePenalty: 0.15,
 });
@@ -256,11 +266,12 @@ function reversePerp(): ParkingScenario {
   // along z = 6 facing north; opposing curb wall at z = -1. Ego enters
   // from the west driving east; to park nose-north in the empty stall
   // it must drive past and reverse in.
-  // Stall-to-stall spacing along the row. 3.0 m centre-to-centre gives
-  // the ego (2.3 m wide) ~0.7 m of lateral clearance on each side once
-  // it's nosed into the empty stall — tight but enough to absorb the
-  // 0.25 m planning inflation plus pure-pursuit drift.
-  const stallSpacing = 3.0;
+  // Stall-to-stall spacing along the row. 4.0 m centre-to-centre leaves the
+  // 2.0 m-wide ego ~2 m of lateral room on each side of the empty stall —
+  // enough for the true-size footprint to swing in slightly off-heading on a
+  // reverse-S without a corner clipping a neighbour. (3.0 m, tuned for the old
+  // under-sized footprint, had the real car grazing on the angled entry.)
+  const stallSpacing = 4.0;
   const parkedCars: ParkedCar[] = [];
   for (const i of [-2, -1, 1, 2]) {
     parkedCars.push({
@@ -280,12 +291,14 @@ function reversePerp(): ParkingScenario {
     heading: Math.PI / 2,
   };
   // Drivable aisle: parked-car row front at z = 3.6, south curb front
-  // at z = -2.1, so the aisle is ~5.7 m wide. Wide enough for the
-  // planner to find a maneuver, but the spawn east of the empty stall
-  // (below) means a forward 90° turn into the stall would overshoot —
-  // a back-in is the natural solution.
+  // at z = -6.6, so the aisle is ~10.2 m wide. The real 4.8 m chassis needs
+  // room to swing the reverse-S without its bumpers crossing the curb or the
+  // parked-car row; the earlier 5.7 m aisle (tuned for a smaller footprint)
+  // left the true car grazing on every back-in. The spawn east of the empty
+  // stall (below) still makes a forward 90° turn overshoot, so a back-in
+  // remains the natural solution.
   const walls: ParkingWall[] = [
-    { id: 'south-curb', x: 0, z: -2.5, hx: 24, hz: 0.4 },
+    { id: 'south-curb', x: 0, z: -7.0, hx: 24, hz: 0.4 },
     { id: 'north-back', x: 0, z: 9.4, hx: 24, hz: 0.4 },
   ];
   const obstacles = [
@@ -300,24 +313,24 @@ function reversePerp(): ParkingScenario {
     parkedCars,
     walls,
     targetStall,
-    // Spawn EAST of the empty stall, heading east, in the middle of the
-    // aisle. A forward arc into the stall from here would require the
-    // car to circle back round — the natural plan is a reverse-S back
-    // into the stall, which is exactly the maneuver this scenario is
-    // here to demonstrate.
+    // Spawn EAST of the empty stall, heading east, in the lane just south of
+    // the parked row. A forward arc into the stall from here would require the
+    // car to circle back round — the natural plan is a reverse-S back into the
+    // stall, which is exactly the maneuver this scenario is here to demonstrate.
     spawn: pose(8, 1.5, 0),
     goal: pose(0, 6, Math.PI / 2),
   };
 }
 
 function parallel(): ParkingScenario {
-  // Two cars parked parallel to curb at z = 0, with an 8.6 m gap
-  // between their inner edges. Ego length is 5.1 m → ratio ≈ 1.69×,
-  // closer to "really roomy" than "tight" parallel park. The wider
-  // gap absorbs residual heading misalignment from pure-pursuit on
-  // the tight Reeds-Shepp arcs — without it, even a 5° tilt at the
-  // end of the maneuver visibly clips one of the parked cars.
-  const gap = 8.6;
+  // Two cars parked parallel to curb at z = 0, with a 14 m gap between their
+  // inner edges. The ego is 4.8 m → ratio ≈ 2.9×: a roomy parallel park. The
+  // gap has to clear the true-size footprint on the angled forward entry
+  // (its diving arc passes the rear car's inner edge ~6.6 m left of centre)
+  // AND absorb the residual heading misalignment pure-pursuit leaves at the
+  // end. The earlier 8.6 m gap (tuned for a smaller box) had the real bumpers
+  // clipping the rear neighbour on the way in.
+  const gap = 14;
   const aheadX = gap / 2 + PARKED_HX;
   const behindX = -gap / 2 - PARKED_HX;
   const parkedCars: ParkedCar[] = [

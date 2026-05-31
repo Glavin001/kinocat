@@ -21,14 +21,21 @@
 //   4. parking replanned on the 300 ms race cadence, re-deciding the whole
 //      multi-cusp maneuver every tick and oscillating at the forward↔reverse
 //      cusp instead of committing to it.
-// Fixing all four (see race-scenario.ts / race-primitives-scenarios.ts /
+// A fifth fix came from the web demo: the planning footprint was
+// `defaultVehicleAgent`'s 3.2 × 1.8 m box, far smaller than the 4.8 × 2.0 m
+// chassis the runner drives and three.js renders, so "collision-free" plans
+// drove the real bumpers into the parked cars. The footprint now matches the
+// true chassis and the (previously over-tight) stall spacing / aisle / gap were
+// widened so the real car still fits.
+//
+// Fixing all five (see race-scenario.ts / race-primitives-scenarios.ts /
 // parking-scenarios.ts / core analytic-shot poses) makes `forward-pullin` and
 // `reverse-perp` park cleanly with a healthy planner. `parallel` now reaches
-// the slot under a healthy planner but still can't nail the terminal-heading
-// straightening shunt (pure-pursuit has no terminal-heading regulation): it
-// stops ~21° off and grazes a neighbour. That residual is kept HONEST as an
-// `it.fails` so it stays exercised and flips to green the moment terminal-pose
-// precision (e.g. an MPC final stage) lands.
+// the slot collision-free under a healthy planner but still can't nail the
+// terminal-heading straightening shunt (pure-pursuit brakes to rest at its
+// approach angle, ~16° off). That residual is kept HONEST as an `it.fails` so
+// it stays exercised and flips to green the moment terminal-pose precision
+// (e.g. an MPC final stage) lands.
 
 import { describe, expect, it } from 'vitest';
 import { ensureRapier } from 'kinocat/adapters/rapier';
@@ -103,7 +110,7 @@ describe.skipIf(!RAPIER_OK)('parking invariants', () => {
   // collision, no teleport rescue, and the planner no longer thrashes.
   const REVERSE_SUCCESS: SuccessTolerances = { posTol: 0.7, headingTol: 0.3, speedTol: 0.5 };
   it('reverse-perp: backs into the stall — clean pose, no collision, no replan storm', OPTS, async () => {
-    const { report } = await park('reverse-perp', 1800, REVERSE_SUCCESS);
+    const { report } = await park('reverse-perp', 2200, REVERSE_SUCCESS);
     const ctx = `\n${formatReport(report)}`;
     // Backed into the stall pose under its own power.
     expect(report.parkedOk, ctx).toBe(true);
@@ -119,12 +126,14 @@ describe.skipIf(!RAPIER_OK)('parking invariants', () => {
     expect(report.failedReplanRatio, ctx).toBeLessThan(0.3);
   });
 
-  // PARTIALLY FIXED — parallel parking. The replan storm is gone and the
-  // chassis now reaches the slot position under a healthy planner (these
-  // invariants pass), but it cannot perform the final straightening shunt
-  // (pure-pursuit has no terminal-heading control) — see the `it.fails` below.
-  it('parallel: reaches the slot under a healthy planner (no replan storm)', OPTS, async () => {
-    const { report } = await park('parallel', 1200);
+  // PARTIALLY FIXED — parallel parking. The replan storm is gone, the chassis
+  // reaches the slot position under a healthy planner, AND it no longer grazes
+  // a neighbour on the way in (these invariants pass). What it still can't do is
+  // the final straightening shunt — pure-pursuit brakes to rest at whatever
+  // approach angle it arrives with (no terminal-heading control), ~16° off the
+  // curb. See the `it.fails` below.
+  it('parallel: reaches the slot cleanly under a healthy planner (no storm, no graze)', OPTS, async () => {
+    const { report } = await park('parallel', 1600);
     const ctx = `\n${formatReport(report)}`;
     // Planner is healthy — the storm (failedReplanRatio ≈ 0.42) is gone.
     expect(report.failedReplanRatio, ctx).toBeLessThan(0.3);
@@ -133,20 +142,22 @@ describe.skipIf(!RAPIER_OK)('parking invariants', () => {
     expect(report.terminalPosError, ctx).toBeLessThan(0.6);
     // Came to rest there.
     expect(report.terminalSpeed, ctx).toBeLessThan(0.5);
+    // Never touched a parked car or the curb (the visible clipping is gone).
+    expect(report.collided, ctx).toBe(false);
     // Not rescued by a teleport.
     expect(report.teleports, ctx).toBe(0);
   });
 
-  // KNOWN BROKEN — parallel terminal precision. The chassis arrives at the slot
-  // position but ~21° off the curb heading and grazes a neighbour while wedging
-  // in (no final back-and-forth straightening). Encoded as the CORRECT-behaviour
-  // assertion under `it.fails`: it throws today and Vitest counts that as a
-  // pass; when terminal-pose precision lands (e.g. an MPC final stage) it will
-  // start passing, flip this to red, and signal that the `.fails` should drop.
-  it.fails('parallel: ends square in the slot without grazing a neighbour', OPTS, async () => {
-    const { report } = await park('parallel', 1200);
+  // KNOWN BROKEN — parallel terminal heading. The chassis arrives in the slot
+  // (right position, no collision) but ~16° off the curb heading: pure-pursuit
+  // has no final back-and-forth straightening shunt. Encoded as the
+  // CORRECT-behaviour assertion under `it.fails`: it throws today and Vitest
+  // counts that as a pass; when terminal-pose precision lands (e.g. an MPC final
+  // stage) it will start passing, flip this to red, and signal that the
+  // `.fails` should drop.
+  it.fails('parallel: ends square with the curb (terminal heading within tolerance)', OPTS, async () => {
+    const { report } = await park('parallel', 1600);
     const ctx = `\n${formatReport(report)}`;
-    expect(report.collided, ctx).toBe(false);
     expect(report.terminalHeadingError, ctx).toBeLessThan(SUCCESS.headingTol);
   });
 });
