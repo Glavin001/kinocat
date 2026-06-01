@@ -82,6 +82,79 @@ export function placeFootprint(
   return local.map(([lx, lz]) => [ox + lx * c - lz * s, oz + lx * s + lz * c] as Pt);
 }
 
+/** Signed twice-area (standard shoelace). Positive for CCW winding in the XZ
+ *  plane (x right, z up), negative for CW. Zero for degenerate polygons. */
+function signedArea2(poly: ReadonlyArray<Pt>): number {
+  let s = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i]!;
+    const b = poly[(i + 1) % poly.length]!;
+    s += a[0] * b[1] - b[0] * a[1];
+  }
+  return s;
+}
+
+/** Area of a simple polygon (shoelace). Winding-agnostic (always ≥ 0). */
+export function polygonArea(poly: ReadonlyArray<Pt>): number {
+  if (poly.length < 3) return 0;
+  return Math.abs(signedArea2(poly)) / 2;
+}
+
+/** Area of the intersection of two CONVEX polygons.
+ *
+ *  Sutherland–Hodgman clip of `subject` against each edge of `clip` (treated as
+ *  a convex window), then shoelace area of the clipped result. Both inputs must
+ *  be convex; winding may be either way — the clip's own winding sign selects
+ *  which half-plane of each edge is the interior, so callers don't need to
+ *  pre-orient. Returns 0 when they don't overlap. Used to measure how much of
+ *  the car footprint sits inside the target-stall box. */
+export function convexPolygonIntersectionArea(
+  subject: ReadonlyArray<Pt>,
+  clip: ReadonlyArray<Pt>,
+): number {
+  if (subject.length < 3 || clip.length < 3) return 0;
+  // For a CCW clip the interior is the LEFT half-plane of each directed edge
+  // (cross ≥ 0); for a CW clip it's the right half-plane. `w` folds that sign
+  // into the test so either winding works without reversing the vertex list.
+  const w = signedArea2(clip) >= 0 ? 1 : -1;
+  let output: Pt[] = subject.slice();
+  for (let i = 0; i < clip.length; i++) {
+    if (output.length === 0) break;
+    const a = clip[i]!;
+    const b = clip[(i + 1) % clip.length]!;
+    const ex = b[0] - a[0];
+    const ez = b[1] - a[1];
+    const inside = (p: Pt) => w * (ex * (p[1] - a[1]) - ez * (p[0] - a[0])) >= -1e-9;
+    const input = output;
+    output = [];
+    for (let k = 0; k < input.length; k++) {
+      const cur = input[k]!;
+      const prev = input[(k + input.length - 1) % input.length]!;
+      const curIn = inside(cur);
+      const prevIn = inside(prev);
+      if (curIn) {
+        if (!prevIn) output.push(segEdgeIntersect(prev, cur, a, b));
+        output.push(cur);
+      } else if (prevIn) {
+        output.push(segEdgeIntersect(prev, cur, a, b));
+      }
+    }
+  }
+  return polygonArea(output);
+}
+
+/** Intersection point of segment p→q with the infinite line through a→b. */
+function segEdgeIntersect(p: Pt, q: Pt, a: Pt, b: Pt): Pt {
+  const r0 = q[0] - p[0];
+  const r1 = q[1] - p[1];
+  const ex = b[0] - a[0];
+  const ez = b[1] - a[1];
+  const denom = r0 * ez - r1 * ex;
+  if (Math.abs(denom) < 1e-12) return q; // parallel — shouldn't happen post-clip
+  const t = ((a[0] - p[0]) * ez - (a[1] - p[1]) * ex) / denom;
+  return [p[0] + t * r0, p[1] + t * r1] as Pt;
+}
+
 /** Distance from point (px,pz) to segment a-b. The projection parameter is
  *  clamped to [0,1] so the nearest point is an endpoint when the foot of the
  *  perpendicular falls outside the segment. Degenerate (zero-length) segments

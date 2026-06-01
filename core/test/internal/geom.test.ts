@@ -7,6 +7,8 @@ import {
   pointSegmentDistance,
   polygonDistance,
   placeFootprint,
+  polygonArea,
+  convexPolygonIntersectionArea,
   type Pt,
 } from '../../src/internal/geom';
 
@@ -81,5 +83,72 @@ describe('polygonDistance', () => {
     const obs = box(4, 0, 1, 1);
     const expected = 3 - Math.SQRT1_2; // ~2.2929
     expect(polygonDistance(fp, obs)).toBeCloseTo(expected, 9);
+  });
+});
+
+describe('polygonArea', () => {
+  it('computes the area of an axis-aligned box (winding-agnostic)', () => {
+    expect(polygonArea(box(0, 0, 2, 1))).toBeCloseTo(8, 12); // 4 x 2
+    // Reverse winding gives the same (absolute) area.
+    expect(polygonArea(box(0, 0, 2, 1).slice().reverse())).toBeCloseTo(8, 12);
+  });
+
+  it('returns 0 for a degenerate (<3 vertex) polygon', () => {
+    expect(polygonArea([[0, 0], [1, 1]])).toBe(0);
+  });
+
+  it('computes the area of a rotated square (rotation-invariant)', () => {
+    const local: Pt[] = [
+      [1, 1],
+      [-1, 1],
+      [-1, -1],
+      [1, -1],
+    ];
+    expect(polygonArea(placeFootprint(local, 3, -2, 0.7))).toBeCloseTo(4, 9);
+  });
+});
+
+describe('convexPolygonIntersectionArea', () => {
+  it('returns the full overlap when one box sits inside another', () => {
+    // 1x1 box fully inside a 4x4 box ⇒ intersection is the small box (area 4).
+    expect(convexPolygonIntersectionArea(box(0, 0, 1, 1), box(0, 0, 2, 2)))
+      .toBeCloseTo(4, 9);
+  });
+
+  it('returns 0 for disjoint boxes', () => {
+    expect(convexPolygonIntersectionArea(box(0, 0, 1, 1), box(10, 0, 1, 1)))
+      .toBeCloseTo(0, 12);
+  });
+
+  it('computes the partial overlap of two offset boxes', () => {
+    // Two 2x2 boxes (half=1) offset by 1 in x ⇒ overlap is 1 (x) by 2 (z) = 2.
+    expect(convexPolygonIntersectionArea(box(0, 0, 1, 1), box(1, 0, 1, 1)))
+      .toBeCloseTo(2, 9);
+  });
+
+  it('is symmetric in its arguments', () => {
+    const a = box(0, 0, 1, 1);
+    const b = box(0.5, 0.3, 1.5, 0.8);
+    expect(convexPolygonIntersectionArea(a, b))
+      .toBeCloseTo(convexPolygonIntersectionArea(b, a), 9);
+  });
+
+  it('drops coverage when the inner box is rotated out of the outer one', () => {
+    // A 4.8 x 2.0 car-sized box exactly covering an identical stall box: full
+    // overlap when aligned, strictly less once rotated (corners poke out).
+    const car: Pt[] = [
+      [2.4, 1.0],
+      [-2.4, 1.0],
+      [-2.4, -1.0],
+      [2.4, -1.0],
+    ];
+    const stall = box(0, 0, 2.4, 1.0);
+    const aligned = convexPolygonIntersectionArea(placeFootprint(car, 0, 0, 0), stall);
+    const rotated = convexPolygonIntersectionArea(
+      placeFootprint(car, 0, 0, 0.28), // ~16°
+      stall,
+    );
+    expect(aligned).toBeCloseTo(polygonArea(stall), 6);
+    expect(rotated).toBeLessThan(aligned * 0.95);
   });
 });

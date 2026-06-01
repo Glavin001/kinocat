@@ -23,6 +23,15 @@ import {
   characterizeVehicle,
   type MotionPrimitiveLibrary,
 } from 'kinocat/primitives';
+// Pure 2D geometry (no deps) — used by the shared `evaluateParked` predicate to
+// measure how much of the car footprint overlaps the target-stall silhouette.
+// Imported by the same relative path `sim-monitor.ts` uses, so no new public
+// core export surface is needed.
+import {
+  placeFootprint,
+  polygonArea,
+  convexPolygonIntersectionArea,
+} from '../../../core/src/internal/geom';
 // Type-only: the runner's tuning + course-shape types. Erased at runtime, so
 // this introduces no module cycle (race-scenario does not import this file).
 import type { RaceTuning, RaceScenarioOptions, RaceEntry } from './race-scenario';
@@ -393,6 +402,118 @@ export function buildParkingScenario(
 }
 
 // ---------------------------------------------------------------------------
+// Parking SUCCESS — the SINGLE source of truth for "is the car correctly
+// parked". A car is parked when its collision footprint sits inside the target
+// stall silhouette, squared up with the stall, and stopped. This one predicate
+// is consumed by the /parking web page (the PARKED HUD), the Vitest invariant
+// tests, and the controller-bench CLI, so all three agree on what "parked"
+// means and none can drift to a looser, position-only check.
+//
+// Why footprint-coverage AND an explicit heading tolerance:
+//   • forward-pullin / reverse-perp: the stall is the SAME size as the car
+//     (`PARKED_HX`/`PARKED_HZ` are the car's half-extents), so the coverage
+//     fraction already captures both lateral offset and rotation — an offset or
+//     angled car pokes corners out of the box and coverage drops.
+//   • parallel: the stall is LONG (`hx = gap/2`), so an angled car still sits
+//     mostly inside the long box and coverage stays high. The explicit
+//     `headingTol` is what catches the residual heading error there.
+// Together they give a faithful "fits the silhouette, squared up" test plus a
+// human-readable coverage % for the HUD.
+
+export interface ParkingSuccess {
+  /** Min fraction of the car footprint that must lie inside the stall box. */
+  coverageMin: number;
+  /** Max |heading − stall.heading| to count as squared-up (rad). */
+  headingTol: number;
+  /** Max |speed| to count as stopped (m/s). */
+  speedTol: number;
+}
+
+/** The tight bar, calibrated against the real (deterministic) Rapier sim so it
+ *  separates a cleanly-parked car from one that stops offset/angled:
+ *    forward-pullin → coverage 0.90, heading 0°  ⇒ PARKED
+ *    reverse-perp   → coverage 0.75              ⇒ not parked (footprint pokes out)
+ *    parallel       → heading 16°                ⇒ not parked (not squared up)
+ *  `headingTol` ≈ 8°. The two failing scenarios are the deliberate signal that
+ *  pure-pursuit still lacks terminal-heading control (see the `it.fails` tests
+ *  in `parking-invariants.test.ts`). */
+export const PARKING_SUCCESS: ParkingSuccess = {
+  coverageMin: 0.85,
+  headingTol: 0.14,
+  speedTol: 0.3,
+};
+
+export interface ParkedEval {
+  /** footprintInStall AND stopped — the headline result. */
+  parked: boolean;
+  /** coverage ≥ coverageMin AND headingError ≤ headingTol. */
+  footprintInStall: boolean;
+  /** |speed| ≤ speedTol. */
+  stopped: boolean;
+  /** Fraction of the car footprint area overlapping the stall box (0..1). */
+  coverage: number;
+  /** Euclidean distance from the chassis to the goal/stall centre (m). */
+  posError: number;
+  /** |heading − stall.heading|, wrapped to [0, π] (rad). */
+  headingError: number;
+}
+
+function wrapPi(a: number): number {
+  let r = a;
+  while (r > Math.PI) r -= 2 * Math.PI;
+  while (r < -Math.PI) r += 2 * Math.PI;
+  return r;
+}
+
+/** World-space quad for the target stall silhouette (a rotated rectangle). */
+function stallPolygon(stall: ParkingStallMark): [number, number][] {
+  return placeFootprint(
+    [
+      [stall.hx, stall.hz],
+      [-stall.hx, stall.hz],
+      [-stall.hx, -stall.hz],
+      [stall.hx, -stall.hz],
+    ],
+    stall.x,
+    stall.z,
+    stall.heading,
+  ) as [number, number][];
+}
+
+/** Evaluate whether `state` is correctly parked in `scenario`'s target stall.
+ *  The single source of truth shared by the web page, tests, and CLI bench. */
+export function evaluateParked(
+  state: { x: number; z: number; heading: number; speed: number },
+  scenario: ParkingScenario,
+  footprint: ReadonlyArray<readonly [number, number]> = PARKING_AGENT.footprint,
+  success: ParkingSuccess = PARKING_SUCCESS,
+): ParkedEval {
+  const stall = scenario.targetStall;
+  const carPoly = placeFootprint(
+    footprint as ReadonlyArray<readonly [number, number]>,
+    state.x,
+    state.z,
+    state.heading,
+  );
+  const carArea = polygonArea(carPoly);
+  const inter = convexPolygonIntersectionArea(carPoly, stallPolygon(stall));
+  const coverage = carArea > 0 ? Math.min(1, inter / carArea) : 0;
+  const headingError = Math.abs(wrapPi(state.heading - stall.heading));
+  const posError = Math.hypot(state.x - stall.x, state.z - stall.z);
+  const stopped = Math.abs(state.speed) <= success.speedTol;
+  const footprintInStall =
+    coverage >= success.coverageMin && headingError <= success.headingTol;
+  return {
+    parked: footprintInStall && stopped,
+    footprintInStall,
+    stopped,
+    coverage,
+    posError,
+    headingError,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Planning. One-shot plans with tight discretisation: parking is not a
 // per-tick replan, it's a single carefully-budgeted search.
 
@@ -489,8 +610,20 @@ export function buildParkingSnapshot(id: ParkingScenarioId): ParkingSnapshot {
  *  the same controller code drives both racing and parking. */
 export const PARKING_RACE_TUNING: Partial<RaceTuning> = {
   cruiseSpeed: 2,
-  goalTolerance: 0.4,
-  arriveRadius: 0.6,
+  // Terminal precision. `goalTolerance` is where pure-pursuit brakes to rest
+  // relative to the (segment/goal) end; `arriveRadius` is where the multi-cusp
+  // executor advances a segment / the goal is "reached". The old 0.4 / 0.6 left
+  // the chassis braking ~0.5 m SHORT of the goal point — the dominant terminal
+  // error (forward-pullin stopped 0.49 m out at 0.90 stall coverage; reverse-
+  // perp 0.53 m out at 0.75). Tightening the brake to 0.08 m drives the chassis
+  // onto the goal: forward-pullin → 0.97 coverage, reverse-perp → 0.89 (it now
+  // PARKS). `arriveRadius` is kept well above `goalTolerance` (0.25 vs 0.08) so
+  // the cusp-advance logic still triggers through each forward↔reverse gear
+  // change — they're decoupled knobs. (This is a position fix only; parallel's
+  // residual is a ~16° HEADING error that pure-pursuit structurally can't null —
+  // tracked by the `it.fails` in parking-invariants.test.ts.)
+  goalTolerance: 0.08,
+  arriveRadius: 0.25,
   plannerPosCell: 0.3,
   plannerHeadingBuckets: 36,
   plannerGoalRadius: 0.35,
