@@ -127,8 +127,8 @@ async function main(): Promise<void> {
       'no-cache': { type: 'boolean', default: false },
       trainer: { type: 'string', default: 'js' },          // 'js' | 'python'
       python: { type: 'string', default: 'python3' },      // python interpreter for --trainer=python
-      'max-iter': { type: 'string', default: '50' },       // LM iters for python trainer
-      'mlp-shape': { type: 'string', default: '64,64' },
+      'max-iter': { type: 'string', default: '2000' },     // optimizer iters (NM default; LM caps internally at 50)
+      'mlp-shape': { type: 'string', default: '32,32' },
       'ensemble-size': { type: 'string', default: '3' },
       epochs: { type: 'string', default: '200' },
       'no-mlp': { type: 'boolean', default: false },

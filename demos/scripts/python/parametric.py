@@ -147,6 +147,125 @@ def parametric_forward_v2(
     return jnp.stack([x + dx, z + dz, heading_next, speed, yaw_rate_next, vy_next, t + dt])
 
 
+# ---------------------------------------------------------------------------
+# Piecewise variant — matches `parametricForwardV2` (NOT Smooth) in
+# vehicle-model.ts exactly. Uses jnp.where for the six non-differentiable
+# branches; jit-compilable but no useful gradients. Used by the Nelder-Mead
+# optimizer (gradient-free) for fitting against the runtime-identical
+# physics, and by the no-regress safety gate.
+
+def parametric_forward_v2_piecewise(
+    params: jnp.ndarray,
+    config: jnp.ndarray,
+    state: jnp.ndarray,
+    controls: jnp.ndarray,
+    dt: float,
+) -> jnp.ndarray:
+    """Single-step piecewise forward sim. Matches parametricForwardV2
+    in core/src/agent/vehicle-model.ts op-for-op."""
+    (engineScale, reverseEffScale, brakeScale, accelTau,
+     gripScale, frictionCircleSlack, steerRatio,
+     understeerOffThrottle, understeerPowerOn, yawRateTau,
+     lateralDamping, lateralFromSteer, slipDrag,
+     _loadTransferCoeff, driveDeadzone, rollingResistance) = (
+        params[i] for i in range(16)
+    )
+    mass, wheelBase, frictionSlip = config[0], config[1], config[2]
+    m = jnp.maximum(50.0, mass)
+
+    x, z, heading, v, yaw_rate, vy, t = (state[i] for i in range(7))
+    steer, drive_force, brake_force = controls[0], controls[1], controls[2]
+
+    # --- Longitudinal command ---
+    f_abs = jnp.abs(drive_force)
+    f_eff = jnp.sign(drive_force) * (f_abs - driveDeadzone)
+    direction = jnp.where(drive_force >= 0.0, engineScale, engineScale * reverseEffScale)
+    drive_accel = jnp.where(f_abs > driveDeadzone, direction * f_eff / m, 0.0)
+
+    brake_accel = (brakeScale * brake_force) / m
+    v_sign = jnp.sign(v)
+    brake_signed = -v_sign * brake_accel
+    rolling = -v_sign * rollingResistance * jnp.abs(v)
+    a_long = drive_accel + brake_signed + rolling
+
+    # --- Steer → bicycle yaw rate ---
+    eff_steer = steer * steerRatio
+    L = jnp.maximum(0.5, 2.0 * wheelBase)
+    yaw_rate_cmd_raw = (v * jnp.sin(eff_steer)) / L
+    is_power_on = (drive_force > 0.0) & (v > 0.0)
+    ku = jnp.where(is_power_on, understeerPowerOn, understeerOffThrottle)
+    yaw_rate_cmd = yaw_rate_cmd_raw / (1 + ku * v * v)
+
+    # --- Friction-circle hard clamp ---
+    aMax = gripScale * frictionSlip * G * frictionCircleSlack
+    a_lat_est = v * yaw_rate_cmd
+    mag = jnp.sqrt(a_long * a_long + a_lat_est * a_lat_est)
+    scale = jnp.where((mag > aMax) & (mag > 0), aMax / jnp.maximum(mag, 1e-12), 1.0)
+    a_long = a_long * scale
+    yaw_rate_allowed = yaw_rate_cmd * scale
+
+    # --- Speed dynamics ---
+    tau = jnp.maximum(0.02, accelTau)
+    a_eff = a_long * (1 - jnp.exp(-dt / tau)) + a_long * jnp.exp(-dt / tau)
+    slip_loss = -slipDrag * jnp.abs(vy) * v_sign * dt
+    speed_pre = v + a_eff * dt + slip_loss
+    # Brake sign-flip guard: same as Math.sign(speed) !== Math.sign(v) check.
+    sign_flipped = (jnp.sign(speed_pre) != jnp.sign(v)) & (brake_force > 0) & (jnp.abs(v) > 0)
+    speed = jnp.where(sign_flipped, 0.0, speed_pre)
+
+    # --- Yaw-rate inertia ---
+    yTau = jnp.maximum(0.02, yawRateTau)
+    yaw_rate_next = yaw_rate + ((yaw_rate_allowed - yaw_rate) * dt) / yTau
+
+    # --- Lateral velocity ---
+    vy_drive = lateralFromSteer * eff_steer * v
+    vy_next = vy + (vy_drive - vy * lateralDamping) * dt
+
+    # --- Integrate pose ---
+    speed_avg = 0.5 * (v + speed)
+    yaw_avg = 0.5 * (yaw_rate + yaw_rate_next)
+    heading_next = wrap_angle(heading + yaw_avg * dt)
+    cosH = jnp.cos(heading)
+    sinH = jnp.sin(heading)
+    vy_avg = 0.5 * (vy + vy_next)
+    dx = (speed_avg * cosH + vy_avg * jnp.sin(heading)) * dt
+    dz = (speed_avg * sinH - vy_avg * jnp.cos(heading)) * dt
+
+    return jnp.stack([x + dx, z + dz, heading_next, speed, yaw_rate_next, vy_next, t + dt])
+
+
+def rollout_trial_piecewise(
+    params: jnp.ndarray,
+    config: jnp.ndarray,
+    init_state: jnp.ndarray,
+    controls_trace: jnp.ndarray,
+    dt: float,
+    sample_every: int,
+    reseat_horizon: int = 0,
+    ground_truth_samples: jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    """Roll out a trial with the piecewise forward, returning predicted samples."""
+    T = controls_trace.shape[0]
+    S = T // sample_every
+
+    def physics_step(s, c):
+        return parametric_forward_v2_piecewise(params, config, s, c, dt), None
+
+    def sample_step(state, idx):
+        ctrl_slice = jax.lax.dynamic_slice_in_dim(controls_trace, idx * sample_every, sample_every)
+        state_after, _ = jax.lax.scan(physics_step, state, ctrl_slice)
+        if ground_truth_samples is not None and reseat_horizon > 0:
+            should_reseat = (((idx + 1) % reseat_horizon) == 0) & (idx + 1 < S)
+            gt = ground_truth_samples[idx]
+            state_next = jnp.where(should_reseat, gt, state_after)
+        else:
+            state_next = state_after
+        return state_next, state_after
+
+    _, samples = jax.lax.scan(sample_step, init_state, jnp.arange(S))
+    return samples
+
+
 def rollout_trial(
     params: jnp.ndarray,
     config: jnp.ndarray,
