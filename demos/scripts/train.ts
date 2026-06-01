@@ -132,6 +132,8 @@ async function main(): Promise<void> {
       'ensemble-size': { type: 'string', default: '3' },
       epochs: { type: 'string', default: '200' },
       'no-mlp': { type: 'boolean', default: false },
+      docker: { type: 'boolean', default: false },
+      'docker-image': { type: 'string', default: 'kinocat-jax-trainer:latest' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -140,12 +142,17 @@ async function main(): Promise<void> {
                        [--seed=N] [--rounds=N] [--trials=N] [--ticks=N]
                        [--out=path/to/v2-default.json]
                        [--cache-dir=path] [--no-cache]
-                       [--trainer=js|python]  [--python=python3]
+                       [--trainer=js|python]  [--python=python3]  [--docker]
                        [--max-iter=N] [--mlp-shape=64,64] [--ensemble-size=3] [--epochs=200]
+                       [--no-mlp]
 
 Trainer modes:
-  js (default)  legacy Nelder-Mead + SGD path
-  python        JAX-based LM + Adam (see demos/scripts/python/README.md)
+  js (default)        legacy Nelder-Mead + SGD path
+  python              JAX LM + Adam, requires local python3 + pip deps
+  python --docker     JAX LM + Adam, runs inside a Docker container so
+                      nothing is installed on the host (see
+                      demos/scripts/python/README.md). Image is auto-built
+                      on first use as kinocat-jax-trainer:latest.
 
 Profiles:
 ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds} trials/round=${v.trialsPerRound} ticks=${v.trialTicks}`).join('\n')}
@@ -263,8 +270,25 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
     const mlpShape = String(values['mlp-shape']);
     const ensembleSize = Number(values['ensemble-size']);
     const epochs = Number(values.epochs);
+    const useDocker = Boolean(values.docker);
+    const dockerImage = String(values['docker-image']);
     const tmpRoot = mkdtempSync(join(tmpdir(), 'kinocat-jax-'));
-    process.stdout.write(`  · trainer: python (JAX) interp=${pythonInterp} tmp=${tmpRoot}\n`);
+
+    if (useDocker) {
+      // Ensure the image exists; auto-build if missing so the first
+      // run is one command. Subsequent runs are instant.
+      const check = spawnSync('docker', ['image', 'inspect', dockerImage], { stdio: 'ignore' });
+      if (check.status !== 0) {
+        process.stdout.write(`  · trainer image ${dockerImage} not found — building (~2 min first time)…\n`);
+        const build = spawnSync('docker', ['build', '-t', dockerImage, pyDir], { stdio: 'inherit' });
+        if (build.status !== 0) {
+          throw new Error(`docker build failed (status ${build.status}). Is Docker running?`);
+        }
+      }
+      process.stdout.write(`  · trainer: python-in-docker image=${dockerImage} tmp=${tmpRoot}\n`);
+    } else {
+      process.stdout.write(`  · trainer: python (JAX) interp=${pythonInterp} tmp=${tmpRoot}\n`);
+    }
 
     pythonFitHook = async (req) => {
       const roundDir = join(tmpRoot, `round-${req.round}`);
@@ -278,30 +302,63 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
       writeTrialsNpz(trialsPath, req.trials);
       writeFileSync(inParamsPath, JSON.stringify(req.currentParams, null, 2));
 
-      const args = [
+      // Inside the docker container the per-round dir is mounted at
+      // /data; on the host it's `roundDir`. Translate so the Python
+      // CLI sees container paths.
+      const containerRound = '/data';
+      const trialsArg = useDocker ? `${containerRound}/trials.npz` : trialsPath;
+      const inParamsArg = useDocker ? `${containerRound}/params-in.json` : inParamsPath;
+      const outParamsArg = useDocker ? `${containerRound}/params-out.json` : outParamsPath;
+      const outResidualArg = outResidualPath
+        ? (useDocker ? `${containerRound}/mlp.npz` : outResidualPath)
+        : null;
+
+      const pyArgs = [
         '-m', 'train_fit',
-        '--trials', trialsPath,
-        '--init-params', inParamsPath,
-        '--out-params', outParamsPath,
+        '--trials', trialsArg,
+        '--init-params', inParamsArg,
+        '--out-params', outParamsArg,
         '--max-iter', String(maxIter),
         '--mlp-shape', mlpShape,
         '--ensemble-size', String(ensembleSize),
         '--epochs', String(epochs),
         '--verbose',
       ];
-      if (outResidualPath) {
-        args.push('--out-residual', outResidualPath);
+      if (outResidualArg) {
+        pyArgs.push('--out-residual', outResidualArg);
       } else {
-        args.push('--no-residual');
+        pyArgs.push('--no-residual');
       }
 
       process.stdout.write(`    [python] round ${req.round + 1} (${req.trials.length} trials)\n`);
       const t0 = Date.now();
-      const res = spawnSync(pythonInterp, args, {
-        cwd: pyDir,
-        stdio: ['ignore', 'inherit', 'inherit'],
-        env: { ...process.env, PYTHONPATH: pyDir },
-      });
+      let res;
+      if (useDocker) {
+        // Mount the round-specific tmp dir as /data, and the python
+        // source as /work so source edits don't require rebuilding the
+        // image. --user matches host UID/GID so the params-out.json /
+        // mlp.npz files come out owned by the user, not root.
+        const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+        const gid = typeof process.getgid === 'function' ? process.getgid() : 0;
+        const dockerArgs = [
+          'run', '--rm', '-i',
+          '-v', `${roundDir}:${containerRound}`,
+          '-v', `${pyDir}:/work`,
+          '-w', '/work',
+          '--user', `${uid}:${gid}`,
+          dockerImage,
+          'python', ...pyArgs,
+        ];
+        res = spawnSync('docker', dockerArgs, {
+          stdio: ['ignore', 'inherit', 'inherit'],
+        });
+      } else {
+        res = spawnSync(pythonInterp, pyArgs, {
+          cwd: pyDir,
+          stdio: ['ignore', 'inherit', 'inherit'],
+          env: { ...process.env, PYTHONPATH: pyDir },
+        });
+      }
       if (res.status !== 0) {
         throw new Error(`python trainer failed with status ${res.status}`);
       }

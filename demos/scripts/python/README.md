@@ -8,17 +8,55 @@ back. Both sides share a versioned schema (see `trial_io.py`).
 
 ## Setup
 
+Two options. **Docker is recommended** — no host Python install, fully
+isolated, reproducible.
+
+### Option A: Docker (recommended)
+
+You need only Docker installed on the host (Docker Desktop on Mac
+works). The image is auto-built on first use; the trainer runs inside
+the container.
+
+```sh
+# One-shot — auto-builds the image on first invocation.
+pnpm run train:docker -- --profile=quick
+
+# Or pre-build explicitly:
+pnpm run train:docker-build
+pnpm run train:docker -- --profile=overnight
+```
+
+What happens under the hood:
+1. Node collects Rapier trials on the host (uses your existing Node).
+2. Trial data is dumped as npz into a host tmp dir.
+3. `docker run` mounts that tmp dir + this directory into a container
+   and invokes `python -m train_fit` inside.
+4. The container writes the fitted params (and optional residual MLP
+   ensemble) back to the same mounted dir.
+5. Node reads the result and writes `v2-default.json`.
+
+Image: `kinocat-jax-trainer:latest` (~600 MB, JAX + jaxopt + optax + numpy).
+Image rebuild is needed only if `requirements.txt` changes — Python
+source is mounted at runtime, so edits don't bust the image.
+
+GPU on Docker: not accessible on Mac (Docker Desktop can't pass through
+Metal). On a Linux+NVIDIA host, add `--gpus all` to the `docker run`
+invocation in `train.ts` and use a `jax[cuda12]` base image.
+
+### Option B: Local Python (for development)
+
 Python 3.11+ is required (JAX wheels).
 
 ```sh
 python3 -m venv demos/scripts/python/.venv
 source demos/scripts/python/.venv/bin/activate
 pip install -r demos/scripts/python/requirements.txt
+
+pnpm run train -- --profile=quick --trainer=python
 ```
 
-GPU is optional — `pip install -U "jax[cuda12]"` (Linux/NVIDIA) or
-`pip install jax-metal` (Apple Silicon) for autodetected acceleration.
-The Node driver does not care which backend JAX picks.
+For Mac native GPU acceleration: `pip install jax-metal` after the
+above. The Node driver does not care which backend JAX picks.
 
 ## Entry points
 
