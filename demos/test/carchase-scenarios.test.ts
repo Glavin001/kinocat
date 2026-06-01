@@ -16,9 +16,19 @@
 //     time-aware env wrapping the static VehicleEnvironment).
 import { describe, it, expect } from 'vitest';
 import {
+  buildCarChaseCourse,
   buildCarChaseSnapshot,
+  CARCHASE_AGENT,
+  CARCHASE_LIB,
   CARCHASE_TEST_MAX_EXPANSIONS,
 } from '../app/lib/carchase-scenarios';
+import { planVehicleOnce } from 'kinocat/planner';
+import { InMemoryNavWorld, rampNavObstacles } from 'kinocat/environment';
+import {
+  placeFootprint,
+  polygonsIntersect,
+  type Pt,
+} from '../../core/src/internal/geom';
 
 // NOTE: pre-existing flake — at the current course tuning two of the three
 // spawn-cops hit the 25000-expansion budget cap before finding a path in
@@ -58,5 +68,50 @@ describe.skip('carchase demo: interactive cops & robbers (pre-existing flake —
     expect(s.course.driftGates.length).toBeGreaterThanOrEqual(2);
     expect(s.course.robberLoop.length).toBeGreaterThanOrEqual(6);
     expect(s.course.buildings.length).toBeGreaterThan(8);
+  });
+});
+
+// Independent of the skipped spawn-matchup suite above: this exercises ONLY the
+// ramp's new solid-wedge planner collision, which is fast and deterministic.
+describe('carchase ramp nav-obstacles (spatial awareness)', () => {
+  it('the course registers the south ramp as planner obstacles', () => {
+    const course = buildCarChaseCourse();
+    expect(course.ramps.length).toBeGreaterThanOrEqual(1);
+    const wallCount = course.ramps.reduce(
+      (n, r) => n + rampNavObstacles(r, { back: true }).length,
+      0,
+    );
+    // Every obstacle = building boxes + ramp walls. The ramp walls must be in
+    // there (regression guard against "forgot the ramp collision" returning).
+    expect(course.obstacles.length).toBe(course.buildings.length + wallCount);
+  });
+
+  it('never plans into the broad side of the south ramp', () => {
+    const course = buildCarChaseCourse();
+    const world = new InMemoryNavWorld(course.polygons, course.obstacles);
+    const walls: Pt[][] = course.ramps.flatMap((r) =>
+      rampNavObstacles(r, { back: true }),
+    );
+
+    // South ramp: base (-40,-50), heading π → body x∈[-47.5,-35], sides at
+    // z≈-46/-54. Start south of the side, goal north of it: a straight line
+    // crosses the broad side, so the planner must detour. Affordances OFF so
+    // the car can't legitimately jump over the body.
+    const res = planVehicleOnce({
+      start: { x: -40, z: -60, heading: Math.PI / 2, speed: 0, t: 0 },
+      goal: { x: -40, z: -40, heading: Math.PI / 2, speed: 0, t: 0 },
+      world,
+      agent: CARCHASE_AGENT,
+      lib: CARCHASE_LIB,
+      deadlineMs: Number.POSITIVE_INFINITY,
+      maxExpansions: 60000,
+    });
+    expect(res.found).toBe(true);
+    for (const p of res.path) {
+      const fp = placeFootprint(CARCHASE_AGENT.footprint, p.x, p.z, p.heading);
+      for (const w of walls) {
+        expect(polygonsIntersect(fp, w)).toBe(false);
+      }
+    }
   });
 });

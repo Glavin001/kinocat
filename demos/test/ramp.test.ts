@@ -2,8 +2,17 @@ import { describe, it, expect } from 'vitest';
 import {
   buildRampCourse,
   buildRampSnapshot,
+  planRampDemo,
   rampHeightSampler,
+  RAMP_AGENT,
+  RAMP_TEST_MAX_EXPANSIONS,
 } from '../app/lib/ramp-scenarios';
+import { rampNavObstacles } from 'kinocat/environment';
+import {
+  placeFootprint,
+  polygonsIntersect,
+  type Pt,
+} from '../../core/src/internal/geom';
 
 describe('ramp + affordance demo', () => {
   it('builds a course with one ramp, one gap, one jump', () => {
@@ -70,5 +79,30 @@ describe('ramp + affordance demo', () => {
     const s = buildRampSnapshot({ withAffordance: false, withGap: false });
     expect(s.result.found).toBe(true);
     expect(s.course.gaps.length).toBe(0);
+  });
+
+  it('the ramp is a solid wedge — a ground plan detours around the broad side', () => {
+    // Ramp base (4,0), width 10 → body x∈[-3,13.5], sides at z≈±5. Plan
+    // side-to-side WITHOUT the affordance: the car can't jump the body, so it
+    // must go around; no footprint may overlap the ramp walls.
+    const course = buildRampCourse({ withGap: false });
+    const walls: Pt[][] = course.ramps.flatMap((r) =>
+      rampNavObstacles(r, { back: true }),
+    );
+    const res = planRampDemo({
+      state: { x: 4, z: -12, heading: Math.PI / 2, speed: 0, t: 0 },
+      goal: { x: 4, z: 12, heading: Math.PI / 2, speed: 0, t: 0 },
+      course,
+      withoutAffordances: true,
+      deadlineMs: Number.POSITIVE_INFINITY,
+      maxExpansions: RAMP_TEST_MAX_EXPANSIONS,
+    });
+    expect(res.found).toBe(true);
+    for (const p of res.path) {
+      const fp = placeFootprint(RAMP_AGENT.footprint, p.x, p.z, p.heading);
+      for (const w of walls) {
+        expect(polygonsIntersect(fp, w)).toBe(false);
+      }
+    }
   });
 });

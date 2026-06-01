@@ -19,6 +19,8 @@
 // What lives in the demo, not here: the planner-only "gap" obstacle and
 // affordance cost tuning. Those are per-scenario.
 
+import { placeFootprint, type Pt } from '../internal/geom';
+
 export type HeightSampler = (x: number, z: number) => number;
 
 export interface RampSpec {
@@ -98,6 +100,87 @@ export function combineHeightSamplers(
     }
     return y;
   };
+}
+
+export interface RampNavObstacleOptions {
+  /** Include the solid back face (the steep back-skirt footprint) as a wall.
+   *  Default true: the only traversable face of the wedge is the front
+   *  up-slope, so the planner can leave the crest only by reversing back out
+   *  the foot or taking the ballistic jump affordance. Set false to leave the
+   *  gentle back-slope drivable in the planner. */
+  back?: boolean;
+  /** Pull the side walls inboard of `width/2` by this much (m). Keeps the nav
+   *  wall just inside where the heightfield's lateral skirt actually pushes the
+   *  car off, so the planner blocks slightly *inside* the physical collision —
+   *  conservative, never approves a path physics would reject. Default 0. */
+  inset?: number;
+  /** Wall thickness in the lateral direction (m). Thin enough to never close
+   *  the foot mouth, thick enough that `polygonsIntersect`/`segmentsIntersect`
+   *  reliably catch a crossing footprint. Default 0.6. */
+  thickness?: number;
+}
+
+/** Planner-collision polygons for a ramp, derived from the SAME `RampSpec`
+ *  that drives `rampHeightSampler` (physics) and the displaced visual mesh, so
+ *  visual / physics / planner stay aligned and the side collision can never be
+ *  forgotten again.
+ *
+ *  A ramp is a solid wedge whose only traversable face is the front up-slope.
+ *  This returns thin oriented walls along the left + right body edges (running
+ *  foot→crest) and, by default, a solid block across the back-skirt footprint.
+ *  The foot mouth and the crest entry zone on the centreline are left open so
+ *  the car can drive straight up and trigger the jump affordance; anything
+ *  approaching a side or the back is rejected by `footprintClear`/
+ *  `segmentClear`.
+ *
+ *  Returns 3 polygons (left, right, back), or 2 when `back` is false. */
+export function rampNavObstacles(
+  ramp: RampSpec,
+  opts: RampNavObstacleOptions = {},
+): Pt[][] {
+  const halfL = ramp.length / 2;
+  const halfW = ramp.width / 2;
+  const backSkirt = ramp.backSkirt ?? 2.5;
+  const thickness = opts.thickness ?? 0.6;
+  const inset = opts.inset ?? 0;
+  const includeBack = opts.back !== false;
+  // Outer = body edge; inner = the inboard face of the thin side wall. The
+  // wall occupies the lateral band [inner, outer]; the centreline (lateral 0)
+  // stays open.
+  const outer = halfW - inset;
+  const inner = outer - thickness;
+  // Local frame is [along, lateral]; placeFootprint maps it to world with the
+  // same cos/sin convention as rampHeightSampler.
+  const place = (rect: Pt[]): Pt[] =>
+    placeFootprint(rect, ramp.base.x, ramp.base.z, ramp.heading);
+  const walls: Pt[][] = [
+    // Left wall (lateral > 0), foot → crest.
+    place([
+      [-halfL, inner],
+      [halfL, inner],
+      [halfL, outer],
+      [-halfL, outer],
+    ]),
+    // Right wall (lateral < 0), foot → crest.
+    place([
+      [-halfL, -outer],
+      [halfL, -outer],
+      [halfL, -inner],
+      [-halfL, -inner],
+    ]),
+  ];
+  if (includeBack) {
+    // Solid block across the back-skirt footprint (crest → back edge).
+    walls.push(
+      place([
+        [halfL, -outer],
+        [halfL + backSkirt, -outer],
+        [halfL + backSkirt, outer],
+        [halfL, outer],
+      ]),
+    );
+  }
+  return walls;
 }
 
 export interface RampJumpSpec {

@@ -38,10 +38,12 @@ export {
   rampHeightSampler,
   combineHeightSamplers,
   jumpSpecFromRamp,
+  rampNavObstacles,
 } from './ramp';
 export type {
   RampSpec,
   RampJumpSpec,
   HeightSampler,
   JumpSpecFromRampOptions,
+  RampNavObstacleOptions,
 } from './ramp';

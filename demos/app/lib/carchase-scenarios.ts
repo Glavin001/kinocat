@@ -35,6 +35,7 @@ import type { VehicleAgent, CarKinematicState } from 'kinocat/agent';
 import { characterizeVehicle } from 'kinocat/primitives';
 import { MotionPrimitiveLibrary } from 'kinocat/primitives';
 import type { ObstacleDescriptor } from 'kinocat/worker';
+import { buildCourseObstacles } from './course-obstacles';
 
 // ---------------------------------------------------------------------------
 // Palette — kept on this module so headless asserts can reference it too.
@@ -115,15 +116,6 @@ export interface CarChaseCourse {
   driftGates: DriftGateSpec[];
   /** Closed loop of waypoints the robber drives in order (XZ + heading). */
   robberLoop: Array<{ x: number; z: number; heading: number }>;
-}
-
-function box(x: number, z: number, hx: number, hz: number): [number, number][] {
-  return [
-    [x - hx, z - hz],
-    [x + hx, z - hz],
-    [x + hx, z + hz],
-    [x - hx, z + hz],
-  ];
 }
 
 /** Build the static car-chase course. Pure: deterministic for the same call. */
@@ -210,9 +202,19 @@ export function buildCarChaseCourse(): CarChaseCourse {
   // `CARCHASE_AGENT`; pushing this much higher closes the south pinch
   // (z = -80 wall) and the downtown alley to the point where the
   // planner can't find any path at all under budget.
-  const obstacles: Array<[number, number][]> = buildings.map((b1) =>
-    box(b1.x, b1.z, b1.hx + 0.5, b1.hz + 0.5),
-  );
+  //
+  // The south ramp now contributes its solid wedge walls (sides + back) via
+  // the shared `buildCourseObstacles`, so cops/robber plan AROUND the broad
+  // side instead of straight through it. This is NOT the old planner-only
+  // "gap" obstacle past the ramp (which forced a detour-or-jump and made cops
+  // miss the robber); it is only the ramp's own footprint, which physics
+  // already collides with.
+  const obstacles = buildCourseObstacles({
+    boxes: buildings,
+    ramps,
+    inflate: 0.5,
+    rampOpts: { back: true },
+  });
 
   // Boost pads — one inside the downtown grid (rewards the robber for
   // committing to the alley shortcut), one on the west highway loop.

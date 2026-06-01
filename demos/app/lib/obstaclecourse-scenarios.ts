@@ -29,6 +29,7 @@ import {
 import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
 import type { VehicleAgent, CarKinematicState } from 'kinocat/agent';
 import { characterizeVehicle, MotionPrimitiveLibrary } from 'kinocat/primitives';
+import { buildCourseObstacles } from './course-obstacles';
 
 export const OBS_BOUNDS = { x0: -60, x1: 60, z0: -40, z1: 40 } as const;
 
@@ -102,15 +103,6 @@ export interface ObstacleCourse {
   boosts: ObsBoostSpec[];
   driftGates: ObsGateSpec[];
   waypoints: CarKinematicState[];
-}
-
-function box(x: number, z: number, hx: number, hz: number): [number, number][] {
-  return [
-    [x - hx, z - hz],
-    [x + hx, z - hz],
-    [x + hx, z + hz],
-    [x - hx, z + hz],
-  ];
 }
 
 const BUILDING_INFLATE = 0.5;
@@ -189,11 +181,17 @@ export function buildObstacleCourse(
     : [];
 
   // Collision obstacles passed to the planner: every cuboid the car must go
-  // around. Ramps are NOT in this list — the car drives over them.
-  const allBlockers = [...buildings, ...driftPillars];
-  const obstacles: Array<[number, number][]> = allBlockers.map((s) =>
-    box(s.x, s.z, s.hx + BUILDING_INFLATE, s.hz + BUILDING_INFLATE),
-  );
+  // around PLUS each ramp's solid wedge walls (sides + back). The ramp is a
+  // solid wedge whose only traversable face is the front up-slope; the shared
+  // `buildCourseObstacles` derives the side/back walls from the same RampSpec
+  // that drives the heightfield, so the planner no longer plans through the
+  // broad side of the ramp.
+  const obstacles = buildCourseObstacles({
+    boxes: [...buildings, ...driftPillars],
+    ramps,
+    inflate: BUILDING_INFLATE,
+    rampOpts: { back: true },
+  });
 
   // Waypoint loop tracing the full course — through the boost pad on the
   // west side, between the buildings, over the ramp, around the goal box,
@@ -201,7 +199,7 @@ export function buildObstacleCourse(
   const waypoints: CarKinematicState[] = [
     pose(-45, -25, 0),
     pose(-15, -25, Math.PI / 4),
-    pose(10, -5, 0),     // approach the ramp
+    pose(8, 0, 0),       // approach the ramp foot head-on (centreline)
     pose(28, 0, 0),      // post-jump
     pose(45, 5, Math.PI / 2),
     pose(20, 22, Math.PI),

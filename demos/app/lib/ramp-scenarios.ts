@@ -34,6 +34,7 @@ import {
 import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
 import type { VehicleAgent, CarKinematicState } from 'kinocat/agent';
 import { characterizeVehicle, MotionPrimitiveLibrary } from 'kinocat/primitives';
+import { buildCourseObstacles } from './course-obstacles';
 
 export { rampHeightSampler };
 export type { RampSpec, RampJumpSpec, HeightSampler };
@@ -73,15 +74,6 @@ export interface RampCourse {
 }
 
 const GAP_INFLATE = 0.5;
-
-function box(x: number, z: number, hx: number, hz: number): [number, number][] {
-  return [
-    [x - hx, z - hz],
-    [x + hx, z - hz],
-    [x + hx, z + hz],
-    [x - hx, z + hz],
-  ];
-}
 
 export interface BuildRampOptions {
   /** Include the gap obstacle the planner has to deal with. Default true. */
@@ -156,9 +148,16 @@ export function buildRampCourse(opts: BuildRampOptions = {}): RampCourse {
       })
     : [];
 
-  const obstacles: Array<[number, number][]> = gaps.map((g) =>
-    box(g.x, g.z, g.hx + GAP_INFLATE, g.hz + GAP_INFLATE),
-  );
+  // Planner obstacles = the ramp's solid wedge walls (sides + back, so the car
+  // can only drive up the front and must jump or reverse off the crest) PLUS
+  // the planner-only "gap" boxes. Both funnel through the shared helper so the
+  // ramp's side collision is never forgotten.
+  const obstacles = buildCourseObstacles({
+    boxes: gaps,
+    ramps,
+    inflate: GAP_INFLATE,
+    rampOpts: { back: true },
+  });
 
   return {
     bounds: RAMP_BOUNDS,
