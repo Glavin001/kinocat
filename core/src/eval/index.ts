@@ -66,3 +66,15 @@ export {
   laneChange,
   slalom,
 } from './reference-shapes';
+
+export {
+  buildDogLegCorridor,
+  assessPassability,
+  sweptClearance,
+  runGauntlet,
+  type CorridorWorld,
+  type BuildCorridorOptions,
+  type PassabilityReport,
+  type GauntletReport,
+  type RunGauntletOptions,
+} from './gauntlet';

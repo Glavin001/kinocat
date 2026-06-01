@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-06-01T05:17:17.464Z",
+  "generatedAt": "2026-06-01T05:52:03.954Z",
   "controller": "pure-pursuit",
   "dt": 0.016666666666666666,
   "frictionLimit": 4,
@@ -389,6 +389,138 @@
       }
     }
   ],
+  "gauntlet": {
+    "widthSpeed": 6,
+    "widthSweep": [
+      {
+        "value": 1.5,
+        "oraclePassable": true,
+        "reachedGoal": true,
+        "collided": false,
+        "oracleClear": 0.6503029164589667,
+        "execClear": 0.6543936718318134,
+        "corridorXtrackMax": 0.09380381250708467,
+        "gatedScore": 1
+      },
+      {
+        "value": 0.75,
+        "oraclePassable": true,
+        "reachedGoal": true,
+        "collided": false,
+        "oracleClear": 0.27533993142049773,
+        "execClear": 0.27939373361639563,
+        "corridorXtrackMax": 0.09380381250708467,
+        "gatedScore": 1
+      },
+      {
+        "value": 0.4,
+        "oraclePassable": true,
+        "reachedGoal": true,
+        "collided": false,
+        "oracleClear": 0.1003571911859697,
+        "execClear": 0.1043937624795747,
+        "corridorXtrackMax": 0.09380381250708467,
+        "gatedScore": 1
+      },
+      {
+        "value": 0.2,
+        "oraclePassable": true,
+        "reachedGoal": true,
+        "collided": false,
+        "oracleClear": 0.00036704978065988514,
+        "execClear": 0.00439377898151424,
+        "corridorXtrackMax": 0.09380381250708467,
+        "gatedScore": 1
+      },
+      {
+        "value": 0.1,
+        "oraclePassable": false,
+        "reachedGoal": true,
+        "collided": true,
+        "oracleClear": 0,
+        "execClear": 0,
+        "corridorXtrackMax": 0.09380381250708467,
+        "gatedScore": 0
+      },
+      {
+        "value": 0.05,
+        "oraclePassable": false,
+        "reachedGoal": true,
+        "collided": true,
+        "oracleClear": 0,
+        "execClear": 0,
+        "corridorXtrackMax": 0.09380381250708467,
+        "gatedScore": 0
+      },
+      {
+        "value": -0.2,
+        "oraclePassable": false,
+        "reachedGoal": true,
+        "collided": true,
+        "oracleClear": 0,
+        "execClear": 0,
+        "corridorXtrackMax": 0.09380381250708467,
+        "gatedScore": 0
+      }
+    ],
+    "geometricImpossibleMargin": 0.1,
+    "controllerClipMargin": 0.2,
+    "speedMargin": 1,
+    "speedSweep": [
+      {
+        "value": 4,
+        "oraclePassable": true,
+        "reachedGoal": true,
+        "collided": false,
+        "oracleClear": 0.40032759752474933,
+        "execClear": 0.4113046770191756,
+        "corridorXtrackMax": 0.07132905022785763,
+        "gatedScore": 1
+      },
+      {
+        "value": 6,
+        "oraclePassable": true,
+        "reachedGoal": true,
+        "collided": false,
+        "oracleClear": 0.40032759752474933,
+        "execClear": 0.40439371301168187,
+        "corridorXtrackMax": 0.09380381250708467,
+        "gatedScore": 1
+      },
+      {
+        "value": 8,
+        "oraclePassable": false,
+        "reachedGoal": true,
+        "collided": false,
+        "oracleClear": 0.40032759752474933,
+        "execClear": 0.35863138640890463,
+        "corridorXtrackMax": 0.1410966021212821,
+        "gatedScore": 0.895844774695387
+      },
+      {
+        "value": 10,
+        "oraclePassable": false,
+        "reachedGoal": true,
+        "collided": false,
+        "oracleClear": 0.40032759752474933,
+        "execClear": 0.30123032737604566,
+        "corridorXtrackMax": 0.19801966090581913,
+        "gatedScore": 0.7524595587178393
+      },
+      {
+        "value": 12,
+        "oraclePassable": false,
+        "reachedGoal": true,
+        "collided": false,
+        "oracleClear": 0.40032759752474933,
+        "execClear": 0.24450157738970052,
+        "corridorXtrackMax": 0.25500884232230475,
+        "gatedScore": 0.6107537399406614
+      }
+    ],
+    "maxFeasibleSpeed": 6,
+    "controllerMaxSpeed": 12
+  },
   "racePlanner": {
     "lapSeconds": 36.716666666665866,
     "plansScored": 181,

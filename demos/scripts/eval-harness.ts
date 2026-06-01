@@ -37,6 +37,7 @@ import {
   type DynamicLimits,
 } from 'kinocat/eval';
 import { arcPath, slalom, laneChange } from 'kinocat/eval';
+import { buildDogLegCorridor, runGauntlet, type GauntletReport } from 'kinocat/eval';
 import { purePursuit, smoothTrajectory } from 'kinocat/execute';
 import type { PurePursuitConfig, PlanPath } from 'kinocat/execute';
 import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
@@ -218,6 +219,109 @@ function aggregate(family: string, rows: MetricVector[]): Aggregate {
 }
 
 // ---------------------------------------------------------------------------
+// Part C — the gauntlet: precision driving through a provably-passable dog-leg
+// corridor (a constraint-satisfaction test, not a quality test). Sweep the
+// lateral margin from generous to impossible; the passability oracle guarantees
+// the task is solvable, so a controller failure is unambiguously its own fault.
+
+interface GauntletRow {
+  /** Swept parameter value (margin in the width sweep, speed in the speed sweep). */
+  value: number;
+  oraclePassable: boolean;
+  reachedGoal: boolean;
+  collided: boolean;
+  oracleClear: number;
+  execClear: number;
+  corridorXtrackMax: number;
+  gatedScore: number;
+}
+
+const GAUNTLET_OFFSET = 4;
+const GAUNTLET_CORRIDOR_LEN = 16;
+
+function runGauntletCase(margin: number, speed: number): GauntletReport {
+  const world = buildDogLegCorridor({
+    footprint: agent.footprint,
+    margin,
+    offset: GAUNTLET_OFFSET,
+    corridorLength: GAUNTLET_CORRIDOR_LEN,
+    speed,
+  });
+  return runGauntlet(world, agent.footprint, purePursuitController, kinematicForwardSim(agent), {
+    dt: DT,
+    limits,
+  });
+}
+
+function toRow(value: number, r: GauntletReport): GauntletRow {
+  return {
+    value,
+    oraclePassable: r.passability.passable,
+    reachedGoal: r.reachedGoal,
+    collided: r.collided,
+    oracleClear: r.passability.oracleMinClearance,
+    execClear: r.executedMinClearance,
+    corridorXtrackMax: r.corridorCrossTrackMax,
+    gatedScore: r.gatedScore,
+  };
+}
+
+interface GauntletResult {
+  // Width sweep at a known-feasible speed: isolates GEOMETRIC passability.
+  widthSpeed: number;
+  widthSweep: GauntletRow[];
+  geometricImpossibleMargin: number | null; // largest margin where the oracle clips
+  controllerClipMargin: number | null; // smallest margin the controller still clears
+  // Speed sweep at a generous margin: isolates DYNAMIC feasibility of the dog-leg.
+  speedMargin: number;
+  speedSweep: GauntletRow[];
+  maxFeasibleSpeed: number | null; // fastest speed the ideal line stays feasible
+  controllerMaxSpeed: number | null; // fastest speed the controller threads cleanly
+}
+
+function evaluateGauntlet(): GauntletResult {
+  const widthSpeed = 6; // comfortably feasible for the dog-leg geometry
+  const margins = [1.5, 0.75, 0.4, 0.2, 0.1, 0.05, -0.2];
+  const widthSweep: GauntletRow[] = [];
+  let geometricImpossibleMargin: number | null = null;
+  let controllerClipMargin: number | null = null;
+  for (const margin of margins) {
+    const r = runGauntletCase(margin, widthSpeed);
+    widthSweep.push(toRow(margin, r));
+    // Geometric impossibility is the oracle CLEARANCE clipping (speed-independent).
+    if (r.passability.oracleMinClearance <= 1e-9) {
+      geometricImpossibleMargin = Math.max(geometricImpossibleMargin ?? -Infinity, margin);
+    }
+    if (!r.collided && r.reachedGoal && (controllerClipMargin === null || margin < controllerClipMargin)) {
+      controllerClipMargin = margin;
+    }
+  }
+
+  const speedMargin = 1.0; // generous width so geometry isn't the limiter
+  const speeds = [4, 6, 8, 10, 12];
+  const speedSweep: GauntletRow[] = [];
+  let maxFeasibleSpeed: number | null = null;
+  let controllerMaxSpeed: number | null = null;
+  for (const speed of speeds) {
+    const r = runGauntletCase(speedMargin, speed);
+    speedSweep.push(toRow(speed, r));
+    if (r.passability.feasible) maxFeasibleSpeed = Math.max(maxFeasibleSpeed ?? -Infinity, speed);
+    if (!r.collided && r.reachedGoal) controllerMaxSpeed = Math.max(controllerMaxSpeed ?? -Infinity, speed);
+  }
+
+  return {
+    widthSpeed,
+    widthSweep,
+    geometricImpossibleMargin,
+    controllerClipMargin,
+    speedMargin,
+    speedSweep,
+    maxFeasibleSpeed,
+    controllerMaxSpeed,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Part B — planner isolation on the REAL planner. Run the live race scenario,
 // capture every distinct committed plan, and score each as a static artifact
 // (feasibility + g-g utilization). This answers "how good is our planner",
@@ -388,6 +492,55 @@ async function main(): Promise<void> {
       '\n',
   );
 
+  // Part C — the gauntlet (precision corridor traversal).
+  const gauntlet = evaluateGauntlet();
+  const printSweep = (label: string, paramHeader: string, rows: GauntletRow[]): void => {
+    process.stdout.write(label + '\n');
+    const gh = [paramHeader, 'oracleOK', 'reached', 'collide', 'oracleClr', 'execClr', 'xtrkMax', 'score'];
+    const gw = [11, 9, 9, 9, 11, 9, 9, 7];
+    const gsep = '─'.repeat(gw.reduce((a, b) => a + b + 2, 0));
+    process.stdout.write(gh.map((h, i) => h.padEnd(gw[i] ?? 0)).join('  ') + '\n' + gsep + '\n');
+    for (const r of rows) {
+      const row = [
+        fmt(r.value, 2),
+        r.oraclePassable ? 'yes' : 'NO',
+        r.reachedGoal ? 'yes' : 'no',
+        r.collided ? 'HIT' : 'no',
+        fmt(r.oracleClear, 3),
+        fmt(r.execClear, 3),
+        fmt(r.corridorXtrackMax, 3),
+        fmt(r.gatedScore, 2),
+      ];
+      process.stdout.write(row.map((c, i) => String(c).padEnd(gw[i] ?? 0)).join('  ') + '\n');
+    }
+    process.stdout.write(gsep + '\n');
+  };
+
+  process.stdout.write('\nGauntlet — precision driving through a provably-passable dog-leg corridor.\n');
+  printSweep(
+    `\n[width sweep @ ${gauntlet.widthSpeed} m/s] how narrow a gap can it thread?`,
+    'margin(m)',
+    gauntlet.widthSweep,
+  );
+  process.stdout.write(
+    `   geometric: oracle impossible at margin ≤ ${gauntlet.geometricImpossibleMargin === null ? '—' : fmt(gauntlet.geometricImpossibleMargin, 2)} m; ` +
+      `controller threads down to margin ${gauntlet.controllerClipMargin === null ? '—' : fmt(gauntlet.controllerClipMargin, 2)} m\n`,
+  );
+  printSweep(
+    `\n[speed sweep @ ${gauntlet.speedMargin} m margin] how fast can it take the dog-leg?`,
+    'speed(m/s)',
+    gauntlet.speedSweep,
+  );
+  process.stdout.write(
+    `   dynamic: ideal line feasible up to ${gauntlet.maxFeasibleSpeed === null ? '—' : fmt(gauntlet.maxFeasibleSpeed, 0)} m/s; ` +
+      `controller threads cleanly up to ${gauntlet.controllerMaxSpeed === null ? '—' : fmt(gauntlet.controllerMaxSpeed, 0)} m/s\n`,
+  );
+  process.stdout.write(
+    '   (the kinematic sim has no tire-slip limit, so it can drive the line the friction\n' +
+      '    circle calls infeasible — the feasibility bound is the physically-honest cap;\n' +
+      '    run against the learned/Rapier model to see the controller actually slide wide)\n',
+  );
+
   // Part B — score the REAL planner's committed plans on the live race course.
   let racePlanner: RacePlannerReport | null = null;
   if (!values['no-scenarios']) {
@@ -428,6 +581,7 @@ async function main(): Promise<void> {
       entrySpeeds: ENTRY_SPEEDS,
       rows: allRows,
       aggregates,
+      gauntlet,
       racePlanner,
     };
     writeFileSync(out, JSON.stringify(payload, null, 2));
