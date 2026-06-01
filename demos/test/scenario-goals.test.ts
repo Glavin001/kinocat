@@ -69,6 +69,7 @@ describe('planVehicleScenario solves the authored goals', () => {
       agent,
       lib,
       envOptions: { posCell: 1, headingBuckets: 12, goalRadius: 2 },
+      deadlineMs: Infinity, // deterministic, expansion-bounded
       maxExpansions: 40000,
     });
     expect(r.raw.found).toBe(true);
@@ -77,14 +78,14 @@ describe('planVehicleScenario solves the authored goals', () => {
   });
 
   it('a parking goal yields a plan that advances toward the stall', () => {
-    const r = planParkingScenario('forward-pullin', { deadlineMs: 4000, maxExpansions: 80000 });
+    const r = planParkingScenario('forward-pullin', { maxExpansions: 80000 });
     // The product search should find a plan (full or best-progress partial).
     expect(r.raw.found).toBe(true);
     expect(r.path.length).toBeGreaterThanOrEqual(2);
   });
 
   it('a single race lap reaches the final waypoint', () => {
-    const r = planRaceLap(undefined, { deadlineMs: 4000, maxExpansions: 200000 });
+    const r = planRaceLap(undefined, { maxExpansions: 200000 });
     expect(r.raw.found).toBe(true);
   });
 });

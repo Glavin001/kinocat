@@ -81,8 +81,10 @@ function planWith(
     agent,
     lib,
     envOptions,
-    deadlineMs: 3500,
-    maxExpansions: 120_000,
+    // Expansion-bounded (not wall-clock) so the plan — and thus the
+    // visualization — is DETERMINISTIC across machines / coverage runs.
+    deadlineMs: Infinity,
+    maxExpansions: 60_000,
     ...extra,
   });
 }
@@ -235,7 +237,7 @@ function parkingPreset(): GoalPreset {
           [s.bounds.x1, s.bounds.z0],
           [s.bounds.x1, s.bounds.z1],
           [s.bounds.x0, s.bounds.z1],
-        ])], deadlineMs: 4000, maxExpansions: 80_000 },
+        ])], deadlineMs: Infinity, maxExpansions: 80_000 },
       ),
   };
 }

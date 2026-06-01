@@ -97,7 +97,7 @@ export function planParkingScenario(
       sweepSegmentCheck: true,
       analyticExpansion: { everyN: 3, step: 0.15 },
     },
-    deadlineMs: opts.deadlineMs ?? 4000,
+    deadlineMs: opts.deadlineMs ?? Infinity,
     maxExpansions: opts.maxExpansions ?? 80_000,
   });
 }
@@ -145,7 +145,7 @@ export function planRaceLap(
     agent: RACE_AGENT,
     lib: buildKinematicLibrary(),
     envOptions: { posCell: 1.5, headingBuckets: 16, goalRadius: 3, goalHeadingTol: Infinity },
-    deadlineMs: opts.deadlineMs ?? 3000,
+    deadlineMs: opts.deadlineMs ?? Infinity,
     maxExpansions: opts.maxExpansions ?? 200_000,
   });
 }
