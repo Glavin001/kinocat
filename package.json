@@ -20,6 +20,10 @@
     "train": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos train",
     "train:quick": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos train:quick",
     "train:sweep": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos train:sweep",
+    "train:docker-build": "pnpm --filter @kinocat/demos train:docker-build",
+    "train:docker": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos train:docker",
+    "train:docker:quick": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos train:docker:quick",
+    "train:docker:overnight": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos train:docker:overnight",
     "race": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos race",
     "race:quick": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos race:quick"
   },

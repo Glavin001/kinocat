@@ -6,17 +6,22 @@
 // `PersistedV2Model` payload the demos load on first visit) +
 // `demos/public/models/v2-default.manifest.json` (provenance sidecar).
 
-import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname, resolve, isAbsolute } from 'node:path';
+import { writeFileSync, mkdirSync, readFileSync, mkdtempSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, resolve, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import {
   runManeuverTraining,
   type TrainingEvent,
   DEFAULT_VEHICLE_OPTS,
+  type PythonFitRequest,
+  type PythonFitResult,
 } from '../app/lib/training-driver';
-import { modelToJson } from '../app/lib/v2-model-file';
+import { writeTrialsNpz } from './lib/trial-npz';
+import { readResidualEnsembleNpz } from './lib/residual-npz';
+import { modelToJson, modelFromJson } from '../app/lib/v2-model-file';
 import {
   computeCacheKey,
   tryReadRoundCache,
@@ -120,6 +125,17 @@ async function main(): Promise<void> {
       'mine-from-trace': { type: 'string' },
       'cache-dir': { type: 'string' },
       'no-cache': { type: 'boolean', default: false },
+      trainer: { type: 'string', default: 'js' },          // 'js' | 'python'
+      python: { type: 'string', default: 'python3' },      // python interpreter for --trainer=python
+      'max-iter': { type: 'string', default: '250' },      // NM iters; JS caps at 120-200, beyond ~250 returns diminish sharply
+      'mlp-shape': { type: 'string', default: '32,32' },
+      'ensemble-size': { type: 'string', default: '3' },
+      epochs: { type: 'string', default: '200' },
+      'no-mlp': { type: 'boolean', default: false },
+      'init-from': { type: 'string' },                  // path to a known-good v2-default.json
+      'init-from-out': { type: 'boolean', default: false },  // also accept --out as init (only set this if you trust it)
+      docker: { type: 'boolean', default: false },
+      'docker-image': { type: 'string', default: 'kinocat-jax-trainer:latest' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -128,6 +144,27 @@ async function main(): Promise<void> {
                        [--seed=N] [--rounds=N] [--trials=N] [--ticks=N]
                        [--out=path/to/v2-default.json]
                        [--cache-dir=path] [--no-cache]
+                       [--trainer=js|python]  [--python=python3]  [--docker]
+                       [--max-iter=N] [--mlp-shape=64,64] [--ensemble-size=3] [--epochs=200]
+                       [--no-mlp]
+                       [--init-from=PATH] [--init-from-out]
+
+Init / no-regress safety:
+  --init-from=PATH    Seed the pipeline from a known-good v2 model file
+                      before round 0. Combined with the LM no-regress
+                      gate (worst case: keep init params) and the residual
+                      MLP val-gate (worst case: drop the MLP), this means
+                      the shipped model is never worse than --init-from.
+  --init-from-out     Same, but uses --out's existing file as init. Only
+                      enable this when the existing file is known-good.
+
+Trainer modes:
+  js (default)        legacy Nelder-Mead + SGD path
+  python              JAX LM + Adam, requires local python3 + pip deps
+  python --docker     JAX LM + Adam, runs inside a Docker container so
+                      nothing is installed on the host (see
+                      demos/scripts/python/README.md). Image is auto-built
+                      on first use as kinocat-jax-trainer:latest.
 
 Profiles:
 ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds} trials/round=${v.trialsPerRound} ticks=${v.trialTicks}`).join('\n')}
@@ -229,6 +266,165 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
     process.stdout.write(`  · Mined ${added} trial${added === 1 ? '' : 's'} from trace ${tracePath}\n`);
   }
 
+  // --trainer=python: replace the JS Nelder-Mead + SGD fits with a
+  // JAX-based pipeline via `demos/scripts/python/train_fit.py`. The hook
+  // runs once per round; on the final round it also fits the residual
+  // MLP ensemble and ships it back as an npz.
+  const trainerMode = String(values.trainer);
+  if (trainerMode !== 'js' && trainerMode !== 'python') {
+    throw new Error(`Unknown --trainer=${trainerMode}. Use 'js' or 'python'.`);
+  }
+  let pythonFitHook: ((req: PythonFitRequest) => Promise<PythonFitResult>) | undefined;
+  if (trainerMode === 'python') {
+    const pythonInterp = String(values.python);
+    const pyDir = resolve(repoRoot, 'demos/scripts/python');
+    const maxIter = Number(values['max-iter']);
+    const mlpShape = String(values['mlp-shape']);
+    const ensembleSize = Number(values['ensemble-size']);
+    const epochs = Number(values.epochs);
+    const useDocker = Boolean(values.docker);
+    const dockerImage = String(values['docker-image']);
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'kinocat-jax-'));
+
+    if (useDocker) {
+      // Ensure the image exists; auto-build if missing so the first
+      // run is one command. Subsequent runs are instant.
+      const check = spawnSync('docker', ['image', 'inspect', dockerImage], { stdio: 'ignore' });
+      if (check.status !== 0) {
+        process.stdout.write(`  · trainer image ${dockerImage} not found — building (~2 min first time)…\n`);
+        const build = spawnSync('docker', ['build', '-t', dockerImage, pyDir], { stdio: 'inherit' });
+        if (build.status !== 0) {
+          throw new Error(`docker build failed (status ${build.status}). Is Docker running?`);
+        }
+      }
+      process.stdout.write(`  · trainer: python-in-docker image=${dockerImage} tmp=${tmpRoot}\n`);
+    } else {
+      process.stdout.write(`  · trainer: python (JAX) interp=${pythonInterp} tmp=${tmpRoot}\n`);
+    }
+
+    pythonFitHook = async (req) => {
+      const roundDir = join(tmpRoot, `round-${req.round}`);
+      mkdirSync(roundDir, { recursive: true });
+      const trialsPath = join(roundDir, 'trials.npz');
+      const inParamsPath = join(roundDir, 'params-in.json');
+      const outParamsPath = join(roundDir, 'params-out.json');
+      const skipMlp = Boolean(values['no-mlp']);
+      const outResidualPath = (!skipMlp && req.isFinalRound) ? join(roundDir, 'mlp.npz') : null;
+
+      writeTrialsNpz(trialsPath, req.trials);
+      writeFileSync(inParamsPath, JSON.stringify(req.currentParams, null, 2));
+
+      // Inside the docker container the per-round dir is mounted at
+      // /data; on the host it's `roundDir`. Translate so the Python
+      // CLI sees container paths.
+      const containerRound = '/data';
+      const trialsArg = useDocker ? `${containerRound}/trials.npz` : trialsPath;
+      const inParamsArg = useDocker ? `${containerRound}/params-in.json` : inParamsPath;
+      const outParamsArg = useDocker ? `${containerRound}/params-out.json` : outParamsPath;
+      const outResidualArg = outResidualPath
+        ? (useDocker ? `${containerRound}/mlp.npz` : outResidualPath)
+        : null;
+
+      const pyArgs = [
+        '-m', 'train_fit',
+        '--trials', trialsArg,
+        '--init-params', inParamsArg,
+        '--out-params', outParamsArg,
+        '--max-iter', String(maxIter),
+        '--mlp-shape', mlpShape,
+        '--ensemble-size', String(ensembleSize),
+        '--epochs', String(epochs),
+        '--verbose',
+      ];
+      if (outResidualArg) {
+        pyArgs.push('--out-residual', outResidualArg);
+      } else {
+        pyArgs.push('--no-residual');
+      }
+
+      process.stdout.write(`    [python] round ${req.round + 1} (${req.trials.length} trials)\n`);
+      const t0 = Date.now();
+      let res;
+      if (useDocker) {
+        // Mount the round-specific tmp dir as /data, and the python
+        // source as /work so source edits don't require rebuilding the
+        // image. --user matches host UID/GID so the params-out.json /
+        // mlp.npz files come out owned by the user, not root.
+        const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+        const gid = typeof process.getgid === 'function' ? process.getgid() : 0;
+        const dockerArgs = [
+          'run', '--rm', '-i',
+          '-v', `${roundDir}:${containerRound}`,
+          '-v', `${pyDir}:/work`,
+          '-w', '/work',
+          '--user', `${uid}:${gid}`,
+          dockerImage,
+          'python', ...pyArgs,
+        ];
+        res = spawnSync('docker', dockerArgs, {
+          stdio: ['ignore', 'inherit', 'inherit'],
+        });
+      } else {
+        res = spawnSync(pythonInterp, pyArgs, {
+          cwd: pyDir,
+          stdio: ['ignore', 'inherit', 'inherit'],
+          env: { ...process.env, PYTHONPATH: pyDir },
+        });
+      }
+      if (res.status !== 0) {
+        throw new Error(`python trainer failed with status ${res.status}`);
+      }
+      process.stdout.write(`    [python] round ${req.round + 1} done in ${fmtMs(Date.now() - t0)}\n`);
+
+      const fittedParams = JSON.parse(readFileSync(outParamsPath, 'utf-8'));
+      let residualEnsemble;
+      if (outResidualPath && existsSync(outResidualPath)) {
+        residualEnsemble = readResidualEnsembleNpz(outResidualPath);
+      } else if (outResidualPath) {
+        process.stdout.write(`    [python] residual MLP skipped by trainer (too few trials)\n`);
+      }
+      return {
+        params: fittedParams,
+        residualEnsemble,
+        residualReferenceDt: req.sampleDt,
+      };
+    };
+  }
+
+  // Seed the pipeline from a previously-shipped model so we never
+  // regress. By default the trainer auto-loads `--out` if it exists,
+  // so re-running overnight on a freshly-trained model refines it.
+  // Use --init-from=PATH to seed from a different file, or
+  // --no-init-from-out to start from DEFAULT_LEARNED_PARAMS_V2.
+  let initialParams: import('kinocat/agent').LearnedVehicleParamsV2 | undefined;
+  let initialResidualEnsemble: import('kinocat/agent').MLP[] | undefined;
+  let initialResidualReferenceDt: number | undefined;
+  // Explicit opt-in: --init-from=PATH (the known-good model), or
+  // --init-from-out to use whatever's currently at --out. Default is
+  // no init (start from DEFAULT_LEARNED_PARAMS_V2 like the JS path),
+  // to avoid the circular failure mode where a bad training run
+  // poisons the next run's init.
+  const initFromArg = values['init-from']
+    ? String(values['init-from'])
+    : (values['init-from-out'] && existsSync(outPath) ? outPath : undefined);
+  if (initFromArg) {
+    try {
+      const initPayload = JSON.parse(readFileSync(initFromArg, 'utf-8'));
+      const initModel = modelFromJson(initPayload);
+      initialParams = initModel.params;
+      if (initModel.residualEnsemble?.length) {
+        initialResidualEnsemble = initModel.residualEnsemble;
+        initialResidualReferenceDt = initModel.residualReferenceDt;
+      }
+      process.stdout.write(
+        `  · init: seeded from ${initFromArg}` +
+        ` (params + ${initialResidualEnsemble?.length ?? 0}-MLP ensemble)\n`,
+      );
+    } catch (err) {
+      process.stdout.write(`  · init: failed to load ${initFromArg} (${err}); starting from DEFAULT\n`);
+    }
+  }
+
   const result = await runManeuverTraining({
     rounds,
     trialsPerRound,
@@ -239,6 +435,12 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
     minedTrials: minedTrials.length > 0 ? (minedTrials as never) : undefined,
     bundle,
     trialCache: cacheDir ? buildTrialCache({ cacheDir, seed, trialsPerRound, trialTicks, sampleEveryNTicks, bundle }) : undefined,
+    pythonFit: pythonFitHook,
+    initialParams,
+    initialResidualEnsemble,
+    initialResidualReferenceDt,
+    // Node runs without a UI to keep responsive — drop the per-iter setTimeout(0).
+    cooperativeYield: () => {},
     onEvent: (e: TrainingEvent) => {
       switch (e.type) {
         case 'round-start':
@@ -283,7 +485,15 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
         }
         case 'round-end': {
           const now = Date.now();
-          process.stdout.write(`    round ${e.round + 1} done — store=${e.trialsAfter} trials, ${fmtMs(now - lastRoundT)}\n`);
+          const roundMs = now - lastRoundT;
+          const roundsDone = e.round + 1;
+          const avgMs = (now - t0) / roundsDone;
+          const remaining = rounds - roundsDone;
+          const etaMs = avgMs * remaining;
+          process.stdout.write(
+            `    round ${roundsDone}/${rounds} done — store=${e.trialsAfter} trials, ${fmtMs(roundMs)}` +
+            ` (avg ${fmtMs(avgMs)}/round, eta ${fmtMs(etaMs)})\n`,
+          );
           lastRoundT = now;
           break;
         }

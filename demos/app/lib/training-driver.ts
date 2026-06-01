@@ -8,7 +8,7 @@
 // pieces together for the /raceprimitives demo.
 
 import type { WheeledCarControls } from 'kinocat/agent';
-import type { CarKinematicState, LearnableVehicleConfig, LearnedVehicleParamsV2 } from 'kinocat/agent';
+import type { CarKinematicState, LearnableVehicleConfig, LearnedVehicleParamsV2, MLP } from 'kinocat/agent';
 import {
   DEFAULT_LEARNED_PARAMS_V2,
   parametricForwardV2,
@@ -608,6 +608,7 @@ export class CarV2TrainingPipeline
   private readonly seed: number;
   private readonly onParametricProgress?: (round: number, e: FitProgressEvent) => void;
   private readonly onResidualProgress?: (round: number, e: FitProgressEvent) => void;
+  private cooperativeYieldFn: () => Promise<void> | void = yieldToMainThread;
 
   private model: LearnedVehicleModel;
   private lastDiag: ModelDiagnostics = { openLoopDivergence: [], perStateRms: [], coverage: [], baselines: {} };
@@ -699,6 +700,25 @@ export class CarV2TrainingPipeline
     return this.model;
   }
 
+  /** Replace the pipeline's model with an externally-fitted one (used by
+   *  the Python JAX trainer to override the JS Nelder-Mead result). */
+  /** Override the cooperative yield hook (used by CLI training to skip
+   *  `setTimeout(0)` latency that's pure overhead off the browser main thread). */
+  setCooperativeYield(fn: () => Promise<void> | void): void {
+    this.cooperativeYieldFn = fn;
+  }
+
+  overrideModel(next: Partial<Pick<LearnedVehicleModel,
+    'params' | 'residualEnsemble' | 'residualReferenceDt' | 'oodStdThreshold'>>): void {
+    this.model = {
+      ...this.model,
+      ...(next.params ? { params: next.params } : {}),
+      ...(next.residualEnsemble ? { residualEnsemble: next.residualEnsemble } : {}),
+      ...(next.residualReferenceDt !== undefined ? { residualReferenceDt: next.residualReferenceDt } : {}),
+      ...(next.oodStdThreshold ? { oodStdThreshold: next.oodStdThreshold } : {}),
+    };
+  }
+
   dispose(): void {
     this.harness.dispose();
   }
@@ -777,7 +797,7 @@ export class CarV2TrainingPipeline
       // iterations and once every ~24 trials inside each loss eval. A
       // single loss eval scans every trial × every sample × substeps, so
       // mid-eval yielding is what actually keeps the page from freezing.
-      cooperativeYield: yieldToMainThread,
+      cooperativeYield: this.cooperativeYieldFn as () => Promise<void>,
       yieldEveryNIter: 1,
       yieldEveryNTrials: 24,
     });
@@ -840,7 +860,7 @@ export class CarV2TrainingPipeline
           onProgress?.(ev);
           this.onResidualProgress?.(ctx.round, ev);
         },
-        cooperativeYield: yieldToMainThread,
+        cooperativeYield: this.cooperativeYieldFn as () => Promise<void>,
         yieldEveryNEpochs: 1,
         yieldEveryNBatches: 8,
       });
@@ -1211,6 +1231,44 @@ export interface ManeuverTrainingOptions {
     tryRead(round: number): Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[] | null;
     write(round: number, trials: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[]): void;
   };
+  /** When set, the JS Nelder-Mead `fitParametric` + SGD `fitResidual`
+   *  calls are replaced by this hook. Used by `train.ts --trainer=python`
+   *  to spawn a JAX-based trainer (LM + Adam) per round. The hook gets
+   *  the current params and all trials; returns the next params and,
+   *  on the final round, an optional residual MLP ensemble. */
+  pythonFit?: (req: PythonFitRequest) => Promise<PythonFitResult>;
+  /** Seed the pipeline with these params before round 0 instead of the
+   *  factory `DEFAULT_LEARNED_PARAMS_V2`. Used by `train.ts` to start
+   *  from the previously-shipped `v2-default.json` so the trainer's
+   *  worst case is "ship the model we started with." */
+  initialParams?: LearnedVehicleParamsV2;
+  /** Same idea for the residual MLP ensemble — preserve it from a
+   *  previous training run rather than starting empty. Cheap insurance
+   *  when the JAX trainer's --min-residual-trials gate or val-set
+   *  guard drops the new MLP. */
+  initialResidualEnsemble?: MLP[];
+  initialResidualReferenceDt?: number;
+  /** When running outside the browser (`pnpm run train`), cooperative
+   *  yields between fit iterations are pure overhead — `setTimeout(0)`
+   *  on the Node event loop adds ~1ms × ~N iterations of latency per
+   *  round. Pass a no-op here to remove the cost. Defaults to the
+   *  browser-friendly `yieldToMainThread`. */
+  cooperativeYield?: () => Promise<void> | void;
+}
+
+export interface PythonFitRequest {
+  round: number;
+  isFinalRound: boolean;
+  currentParams: LearnedVehicleParamsV2;
+  trials: Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>[];
+  config: LearnableVehicleConfig;
+  sampleDt: number;
+}
+
+export interface PythonFitResult {
+  params: LearnedVehicleParamsV2;
+  residualEnsemble?: MLP[];
+  residualReferenceDt?: number;
 }
 
 const DEFAULT_SPEED_SCHEDULE = [0, 4, 8, 12, 16, 20, 24, 28];
@@ -1238,6 +1296,16 @@ export async function runManeuverTraining(
     rounds, trialsPerActiveRound: trialsPerRound, trialTicks: ticks,
     sampleEveryNTicks: sampleEveryN, seed, vehicleOptions: veh,
   });
+  if (opts.cooperativeYield) pipeline.setCooperativeYield(opts.cooperativeYield);
+  if (opts.initialParams || opts.initialResidualEnsemble) {
+    pipeline.overrideModel({
+      ...(opts.initialParams ? { params: opts.initialParams } : {}),
+      ...(opts.initialResidualEnsemble ? {
+        residualEnsemble: opts.initialResidualEnsemble,
+        residualReferenceDt: opts.initialResidualReferenceDt,
+      } : {}),
+    });
+  }
   // Replace cell-based trial sourcing with maneuver-based on every round.
   // (Round 0 in the default pipeline uses the seed grid; rounds 1+ use
   // active exploration. We replace BOTH with fresh maneuver bundles so
@@ -1343,22 +1411,47 @@ export async function runManeuverTraining(
       });
     }
     const ctx = { round, store };
-    opts.onEvent?.({ type: 'phase', round, phase: 'parametric' });
-    const paramMax = pipeline.parametricMaxIter(round);
-    const params = await pipeline.fitParametric(ctx, (event) =>
-      opts.onEvent?.({
-        type: 'fit-progress', round, phase: 'parametric', event,
-        iterIndex: event.iter, iterTotal: paramMax,
-      }),
-    );
-    opts.onEvent?.({ type: 'phase', round, phase: 'residual' });
-    const resEpochs = pipeline.residualEpochs(round);
-    await pipeline.fitResidual(ctx, params, (event) =>
-      opts.onEvent?.({
-        type: 'fit-progress', round, phase: 'residual', event,
-        iterIndex: event.iter, iterTotal: resEpochs,
-      }),
-    );
+    const isFinalRound = round === rounds - 1;
+    let params: LearnedVehicleParamsV2;
+    if (opts.pythonFit) {
+      // External JAX trainer path. Bypasses Nelder-Mead + SGD; the hook
+      // returns the fitted params and (on the final round) the residual
+      // ensemble in one shot. `evaluate()` below still measures these.
+      opts.onEvent?.({ type: 'phase', round, phase: 'parametric' });
+      const fit = await opts.pythonFit({
+        round, isFinalRound,
+        currentParams: pipeline.currentLearnedModel().params,
+        trials: [...store.all()],
+        config: pipeline.config,
+        sampleDt: pipeline.sampleDt,
+      });
+      params = fit.params;
+      pipeline.overrideModel({
+        params: fit.params,
+        ...(fit.residualEnsemble ? {
+          residualEnsemble: fit.residualEnsemble,
+          residualReferenceDt: fit.residualReferenceDt ?? pipeline.sampleDt,
+        } : {}),
+      });
+      opts.onEvent?.({ type: 'phase', round, phase: 'residual' });
+    } else {
+      opts.onEvent?.({ type: 'phase', round, phase: 'parametric' });
+      const paramMax = pipeline.parametricMaxIter(round);
+      params = await pipeline.fitParametric(ctx, (event) =>
+        opts.onEvent?.({
+          type: 'fit-progress', round, phase: 'parametric', event,
+          iterIndex: event.iter, iterTotal: paramMax,
+        }),
+      );
+      opts.onEvent?.({ type: 'phase', round, phase: 'residual' });
+      const resEpochs = pipeline.residualEpochs(round);
+      await pipeline.fitResidual(ctx, params, (event) =>
+        opts.onEvent?.({
+          type: 'fit-progress', round, phase: 'residual', event,
+          iterIndex: event.iter, iterTotal: resEpochs,
+        }),
+      );
+    }
     await yieldToMainThread();
     opts.onEvent?.({ type: 'phase', round, phase: 'evaluating' });
     const trained = { params, forwardSim: learnedForwardSimV2(pipeline.currentLearnedModel()) };
