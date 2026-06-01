@@ -127,6 +127,13 @@ export default function Parking() {
     let goalMesh: THREE.Mesh | null = null;
     let raceScenario: RaceScenario | null = null;
     let cancelled = false;
+    // Monotonic token guarding the async scenario build. `buildScenario` awaits
+    // `createRaceScenario`, so two builds can be in flight at once (mount fires
+    // the initial build and a fast scenario switch fires another). Each build
+    // captures the token it started with; when it resumes after the await it
+    // bails if a newer build has superseded it — otherwise the stale build's
+    // car mesh / runner leak into the scene as a static "ghost" ego car.
+    let buildToken = 0;
 
     // Footprint-overlay group: the polygons the PLANNER actually reasons about
     // — the ego's collision footprint (so you can see it matches the car mesh)
@@ -239,6 +246,7 @@ export default function Parking() {
     }
 
     async function buildScenario(id: ParkingScenarioId) {
+      const myToken = ++buildToken;
       clearScenarioMeshes();
       if (raceScenario) {
         raceScenario.dispose();
@@ -256,7 +264,14 @@ export default function Parking() {
       // Canonical parking options shared with the CLI bench + Vitest tests
       // (incl. zero teleportation — no stall/off-track rescue masking a stuck
       // maneuver). The page is a thin view over the exact same config.
-      raceScenario = await createRaceScenario(parkingScenarioOptions(id, [parkingEntry('ego')]));
+      const instance = await createRaceScenario(parkingScenarioOptions(id, [parkingEntry('ego')]));
+      // A newer build (or unmount) superseded us while we awaited — drop this
+      // runner instead of leaking it (and its car mesh) into the scene.
+      if (cancelled || myToken !== buildToken) {
+        instance.dispose();
+        return;
+      }
+      raceScenario = instance;
       // Car mesh attached to the chassis from the scenario.
       const handle = raceScenario.getCarHandle('ego');
       if (handle) {
@@ -265,8 +280,6 @@ export default function Parking() {
       }
       setStatus(`scenario: ${PARKING_LABELS[id]}`);
     }
-
-    void buildScenario(scenarioId);
 
     function refreshPathLine(plan: ReadonlyArray<{ x: number; z: number }> | null) {
       if (pathLine) {
