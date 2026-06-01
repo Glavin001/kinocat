@@ -491,10 +491,19 @@ def main():
                     help="nm: Nelder-Mead on the piecewise (runtime-identical) "
                          "loss. lm: legacy Levenberg-Marquardt on the smooth "
                          "proxy (kept as fallback).")
-    # NM iters: scipy adaptive NM in 16D needs ~1000-3000 evals to converge.
-    # LM (legacy) caps at 50 because it uses gradients.
-    ap.add_argument("--max-iter", type=int, default=2000)
+    # NM iter cap. JS uses 120-200 iters per round and gets the bulk of
+    # the improvement in the first ~100 iters. Empirically (sandbox
+    # overnight bench), running scipy NM to "convergence" (~1500-2000
+    # iters) buys <1% additional data-loss improvement per round in
+    # exchange for 5-10× wall time. 250 matches JS's effective iter
+    # budget per round.
+    ap.add_argument("--max-iter", type=int, default=250)
     ap.add_argument("--tol", type=float, default=1e-6)
+    # Early-stop NM when relative improvement over a window is below
+    # this threshold (in addition to scipy's xatol/fatol). Default
+    # matches "JS-like" behavior of accepting modest progress.
+    ap.add_argument("--early-stop-rel-impr", type=float, default=1e-4)
+    ap.add_argument("--early-stop-window", type=int, default=60)
     # Matches REG_SCALES strength in training-driver.ts fitParametric.
     ap.add_argument("--reg-strength", type=float, default=0.05)
     # Matches JS training-driver.ts:781 (trajectoryHorizon=10) so the
