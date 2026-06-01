@@ -21,7 +21,7 @@ import {
 } from '../app/lib/training-driver';
 import { writeTrialsNpz } from './lib/trial-npz';
 import { readResidualEnsembleNpz } from './lib/residual-npz';
-import { modelToJson } from '../app/lib/v2-model-file';
+import { modelToJson, modelFromJson } from '../app/lib/v2-model-file';
 import {
   computeCacheKey,
   tryReadRoundCache,
@@ -132,6 +132,8 @@ async function main(): Promise<void> {
       'ensemble-size': { type: 'string', default: '3' },
       epochs: { type: 'string', default: '200' },
       'no-mlp': { type: 'boolean', default: false },
+      'init-from': { type: 'string' },                  // path to a known-good v2-default.json
+      'init-from-out': { type: 'boolean', default: false },  // also accept --out as init (only set this if you trust it)
       docker: { type: 'boolean', default: false },
       'docker-image': { type: 'string', default: 'kinocat-jax-trainer:latest' },
       help: { type: 'boolean', short: 'h' },
@@ -145,6 +147,16 @@ async function main(): Promise<void> {
                        [--trainer=js|python]  [--python=python3]  [--docker]
                        [--max-iter=N] [--mlp-shape=64,64] [--ensemble-size=3] [--epochs=200]
                        [--no-mlp]
+                       [--init-from=PATH] [--init-from-out]
+
+Init / no-regress safety:
+  --init-from=PATH    Seed the pipeline from a known-good v2 model file
+                      before round 0. Combined with the LM no-regress
+                      gate (worst case: keep init params) and the residual
+                      MLP val-gate (worst case: drop the MLP), this means
+                      the shipped model is never worse than --init-from.
+  --init-from-out     Same, but uses --out's existing file as init. Only
+                      enable this when the existing file is known-good.
 
 Trainer modes:
   js (default)        legacy Nelder-Mead + SGD path
@@ -379,6 +391,40 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
     };
   }
 
+  // Seed the pipeline from a previously-shipped model so we never
+  // regress. By default the trainer auto-loads `--out` if it exists,
+  // so re-running overnight on a freshly-trained model refines it.
+  // Use --init-from=PATH to seed from a different file, or
+  // --no-init-from-out to start from DEFAULT_LEARNED_PARAMS_V2.
+  let initialParams: import('kinocat/agent').LearnedVehicleParamsV2 | undefined;
+  let initialResidualEnsemble: import('kinocat/agent').MLP[] | undefined;
+  let initialResidualReferenceDt: number | undefined;
+  // Explicit opt-in: --init-from=PATH (the known-good model), or
+  // --init-from-out to use whatever's currently at --out. Default is
+  // no init (start from DEFAULT_LEARNED_PARAMS_V2 like the JS path),
+  // to avoid the circular failure mode where a bad training run
+  // poisons the next run's init.
+  const initFromArg = values['init-from']
+    ? String(values['init-from'])
+    : (values['init-from-out'] && existsSync(outPath) ? outPath : undefined);
+  if (initFromArg) {
+    try {
+      const initPayload = JSON.parse(readFileSync(initFromArg, 'utf-8'));
+      const initModel = modelFromJson(initPayload);
+      initialParams = initModel.params;
+      if (initModel.residualEnsemble?.length) {
+        initialResidualEnsemble = initModel.residualEnsemble;
+        initialResidualReferenceDt = initModel.residualReferenceDt;
+      }
+      process.stdout.write(
+        `  · init: seeded from ${initFromArg}` +
+        ` (params + ${initialResidualEnsemble?.length ?? 0}-MLP ensemble)\n`,
+      );
+    } catch (err) {
+      process.stdout.write(`  · init: failed to load ${initFromArg} (${err}); starting from DEFAULT\n`);
+    }
+  }
+
   const result = await runManeuverTraining({
     rounds,
     trialsPerRound,
@@ -390,6 +436,9 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
     bundle,
     trialCache: cacheDir ? buildTrialCache({ cacheDir, seed, trialsPerRound, trialTicks, sampleEveryNTicks, bundle }) : undefined,
     pythonFit: pythonFitHook,
+    initialParams,
+    initialResidualEnsemble,
+    initialResidualReferenceDt,
     // Node runs without a UI to keep responsive — drop the per-iter setTimeout(0).
     cooperativeYield: () => {},
     onEvent: (e: TrainingEvent) => {

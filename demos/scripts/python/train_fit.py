@@ -85,7 +85,12 @@ def wrap_residual(a: jnp.ndarray) -> jnp.ndarray:
 def build_loss(trials, trajectory_horizon: int, reg_strength: float, prior_vec: jnp.ndarray):
     """Build the residual function the LM optimizer minimizes.
 
-    Returns a function `residual(params) -> jnp.ndarray (flat residual vector)`.
+    Returns `(residual_fn, data_residual_fn)`:
+      - `residual_fn(params)`   : data residual + sqrt-reg pull toward prior,
+                                  concatenated. This is what LM optimizes.
+      - `data_residual_fn(params)`: data residual only, used by the safety
+                                  gate to compare init vs fitted on the
+                                  underlying trial loss (no reg bias).
     """
     dt = trials.dt
     sample_every = trials.sample_every
@@ -93,24 +98,15 @@ def build_loss(trials, trajectory_horizon: int, reg_strength: float, prior_vec: 
     init_states = jnp.asarray(trials.init_states)
     controls = jnp.asarray(trials.controls_trace)
     samples = jnp.asarray(trials.samples)
-    # `trials.config` is now (N, 13); the parametric forward needs only
-    # (chassisMass, wheelBase, frictionSlip).
     configs = jnp.asarray(trials.config)[:, jnp.asarray(PARAMETRIC_CONFIG_INDICES)]
 
     @jax.jit
-    def residual_fn(params_vec):
-        # vmap rollout across all trials. Trials are stored as
-        # [initial, sample1, sample2, ...] (S+1 entries); the rollout
-        # produces S predictions aligned with samples[1:].
+    def data_residual_fn(params_vec):
         def per_trial(init_s, ctrls, cfg, gt_samples_full):
-            gt_after_init = gt_samples_full[1:]   # (S, 7)
+            gt_after_init = gt_samples_full[1:]
             pred = rollout_trial(
-                params=params_vec,
-                config=cfg,
-                init_state=init_s,
-                controls_trace=ctrls,
-                dt=dt,
-                sample_every=sample_every,
+                params=params_vec, config=cfg, init_state=init_s,
+                controls_trace=ctrls, dt=dt, sample_every=sample_every,
                 reseat_horizon=trajectory_horizon,
                 ground_truth_samples=gt_after_init,
             )
@@ -121,12 +117,15 @@ def build_loss(trials, trajectory_horizon: int, reg_strength: float, prior_vec: 
             return diff * jnp.sqrt(STATE_COMPONENT_WEIGHTS)
 
         all_res = jax.vmap(per_trial)(init_states, controls, configs, samples)
-        flat = all_res.reshape(-1)
-        # L2 regularization toward prior (encoded as residual too).
-        reg = jnp.sqrt(reg_strength) * (params_vec - prior_vec) / jnp.maximum(jnp.abs(prior_vec), 1e-3)
-        return jnp.concatenate([flat, reg])
+        return all_res.reshape(-1)
 
-    return residual_fn
+    @jax.jit
+    def residual_fn(params_vec):
+        data = data_residual_fn(params_vec)
+        reg = jnp.sqrt(reg_strength) * (params_vec - prior_vec) / jnp.maximum(jnp.abs(prior_vec), 1e-3)
+        return jnp.concatenate([data, reg])
+
+    return residual_fn, data_residual_fn
 
 
 def fit_parametric_lm(
@@ -144,7 +143,7 @@ def fit_parametric_lm(
     Returns the fitted 16-vector (clamped to bounds).
     """
     prior_vec = jnp.asarray(init_params)
-    residual_fn = build_loss(trials, trajectory_horizon, reg_strength, prior_vec)
+    residual_fn, data_residual_fn = build_loss(trials, trajectory_horizon, reg_strength, prior_vec)
 
     # LM in jaxopt doesn't accept hard bounds — apply a soft sigmoid mapping.
     lo = PARAM_LO
@@ -183,7 +182,26 @@ def fit_parametric_lm(
     elapsed = time.time() - t0
     per_iter = elapsed / max(1, iters)
     print(f"[lm] done in {elapsed:.1f}s ({iters} iter, {per_iter*1000:.0f} ms/iter, gradNorm={float(sol.state.gradient.dot(sol.state.gradient))**0.5:.2e})", file=sys.stderr, flush=True)
-    return np.asarray(fitted)
+
+    # Safety gate: reject the LM fit if it doesn't improve data loss
+    # vs the init. This is the "no worse than init" guarantee — if
+    # the LM pinned params to bounds and ended up worse than where it
+    # started, we discard the result. Combined with initializing from
+    # the previously-shipped model in train.ts, this means the worst
+    # case is shipping the same model we started from.
+    init_data = data_residual_fn(prior_vec)
+    fit_data = data_residual_fn(fitted)
+    init_loss = float(jnp.sum(init_data * init_data))
+    fit_loss = float(jnp.sum(fit_data * fit_data))
+    rel = (fit_loss - init_loss) / max(abs(init_loss), 1e-9)
+    if fit_loss < init_loss:
+        print(f"[lm] accepted — data loss {init_loss:.3f} -> {fit_loss:.3f} ({rel*100:+.2f}%)", file=sys.stderr, flush=True)
+        return np.asarray(fitted)
+    print(
+        f"[lm] REJECTED — fitted data loss {fit_loss:.3f} >= init {init_loss:.3f}; "
+        f"keeping init params (no-regress guard)", file=sys.stderr, flush=True,
+    )
+    return np.asarray(init_params)
 
 
 def build_mlp_dataset(trials, parametric_params: np.ndarray):

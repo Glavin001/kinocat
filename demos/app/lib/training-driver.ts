@@ -1237,6 +1237,17 @@ export interface ManeuverTrainingOptions {
    *  the current params and all trials; returns the next params and,
    *  on the final round, an optional residual MLP ensemble. */
   pythonFit?: (req: PythonFitRequest) => Promise<PythonFitResult>;
+  /** Seed the pipeline with these params before round 0 instead of the
+   *  factory `DEFAULT_LEARNED_PARAMS_V2`. Used by `train.ts` to start
+   *  from the previously-shipped `v2-default.json` so the trainer's
+   *  worst case is "ship the model we started with." */
+  initialParams?: LearnedVehicleParamsV2;
+  /** Same idea for the residual MLP ensemble — preserve it from a
+   *  previous training run rather than starting empty. Cheap insurance
+   *  when the JAX trainer's --min-residual-trials gate or val-set
+   *  guard drops the new MLP. */
+  initialResidualEnsemble?: MLP[];
+  initialResidualReferenceDt?: number;
   /** When running outside the browser (`pnpm run train`), cooperative
    *  yields between fit iterations are pure overhead — `setTimeout(0)`
    *  on the Node event loop adds ~1ms × ~N iterations of latency per
@@ -1286,6 +1297,15 @@ export async function runManeuverTraining(
     sampleEveryNTicks: sampleEveryN, seed, vehicleOptions: veh,
   });
   if (opts.cooperativeYield) pipeline.setCooperativeYield(opts.cooperativeYield);
+  if (opts.initialParams || opts.initialResidualEnsemble) {
+    pipeline.overrideModel({
+      ...(opts.initialParams ? { params: opts.initialParams } : {}),
+      ...(opts.initialResidualEnsemble ? {
+        residualEnsemble: opts.initialResidualEnsemble,
+        residualReferenceDt: opts.initialResidualReferenceDt,
+      } : {}),
+    });
+  }
   // Replace cell-based trial sourcing with maneuver-based on every round.
   // (Round 0 in the default pipeline uses the seed grid; rounds 1+ use
   // active exploration. We replace BOTH with fresh maneuver bundles so
