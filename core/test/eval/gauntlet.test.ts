@@ -10,7 +10,8 @@ import type { DynamicLimits } from '../../src/eval';
 import { purePursuit } from '../../src/execute/pure-pursuit';
 import type { PurePursuitConfig } from '../../src/execute/types';
 import { defaultVehicleAgent, kinematicForwardSim } from '../../src/agent/vehicle';
-import type { CarKinematicState, Pt } from '../../src/agent/types';
+import type { CarKinematicState } from '../../src/agent/types';
+import type { Pt } from '../../src/internal/geom';
 
 const agent = defaultVehicleAgent();
 const footprint = agent.footprint as Pt[];
