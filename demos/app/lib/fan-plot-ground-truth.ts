@@ -243,8 +243,10 @@ export function computeActionComparison(opts: {
     };
     const pred = hasEnsemble
       ? predictWithUncertainty(opts.model, state, full.controls, dt)
-      : { std: [0, 0, 0, 0, 0, 0] };
-    const gate = pred.std.some((s, i) => s > (OOD_STD_THRESHOLD[i] ?? Infinity));
+      : { std: [0, 0, 0, 0, 0, 0], ood: false };
+    // Use the model's own combined gate decision (coverage + variance) when
+    // available; fall back to the variance-only check for legacy callers.
+    const gate = pred.ood ?? pred.std.some((s, i) => s > (OOD_STD_THRESHOLD[i] ?? Infinity));
     const residualActive = Math.hypot(full.end.dx - para.end.dx, full.end.dz - para.end.dz) > 1e-4;
     actions.push({
       index: g.index,

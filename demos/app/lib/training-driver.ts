@@ -18,6 +18,7 @@ import {
   buildParametricOnlyModel,
   type LearnedVehicleModel,
   buildMLPInput,
+  computeInputSupport,
   MLP_INPUT_DIM,
   MLP_OUTPUT_DIM,
   learnedForwardSimV2,
@@ -323,6 +324,29 @@ function stateDeltaForFit(pred: CarKinematicState, act: CarKinematicState): numb
 
 function controlsToVec(c: WheeledCarControls): number[] {
   return [c.steer, c.driveForce, c.brakeForce];
+}
+
+/** Build the cloud of MLP inputs the residual saw, pairing each recorded
+ *  sample state with the control active at that sample's tick. Feeds
+ *  `computeInputSupport` for the coverage OOD gate. */
+function buildSupportInputs(
+  trials: ReadonlyArray<Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>>,
+  defaultConfig: LearnableVehicleConfig,
+): number[][] {
+  const inputs: number[][] = [];
+  for (const t of trials) {
+    const cfg = t.config ?? defaultConfig;
+    for (const sample of t.samples) {
+      const tick = Math.min(
+        t.controlsTrace.length - 1,
+        Math.max(0, Math.round(sample.t / t.dt)),
+      );
+      const c = t.controlsTrace[tick];
+      if (!c) continue;
+      inputs.push(buildMLPInput(sample.state, controlsToVec(c), cfg));
+    }
+  }
+  return inputs;
 }
 
 /** Build a coverage summary over the current store contents using the
@@ -776,11 +800,17 @@ export class CarV2TrainingPipeline
         yieldEveryNEpochs: 1,
         yieldEveryNBatches: 8,
       });
+      // Coverage gate: snapshot the distribution of MLP inputs the residual
+      // was just fit on, so inference can fall back to parametric for queries
+      // outside it (the confident-bias fix). Uses the same (state, control)
+      // pairing the fit consumed.
+      const supportInputs = buildSupportInputs(ctx.store.all(), this.config);
       this.model = {
         ...this.model,
         params,
         residualEnsemble: residualFit.ensemble,
         residualReferenceDt: this.sampleEveryN / 60,
+        inputSupport: computeInputSupport(supportInputs) ?? undefined,
       };
     } else {
       this.model = { ...this.model, params };

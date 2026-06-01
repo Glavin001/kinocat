@@ -256,7 +256,7 @@ async function main(): Promise<void> {
           controls,
           dt0,
         );
-        const gateFired = pred.std.some((sd, i) => sd > (OOD_STD_THRESHOLD[i] ?? Infinity));
+        const gateFired = pred.ood ?? pred.std.some((sd, i) => sd > (OOD_STD_THRESHOLD[i] ?? Infinity));
         const residualActive = posErr(full, para) > 1e-4;
 
         rows.push({

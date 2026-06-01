@@ -47,6 +47,7 @@ export type {
   LearnedVehicleParamsV2,
   LearnedVehicleModel,
   PredictionWithUncertainty,
+  InputSupport,
 } from './vehicle-model';
 export {
   DEFAULT_LEARNED_PARAMS_V2,
@@ -62,6 +63,9 @@ export {
   buildMLPInput,
   MLP_INPUT_DIM,
   MLP_OUTPUT_DIM,
+  DEFAULT_OOD_STD_THRESHOLD,
+  inputSupportDistance,
+  computeInputSupport,
 } from './vehicle-model';
 
 // MLP serialization (used by the demo's v2-model-persistence to round-trip

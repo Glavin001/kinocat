@@ -29,6 +29,7 @@ export function modelToJson(
     residualEnsembleJson,
     residualReferenceDt: model.residualReferenceDt ?? 0.1,
     oodStdThreshold: model.oodStdThreshold,
+    inputSupport: model.inputSupport,
     meta,
   };
 }
@@ -59,6 +60,7 @@ export function modelFromJson(payload: PersistedV2Model | { version?: number; [k
       residualEnsemble: p.residualEnsembleJson.map((j) => deserializeMLP(j)),
       residualReferenceDt: p.residualReferenceDt ?? 0.1,
       oodStdThreshold: p.oodStdThreshold,
+      inputSupport: p.inputSupport,
     };
   }
   return base;

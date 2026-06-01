@@ -15,6 +15,8 @@ import {
   buildMLPInput,
   MLP_INPUT_DIM,
   createMLP,
+  computeInputSupport,
+  inputSupportDistance,
   type MLP,
 } from 'kinocat/agent';
 import { DEFAULT_LEARNABLE_CONFIG } from 'kinocat/agent';
@@ -263,3 +265,116 @@ describe('learnedForwardSimV2 — OOD fallback', () => {
     expect(diff).toBeGreaterThan(0);
   });
 });
+
+describe('coverage OOD gate (inputSupport)', () => {
+  // Build a support cloud over a narrow forward-driving regime: speeds 6-10,
+  // gentle steer, modest throttle, NO reverse and NO sliding. Reverse /
+  // mid-slide queries are then genuinely out of support.
+  function trainingInputs(): number[][] {
+    const inputs: number[][] = [];
+    for (let speed = 6; speed <= 10; speed += 0.5) {
+      for (const steer of [-0.1, 0, 0.1]) {
+        for (const drive of [800, 1600, 2400]) {
+          const s: CarKinematicState = {
+            x: 0, z: 0, heading: 0, speed, yawRate: 0, lateralVelocity: 0, t: 0,
+          };
+          inputs.push(buildMLPInput(s, [steer, drive, 0], cfg));
+        }
+      }
+    }
+    return inputs;
+  }
+
+  it('computeInputSupport: in-distribution distance < threshold < far-OOD distance', () => {
+    const support = computeInputSupport(trainingInputs(), 0.99)!;
+    expect(support).not.toBeNull();
+    expect(support.mean).toHaveLength(MLP_INPUT_DIM);
+    // A point near the centre of the cloud (speed 8, straight, mid throttle).
+    const inDist = inputSupportDistance(
+      support,
+      buildMLPInput({ x: 0, z: 0, heading: 0, speed: 8, yawRate: 0, lateralVelocity: 0, t: 0 }, [0, 1600, 0], cfg),
+    );
+    // Reverse at speed -4 with full reverse force, mid-slide — far outside.
+    const oodDist = inputSupportDistance(
+      support,
+      buildMLPInput({ x: 0, z: 0, heading: 0, speed: -4, yawRate: 1.2, lateralVelocity: 3, t: 0 }, [0, -2000, 0], cfg),
+    );
+    expect(inDist).toBeLessThan(support.threshold);
+    expect(oodDist).toBeGreaterThan(support.threshold);
+  });
+
+  it('learnedForwardSimV2 falls back to parametric on an out-of-support query, even when the ensemble agrees', () => {
+    const para = buildParametricOnlyModel();
+    const model = {
+      ...para,
+      residualEnsemble: makeEnsemble(3),
+      residualReferenceDt: 1 / 60,
+      // Generous variance threshold: the variance gate would NOT fire here.
+      oodStdThreshold: [100, 100, 100, 100, 100, 100],
+      inputSupport: computeInputSupport(trainingInputs(), 0.99)!,
+    };
+    const fwd = learnedForwardSimV2(model);
+    const directParam = parametricForwardV2(para.params, para.config);
+    // Out-of-support: reverse + slide.
+    const sOod: CarKinematicState = {
+      x: 0, z: 0, heading: 0, speed: -4, yawRate: 1.2, lateralVelocity: 3, t: 0,
+    };
+    const ctrl = [0, -2000, 0];
+    const got = fwd(sOod, ctrl, 1 / 60);
+    const expected = directParam(sOod, ctrl, 1 / 60);
+    expect(got.speed).toBeCloseTo(expected.speed, 10);
+    expect(got.x).toBeCloseTo(expected.x, 10);
+    expect(got.heading).toBeCloseTo(expected.heading, 10);
+
+    // In-support: residual IS applied (output differs from pure parametric).
+    const sIn: CarKinematicState = {
+      x: 0, z: 0, heading: 0, speed: 8, yawRate: 0, lateralVelocity: 0, t: 0,
+    };
+    const inCtrl = [0, 1600, 0];
+    const gotIn = fwd(sIn, inCtrl, 1 / 60);
+    const baseIn = directParam(sIn, inCtrl, 1 / 60);
+    const diff = Math.abs(gotIn.speed - baseIn.speed) + Math.abs(gotIn.x - baseIn.x);
+    expect(diff).toBeGreaterThan(0);
+  });
+
+  it('predictWithUncertainty reports supportDistance and ood=true out of support', () => {
+    const para = buildParametricOnlyModel();
+    const model = {
+      ...para,
+      residualEnsemble: makeEnsemble(3),
+      residualReferenceDt: 1 / 60,
+      oodStdThreshold: [100, 100, 100, 100, 100, 100],
+      inputSupport: computeInputSupport(trainingInputs(), 0.99)!,
+    };
+    const outOfSupport = predictWithUncertainty(
+      model,
+      { x: 0, z: 0, heading: 0, speed: -4, yawRate: 1.2, lateralVelocity: 3, t: 0 },
+      [0, -2000, 0],
+      1 / 60,
+    );
+    expect(outOfSupport.ood).toBe(true);
+    expect(outOfSupport.supportDistance!).toBeGreaterThan(model.inputSupport.threshold);
+
+    const inSupport = predictWithUncertainty(
+      model,
+      { x: 0, z: 0, heading: 0, speed: 8, yawRate: 0, lateralVelocity: 0, t: 0 },
+      [0, 1600, 0],
+      1 / 60,
+    );
+    expect(inSupport.ood).toBe(false);
+    expect(inSupport.supportDistance!).toBeLessThan(model.inputSupport.threshold);
+  });
+
+  it('computeInputSupport returns null for an empty input set', () => {
+    expect(computeInputSupport([])).toBeNull();
+  });
+});
+
+// Deterministic small ensemble for the coverage tests (trained-ish: tiny
+// random weights, all members near-identical so the variance gate stays quiet
+// and we isolate the coverage gate's behaviour).
+function makeEnsemble(size: number): MLP[] {
+  return Array.from({ length: size }, (_, i) =>
+    createMLP({ inputDim: MLP_INPUT_DIM, hiddenDims: [16], outputDim: 6 }, i + 1),
+  );
+}

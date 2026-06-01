@@ -42,6 +42,11 @@ export interface PersistedV2Model {
    *  the corresponding threshold. Optional — sensible defaults applied
    *  by the loader. */
   oodStdThreshold?: number[];
+  /** Coverage gate: training-input distribution stats + threshold. The
+   *  primary OOD trigger (distance-to-training-support); inference falls back
+   *  to parametric for queries outside it. Optional — absent on legacy
+   *  models, which keep variance-only gating. */
+  inputSupport?: import('kinocat/agent').InputSupport;
   /** Headline diagnostic at save time, for the UI to show "trained on …". */
   meta: {
     trialsUsed: number;
@@ -116,6 +121,8 @@ function rebuildModel(payload: PersistedV2Model): LearnedVehicleModel {
       ...base,
       residualEnsemble: payload.residualEnsembleJson.map((j) => deserializeMLP(j) as never),
       residualReferenceDt: payload.residualReferenceDt ?? 0.1,
+      oodStdThreshold: payload.oodStdThreshold,
+      inputSupport: payload.inputSupport,
     };
   }
   return base;
@@ -195,6 +202,8 @@ function buildPayload(model: LearnedVehicleModel, meta: PersistedV2Model['meta']
     config: model.config,
     residualEnsembleJson: ensembleJson,
     residualReferenceDt: model.residualReferenceDt ?? 0.1,
+    oodStdThreshold: model.oodStdThreshold,
+    inputSupport: model.inputSupport,
     meta,
   };
 }
