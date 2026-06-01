@@ -42,6 +42,7 @@ import {
   parkingLibrary,
   parkingCourse,
   parkingScenarioOptions,
+  evaluateParked,
   type ParkingScenarioId,
   type ParkingScenario,
 } from '../lib/parking-scenarios';
@@ -126,6 +127,9 @@ export default function Parking() {
     let carMesh: ReturnType<typeof createCarMeshHelper> | null = null;
     let goalMesh: THREE.Mesh | null = null;
     let raceScenario: RaceScenario | null = null;
+    // Current scenario geometry — held so the frame loop can read `targetStall`
+    // for the shared `evaluateParked` "in-the-stall" check that drives the HUD.
+    let currentScenario: ParkingScenario | null = null;
     let cancelled = false;
 
     // Footprint-overlay group: the polygons the PLANNER actually reasons about
@@ -245,6 +249,7 @@ export default function Parking() {
         raceScenario = null;
       }
       const s = buildParkingScenario(id);
+      currentScenario = s;
       renderObstacles(s);
       buildFootprintOverlay(id);
       // Goal marker.
@@ -324,7 +329,27 @@ export default function Parking() {
           setHud(
             `v=${s.state.speed.toFixed(2)} m/s · goal=${goalDist.toFixed(2)} m · replans=${s.diagnostics.totalReplans} · plan-ms=${s.diagnostics.lastReplanMs.toFixed(0)}`,
           );
-          if (s.laps.length >= 1 && s.laps[0]) setStatus(`PARKED · ${s.laps[0].duration.toFixed(2)}s`);
+          // Honest PARKED status from the shared `evaluateParked` predicate:
+          // the car must actually sit inside the stall silhouette, squared up,
+          // and stopped — NOT merely be within arrive-radius of the goal point
+          // (which is all the old `laps.length >= 1` check tested). A car that
+          // arrives at the slot but comes to rest offset or angled reads NOT
+          // PARKED, exactly as it would earn a real-world ticket. The verdict is
+          // gated on lap completion (the car has reached the slot) so it doesn't
+          // flash at the at-rest spawn.
+          if (currentScenario) {
+            const ev = evaluateParked(s.state, currentScenario);
+            const cov = `${(ev.coverage * 100).toFixed(0)}% in stall`;
+            if (ev.parked) {
+              const lapT = s.laps[0] ? ` · ${s.laps[0].duration.toFixed(2)}s` : '';
+              setStatus(`PARKED ✓ · ${cov}${lapT}`);
+            } else if (s.laps.length >= 1) {
+              const hdgDeg = `${((ev.headingError * 180) / Math.PI).toFixed(0)}° off`;
+              setStatus(`NOT PARKED · ${cov} · ${hdgDeg}`);
+            } else {
+              setStatus(`parking… · goal=${goalDist.toFixed(2)} m · ${cov}`);
+            }
+          }
         }
       }
       controls.update();

@@ -37,6 +37,8 @@ import {
   parkingLibrary,
   parkingCourse,
   parkingScenarioOptions,
+  buildParkingScenario,
+  evaluateParked,
   type ParkingScenarioId,
 } from '../app/lib/parking-scenarios';
 import {
@@ -126,13 +128,6 @@ interface BenchResult {
   note: string;
 }
 
-function wrapPi(a: number): number {
-  let r = a;
-  while (r > Math.PI) r -= 2 * Math.PI;
-  while (r < -Math.PI) r += 2 * Math.PI;
-  return r;
-}
-
 /** Race scenario: lap the existing /raceprimitives course once.
  *  PASS criteria: complete 1 lap in ≤ 90 s sim, zero off-tracks. */
 const raceScenario: BenchScenario = {
@@ -203,19 +198,23 @@ function makeParkingScenario(
       const simTime = scenario.simTime();
       scenario.dispose();
       const dist = Math.hypot(status.state.x - goal.x, status.state.z - goal.z);
-      const headingErr = Math.abs(wrapPi(status.state.heading - goal.heading));
-      const stopped = Math.abs(status.state.speed) < 1.0;
-      const passed = dist <= posTolM && stopped && simTime < maxSim;
+      // Shared "in-the-stall" predicate — the SAME `evaluateParked` the web page
+      // and the Vitest tests use, so the bench can't drift to a looser,
+      // position-only bar. A car that stops offset or angled FAILS honestly.
+      const ev = evaluateParked(status.state, buildParkingScenario(id));
+      const passed = ev.parked && simTime < maxSim;
       return {
         scenario: `parking-${id}`,
         passed,
         simTime,
         terminalErrorM: dist,
-        terminalHeadingErr: headingErr,
+        terminalHeadingErr: ev.headingError,
         terminalSpeed: Math.abs(status.state.speed),
         offTrackEvents: status.offTrackEvents,
         totalReplans: status.diagnostics.totalReplans,
-        note: passed ? 'parked' : `off by ${dist.toFixed(2)}m, |v|=${status.state.speed.toFixed(2)}`,
+        note: passed
+          ? `parked (${(ev.coverage * 100).toFixed(0)}% in stall)`
+          : `${(ev.coverage * 100).toFixed(0)}% in stall, ${((ev.headingError * 180) / Math.PI).toFixed(0)}° off, |v|=${status.state.speed.toFixed(2)}`,
       };
     },
   };

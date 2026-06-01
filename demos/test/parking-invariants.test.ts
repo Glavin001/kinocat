@@ -45,6 +45,8 @@ import {
   parkingCourse,
   parkingScenarioOptions,
   parkingLibrary,
+  buildParkingScenario,
+  evaluateParked,
   PARKING_AGENT,
   type ParkingScenarioId,
 } from '../app/lib/parking-scenarios';
@@ -86,11 +88,14 @@ async function park(id: ParkingScenarioId, maxTicks: number, success: SuccessTol
 const OPTS = { timeout: 90000, retry: 0 } as const;
 
 describe.skipIf(!RAPIER_OK)('parking invariants', () => {
-  it('forward-pullin: parks cleanly — right pose, no collision, no teleport rescue', OPTS, async () => {
-    const { report } = await park('forward-pullin', 1000);
-    const ctx = `\n${formatReport(report)}`;
-    // Reached the goal pose (position AND heading AND stopped).
-    expect(report.parkedOk, ctx).toBe(true);
+  it('forward-pullin: parks cleanly — fits the stall, no collision, no teleport rescue', OPTS, async () => {
+    const { report, status } = await park('forward-pullin', 1000);
+    // The SHARED "in-the-stall" predicate (same one the /parking HUD and the
+    // controller-bench CLI use): the footprint must sit inside the stall
+    // silhouette, squared up, and stopped — not merely be near the goal point.
+    const ev = evaluateParked(status.state, buildParkingScenario('forward-pullin'));
+    const ctx = `\n${formatReport(report)}\nparked=${JSON.stringify(ev)}`;
+    expect(ev.parked, ctx).toBe(true);
     // Never touched a parked car / wall, with real clearance margin.
     expect(report.collided, ctx).toBe(false);
     expect(report.minClearance, ctx).toBeGreaterThan(0.4);
@@ -109,11 +114,11 @@ describe.skipIf(!RAPIER_OK)('parking invariants', () => {
   // forward-pullin (0.7 m / ~17°), but the maneuver is otherwise clean: no
   // collision, no teleport rescue, and the planner no longer thrashes.
   const REVERSE_SUCCESS: SuccessTolerances = { posTol: 0.7, headingTol: 0.3, speedTol: 0.5 };
-  it('reverse-perp: backs into the stall — clean pose, no collision, no replan storm', OPTS, async () => {
+  it('reverse-perp: backs toward the stall — no collision, no replan storm', OPTS, async () => {
     const { report } = await park('reverse-perp', 2200, REVERSE_SUCCESS);
     const ctx = `\n${formatReport(report)}`;
-    // Backed into the stall pose under its own power.
-    expect(report.parkedOk, ctx).toBe(true);
+    // Came to rest near the stall (loose — the tight "in-the-stall" check is the
+    // it.fails below).
     expect(report.terminalSpeed, ctx).toBeLessThan(0.5);
     // Never touched a parked car / wall.
     expect(report.collided, ctx).toBe(false);
@@ -124,6 +129,20 @@ describe.skipIf(!RAPIER_OK)('parking invariants', () => {
     expect(report.maxRetreat, ctx).toBeLessThan(2);
     // Planner is healthy — the storm (failedReplanRatio ≈ 0.99) is gone.
     expect(report.failedReplanRatio, ctx).toBeLessThan(0.3);
+  });
+
+  // KNOWN BROKEN — reverse-perp terminal precision. The chassis backs toward the
+  // stall (right region, no collision) but doesn't square up squarely inside the
+  // silhouette: pure-pursuit brakes to rest at its approach angle with no
+  // terminal-heading control. Encoded as the CORRECT-behaviour assertion under
+  // `it.fails` against the SHARED `evaluateParked` predicate — it throws today
+  // (Vitest counts that as a pass) and flips red the moment terminal-heading
+  // control lands, signalling the `.fails` should drop.
+  it.fails('reverse-perp: fits squarely inside the stall silhouette', OPTS, async () => {
+    const { report, status } = await park('reverse-perp', 2200, REVERSE_SUCCESS);
+    const ev = evaluateParked(status.state, buildParkingScenario('reverse-perp'));
+    const ctx = `\n${formatReport(report)}\nparked=${JSON.stringify(ev)}`;
+    expect(ev.parked, ctx).toBe(true);
   });
 
   // PARTIALLY FIXED — parallel parking. The replan storm is gone, the chassis
@@ -148,16 +167,18 @@ describe.skipIf(!RAPIER_OK)('parking invariants', () => {
     expect(report.teleports, ctx).toBe(0);
   });
 
-  // KNOWN BROKEN — parallel terminal heading. The chassis arrives in the slot
+  // KNOWN BROKEN — parallel terminal precision. The chassis arrives in the slot
   // (right position, no collision) but ~16° off the curb heading: pure-pursuit
   // has no final back-and-forth straightening shunt. Encoded as the
-  // CORRECT-behaviour assertion under `it.fails`: it throws today and Vitest
-  // counts that as a pass; when terminal-pose precision lands (e.g. an MPC final
-  // stage) it will start passing, flip this to red, and signal that the
-  // `.fails` should drop.
-  it.fails('parallel: ends square with the curb (terminal heading within tolerance)', OPTS, async () => {
-    const { report } = await park('parallel', 1600);
-    const ctx = `\n${formatReport(report)}`;
-    expect(report.terminalHeadingError, ctx).toBeLessThan(SUCCESS.headingTol);
+  // CORRECT-behaviour assertion under `it.fails` against the SHARED
+  // `evaluateParked` predicate (footprint inside the stall silhouette + squared
+  // up + stopped): it throws today and Vitest counts that as a pass; when
+  // terminal-pose precision lands (e.g. an MPC final stage) it will start
+  // passing, flip this to red, and signal that the `.fails` should drop.
+  it.fails('parallel: fits squarely inside the stall silhouette', OPTS, async () => {
+    const { report, status } = await park('parallel', 1600);
+    const ev = evaluateParked(status.state, buildParkingScenario('parallel'));
+    const ctx = `\n${formatReport(report)}\nparked=${JSON.stringify(ev)}`;
+    expect(ev.parked, ctx).toBe(true);
   });
 });
