@@ -6,11 +6,27 @@ Schema (versioned; bump TRIAL_NPZ_VERSION on incompatible changes):
     controls_trace   : float64 (N, T, 3)     — [steer, drive, brake] per physics tick
     samples          : float64 (N, S, 7)     — observed states at sample boundaries
     sample_times     : float64 (N, S)        — t at each sample
-    config           : float64 (N, 3)        — [chassisMass, wheelBase, frictionSlip]
+    config           : float64 (N, 13)       — full encodeConfigOneHot vector
     split            : int32   (N,)          — 0=train, 1=val, 2=test
     dt               : float64 ()            — physics tick (e.g. 1/60)
     sample_every     : int32 ()              — ticks per sample (== T / S)
     version          : int32 ()              — TRIAL_NPZ_VERSION
+
+config layout (13 dims, matches encodeConfigOneHot in
+vehicle-config.ts):
+    [0]  chassisMass
+    [1]  wheelBase
+    [2]  wheelTrack
+    [3]  wheelRadius
+    [4]  suspensionStiffness
+    [5]  frictionSlip
+    [6]  sideFrictionStiffness
+    [7]  maxDriveForce
+    [8]  maxBrakeForce
+    [9]  maxSteerAngle
+    [10] drivenWheels == 'rwd'
+    [11] drivenWheels == 'fwd'
+    [12] drivenWheels == 'awd'
 """
 
 from __future__ import annotations
@@ -19,7 +35,20 @@ from dataclasses import dataclass
 
 import numpy as np
 
-TRIAL_NPZ_VERSION = 1
+TRIAL_NPZ_VERSION = 2
+
+# Indices into the 13-dim config vector that the parametric forward uses
+# (chassisMass, wheelBase, frictionSlip).
+PARAMETRIC_CONFIG_INDICES = (0, 1, 5)
+
+# Per-dim normalisation scales for the config (matches
+# CONFIG_SCALES_ORDINAL in vehicle-config.ts; one-hot dims share the
+# trailing scale=2).
+CONFIG_SCALES = np.array([
+    1000.0, 2.0, 1.2, 0.5, 150.0,
+    3.0, 2.0, 8000.0, 4000.0, 1.2,
+    2.0, 2.0, 2.0,
+])
 
 
 @dataclass(frozen=True)

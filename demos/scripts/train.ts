@@ -6,7 +6,7 @@
 // `PersistedV2Model` payload the demos load on first visit) +
 // `demos/public/models/v2-default.manifest.json` (provenance sidecar).
 
-import { writeFileSync, mkdirSync, readFileSync, mkdtempSync } from 'node:fs';
+import { writeFileSync, mkdirSync, readFileSync, mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -366,8 +366,10 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
 
       const fittedParams = JSON.parse(readFileSync(outParamsPath, 'utf-8'));
       let residualEnsemble;
-      if (outResidualPath) {
+      if (outResidualPath && existsSync(outResidualPath)) {
         residualEnsemble = readResidualEnsembleNpz(outResidualPath);
+      } else if (outResidualPath) {
+        process.stdout.write(`    [python] residual MLP skipped by trainer (too few trials)\n`);
       }
       return {
         params: fittedParams,

@@ -36,7 +36,15 @@ from parametric import (  # noqa: E402
 from residual import (  # noqa: E402
     RESIDUAL_LOSS_WEIGHTS, ensemble_to_layer_arrays, train_ensemble,
 )
-from trial_io import load_trials, save_mlp_ensemble  # noqa: E402
+from trial_io import (  # noqa: E402
+    CONFIG_SCALES, PARAMETRIC_CONFIG_INDICES,
+    load_trials, save_mlp_ensemble,
+)
+
+# Normalisation scales used by buildMLPInput in vehicle-model.ts —
+# must stay in sync.
+STATE_SCALES_MLP = jnp.array([1.0, 1.0, 20.0, 4.0, 6.0])
+CONTROL_SCALES_MLP = jnp.array([1.0, 4000.0, 2000.0])
 
 # Loss weights — must match POS_LOSS_WEIGHT, HEADING_LOSS_WEIGHT,
 # SPEED_LOSS_WEIGHT in demos/app/lib/training-driver.ts.
@@ -85,7 +93,9 @@ def build_loss(trials, trajectory_horizon: int, reg_strength: float, prior_vec: 
     init_states = jnp.asarray(trials.init_states)
     controls = jnp.asarray(trials.controls_trace)
     samples = jnp.asarray(trials.samples)
-    configs = jnp.asarray(trials.config)
+    # `trials.config` is now (N, 13); the parametric forward needs only
+    # (chassisMass, wheelBase, frictionSlip).
+    configs = jnp.asarray(trials.config)[:, jnp.asarray(PARAMETRIC_CONFIG_INDICES)]
 
     @jax.jit
     def residual_fn(params_vec):
@@ -179,74 +189,73 @@ def fit_parametric_lm(
 def build_mlp_dataset(trials, parametric_params: np.ndarray):
     """Build (inputs, targets) pairs for residual training.
 
-    Input layout matches `buildMLPInput` (21-dim: 5 state-as-sin/cos + 3 controls +
-    13 config one-hot). For now we approximate with a simple layout — the
-    Node-side glue will rebuild the exact 21-dim featurisation from the
-    canonical `buildMLPInput` at residual-load time.
+    Input layout MATCHES `buildMLPInput` EXACTLY (21-dim):
+      [0..4]   state: [sin(h), cos(h), speed, yawRate, lateralVelocity]
+               divided by STATE_SCALES_MLP = [1, 1, 20, 4, 6]
+      [5..7]   controls: [steer, drive, brake]
+               divided by CONTROL_SCALES_MLP = [1, 4000, 2000]
+      [8..20]  config: full 13-dim encodeConfigOneHot vector
+               divided by CONFIG_SCALES
 
     Residual targets: (actual_next - parametric_predicted_next) for the 6
-    output dims `[x, z, heading, speed, yawRate, vy]`.
+    output dims [x, z, heading, speed, yawRate, vy]. `pred_samples[k]`
+    predicts `samples[k+1]`, so they align 1:1 with samples[:, 1:, :].
     """
-    # Roll one parametric step per sample boundary and compute the residual.
-    # This is the *open-loop residual at the sample horizon* — same target
-    # the JS `runResidualMLPFitAsync` uses.
     dt = trials.dt
     sample_every = trials.sample_every
     params_j = jnp.asarray(parametric_params)
     init_states = jnp.asarray(trials.init_states)
     controls = jnp.asarray(trials.controls_trace)
     samples = jnp.asarray(trials.samples)
-    configs = jnp.asarray(trials.config)
+    configs_full = jnp.asarray(trials.config)                  # (N, 13)
+    configs_param = configs_full[:, jnp.asarray(PARAMETRIC_CONFIG_INDICES)]  # (N, 3)
 
     def per_trial(init_s, ctrls, cfg, gt_samples):
-        # Roll out without reseating to get parametric predictions.
-        pred = rollout_trial(
+        return rollout_trial(
             params=params_j, config=cfg, init_state=init_s,
             controls_trace=ctrls, dt=dt, sample_every=sample_every,
             reseat_horizon=0, ground_truth_samples=None,
         )
-        return pred
 
-    pred_samples = jax.vmap(per_trial)(init_states, controls, configs, samples)
+    pred_samples = jax.vmap(per_trial)(init_states, controls, configs_param, samples)
 
-    # Inputs: rebuild a simple 16-dim featurisation — heading sin/cos,
-    # speed, yawRate, vy, controls, config. The Node side rebuilds the
-    # full 21-dim layout; for the Python trainer we use this reduced form
-    # because the residual MLP layout is fully defined by the saved
-    # weights anyway.
-    # Note: keeping featurisation explicit here lets us re-train with the
-    # exact training-driver buildMLPInput later if needed.
-    states = samples[:, :-1, :]   # (N, S-1, 7) — input is state BEFORE each transition
-    next_states = samples[:, 1:, :]  # (N, S-1, 7)
-    # Controls midpoint of each sample window:
-    # use control at the first physics tick of each window for simplicity.
-    ctrl_by_sample = controls[:, ::sample_every, :][:, :states.shape[1], :]
-    cfg_bcast = jnp.broadcast_to(configs[:, None, :], (configs.shape[0], states.shape[1], 3))
+    # Input state is the sample BEFORE each transition (including the
+    # initial state). Target is the residual at the NEXT sample.
+    states = samples[:, :-1, :]                # (N, S, 7) where S = n_samples - 1
+    next_states = samples[:, 1:, :]            # (N, S, 7), aligns with pred_samples
+    S_eff = states.shape[1]
 
-    cosH = jnp.cos(states[:, :, 2:3])
+    # Controls at the start of each sample window.
+    ctrl_by_sample = controls[:, ::sample_every, :][:, :S_eff, :]
+
+    # Broadcast the 13-dim config across (N, S, 13).
+    cfg_bcast = jnp.broadcast_to(configs_full[:, None, :], (configs_full.shape[0], S_eff, 13))
+
+    # Build inputs in the canonical buildMLPInput order.
     sinH = jnp.sin(states[:, :, 2:3])
-    # 16-dim: [cosH, sinH, speed, yawRate, vy, steer, drive/4000, brake/2000, mass/1500, wheelBase/1.5, friction]
-    feats = jnp.concatenate([
-        cosH, sinH,
-        states[:, :, 3:4], states[:, :, 4:5], states[:, :, 5:6],
-        ctrl_by_sample[:, :, 0:1], ctrl_by_sample[:, :, 1:2] / 4000.0, ctrl_by_sample[:, :, 2:3] / 2000.0,
-        cfg_bcast[:, :, 0:1] / 1500.0, cfg_bcast[:, :, 1:2] / 1.5, cfg_bcast[:, :, 2:3],
-    ], axis=-1)
+    cosH = jnp.cos(states[:, :, 2:3])
+    state_feat = jnp.concatenate([
+        sinH, cosH,
+        states[:, :, 3:4],   # speed
+        states[:, :, 4:5],   # yawRate
+        states[:, :, 5:6],   # lateralVelocity
+    ], axis=-1) / STATE_SCALES_MLP
 
-    # `pred_samples[k]` predicts `samples[k+1]`, so it already aligns with
-    # `next_states = samples[:, 1:, :]` — no extra slicing needed.
+    ctrl_feat = ctrl_by_sample / CONTROL_SCALES_MLP
+    cfg_feat = cfg_bcast / jnp.asarray(CONFIG_SCALES)
+
+    feats = jnp.concatenate([state_feat, ctrl_feat, cfg_feat], axis=-1)  # (N, S, 21)
+    assert feats.shape[-1] == 21, f"expected 21-dim MLP input, got {feats.shape[-1]}"
+
+    # Residual targets: actual next - predicted next, heading wrapped.
     tgt = (next_states - pred_samples)[:, :, :6]
-    heading_diff2 = wrap_residual(next_states[:, :, 2] - pred_samples[:, :, 2])
-    tgt = tgt.at[:, :, 2].set(heading_diff2)
+    heading_diff = wrap_residual(next_states[:, :, 2] - pred_samples[:, :, 2])
+    tgt = tgt.at[:, :, 2].set(heading_diff)
 
-    # Flatten across trial × sample.
-    F = feats.shape[-1]
-    inputs = feats.reshape(-1, F)
+    inputs = feats.reshape(-1, feats.shape[-1])
     targets_flat = tgt.reshape(-1, 6)
-
-    # Split by trial-level split mask (broadcast).
     split = jnp.asarray(trials.split)
-    split_b = jnp.broadcast_to(split[:, None], (split.shape[0], feats.shape[1])).reshape(-1)
+    split_b = jnp.broadcast_to(split[:, None], (split.shape[0], S_eff)).reshape(-1)
     return np.asarray(inputs), np.asarray(targets_flat), np.asarray(split_b)
 
 
@@ -258,15 +267,28 @@ def main():
     ap.add_argument("--out-residual", default=None)
     ap.add_argument("--max-iter", type=int, default=50)
     ap.add_argument("--tol", type=float, default=1e-7)
+    # Matches REG_SCALES strength in training-driver.ts fitParametric.
     ap.add_argument("--reg-strength", type=float, default=0.05)
-    ap.add_argument("--trajectory-horizon", type=int, default=10)
+    # Shorter horizon (10 -> 5) so the loss focuses on short-term
+    # prediction quality. Long-horizon reseating with the smooth proxy
+    # accumulates per-tick smooth-vs-piecewise drift that can push LM
+    # toward bound-pinning unrelated to the underlying physics fit.
+    ap.add_argument("--trajectory-horizon", type=int, default=5)
     ap.add_argument("--mlp-shape", default="64,64",
                     help="Comma-separated hidden dims, e.g. '64,64' or '128,128,128'.")
     ap.add_argument("--ensemble-size", type=int, default=3)
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--learning-rate", type=float, default=1e-3)
-    ap.add_argument("--weight-decay", type=float, default=1e-4)
+    # Stronger weight decay (1e-4 -> 1e-3) — with [64,64]×3 = ~17k
+    # params the ensemble overfits aggressively on small trial sets
+    # and predicts large residuals OOD. Higher decay keeps it close
+    # to zero on inputs it hasn't seen.
+    ap.add_argument("--weight-decay", type=float, default=1e-3)
     ap.add_argument("--batch-size", type=int, default=64)
+    # Skip residual MLP training when the trial set is too small to
+    # constrain a [64,64]×3 ensemble — the MLP overfits and predicts
+    # huge residuals at eval time. Tune via --min-residual-trials.
+    ap.add_argument("--min-residual-trials", type=int, default=200)
     ap.add_argument("--no-residual", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -296,6 +318,13 @@ def main():
     print(f"[jax-trainer] wrote params to {args.out_params}", file=sys.stderr)
 
     if not args.no_residual and args.out_residual:
+        if trials.n < args.min_residual_trials:
+            print(
+                f"[jax-trainer] skipping residual MLP — {trials.n} trials < "
+                f"--min-residual-trials={args.min_residual_trials} (would overfit)",
+                file=sys.stderr,
+            )
+            return
         print(f"[jax-trainer] training residual MLP", file=sys.stderr)
         inputs, targets, split = build_mlp_dataset(trials, fitted_vec)
         train_mask = split == 0

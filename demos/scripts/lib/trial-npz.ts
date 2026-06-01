@@ -11,9 +11,16 @@ import { Buffer } from 'node:buffer';
 import { writeFileSync } from 'node:fs';
 import { crc32 } from 'node:zlib';
 import type { Trial } from 'kinocat/learning';
+import { encodeConfigOneHot } from 'kinocat/agent';
 import type { CarKinematicState, LearnableVehicleConfig, WheeledCarControls } from 'kinocat/agent';
 
-export const TRIAL_NPZ_VERSION = 1;
+// Bump on incompatible schema changes — must match TRIAL_NPZ_VERSION in
+// demos/scripts/python/trial_io.py. v2: config layout changed from 3
+// fields (chassisMass, wheelBase, frictionSlip) to the full 13-dim
+// `encodeConfigOneHot` vector so the MLP featurisation can match
+// `buildMLPInput` exactly on the Python side.
+export const TRIAL_NPZ_VERSION = 2;
+export const CONFIG_DIM = 13;
 
 type CarTrial = Trial<CarKinematicState, WheeledCarControls, LearnableVehicleConfig>;
 
@@ -162,7 +169,7 @@ export function flattenTrials(trials: CarTrial[]): FlatTrials {
   const controlsTrace = new Float64Array(N * T * 3);
   const samples = new Float64Array(N * S * 7);
   const sampleTimes = new Float64Array(N * S);
-  const config = new Float64Array(N * 3);
+  const config = new Float64Array(N * CONFIG_DIM);
   const split = new Int32Array(N);
   let dt = trials[0]!.dt;
   // Sample every: infer from the first trial's sample stride.
@@ -205,9 +212,12 @@ export function flattenTrials(trials: CarTrial[]): FlatTrials {
       samples[base + 6] = st.t ?? sm.t;
       sampleTimes[i * S + k] = sm.t;
     }
-    config[i * 3 + 0] = t.config.chassisMass;
-    config[i * 3 + 1] = t.config.wheelBase;
-    config[i * 3 + 2] = t.config.frictionSlip;
+    // Full 13-dim config encoding — mirrors encodeConfigOneHot exactly
+    // so the Python side reproduces buildMLPInput's 21-dim layout.
+    const cfgVec = encodeConfigOneHot(t.config);
+    for (let k = 0; k < CONFIG_DIM; k++) {
+      config[i * CONFIG_DIM + k] = cfgVec[k] ?? 0;
+    }
     split[i] = t.split === 'val' ? 1 : t.split === 'test' ? 2 : 0;
     if (t.dt > 0) dt = t.dt;
   }
@@ -222,7 +232,7 @@ export function writeTrialsNpz(path: string, trials: CarTrial[]): void {
     { name: 'controls_trace.npy', data: encodeNpy('<f8', [f.N, f.T, 3], f.controlsTrace) },
     { name: 'samples.npy', data: encodeNpy('<f8', [f.N, f.S, 7], f.samples) },
     { name: 'sample_times.npy', data: encodeNpy('<f8', [f.N, f.S], f.sampleTimes) },
-    { name: 'config.npy', data: encodeNpy('<f8', [f.N, 3], f.config) },
+    { name: 'config.npy', data: encodeNpy('<f8', [f.N, CONFIG_DIM], f.config) },
     { name: 'split.npy', data: encodeNpy('<i4', [f.N], f.split) },
     { name: 'dt.npy', data: encodeNpy('<f8', [], [f.dt]) },
     { name: 'sample_every.npy', data: encodeNpy('<i4', [], [f.sampleEvery]) },
