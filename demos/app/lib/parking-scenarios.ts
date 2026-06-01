@@ -610,8 +610,20 @@ export function buildParkingSnapshot(id: ParkingScenarioId): ParkingSnapshot {
  *  the same controller code drives both racing and parking. */
 export const PARKING_RACE_TUNING: Partial<RaceTuning> = {
   cruiseSpeed: 2,
-  goalTolerance: 0.4,
-  arriveRadius: 0.6,
+  // Terminal precision. `goalTolerance` is where pure-pursuit brakes to rest
+  // relative to the (segment/goal) end; `arriveRadius` is where the multi-cusp
+  // executor advances a segment / the goal is "reached". The old 0.4 / 0.6 left
+  // the chassis braking ~0.5 m SHORT of the goal point — the dominant terminal
+  // error (forward-pullin stopped 0.49 m out at 0.90 stall coverage; reverse-
+  // perp 0.53 m out at 0.75). Tightening the brake to 0.08 m drives the chassis
+  // onto the goal: forward-pullin → 0.97 coverage, reverse-perp → 0.89 (it now
+  // PARKS). `arriveRadius` is kept well above `goalTolerance` (0.25 vs 0.08) so
+  // the cusp-advance logic still triggers through each forward↔reverse gear
+  // change — they're decoupled knobs. (This is a position fix only; parallel's
+  // residual is a ~16° HEADING error that pure-pursuit structurally can't null —
+  // tracked by the `it.fails` in parking-invariants.test.ts.)
+  goalTolerance: 0.08,
+  arriveRadius: 0.25,
   plannerPosCell: 0.3,
   plannerHeadingBuckets: 36,
   plannerGoalRadius: 0.35,

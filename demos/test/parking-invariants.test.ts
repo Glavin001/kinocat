@@ -64,6 +64,7 @@ const SUCCESS: SuccessTolerances = { posTol: 0.6, headingTol: 0.26, speedTol: 0.
 
 async function park(id: ParkingScenarioId, maxTicks: number, success: SuccessTolerances = SUCCESS) {
   const course = parkingCourse(id);
+  const scenario = buildParkingScenario(id);
   const goal = course.waypoints[course.waypoints.length - 1]!;
   return runMonitored({
     // The SAME canonical options the /parking page and the controller-bench
@@ -76,10 +77,12 @@ async function park(id: ParkingScenarioId, maxTicks: number, success: SuccessTol
     goal: { x: goal.x, z: goal.z, heading: goal.heading },
     success,
     maxTicks,
-    // Stop early once genuinely parked (saves CI wall time).
-    done: (s) =>
-      Math.hypot(s.state.x - goal.x, s.state.z - goal.z) < success.posTol &&
-      Math.abs(s.state.speed) < 0.3,
+    // Stop early only once GENUINELY parked (footprint in the stall + squared up
+    // + stopped). Gating on the shared predicate can't false-trigger mid-
+    // maneuver (a forward↔reverse cusp pause isn't inside the stall) and lets a
+    // scenario that never squares up (parallel) run the full budget and fail
+    // honestly rather than being captured mid-settle.
+    done: (s) => evaluateParked(s.state, scenario).parked,
   });
 }
 
@@ -114,35 +117,25 @@ describe.skipIf(!RAPIER_OK)('parking invariants', () => {
   // forward-pullin (0.7 m / ~17°), but the maneuver is otherwise clean: no
   // collision, no teleport rescue, and the planner no longer thrashes.
   const REVERSE_SUCCESS: SuccessTolerances = { posTol: 0.7, headingTol: 0.3, speedTol: 0.5 };
-  it('reverse-perp: backs toward the stall — no collision, no replan storm', OPTS, async () => {
-    const { report } = await park('reverse-perp', 2200, REVERSE_SUCCESS);
-    const ctx = `\n${formatReport(report)}`;
-    // Came to rest near the stall (loose — the tight "in-the-stall" check is the
-    // it.fails below).
-    expect(report.terminalSpeed, ctx).toBeLessThan(0.5);
+  it('reverse-perp: backs into the stall — fits the silhouette, no collision, no replan storm', OPTS, async () => {
+    const { report, status } = await park('reverse-perp', 2600, REVERSE_SUCCESS);
+    const ev = evaluateParked(status.state, buildParkingScenario('reverse-perp'));
+    const ctx = `\n${formatReport(report)}\nparked=${JSON.stringify(ev)}`;
+    // Backed into the stall and fits the silhouette, squared up + stopped. This
+    // PASSES since the terminal brake was tightened (goalTolerance 0.4 → 0.08):
+    // the chassis now stops ON the goal instead of ~0.5 m short. (reverse-perp's
+    // residual was position, not heading — see the parallel it.fails for the
+    // heading gap that remains.)
+    expect(ev.parked, ctx).toBe(true);
     // Never touched a parked car / wall.
     expect(report.collided, ctx).toBe(false);
     // Not rescued by a stall/off-track jump.
     expect(report.teleports, ctx).toBe(0);
-    // Net motion was toward the goal, not the 40 m drive-away of the bug.
+    // Net motion was toward the goal, not the 40 m drive-away of the old bug.
     expect(report.netProgress, ctx).toBeGreaterThan(0);
     expect(report.maxRetreat, ctx).toBeLessThan(2);
     // Planner is healthy — the storm (failedReplanRatio ≈ 0.99) is gone.
     expect(report.failedReplanRatio, ctx).toBeLessThan(0.3);
-  });
-
-  // KNOWN BROKEN — reverse-perp terminal precision. The chassis backs toward the
-  // stall (right region, no collision) but doesn't square up squarely inside the
-  // silhouette: pure-pursuit brakes to rest at its approach angle with no
-  // terminal-heading control. Encoded as the CORRECT-behaviour assertion under
-  // `it.fails` against the SHARED `evaluateParked` predicate — it throws today
-  // (Vitest counts that as a pass) and flips red the moment terminal-heading
-  // control lands, signalling the `.fails` should drop.
-  it.fails('reverse-perp: fits squarely inside the stall silhouette', OPTS, async () => {
-    const { report, status } = await park('reverse-perp', 2200, REVERSE_SUCCESS);
-    const ev = evaluateParked(status.state, buildParkingScenario('reverse-perp'));
-    const ctx = `\n${formatReport(report)}\nparked=${JSON.stringify(ev)}`;
-    expect(ev.parked, ctx).toBe(true);
   });
 
   // PARTIALLY FIXED — parallel parking. The replan storm is gone, the chassis
@@ -167,14 +160,17 @@ describe.skipIf(!RAPIER_OK)('parking invariants', () => {
     expect(report.teleports, ctx).toBe(0);
   });
 
-  // KNOWN BROKEN — parallel terminal precision. The chassis arrives in the slot
-  // (right position, no collision) but ~16° off the curb heading: pure-pursuit
-  // has no final back-and-forth straightening shunt. Encoded as the
-  // CORRECT-behaviour assertion under `it.fails` against the SHARED
-  // `evaluateParked` predicate (footprint inside the stall silhouette + squared
-  // up + stopped): it throws today and Vitest counts that as a pass; when
-  // terminal-pose precision lands (e.g. an MPC final stage) it will start
-  // passing, flip this to red, and signal that the `.fails` should drop.
+  // KNOWN BROKEN — parallel TERMINAL HEADING. With the tightened terminal brake
+  // the chassis now reaches the slot POSITION precisely (~0.15 m, perfect after
+  // the goalTolerance fix that parked reverse-perp) but comes to rest ~16° off
+  // the curb: pure-pursuit is a position-chasing law with no heading target and
+  // no final back-and-forth straightening shunt, so it cannot null the residual
+  // orientation. (A single-stage smooth pose-regulator was prototyped and shown
+  // by its own kinematic tests to over-rotate / limit-cycle on this geometry, so
+  // it was not adopted — the real fix is a maneuver-based terminal stage.)
+  // Encoded as the CORRECT-behaviour assertion under `it.fails`: it throws today
+  // and flips red the moment terminal-heading control lands, signalling the
+  // `.fails` should drop.
   it.fails('parallel: fits squarely inside the stall silhouette', OPTS, async () => {
     const { report, status } = await park('parallel', 1600);
     const ev = evaluateParked(status.state, buildParkingScenario('parallel'));

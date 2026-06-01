@@ -173,7 +173,6 @@ const raceScenario: BenchScenario = {
 function makeParkingScenario(
   id: ParkingScenarioId,
   maxSim: number,
-  posTolM: number,
   label: string,
 ): BenchScenario {
   return {
@@ -182,17 +181,24 @@ function makeParkingScenario(
     async run(tuning, entryKind) {
       const course = parkingCourse(id);
       const goal = course.waypoints[course.waypoints.length - 1]!;
+      const parkScenario = buildParkingScenario(id);
       // The complete, canonical parking options (incl. zero teleportation) —
       // the SAME definition the web page and the Vitest tests use. `tuning`
       // here carries only the tracker selection.
       const scenario = await createRaceScenario(
         parkingScenarioOptions(id, [loadEntry(entryKind, 'parking')], tuning),
       );
+      // Stop once GENUINELY parked, or once the chassis has been stationary long
+      // enough that it's clearly done maneuvering (settled — captures the true
+      // terminal for scenarios that don't square up, without breaking mid-settle
+      // the way a loose `|v|<0.5` did, which mis-read reverse-perp as failing).
+      let settledTicks = 0;
       while (scenario.simTime() < maxSim) {
         scenario.tick();
         const status = scenario.status()[0]!;
-        const dist = Math.hypot(status.state.x - goal.x, status.state.z - goal.z);
-        if (dist < posTolM * 0.7 && Math.abs(status.state.speed) < 0.5) break;
+        if (evaluateParked(status.state, parkScenario).parked) break;
+        settledTicks = Math.abs(status.state.speed) < 0.03 ? settledTicks + 1 : 0;
+        if (settledTicks >= 45) break;
       }
       const status = scenario.status()[0]!;
       const simTime = scenario.simTime();
@@ -201,7 +207,7 @@ function makeParkingScenario(
       // Shared "in-the-stall" predicate — the SAME `evaluateParked` the web page
       // and the Vitest tests use, so the bench can't drift to a looser,
       // position-only bar. A car that stops offset or angled FAILS honestly.
-      const ev = evaluateParked(status.state, buildParkingScenario(id));
+      const ev = evaluateParked(status.state, parkScenario);
       const passed = ev.parked && simTime < maxSim;
       return {
         scenario: `parking-${id}`,
@@ -321,9 +327,9 @@ const rampScenario: BenchScenario = {
 
 const ALL_SCENARIOS: BenchScenario[] = [
   raceScenario,
-  makeParkingScenario('forward-pullin', 25, 1.5, 'forward pull-in (easy)'),
-  makeParkingScenario('reverse-perp', 40, 1.5, 'reverse perpendicular (medium)'),
-  makeParkingScenario('parallel', 40, 1.5, 'parallel parking (hard)'),
+  makeParkingScenario('forward-pullin', 25, 'forward pull-in (easy)'),
+  makeParkingScenario('reverse-perp', 40, 'reverse perpendicular (medium)'),
+  makeParkingScenario('parallel', 40, 'parallel parking (hard)'),
   obstacleCourseScenario,
   rampScenario,
 ];
