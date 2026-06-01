@@ -657,6 +657,7 @@ const TESTED_DEMOS = new Set([
   'dogfight', // 'dogfight demo' — buildDogfightSnapshot (heightfield + multi-AI)
   'dynamic', // 'dynamic demo scenarios' — buildDynamic (moving/coop/jump)
   'flagship', // 'flagship demo' — buildFlagship (large multi-agent navcat)
+  'goals', // 'Goal Lab' — canonical scenario-goal authoring + visualization; presets exercised headlessly in goallab-presets.test.ts (compile + validate + plan) and scenario-goals.test.ts
   'humanoid', // 'humanoid demo' — buildHumanoid
   'jumplinks', // 'jumplinks demo' — buildJumpLinks
   'learnprimitives', // 'learnprimitives demo' — autonomous motion-primitive learner (Rapier)

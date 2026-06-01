@@ -93,3 +93,12 @@ export type { Diagnostic, Severity, ValidateOptions } from './validate';
 
 // Diagram
 export { toMermaid } from './diagram';
+
+// AST walkers (visualizer / rubric / generators)
+export {
+  goalRegions,
+  avoidRegions,
+  maintainRegions,
+  collectScenarioRegions,
+} from './walk';
+export type { ScenarioRegions } from './walk';
