@@ -10,7 +10,6 @@
 // that exercises the real bridge, with `validate()` as a load-time gate.
 
 import { InMemoryNavWorld } from 'kinocat/environment';
-import type { NavPolygon } from 'kinocat/environment';
 import { planVehicleScenario } from 'kinocat/planner';
 import type { ScenarioPlanResult } from 'kinocat/planner';
 import type { CarKinematicState } from 'kinocat/agent';
@@ -29,7 +28,7 @@ import {
   maxProgress,
   deg,
 } from 'kinocat/scenario';
-import type { Scenario, ScenarioState } from 'kinocat/scenario';
+import type { Scenario } from 'kinocat/scenario';
 
 import {
   buildParkingScenario,
@@ -52,10 +51,6 @@ function boundsPoly(b: { x0: number; x1: number; z0: number; z1: number }): [num
     [b.x1, b.z1],
     [b.x0, b.z1],
   ];
-}
-
-function worldPolys(b: { x0: number; x1: number; z0: number; z1: number }): NavPolygon[] {
-  return [{ id: 1, y: 0, ring: boundsPoly(b) }];
 }
 
 // ---------------------------------------------------------------------------
@@ -104,10 +99,6 @@ export function planParkingScenario(
 
 // ---------------------------------------------------------------------------
 // Race: a single lap is seq(reach(gate)...); the circuit is repeat(seq(...)).
-
-function raceState(c: CarKinematicState): ScenarioState {
-  return { x: c.x, z: c.z, heading: c.heading, speed: c.speed, t: c.t };
-}
 
 /** A single drive-through lap, ordered. */
 export function authorRaceLap(course: RaceCourse = buildRaceCourse()): Scenario {
@@ -184,8 +175,4 @@ export function authorPointToPoint(inp: PointToPointInput): Scenario {
   });
 }
 
-export {
-  raceState,
-  worldPolys,
-  boundsPoly,
-};
+export { boundsPoly };

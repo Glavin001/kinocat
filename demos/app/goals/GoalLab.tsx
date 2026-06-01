@@ -149,7 +149,8 @@ export default function GoalLab() {
       if (path.length) syncCarMesh(car.group, path[0]!);
     }
     loadRef.current = load;
-    load(presetIdRef.current);
+    // NB: initial load is driven by the [presetId] effect below (which fires on
+    // mount), so we don't call load() here — doing both double-plans on mount.
 
     function poseAt(tSim: number): CarKinematicState {
       if (path.length === 0) return { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
@@ -182,6 +183,7 @@ export default function GoalLab() {
 
     let raf = 0;
     let last = performance.now();
+    let lastHud = 0;
     function tick() {
       raf = requestAnimationFrame(tick);
       const now = performance.now();
@@ -203,8 +205,10 @@ export default function GoalLab() {
         if (tp) targetMarker.position.set(tp.x, 0.6, tp.z);
       }
 
-      // Deterministic progress via the shared evaluator.
-      if (automaton) {
+      // Deterministic progress via the shared evaluator. Throttle the React
+      // state update to ~10 Hz so the render loop doesn't thrash 60 setState/s.
+      if (automaton && now - lastHud >= 100) {
+        lastHud = now;
         const idx = prefixIndex(animClock);
         const prefix: ScenarioState[] = path.slice(0, Math.max(1, idx + 1));
         const p = evaluateProgress(automaton, prefix);

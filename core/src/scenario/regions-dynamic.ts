@@ -9,7 +9,7 @@
 // admissible even though the true target time is unknown at precompute time.
 
 import type { Region, ScenarioState, RegionAgent } from './types';
-import { angleDiff } from '../internal/math';
+import { angleDiff, wrapAngle } from '../internal/math';
 
 function ref(agent: RegionAgent): ScenarioState {
   return agent.predict(0) ?? { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
@@ -72,7 +72,7 @@ export function behind(agent: RegionAgent, d: number, tol = 1.5): Region {
       id: `${agent.id}#behind`,
       predict: (t) => {
         const a = agent.predict(t);
-        return a ? { ...a, heading: a.heading + Math.PI } : null;
+        return a ? { ...a, heading: wrapAngle(a.heading + Math.PI) } : null;
       },
     },
     d,

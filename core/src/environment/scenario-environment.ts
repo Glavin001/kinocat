@@ -19,7 +19,7 @@ import type {
   CostTerm,
   Region,
 } from '../scenario/index';
-import { nextGuardPose, guardSatisfied } from '../scenario/index';
+import { guardSatisfied } from '../scenario/index';
 
 export interface ScenarioAugState<S> {
   readonly inner: S;
@@ -53,6 +53,10 @@ export class ScenarioEnvironment<S extends ScenarioState>
   private readonly horizon?: { phases?: number; seconds?: number };
   private readonly progressMode: boolean;
   private readonly maxDepth: number;
+  /** Representative pose of each outgoing guard, precomputed per automaton
+   *  state — these are deterministic and never change, so we avoid re-calling
+   *  `region.representative()` (an allocation) on every expanded node. */
+  private readonly repByState: ScenarioState[][];
 
   /** avoid (+ unscoped maintain) — active in every automaton state. */
   private readonly alwaysActive: Invariant[] = [];
@@ -73,6 +77,9 @@ export class ScenarioEnvironment<S extends ScenarioState>
     this.horizon = opts.horizon;
     this.progressMode = opts.automaton.progress;
     this.maxDepth = opts.automaton.states.reduce((m, s) => Math.max(m, s.depth), 0);
+    this.repByState = opts.automaton.states.map((s) =>
+      s.transitions.map((tr) => tr.guard.region.representative()),
+    );
 
     if (this.progressMode && !this.horizon) {
       throw new Error(
@@ -183,7 +190,7 @@ export class ScenarioEnvironment<S extends ScenarioState>
     const st = this.automaton.states[q];
     if (!st || st.transitions.length === 0) return [];
 
-    const rep = nextGuardPose(this.automaton, q);
+    const rep = this.repByState[q]![0] ?? null;
     const innerNode = this.base.createNode(node.state.inner, null, null);
     innerNode.g = node.g;
     const innerGoal = this.base.createNode(
@@ -244,8 +251,7 @@ export class ScenarioEnvironment<S extends ScenarioState>
     const st = this.automaton.states[q];
     if (!st || st.transitions.length === 0) return this.progressMode ? 0 : Infinity;
     let head = Infinity;
-    for (const tr of st.transitions) {
-      const rep = tr.guard.region.representative();
+    for (const rep of this.repByState[q]!) {
       head = Math.min(head, this.base.heuristic(from.inner, this.asInner(from.inner, rep)));
     }
     const chain = this.automaton.remainingChain[q] ?? 0;

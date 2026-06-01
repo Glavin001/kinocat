@@ -114,6 +114,13 @@ describe('cost terms', () => {
   it('smooth penalizes heading + speed change', () => {
     expect(smooth(1).edgeCost(a, b, 1)).toBeGreaterThan(0);
   });
+  it('smooth uses the SHORTEST-arc heading delta (wrap-safe)', () => {
+    // A heading change of -6 rad is really a +0.283 rad turn (shortest arc),
+    // not 6.0. Speeds equal so only the heading term contributes.
+    const from = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
+    const to = { x: 0, z: 0, heading: -6, speed: 0, t: 1 };
+    expect(smooth(1).edgeCost(from, to, 1)).toBeCloseTo(Math.abs(-6 + 2 * Math.PI), 5);
+  });
   it('keepClear ramps up as clearance drops', () => {
     const term = keepClear(10, 2, [{ x: 3, z: 4 }]);
     expect(term.edgeCost(a, b, 1)).toBeGreaterThan(0); // at the obstacle

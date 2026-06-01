@@ -191,12 +191,14 @@ function computeRemainingChain(
   if (progress || accepting.length === 0) return chain; // no terminal F
 
   const acceptSet = new Set(accepting);
-  // entryRep[q] = a representative pose of a guard that enters q (the "from"
-  // pose used to estimate the next leg). Start has none -> handled as ~0.
-  const entryRep = new Array<ScenarioState | null>(states.length).fill(null);
+  // entryReps[q] = representative poses of ALL guards that enter q (the candidate
+  // "from" poses for estimating the next leg). Using the MIN leg over these is
+  // deterministic (order-independent) and a valid lower bound — so the chain
+  // stays admissible even for states with multiple incoming edges (`all`/`any`).
+  const entryReps: ScenarioState[][] = states.map(() => []);
   for (const s of states) {
     for (const tr of s.transitions) {
-      entryRep[tr.target] = tr.guard.region.representative();
+      entryReps[tr.target]!.push(tr.guard.region.representative());
     }
   }
   const memo = new Array<number | undefined>(states.length).fill(undefined);
@@ -206,10 +208,16 @@ function computeRemainingChain(
     if (memo[q] !== undefined) return memo[q]!;
     if (visiting[q]) return 0; // cycle guard (shouldn't happen on a DAG)
     visiting[q] = true;
-    const from = entryRep[q];
+    const froms = entryReps[q]!;
     let best = Infinity;
     for (const tr of states[q]!.transitions) {
-      const leg = from ? tr.guard.region.costToGo(from) : 0;
+      // Admissible leg: cheapest cost-to-reach this guard over all entry poses
+      // (0 at the start, which has no incoming guard).
+      let leg = 0;
+      if (froms.length > 0) {
+        leg = Infinity;
+        for (const from of froms) leg = Math.min(leg, tr.guard.region.costToGo(from));
+      }
       best = Math.min(best, leg + D(tr.target));
     }
     visiting[q] = false;

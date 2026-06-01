@@ -5,6 +5,7 @@
 
 import type { CostTerm, ScenarioState } from './types';
 import { pointSegmentDistance } from '../internal/geom';
+import { angleDiff } from '../internal/math';
 
 /** Penalize elapsed time (the racing default). dt is the edge duration. */
 export function minTime(weight = 1): CostTerm {
@@ -23,7 +24,9 @@ export function smooth(weight = 1): CostTerm {
     name: 'smooth',
     weight,
     edgeCost(from, to) {
-      const dHeading = Math.abs(((to.heading - from.heading + Math.PI) % (2 * Math.PI)) - Math.PI);
+      // Shortest-arc heading delta (the naive modulo formula mishandles
+      // negative wraps, e.g. a -6 rad delta reads as 6.0 instead of ~0.28).
+      const dHeading = Math.abs(angleDiff(from.heading, to.heading));
       const dSpeed = Math.abs(to.speed - from.speed);
       return weight * (dHeading + dSpeed);
     },
