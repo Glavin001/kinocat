@@ -26,6 +26,17 @@ export interface PurePursuitConfig {
    * the smoothed profile is ignored. Default false (legacy behaviour).
    */
   respectPathSpeed?: boolean;
+  /** Optional Stanley-style heading-alignment gain. When > 0, a curvature term
+   *  proportional to the heading error against the local path tangent is added
+   *  (forward gear only), so the tracker drives the chassis onto the planned
+   *  heading rather than only chasing the lookahead point. Default 0 (off) —
+   *  used by parking for terminal-pose precision; racing leaves it off. */
+  headingGain?: number;
+  /** Only apply `headingGain` within this distance of the goal (m). Confines the
+   *  heading correction to the clear terminal zone so it doesn't perturb the
+   *  chassis off a tight, clearance-critical earlier part of the path. Default
+   *  Infinity (apply whenever headingGain > 0). */
+  headingRadius?: number;
 }
 
 export interface TrackingCommand {

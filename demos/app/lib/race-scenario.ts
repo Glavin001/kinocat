@@ -327,6 +327,19 @@ export interface RaceTuning {
   goalTolerance?: number;
   arriveRadius?: number;
   /**
+   * Stanley-style heading-alignment gain for the pure-pursuit tracker (forward
+   * gear only). 0/undefined ⇒ classic position-only pursuit (racing). Parking
+   * sets this so the chassis drives onto the plan's terminal HEADING instead of
+   * cutting the short final straightening curve and resting at its approach
+   * angle — the parallel-park "ends ~16° off the curb" failure. See
+   * `purePursuit`'s `headingGain`.
+   */
+  terminalHeadingGain?: number;
+  /** Confine the heading-alignment term to within this distance of the goal (m)
+   *  — the clear terminal zone — so it doesn't perturb the chassis off the
+   *  tight, clearance-critical approach. See `purePursuit`'s `headingRadius`. */
+  terminalHeadingRadius?: number;
+  /**
    * Planner pose discretisation. Race uses defaults (1.5 m grid,
    * 16 heading buckets, 4 m goal radius, ignore terminal heading);
    * parking sets tight values (0.3 m / 36 / 0.35 / 0.15) so the
@@ -638,6 +651,8 @@ export async function createRaceScenario(
     cruiseSpeed: tuning.cruiseSpeed ?? PURE_PURSUIT_CONFIG.cruiseSpeed,
     goalTolerance: tuning.goalTolerance ?? PURE_PURSUIT_CONFIG.goalTolerance,
     respectPathSpeed: tuning.respectPathSpeed,
+    headingGain: tuning.terminalHeadingGain ?? 0,
+    headingRadius: tuning.terminalHeadingRadius ?? Infinity,
   };
   const arriveRadius = tuning.arriveRadius ?? RACE_ARRIVE_RADIUS;
 

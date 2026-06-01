@@ -5,7 +5,7 @@
 
 import type { CarKinematicState } from '../agent/types';
 import type { PlanPath, PurePursuitConfig, TrackingCommand } from './types';
-import { clamp, dist } from '../internal/math';
+import { clamp, dist, wrapAngle } from '../internal/math';
 
 function nearestIndex(path: PlanPath, x: number, z: number): number {
   let bi = 0;
@@ -74,6 +74,32 @@ export function purePursuit(
   if (config.minTurnRadius) {
     const kMax = 1 / config.minTurnRadius;
     kappa = clamp(kappa, -kMax, kMax);
+  }
+
+  // Optional Stanley-style heading-alignment term. Pure-pursuit chases a
+  // lookahead POINT and ignores the path's HEADING, so on a tight terminal
+  // straightening curve (e.g. a parking final approach) — where the lookahead
+  // overshoots the short curve — it cuts the corner and comes to rest at the
+  // approach angle instead of the planned terminal heading. Blending in a term
+  // proportional to the error against the local path tangent makes the chassis
+  // actively rotate onto the planned heading, the component pure-pursuit
+  // structurally lacks. Self-gating: on a straight run the tangent equals the
+  // chassis heading so the term is ~0; it only acts where the plan's heading
+  // diverges from the chassis (the straighten). Forward gear only — the parking
+  // terminal approach is forward, reverse maneuvers already arrive aligned, and
+  // the curvature sign convention differs in reverse. Off (0) for racing.
+  if (
+    config.headingGain &&
+    gear > 0 &&
+    path.length >= 2 &&
+    distToGoal <= (config.headingRadius ?? Infinity)
+  ) {
+    const tangent = path[Math.min(ni + 1, path.length - 1)]!.heading;
+    kappa += config.headingGain * wrapAngle(tangent - current.heading);
+    if (config.minTurnRadius) {
+      const kMax = 1 / config.minTurnRadius;
+      kappa = clamp(kappa, -kMax, kMax);
+    }
   }
 
   const vCurve = Math.sqrt(config.maxLateralAccel / Math.max(Math.abs(kappa), 1e-3));

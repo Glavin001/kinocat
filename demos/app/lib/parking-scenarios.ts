@@ -624,6 +624,20 @@ export const PARKING_RACE_TUNING: Partial<RaceTuning> = {
   // tracked by the `it.fails` in parking-invariants.test.ts.)
   goalTolerance: 0.08,
   arriveRadius: 0.25,
+  // Stanley-style terminal heading alignment. Pure-pursuit chases a lookahead
+  // POINT and ignores the plan's heading, so on a parking final approach — where
+  // the lookahead overshoots the short (~1 m, curvature-limited) terminal
+  // straightening curve — it cuts the corner and rests at its approach angle
+  // (parallel-park came to rest ~16° off the curb). This adds a curvature term
+  // proportional to the heading error vs the local path tangent so the chassis
+  // rotates onto the planned heading. Confined to within 2 m of the goal (the
+  // clear terminal zone) so it doesn't perturb the chassis off the tight,
+  // clearance-critical dive past the parked cars (~1 cm margin, ~9 m out) — that
+  // gating is what keeps it collision-free. Effect: parallel 16° → ~0° (now
+  // PARKS); forward/reverse unaffected (straight-in / reverse arrive aligned and
+  // the term is forward-gear only). Gain is on a wide stable plateau (3.5–6).
+  terminalHeadingGain: 4.0,
+  terminalHeadingRadius: 2.0,
   plannerPosCell: 0.3,
   plannerHeadingBuckets: 36,
   plannerGoalRadius: 0.35,
