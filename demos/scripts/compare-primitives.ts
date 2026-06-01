@@ -32,9 +32,9 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 import {
-  characterizeVehicle,
   coarseWheeledControls,
   fineWheeledControls,
+  type ForwardSim,
 } from 'kinocat/primitives';
 import {
   learnedForwardSimV2,
@@ -42,6 +42,7 @@ import {
   predictWithUncertainty,
   decodeWheeled,
   type LearnedVehicleModel,
+  type CarKinematicState,
 } from 'kinocat/agent';
 import {
   createHeadlessTrialHarness,
@@ -97,28 +98,55 @@ function posErr(a: LocalEnd, b: LocalEnd): number {
   return Math.hypot(a.dx - b.dx, a.dz - b.dz);
 }
 
-/** Roll one control vector through Rapier at the physics tick and return the
- *  end pose in the primitive's start-local frame. */
-function groundTruthEnd(
+/** Roll one control vector through Rapier at the physics tick. Returns the
+ *  POST-SETTLE start state and the end pose expressed in that start's local
+ *  frame. We hand the same post-settle start back to the model rollouts so
+ *  both start from byte-identical initial conditions (matched ICs) — this is
+ *  what makes the model-vs-physics gap a pure dynamics comparison rather than
+ *  one polluted by the harness's settle-phase coast. */
+function groundTruth(
   harness: HeadlessTrialHarness,
   startSpeed: number,
   controls: number[],
   duration: number,
-  sampleEveryNTicks: number,
-): LocalEnd | null {
+): { start: CarKinematicState; localEnd: LocalEnd } | null {
   const ticks = Math.round(duration / PHYSICS_DT);
   const wc = decodeWheeled(controls);
   const outcome = harness.runTrial({
     pose: { x: 0, z: 0, heading: 0 },
     kin: { forwardSpeed: startSpeed },
     controlsTrace: Array.from({ length: ticks }, () => ({ ...wc })),
-    sampleEveryNTicks,
+    sampleEveryNTicks: ticks, // just the post-settle start + the end pose
   });
   if (!outcome.ok) return null;
   const s = outcome.trial.samples;
   const start = s[0]!;
   const end = s[s.length - 1]!;
-  return toLocal(start, end);
+  return { start, localEnd: toLocal(start, end) };
+}
+
+/** Roll a model ForwardSim from a matched start state (re-zeroed to the
+ *  local frame: origin, heading 0, but carrying the start's speed / yaw rate
+ *  / lateral velocity) for the primitive's duration. */
+function rollModel(
+  sim: ForwardSim<CarKinematicState>,
+  start: CarKinematicState,
+  controls: number[],
+  duration: number,
+  substeps: number,
+): LocalEnd {
+  const dt = duration / substeps;
+  let s: CarKinematicState = {
+    x: 0,
+    z: 0,
+    heading: 0,
+    speed: start.speed,
+    yawRate: start.yawRate ?? 0,
+    lateralVelocity: start.lateralVelocity ?? 0,
+    t: 0,
+  };
+  for (let k = 0; k < substeps; k++) s = sim(s, controls, dt);
+  return { dx: s.x, dz: s.z, dHeading: wrapAngle(s.heading), speed: s.speed };
 }
 
 interface Row {
@@ -137,6 +165,7 @@ interface Row {
   oodStd: number[]; // ensemble disagreement at the FIRST step
   gateFired: boolean; // would any channel exceed its OOD threshold
   residualActive: boolean; // did the residual move the endpoint off parametric
+  settleDecay: number; // bucket speed − Rapier post-settle start speed (m/s)
 }
 
 function labelFor(c: number[]): string {
@@ -195,49 +224,39 @@ async function main(): Promise<void> {
     if (!tier) throw new Error(`unknown tier ${tierName}`);
     const { duration, substeps } = tier;
     const startSpeeds: number[] = [...tier.startSpeeds];
-    const sampleEveryNTicks = Math.round(duration / PHYSICS_DT / substeps);
     const controlSets =
       tierName === 'coarse'
         ? coarseWheeledControls({ config: model.config })
         : fineWheeledControls({ config: model.config });
 
-    // Learned libraries (full + parametric-only) — exactly the planner's path.
-    const fullLib = characterizeVehicle({
-      forwardSim: learnedForwardSimV2(model),
-      controlSets,
-      duration,
-      substeps,
-      startSpeeds,
-    });
-    const paraLib = characterizeVehicle({
-      forwardSim: learnedForwardSimV2(paraModel),
-      controlSets,
-      duration,
-      substeps,
-      startSpeeds,
-    });
+    // Same ForwardSims the planner library is characterized from: the full
+    // learned model and the parametric-only backbone (residual stripped).
+    const fullSim = learnedForwardSimV2(model);
+    const paraSim = learnedForwardSimV2(paraModel);
 
-    // Match by index — characterizeVehicle iterates startSpeed outer, control
-    // inner, in array order.
-    let idx = 0;
     for (const startSpeed of startSpeeds) {
       for (const controls of controlSets) {
-        const full = fullLib.primitives[idx]!.end;
-        const para = paraLib.primitives[idx]!.end;
-        idx++;
-        const gt = groundTruthEnd(harness, startSpeed, controls, duration, sampleEveryNTicks);
-        if (!gt) continue; // discarded by Rapier (off-arena / spin) — rare here
+        // Ground truth + the post-settle start state we roll the model from.
+        const gtResult = groundTruth(harness, startSpeed, controls, duration);
+        if (!gtResult) continue; // discarded by Rapier (off-arena / spin)
+        const { start, localEnd: gt } = gtResult;
+
+        // Matched ICs: model rollouts start from the identical post-settle
+        // state, so the only difference is the dynamics model itself.
+        const full = rollModel(fullSim, start, controls, duration, substeps);
+        const para = rollModel(paraSim, start, controls, duration, substeps);
 
         // OOD signal at the first integration step (dt = duration/substeps),
-        // the step the residual contributes most strongly to.
+        // the step the residual contributes most strongly to. Evaluated from
+        // the same matched start state.
         const dt0 = duration / substeps;
         const pred = predictWithUncertainty(
           model,
-          { x: 0, z: 0, heading: 0, speed: startSpeed, t: 0 },
+          { x: 0, z: 0, heading: 0, speed: start.speed, yawRate: start.yawRate ?? 0, lateralVelocity: start.lateralVelocity ?? 0, t: 0 },
           controls,
           dt0,
         );
-        const gateFired = pred.std.some((s, i) => s > (OOD_STD_THRESHOLD[i] ?? Infinity));
+        const gateFired = pred.std.some((sd, i) => sd > (OOD_STD_THRESHOLD[i] ?? Infinity));
         const residualActive = posErr(full, para) > 1e-4;
 
         rows.push({
@@ -245,7 +264,7 @@ async function main(): Promise<void> {
           startSpeed,
           controls,
           label: labelFor(controls),
-          reverse: fullLib.primitives[idx - 1]!.reverse,
+          reverse: decodeWheeled(controls).driveForce < 0,
           gt,
           para,
           full,
@@ -256,6 +275,7 @@ async function main(): Promise<void> {
           oodStd: pred.std,
           gateFired,
           residualActive,
+          settleDecay: startSpeed - start.speed,
         });
       }
     }
@@ -275,8 +295,13 @@ async function main(): Promise<void> {
   out('');
   out('"Stage 2 from ground truth" = roll the SAME control × start-speed grid');
   out('straight through the Rapier raycast-vehicle (no learned model). Endpoint');
-  out('position error is the gap between each primitive\'s predicted end pose and');
+  out('position error is the gap between each model\'s predicted end pose and');
   out('where the real chassis actually ends up, in the start-local frame.');
+  out('');
+  out('**Matched initial conditions**: the learned/parametric rollouts start from');
+  out('Rapier\'s exact post-settle state (speed, yaw rate, lateral velocity), so the');
+  out('measured gap is pure dynamics-model error — not a start-state mismatch.');
+  out(`Mean settle-phase speed decay across all primitives: ${rms(rows.map((r) => r.settleDecay)).toFixed(3)} m/s (handed to both models, so it cancels).`);
   out('');
 
   for (const tierName of tiersToRun) {
@@ -338,13 +363,12 @@ async function main(): Promise<void> {
   out('- The Rapier column is the alternative Stage 2: zero model error by');
   out('  construction, at the cost of needing the physics engine in the loop.');
   out('');
-  out('Caveats: (1) `spdErr` is the error in *forward-axis-projected* speed; under');
-  out('hard steer the chassis slides and its velocity rotates off the heading axis,');
-  out('so high-steer rows show large `spdErr` even when the path is close. (2) The');
-  out('ground-truth harness settles the suspension (~0.15s coast) before recording,');
-  out('matching training conditions, so the GT primitive starts a hair below its');
-  out('bucket speed — a small handicap charged against the learned model. Endpoint');
-  out('position error (re-zeroed to the post-settle start) is the robust headline.');
+  out('Caveats: `spdErr` is the error in *forward-axis-projected* speed (lin·forward,');
+  out('measured identically for model and Rapier); under hard steer the chassis slides');
+  out('and its velocity rotates off the heading axis, so high-steer rows show large');
+  out('`spdErr` even when the path is close. Both models are rolled from Rapier\'s');
+  out('exact post-settle start state, so suspension settle and start-speed decay');
+  out('cancel — the residual gap is dynamics-model error alone.');
 
   const outPath = isAbsolute(String(values.out)) ? String(values.out) : resolve(repoRoot, String(values.out));
   mkdirSync(dirname(outPath), { recursive: true });
