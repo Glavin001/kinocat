@@ -131,6 +131,7 @@ async function main(): Promise<void> {
       'mlp-shape': { type: 'string', default: '64,64' },
       'ensemble-size': { type: 'string', default: '3' },
       epochs: { type: 'string', default: '200' },
+      'no-mlp': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -271,7 +272,8 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
       const trialsPath = join(roundDir, 'trials.npz');
       const inParamsPath = join(roundDir, 'params-in.json');
       const outParamsPath = join(roundDir, 'params-out.json');
-      const outResidualPath = req.isFinalRound ? join(roundDir, 'mlp.npz') : null;
+      const skipMlp = Boolean(values['no-mlp']);
+      const outResidualPath = (!skipMlp && req.isFinalRound) ? join(roundDir, 'mlp.npz') : null;
 
       writeTrialsNpz(trialsPath, req.trials);
       writeFileSync(inParamsPath, JSON.stringify(req.currentParams, null, 2));
@@ -285,6 +287,7 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
         '--mlp-shape', mlpShape,
         '--ensemble-size', String(ensembleSize),
         '--epochs', String(epochs),
+        '--verbose',
       ];
       if (outResidualPath) {
         args.push('--out-residual', outResidualPath);
@@ -374,7 +377,15 @@ ${Object.entries(PROFILES).map(([k, v]) => `  ${k.padEnd(10)} rounds=${v.rounds}
         }
         case 'round-end': {
           const now = Date.now();
-          process.stdout.write(`    round ${e.round + 1} done — store=${e.trialsAfter} trials, ${fmtMs(now - lastRoundT)}\n`);
+          const roundMs = now - lastRoundT;
+          const roundsDone = e.round + 1;
+          const avgMs = (now - t0) / roundsDone;
+          const remaining = rounds - roundsDone;
+          const etaMs = avgMs * remaining;
+          process.stdout.write(
+            `    round ${roundsDone}/${rounds} done — store=${e.trialsAfter} trials, ${fmtMs(roundMs)}` +
+            ` (avg ${fmtMs(avgMs)}/round, eta ${fmtMs(etaMs)})\n`,
+          );
           lastRoundT = now;
           break;
         }

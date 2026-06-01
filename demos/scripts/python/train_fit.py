@@ -89,8 +89,11 @@ def build_loss(trials, trajectory_horizon: int, reg_strength: float, prior_vec: 
 
     @jax.jit
     def residual_fn(params_vec):
-        # vmap rollout across all trials
-        def per_trial(init_s, ctrls, cfg, gt_samples):
+        # vmap rollout across all trials. Trials are stored as
+        # [initial, sample1, sample2, ...] (S+1 entries); the rollout
+        # produces S predictions aligned with samples[1:].
+        def per_trial(init_s, ctrls, cfg, gt_samples_full):
+            gt_after_init = gt_samples_full[1:]   # (S, 7)
             pred = rollout_trial(
                 params=params_vec,
                 config=cfg,
@@ -99,15 +102,12 @@ def build_loss(trials, trajectory_horizon: int, reg_strength: float, prior_vec: 
                 dt=dt,
                 sample_every=sample_every,
                 reseat_horizon=trajectory_horizon,
-                ground_truth_samples=gt_samples,
+                ground_truth_samples=gt_after_init,
             )
-            # State diff: components 0..6 with heading wrapped.
-            diff = pred - gt_samples
-            heading_diff = wrap_residual(pred[:, 2] - gt_samples[:, 2])
+            diff = pred - gt_after_init
+            heading_diff = wrap_residual(pred[:, 2] - gt_after_init[:, 2])
             diff = diff.at[:, 2].set(heading_diff)
-            # Drop component 6 (time) — uninformative.
             diff = diff[:, :6]
-            # Apply per-component sqrt of weights so LM sees weighted residual.
             return diff * jnp.sqrt(STATE_COMPONENT_WEIGHTS)
 
         all_res = jax.vmap(per_trial)(init_states, controls, configs, samples)
@@ -153,6 +153,12 @@ def fit_parametric_lm(
 
     z0 = bounded_to_unconstrained(prior_vec)
 
+    # Pre-JIT pass so the first reported time isn't compile-dominated.
+    print(f"[lm] jit-compiling forward + residual (this is the cold-start cost)…", file=sys.stderr, flush=True)
+    t_compile_start = time.time()
+    _ = wrapped_residual(z0).block_until_ready()
+    print(f"[lm] jit-compile done in {time.time() - t_compile_start:.1f}s", file=sys.stderr, flush=True)
+
     lm = jaxopt.LevenbergMarquardt(
         residual_fun=wrapped_residual,
         maxiter=max_iter,
@@ -161,9 +167,12 @@ def fit_parametric_lm(
     )
     t0 = time.time()
     sol = lm.run(z0)
-    if verbose:
-        print(f"LM done in {time.time() - t0:.2f}s; iter={sol.state.iter_num}")
     fitted = unconstrained_to_bounded(sol.params)
+    fitted.block_until_ready()
+    iters = int(sol.state.iter_num)
+    elapsed = time.time() - t0
+    per_iter = elapsed / max(1, iters)
+    print(f"[lm] done in {elapsed:.1f}s ({iters} iter, {per_iter*1000:.0f} ms/iter, gradNorm={float(sol.state.gradient.dot(sol.state.gradient))**0.5:.2e})", file=sys.stderr, flush=True)
     return np.asarray(fitted)
 
 
@@ -199,9 +208,10 @@ def build_mlp_dataset(trials, parametric_params: np.ndarray):
         return pred
 
     pred_samples = jax.vmap(per_trial)(init_states, controls, configs, samples)
-    # Residual is actual - predicted, with heading wrapped.
-    diff = samples - pred_samples
-    heading_diff = wrap_residual(samples[:, :, 2] - pred_samples[:, :, 2])
+    # Drop the initial state from `samples` so it aligns with `pred_samples`.
+    gt_after_init = samples[:, 1:, :]   # (N, S, 7) — matches pred
+    diff = gt_after_init - pred_samples
+    heading_diff = wrap_residual(gt_after_init[:, :, 2] - pred_samples[:, :, 2])
     diff = diff.at[:, :, 2].set(heading_diff)
     targets = diff[:, :, :6]                         # (N, S, 6)
 

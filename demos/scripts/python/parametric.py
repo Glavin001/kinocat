@@ -173,14 +173,19 @@ def rollout_trial(
         return parametric_forward_v2(params, config, s, c, dt), None
 
     def sample_step(carry, idx):
-        state, _ = carry, None
+        state = carry
         # Roll `sample_every` physics ticks from current state.
         ctrl_slice = jax.lax.dynamic_slice_in_dim(controls_trace, idx * sample_every, sample_every)
         state_after, _ = jax.lax.scan(physics_step, state, ctrl_slice)
-        # Optional reseating.
+        # Optional reseating: every `reseat_horizon` samples, replace the
+        # carry-forward state with ground truth so the loss focuses on
+        # short-horizon prediction quality (matches trajectoryHorizon=10
+        # in training-driver.ts). `ground_truth_samples[idx]` is the
+        # truth at the END of this rollout window (initial state is the
+        # separate `init_state` carry).
         if ground_truth_samples is not None and reseat_horizon > 0:
-            should_reseat = ((idx + 1) % reseat_horizon == 0) & (idx + 1 < S)
-            gt = ground_truth_samples[idx + 1]
+            should_reseat = (((idx + 1) % reseat_horizon) == 0) & (idx + 1 < S)
+            gt = ground_truth_samples[idx]
             state_next = jnp.where(should_reseat, gt, state_after)
         else:
             state_next = state_after

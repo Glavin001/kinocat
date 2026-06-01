@@ -141,6 +141,11 @@ def train_ensemble(
     best_val = float("inf")
     bad_epochs = 0
 
+    import sys as _sys
+    import time as _time
+    t_start = _time.time()
+    log_every = max(1, epochs // 20)  # ~20 progress lines per run
+
     for epoch in range(epochs):
         rng, sub = jax.random.split(rng)
         perm = jax.random.permutation(sub, N)
@@ -158,16 +163,22 @@ def train_ensemble(
         else:
             val_loss = epoch_loss
         history["val_loss"].append(val_loss)
-        if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
-            print(f"epoch {epoch:4d}  train={epoch_loss:.5f}  val={val_loss:.5f}")
+        if epoch % log_every == 0 or epoch == epochs - 1:
+            elapsed = _time.time() - t_start
+            per_ep = elapsed / max(1, epoch + 1)
+            eta = per_ep * (epochs - epoch - 1)
+            print(
+                f"[mlp] ep {epoch + 1:4d}/{epochs}  train={epoch_loss:.5f}  val={val_loss:.5f}  "
+                f"elapsed={elapsed:.1f}s  eta={eta:.1f}s",
+                file=_sys.stderr, flush=True,
+            )
         if val_loss + 1e-6 < best_val:
             best_val = val_loss
             bad_epochs = 0
         else:
             bad_epochs += 1
             if bad_epochs >= early_stop_patience:
-                if verbose:
-                    print(f"early-stop at epoch {epoch}, best val={best_val:.5f}")
+                print(f"[mlp] early-stop at epoch {epoch + 1}, best val={best_val:.5f}", file=_sys.stderr, flush=True)
                 break
 
     return _unstack_ensemble(stacked, ensemble_size), history
