@@ -675,7 +675,16 @@ export function parkingScenarioOptions(
   id: ParkingScenarioId,
   entries: RaceEntry[],
   tuningOverride?: Partial<RaceTuning>,
+  // Per-run tweaks to the parking agent — e.g. the `/parking` page's
+  // direction-switch-cost slider passes `{ directionChangePenalty }` here so
+  // changing the knob re-plans with a different forward↔reverse switch penalty
+  // without touching the cached primitive library (the library depends only on
+  // `minTurnRadius`/`maxSpeed`, not on the cost weights, so it stays valid).
+  agentOverride?: Partial<VehicleAgent>,
 ): RaceScenarioOptions {
+  const agent: VehicleAgent = agentOverride
+    ? { ...PARKING_AGENT, ...agentOverride }
+    : PARKING_AGENT;
   return {
     // Pin every parking entry to PARKING_AGENT so the planner's heuristic +
     // footprint + turn radius match the parking primitive library. Without
@@ -685,7 +694,7 @@ export function parkingScenarioOptions(
     // that A* degenerated into near-breadth-first search — the reverse-perp /
     // parallel replan-failure storm. Callers don't need to know the agent;
     // they just pass `{ name, lib: parkingLibrary() }`.
-    entries: entries.map((e) => ({ ...e, agent: PARKING_AGENT })),
+    entries: entries.map((e) => ({ ...e, agent })),
     targetLaps: 1,
     syncHold: false,
     offTrackRecovery: 'none',
