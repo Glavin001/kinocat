@@ -28,6 +28,20 @@ export interface MotionPrimitiveLike {
   primitives: ReadonlyArray<{ sweep: ReadonlyArray<{ x: number; z: number }> }>;
 }
 
+/** Structural view of `kinocat/plan`'s `Plan` — just the fields the debug
+ *  overlay reads, so this adapter doesn't hard-depend on the plan module. */
+export interface PlanLike {
+  points: ReadonlyArray<{
+    x: number;
+    z: number;
+    heading: number;
+    vRef: number;
+    kappa: number;
+    steerFf?: number;
+  }>;
+  segments: ReadonlyArray<{ endIdx: number }>;
+}
+
 function toVecs(pts: ReadonlyArray<PlanarPoint>, y: number): THREE.Vector3[] {
   return pts.map((p) => new THREE.Vector3(p.x, y, p.z));
 }
@@ -67,6 +81,96 @@ export function createMotionPrimitiveHelper(
     const geo = new THREE.BufferGeometry().setFromPoints(toVecs(p.sweep, opts.y ?? 0.05));
     group.add(new THREE.Line(geo, mat));
   }
+  return group;
+}
+
+export interface PlanDebugOptions {
+  /** Height to draw at. Default 0.06 (just above `createPlanPathHelper`). */
+  y?: number;
+  /** Speed magnitude (m/s) mapped to the "fast" end of the color ramp.
+   *  Default 12. */
+  maxSpeed?: number;
+  /** Draw short feedforward-steer ticks at each point. Default true. */
+  showSteer?: boolean;
+  /** Tick length (m) for a steer angle of ±45°. Default 0.6. */
+  steerTickLength?: number;
+}
+
+/** Rich-plan debug overlay: a speed-colored path (slow → fast = red → green,
+ *  reverse spans in blue), cusp markers where the chassis stops and flips
+ *  gear, and optional feedforward-steer ticks. Returns a `THREE.Group` the
+ *  caller owns (add/remove/dispose like any other helper). Consumes the
+ *  `kinocat/plan` `Plan` shape structurally so this adapter need not import
+ *  the plan module at type-check time. */
+export function createPlanDebugHelper(
+  plan: PlanLike,
+  opts: PlanDebugOptions = {},
+): THREE.Group {
+  const y = opts.y ?? 0.06;
+  const vMax = Math.max(opts.maxSpeed ?? 12, 0.1);
+  const group = new THREE.Group();
+  const pts = plan.points;
+  if (pts.length < 2) return group;
+
+  // Speed-colored path as a vertex-colored line-segment list (one segment per
+  // adjacent pair so each can carry its own color).
+  const positions: number[] = [];
+  const colors: number[] = [];
+  const fwdSlow = new THREE.Color(0xcc3333); // slow forward
+  const fwdFast = new THREE.Color(0x33cc55); // fast forward
+  const rev = new THREE.Color(0x3366ff); // reverse
+  const colorFor = (vRef: number): THREE.Color => {
+    if (vRef < 0) return rev;
+    const u = Math.min(Math.abs(vRef) / vMax, 1);
+    return fwdSlow.clone().lerp(fwdFast, u);
+  };
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1]!;
+    const b = pts[i]!;
+    positions.push(a.x, y, a.z, b.x, y, b.z);
+    const ca = colorFor(a.vRef);
+    const cb = colorFor(b.vRef);
+    colors.push(ca.r, ca.g, ca.b, cb.r, cb.g, cb.b);
+  }
+  const lineGeo = new THREE.BufferGeometry();
+  lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  lineGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  group.add(new THREE.LineSegments(lineGeo, new THREE.LineBasicMaterial({ vertexColors: true })));
+
+  // Cusp markers — interior segment boundaries are gear flips by construction.
+  if (plan.segments.length > 1) {
+    const cuspPts: THREE.Vector3[] = [];
+    for (let s = 0; s < plan.segments.length - 1; s++) {
+      const idx = plan.segments[s]!.endIdx;
+      const p = pts[idx];
+      if (p) cuspPts.push(new THREE.Vector3(p.x, y + 0.02, p.z));
+    }
+    if (cuspPts.length > 0) {
+      const cuspGeo = new THREE.BufferGeometry().setFromPoints(cuspPts);
+      group.add(
+        new THREE.Points(cuspGeo, new THREE.PointsMaterial({ color: 0xffff00, size: 0.5 })),
+      );
+    }
+  }
+
+  // Feedforward-steer ticks: a short segment at each point rotated off the
+  // heading by the feedforward steer angle (falls back to atan of curvature
+  // when steerFf is absent).
+  if (opts.showSteer ?? true) {
+    const len = opts.steerTickLength ?? 0.6;
+    const tickPts: THREE.Vector3[] = [];
+    for (const p of pts) {
+      const steer = p.steerFf ?? Math.atan(p.kappa);
+      const ang = p.heading + steer;
+      const scale = len * (steer / (Math.PI / 4)); // signed, ±45° ⇒ ±len
+      const dx = Math.cos(ang) * scale;
+      const dz = Math.sin(ang) * scale;
+      tickPts.push(new THREE.Vector3(p.x, y, p.z), new THREE.Vector3(p.x + dx, y, p.z + dz));
+    }
+    const tickGeo = new THREE.BufferGeometry().setFromPoints(tickPts);
+    group.add(new THREE.LineSegments(tickGeo, new THREE.LineBasicMaterial({ color: 0xffaa33 })));
+  }
+
   return group;
 }
 

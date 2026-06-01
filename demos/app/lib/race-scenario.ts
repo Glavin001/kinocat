@@ -54,6 +54,7 @@ import {
   DEFAULT_LEARNABLE_CONFIG,
   type VehicleAgent,
 } from 'kinocat/agent';
+import { buildPlan, type Plan } from 'kinocat/plan';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavWorld, AnalyticEdgeData } from 'kinocat/environment';
 import type { PlanResult } from 'kinocat/planner';
@@ -490,6 +491,10 @@ export interface RaceCarStatus {
   metrics: RaceMetrics;
   /** Latest plan (lifted to a sequence of state samples for visualization). */
   plan: CarKinematicState[] | null;
+  /** Rich Plan built from `plan` (kinocat/plan): per-point curvature,
+   *  feedforward, dynamic-state slots, and single-gear segment/cusp
+   *  structure — for the debug overlay and future controllers. */
+  richPlan: Plan | null;
   /** Sim time at which the current plan was committed. */
   planStartSimTime: number;
   /** Most recent predicted state at the first primitive's boundary. */
@@ -592,6 +597,15 @@ interface CarInternal {
    * unchanged.
    */
   segments: CarKinematicState[][];
+  /**
+   * Rich Plan (kinocat/plan) built from the committed `plan` for
+   * visualization / future controllers. Produce-but-don't-consume:
+   * pure-pursuit / MPPI still track `plan`/`segments`; this carries the
+   * per-point curvature, feedforward, and cusp structure the bare state
+   * array discards, so the debug overlay can plot it. Null until the first
+   * plan commits.
+   */
+  richPlan: Plan | null;
   activeSegIdx: number;
   /** Sim time of the chassis state when the active segment was
    *  entered — used to gate the "segment done, advance" check on
@@ -753,6 +767,7 @@ export async function createRaceScenario(
       pendingPlan: null,
       pendingPlanStartSimTime: 0,
       segments: [],
+      richPlan: null,
       activeSegIdx: 0,
       activeSegStartSimTime: 0,
       predictedEnd: null,
@@ -990,6 +1005,7 @@ export async function createRaceScenario(
         c.planStartSimTime = planStartSimTime;
         c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
         c.segments = splitAtGearCusps(smoothed);
+        c.richPlan = buildPlan(smoothed, { wheelBase: 2 * WHEEL_BASE });
         c.activeSegIdx = 0;
         c.activeSegStartSimTime = simTime;
       }
@@ -1008,6 +1024,7 @@ export async function createRaceScenario(
       c.planStartSimTime = c.pendingPlanStartSimTime;
       c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
       c.segments = splitAtGearCusps(c.plan);
+      c.richPlan = buildPlan(c.plan, { wheelBase: 2 * WHEEL_BASE });
       c.activeSegIdx = 0;
       c.activeSegStartSimTime = simTime;
     }
@@ -1328,6 +1345,7 @@ export async function createRaceScenario(
       diagnostics: c.diagnostics,
       metrics: c.metrics,
       plan: c.plan,
+      richPlan: c.richPlan,
       planStartSimTime: c.planStartSimTime,
       predictedEnd: c.predictedEnd,
       lastAdvanceSimTime: c.lastMoveSimTime,
@@ -1347,6 +1365,7 @@ export async function createRaceScenario(
       c.plan = null;
       c.planStartSimTime = 0;
       c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
+      c.richPlan = null;
       c.pendingPlanStartSimTime = 0;
       c.predictedEnd = null;
       c.predErrSumSq = 0;
@@ -1377,6 +1396,7 @@ export async function createRaceScenario(
           if (!c.finished) c.holdingForSync = false;
           c.plan = null;
           c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
+          c.richPlan = null;
         }
         // Force an immediate replan so neither car coasts on a stale plan.
         for (const c of cars) replanCar(c);
