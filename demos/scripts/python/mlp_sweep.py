@@ -68,7 +68,7 @@ def main():
     for shape in SHAPES:
         for ens in ENSEMBLES:
             t0 = time.time()
-            _, history = train_ensemble(
+            _, history, _ = train_ensemble(
                 inputs=train_inputs, targets=train_targets,
                 val_inputs=val_inputs, val_targets=val_targets,
                 input_dim=inputs.shape[1], output_dim=6,

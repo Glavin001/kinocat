@@ -344,7 +344,7 @@ def main():
             val_targets = targets[val_mask]
 
         hidden_dims = [int(x) for x in args.mlp_shape.split(",") if x]
-        ensemble, history = train_ensemble(
+        ensemble, history, best_val = train_ensemble(
             inputs=train_inputs,
             targets=train_targets,
             val_inputs=val_inputs,
@@ -359,8 +359,31 @@ def main():
             weight_decay=args.weight_decay,
             verbose=args.verbose,
         )
-        save_mlp_ensemble(args.out_residual, ensemble_to_layer_arrays(ensemble))
-        print(f"[jax-trainer] wrote MLP ensemble to {args.out_residual} (final val={history['val_loss'][-1]:.5f})", file=sys.stderr)
+        # Safety gate: only ship the residual MLP if it actually improves
+        # val loss vs parametric-only (zero residual). Otherwise the MLP
+        # adds noise at inference and the runtime model is strictly
+        # worse than the parametric backbone. The previous overnight run
+        # (commit a46b8a2) emitted a residual that doubled posRms; this
+        # check makes that case auto-degrade to parametric-only.
+        zero_baseline = float(np.mean(np.sum(
+            np.asarray(RESIDUAL_LOSS_WEIGHTS) * val_targets * val_targets, axis=-1
+        )))
+        # Use the best val loss seen during training (early-stop can
+        # leave the last-epoch value above the minimum).
+        mlp_val = float(best_val)
+        improved = mlp_val < zero_baseline * 0.95   # require >5% improvement
+        print(
+            f"[jax-trainer] residual val loss={mlp_val:.4f}  zero-residual baseline={zero_baseline:.4f}  "
+            f"({'KEEP — MLP helps' if improved else 'DROP — MLP does not help, falling back to parametric-only'})",
+            file=sys.stderr,
+        )
+        if improved:
+            save_mlp_ensemble(args.out_residual, ensemble_to_layer_arrays(ensemble))
+            print(f"[jax-trainer] wrote MLP ensemble to {args.out_residual} (final val={mlp_val:.5f})", file=sys.stderr)
+        else:
+            # Deliberately don't write the npz; Node side falls back to
+            # parametric-only when the file is missing.
+            print(f"[jax-trainer] residual MLP not shipped — parametric-only at inference", file=sys.stderr)
 
 
 if __name__ == "__main__":

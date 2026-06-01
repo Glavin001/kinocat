@@ -189,7 +189,7 @@ def train_ensemble(
                 print(f"[mlp] early-stop at epoch {epoch + 1}, best val={best_val:.5f}", file=_sys.stderr, flush=True)
                 break
 
-    return _unstack_ensemble(stacked, ensemble_size), history
+    return _unstack_ensemble(stacked, ensemble_size), history, best_val
 
 
 def ensemble_to_layer_arrays(ensemble: list[MLPParams]) -> list[list[tuple[np.ndarray, np.ndarray]]]:
