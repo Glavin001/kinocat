@@ -14,6 +14,7 @@
     "train:quick": "tsx scripts/train.ts --profile=quick --out=demos/public/models/v2-ci.json",
     "train:sweep": "tsx scripts/train.ts --profile=sweep",
     "train:overnight": "tsx scripts/train.ts --profile=overnight",
+    "compare:primitives": "tsx scripts/compare-primitives.ts",
     "race": "tsx scripts/race.ts",
     "race:quick": "tsx scripts/race.ts --quick --no-parametric --ledger=docs/race-results",
     "ablation": "tsx scripts/ablation.ts",
