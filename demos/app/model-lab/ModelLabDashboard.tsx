@@ -35,7 +35,13 @@ import {
   buildLearnedRaceLibraryV2,
   RACE_START_SPEEDS,
 } from '../lib/race-primitives-scenarios';
-import { computeGroundTruthDots, computeUncertaintyHalos } from '../lib/fan-plot-ground-truth';
+import {
+  computeGroundTruthDots,
+  computeUncertaintyHalos,
+  computePrimitiveComparisonStats,
+  type PrimitiveComparisonStats,
+} from '../lib/fan-plot-ground-truth';
+import { buildParametricOnlyModel } from 'kinocat/agent';
 
 export default function ModelLabDashboard() {
   return (
@@ -101,8 +107,8 @@ function DashboardInner() {
         <RoundEvolutionTable rounds={roundHistory} />
       </Section>
 
-      <Section title="Action space at a speed bucket"
-        subtitle="The fan plot shows where the model thinks each control will end up after 0.55–1.5s. White dots are the Rapier ground-truth endpoints for the same controls; arrows = per-control error. Cyan halos = ensemble uncertainty (1σ).">
+      <Section title="Action space at a speed bucket — learned vs parametric vs Rapier"
+        subtitle="Three Stage-2 libraries over the same controls: KINEMATIC (bicycle baseline), PARAMETRIC (the learned analytical floor, residual stripped), and V2 LEARNED (parametric + residual ensemble). White dots are the Rapier ground-truth endpoints; arrows = per-control error; cyan halos = ensemble 1σ. Hit “overlay Rapier ground truth” to compute the dots and the quantitative panel — it reveals where the residual helps, and where it's confidently wrong in a regime the OOD gate misses.">
         <FanPlotRow
           model={model}
           config={config}
@@ -175,8 +181,24 @@ function FanPlotRow({
 
   const kinematicLib = useMemo(() => buildKinematicLibrary(), []);
   const v2Lib = useMemo(() => (model ? buildLearnedRaceLibraryV2(model) : null), [model]);
+  // Parametric-only (residual MLP stripped) — the safety floor the residual is
+  // allowed to correct. Same control sets/order as the full v2 library.
+  const paraLib = useMemo(
+    () => (model ? buildLearnedRaceLibraryV2(buildParametricOnlyModel(model.params, model.config)) : null),
+    [model],
+  );
   const kinAtSpeed = useMemo(() => kinematicLib.lookup(selectedSpeed), [kinematicLib, selectedSpeed]);
   const v2AtSpeed = useMemo(() => (v2Lib ? v2Lib.lookup(selectedSpeed) : null), [v2Lib, selectedSpeed]);
+  const paraAtSpeed = useMemo(() => (paraLib ? paraLib.lookup(selectedSpeed) : null), [paraLib, selectedSpeed]);
+
+  // Quantitative comparison vs the Rapier ground truth (only once GT computed).
+  const stats: PrimitiveComparisonStats | null = useMemo(() => {
+    if (!model || !v2AtSpeed || !paraAtSpeed || groundTruth.length === 0) return null;
+    return computePrimitiveComparisonStats({
+      full: v2AtSpeed, parametric: paraAtSpeed, groundTruth, model,
+      startSpeed: selectedSpeed, topN: 4,
+    });
+  }, [model, v2AtSpeed, paraAtSpeed, groundTruth, selectedSpeed]);
 
   // Recompute uncertainty when the speed bucket or model changes. Cheap.
   useEffect(() => {
@@ -282,37 +304,130 @@ function FanPlotRow({
           show GT
         </label>
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)', gap: 12 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: 12 }}>
         <PrimitiveFanPlot
           primitives={kinAtSpeed}
           forwardColor="#ff8aa0"
           title={`KINEMATIC · ${selectedSpeed} m/s`}
-          subtitle={`${kinAtSpeed.length} primitives`}
+          subtitle={`${kinAtSpeed.length} primitives · bicycle baseline`}
           fixedExtent={extent}
+          groundTruth={showGT ? groundTruth : undefined}
         />
+        {paraAtSpeed ? (
+          <PrimitiveFanPlot
+            primitives={paraAtSpeed}
+            forwardColor="#c8b6ff"
+            title={`PARAMETRIC · ${selectedSpeed} m/s`}
+            subtitle={`${paraAtSpeed.length} primitives · residual stripped (safety floor)`}
+            fixedExtent={extent}
+            groundTruth={showGT ? groundTruth : undefined}
+          />
+        ) : <NoModelPanel />}
         {v2AtSpeed ? (
           <PrimitiveFanPlot
             primitives={v2AtSpeed}
             forwardColor="#55dcff"
             title={`V2 LEARNED · ${selectedSpeed} m/s`}
-            subtitle={`${v2AtSpeed.length} primitives${uncertainty.length > 0 ? ' · uncertainty halos' : ''}`}
+            subtitle={`${v2AtSpeed.length} primitives · parametric + residual${uncertainty.length > 0 ? ' · σ halos' : ''}`}
             fixedExtent={extent}
             groundTruth={showGT ? groundTruth : undefined}
             uncertainty={uncertainty}
           />
-        ) : (
-          <div style={{
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            border: '1px dashed #1f2735', borderRadius: 6, padding: 24,
-            opacity: 0.6, fontSize: 12, textAlign: 'center', minHeight: 200,
-          }}>
-            No v2 model — train one above to see its action space.
-          </div>
-        )}
+        ) : <NoModelPanel />}
       </div>
+      {stats && <ComparisonStatsPanel stats={stats} speed={selectedSpeed} />}
     </div>
   );
 }
+
+function NoModelPanel() {
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      border: '1px dashed #1f2735', borderRadius: 6, padding: 24,
+      opacity: 0.6, fontSize: 12, textAlign: 'center', minHeight: 200,
+    }}>
+      No v2 model — train one above to see its action space.
+    </div>
+  );
+}
+
+/** Quantitative learned-vs-parametric-vs-Rapier panel — the numbers behind the
+ *  fan plots. Surfaces where the residual helps, where it's confidently wrong
+ *  (residual active but full error ≥ parametric, OOD gate off), and where the
+ *  gate correctly falls back. */
+function ComparisonStatsPanel({ stats, speed }: { stats: PrimitiveComparisonStats; speed: number }) {
+  const residualHurts = stats.residualHelpPct < 0;
+  const helpColor = residualHurts ? '#ff8aa0' : '#7CFFB2';
+  return (
+    <div style={{
+      border: '1px solid #1f2735', borderRadius: 6, padding: '12px 14px',
+      display: 'flex', flexDirection: 'column', gap: 10, background: '#0b0f17',
+    }}>
+      <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', alignItems: 'baseline' }}>
+        <span style={{ fontSize: 12, color: '#7fd6ff' }}>
+          ENDPOINT ERROR vs RAPIER · {speed} m/s · {stats.count} primitives
+        </span>
+        <Stat label="parametric RMS" value={`${stats.paraRmsM.toFixed(3)} m`} color="#c8b6ff" />
+        <Stat label="full learned RMS" value={`${stats.fullRmsM.toFixed(3)} m`} color="#55dcff" />
+        <Stat
+          label={residualHurts ? 'residual HURTS' : 'residual helps'}
+          value={`${stats.residualHelpPct >= 0 ? '−' : '+'}${Math.abs(stats.residualHelpPct).toFixed(0)}%`}
+          color={helpColor}
+        />
+        <Stat label="OOD gate fires" value={`${stats.gateFires}/${stats.count}`} color="#ffd479" />
+        <Stat label="residual active" value={`${stats.residualActive}/${stats.count}`} color="#9aa6b2" />
+      </div>
+      <table style={{ borderCollapse: 'collapse', fontSize: 11, width: '100%', maxWidth: 560 }}>
+        <thead>
+          <tr style={{ color: '#7f8a99', textAlign: 'left' }}>
+            <th style={thStyle}>worst action</th>
+            <th style={thStyle}>full err</th>
+            <th style={thStyle}>para err</th>
+            <th style={thStyle}>ens σ (pos)</th>
+            <th style={thStyle}>gate</th>
+          </tr>
+        </thead>
+        <tbody>
+          {stats.worst.map((w, i) => {
+            const confidentlyWrong = w.fullErrM >= w.paraErrM && !w.gate;
+            return (
+              <tr key={i} style={{ color: confidentlyWrong ? '#ff8aa0' : '#cdd3de' }}>
+                <td style={tdStyle}>
+                  {w.label}
+                  {confidentlyWrong && <span title="residual worse than parametric, OOD gate off"> ⚠</span>}
+                </td>
+                <td style={tdStyle}>{w.fullErrM.toFixed(3)} m</td>
+                <td style={tdStyle}>{w.paraErrM.toFixed(3)} m</td>
+                <td style={tdStyle}>{w.ensSigmaPos.toFixed(3)}</td>
+                <td style={tdStyle}>{w.gate ? 'ON' : 'off'}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <p style={{ margin: 0, fontSize: 10.5, opacity: 0.6, lineHeight: 1.5, maxWidth: 620 }}>
+        Rows in red ⚠ are the shared-bias failure: the residual pushed the
+        endpoint <em>further</em> from physics than the parametric floor, yet the
+        ensemble agreed (low σ) so the OOD gate never fired — the bias flows
+        straight into the planner library. High-σ rows with the gate ON are the
+        regimes the safety fallback actually protects.
+      </p>
+    </div>
+  );
+}
+
+function Stat({ label, value, color }: { label: string; value: string; color: string }) {
+  return (
+    <span style={{ display: 'inline-flex', flexDirection: 'column' }}>
+      <span style={{ fontSize: 14, color, fontWeight: 600 }}>{value}</span>
+      <span style={{ fontSize: 10, opacity: 0.6 }}>{label}</span>
+    </span>
+  );
+}
+
+const thStyle: React.CSSProperties = { padding: '3px 8px', borderBottom: '1px solid #1f2735', fontWeight: 400 };
+const tdStyle: React.CSSProperties = { padding: '3px 8px', fontVariantNumeric: 'tabular-nums' };
 
 function Section({ title, subtitle, children }: { title?: string; subtitle?: string; children: React.ReactNode }) {
   return (

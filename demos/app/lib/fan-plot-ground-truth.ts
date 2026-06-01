@@ -106,6 +106,110 @@ export function computeGroundTruthDots(opts: ComputeGroundTruthOpts): GroundTrut
   return out;
 }
 
+// Default per-output-dim OOD thresholds (x, z, heading, speed, yawRate,
+// lateralVelocity) — mirrors `DEFAULT_OOD_STD_THRESHOLD` in the core model
+// (not re-exported from the agent barrel). Used only to report whether the
+// runtime gate WOULD fall back to parametric for a given primitive.
+const OOD_STD_THRESHOLD = [0.5, 0.5, 0.1, 1.0, 0.5, 0.5];
+
+export interface PrimitiveComparisonRow {
+  label: string;
+  fullErrM: number;
+  paraErrM: number;
+  ensSigmaPos: number;
+  gate: boolean;
+}
+
+export interface PrimitiveComparisonStats {
+  startSpeed: number;
+  count: number;
+  /** Full learned-model endpoint RMS vs Rapier ground truth (m). */
+  fullRmsM: number;
+  /** Parametric-only (residual-stripped) endpoint RMS vs Rapier (m). */
+  paraRmsM: number;
+  /** Percentage error reduction the residual buys over parametric.
+   *  Negative ⇒ the residual is net-HARMFUL in this bucket. */
+  residualHelpPct: number;
+  /** How many primitives the OOD gate would fall back to parametric on. */
+  gateFires: number;
+  /** How many primitives the residual actually moves off the parametric path. */
+  residualActive: number;
+  /** Worst offenders by full-model endpoint error, descending. */
+  worst: PrimitiveComparisonRow[];
+}
+
+function controlLabel(c: ReadonlyArray<number>): string {
+  const steer = c[0] ?? 0;
+  const drive = c[1] ?? 0;
+  const brake = c[2] ?? 0;
+  const dir = Math.abs(steer) < 1e-6 ? 'straight' : steer > 0 ? 'left' : 'right';
+  const eff = brake > 0 ? 'brake' : drive < 0 ? 'reverse' : drive > 0 ? 'drive' : 'coast';
+  return `${eff}-${dir}`;
+}
+
+/** Quantify, for the selected start-speed bucket, how the parametric floor and
+ *  the full learned model each diverge from the Rapier ground-truth endpoints,
+ *  plus where the OOD gate fires. `groundTruth[i].index` indexes into `full`;
+ *  `parametric` must be the same control set in the same order. */
+export function computePrimitiveComparisonStats(opts: {
+  full: ReadonlyArray<MotionPrimitive>;
+  parametric: ReadonlyArray<MotionPrimitive>;
+  groundTruth: ReadonlyArray<GroundTruthDot>;
+  model: LearnedVehicleModel;
+  startSpeed: number;
+  perStepDt?: number;
+  topN?: number;
+}): PrimitiveComparisonStats | null {
+  if (opts.groundTruth.length === 0) return null;
+  const dt = opts.perStepDt ?? opts.model.residualReferenceDt;
+  const hasEnsemble = opts.model.residualEnsemble.length > 0;
+  const rows: PrimitiveComparisonRow[] = [];
+  let fullSq = 0;
+  let paraSq = 0;
+  let gateFires = 0;
+  let residualActive = 0;
+  for (const g of opts.groundTruth) {
+    const full = opts.full[g.index];
+    const para = opts.parametric[g.index];
+    if (!full || !para) continue;
+    const fullErr = Math.hypot(full.end.dx - g.dx, full.end.dz - g.dz);
+    const paraErr = Math.hypot(para.end.dx - g.dx, para.end.dz - g.dz);
+    fullSq += fullErr * fullErr;
+    paraSq += paraErr * paraErr;
+    const state: CarKinematicState = {
+      x: 0, z: 0, heading: 0, speed: opts.startSpeed, t: 0, yawRate: 0, lateralVelocity: 0,
+    };
+    const pred = hasEnsemble
+      ? predictWithUncertainty(opts.model, state, full.controls, dt)
+      : { std: [0, 0, 0, 0, 0, 0] };
+    const gate = pred.std.some((s, i) => s > (OOD_STD_THRESHOLD[i] ?? Infinity));
+    if (gate) gateFires++;
+    const moved = Math.hypot(full.end.dx - para.end.dx, full.end.dz - para.end.dz) > 1e-4;
+    if (moved) residualActive++;
+    rows.push({
+      label: controlLabel(full.controls),
+      fullErrM: fullErr,
+      paraErrM: paraErr,
+      ensSigmaPos: Math.hypot(pred.std[0] ?? 0, pred.std[1] ?? 0),
+      gate,
+    });
+  }
+  const n = rows.length;
+  if (n === 0) return null;
+  const fullRmsM = Math.sqrt(fullSq / n);
+  const paraRmsM = Math.sqrt(paraSq / n);
+  return {
+    startSpeed: opts.startSpeed,
+    count: n,
+    fullRmsM,
+    paraRmsM,
+    residualHelpPct: paraRmsM > 0 ? (1 - fullRmsM / paraRmsM) * 100 : 0,
+    gateFires,
+    residualActive,
+    worst: [...rows].sort((a, b) => b.fullErrM - a.fullErrM).slice(0, opts.topN ?? 5),
+  };
+}
+
 export interface ComputeUncertaintyOpts {
   primitives: ReadonlyArray<MotionPrimitive>;
   model: LearnedVehicleModel;
