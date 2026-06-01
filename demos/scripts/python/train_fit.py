@@ -208,12 +208,6 @@ def build_mlp_dataset(trials, parametric_params: np.ndarray):
         return pred
 
     pred_samples = jax.vmap(per_trial)(init_states, controls, configs, samples)
-    # Drop the initial state from `samples` so it aligns with `pred_samples`.
-    gt_after_init = samples[:, 1:, :]   # (N, S, 7) — matches pred
-    diff = gt_after_init - pred_samples
-    heading_diff = wrap_residual(gt_after_init[:, :, 2] - pred_samples[:, :, 2])
-    diff = diff.at[:, :, 2].set(heading_diff)
-    targets = diff[:, :, :6]                         # (N, S, 6)
 
     # Inputs: rebuild a simple 16-dim featurisation — heading sin/cos,
     # speed, yawRate, vy, controls, config. The Node side rebuilds the
@@ -239,9 +233,10 @@ def build_mlp_dataset(trials, parametric_params: np.ndarray):
         cfg_bcast[:, :, 0:1] / 1500.0, cfg_bcast[:, :, 1:2] / 1.5, cfg_bcast[:, :, 2:3],
     ], axis=-1)
 
-    # Truncate targets to match window count (drop the first sample row used as state).
-    tgt = (next_states - pred_samples[:, 1:, :])[:, :, :6]
-    heading_diff2 = wrap_residual(next_states[:, :, 2] - pred_samples[:, 1:, 2])
+    # `pred_samples[k]` predicts `samples[k+1]`, so it already aligns with
+    # `next_states = samples[:, 1:, :]` — no extra slicing needed.
+    tgt = (next_states - pred_samples)[:, :, :6]
+    heading_diff2 = wrap_residual(next_states[:, :, 2] - pred_samples[:, :, 2])
     tgt = tgt.at[:, :, 2].set(heading_diff2)
 
     # Flatten across trial × sample.

@@ -25,9 +25,17 @@ RESIDUAL_LOSS_WEIGHTS = jnp.array([1.0, 1.0, 100.0, 1.0, 10.0, 1.0])
 
 @dataclass(frozen=True)
 class MLPParams:
-    """A single MLP's weights, layer-flat. Pytree-compatible by `jax.tree_util`."""
+    """A single MLP's weights, layer-flat. Registered as a JAX pytree below so
+    optax/jax treat `Ws`/`bs` as the children (the arrays are the leaves)."""
     Ws: list[jnp.ndarray]  # each (out, in)
     bs: list[jnp.ndarray]  # each (out,)
+
+
+jax.tree_util.register_pytree_node(
+    MLPParams,
+    lambda p: ((p.Ws, p.bs), None),
+    lambda _aux, children: MLPParams(Ws=children[0], bs=children[1]),
+)
 
 
 def init_mlp(key, input_dim: int, hidden_dims: list[int], output_dim: int) -> MLPParams:
