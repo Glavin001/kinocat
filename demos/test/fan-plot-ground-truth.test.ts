@@ -14,7 +14,7 @@ import {
 import { characterizeVehicle } from 'kinocat/primitives';
 import {
   computeUncertaintyHalos,
-  computePrimitiveComparisonStats,
+  computeActionComparison,
 } from '../app/lib/fan-plot-ground-truth';
 import type { GroundTruthDot } from '../app/lib/fan-plot-ground-truth';
 
@@ -61,60 +61,59 @@ describe('computeUncertaintyHalos', () => {
   });
 });
 
-describe('computePrimitiveComparisonStats', () => {
+describe('computeActionComparison', () => {
   it('returns null when there is no ground truth yet', () => {
     const { lib, model } = buildLibFromModel(10);
-    const stats = computePrimitiveComparisonStats({
+    const summary = computeActionComparison({
       full: lib.primitives, parametric: lib.primitives, groundTruth: [],
       model, startSpeed: 10,
     });
-    expect(stats).toBeNull();
+    expect(summary).toBeNull();
   });
 
-  it('measures full/parametric endpoint RMS against ground truth and ranks worst', () => {
+  it('measures full/parametric endpoint RMS and sorts actions worst-first', () => {
     const { lib, model } = buildLibFromModel(10);
-    // Synthesize ground truth exactly on the parametric endpoints EXCEPT one
-    // primitive (index 1) offset by a known amount — para should be perfect,
-    // and the offset primitive should sort to the top.
+    // Ground truth on the model endpoints EXCEPT index 1, offset 1m — that
+    // action should sort to the top.
     const gt: GroundTruthDot[] = lib.primitives.map((p, i) => ({
-      index: i,
-      dx: p.end.dx + (i === 1 ? 1.0 : 0),
-      dz: p.end.dz,
+      index: i, dx: p.end.dx + (i === 1 ? 1.0 : 0), dz: p.end.dz,
     }));
-    const stats = computePrimitiveComparisonStats({
+    const summary = computeActionComparison({
       full: lib.primitives, parametric: lib.primitives, groundTruth: gt,
-      model, startSpeed: 10, topN: 4,
+      model, startSpeed: 10,
     });
-    expect(stats).not.toBeNull();
-    // full === parametric here (same lib), so both RMS match and residual is
-    // neither helping nor hurting.
-    expect(stats!.count).toBe(lib.primitives.length);
-    expect(stats!.fullRmsM).toBeCloseTo(stats!.paraRmsM, 9);
-    // Only one primitive is off by 1m → RMS = 1/sqrt(n).
-    expect(stats!.fullRmsM).toBeCloseTo(1 / Math.sqrt(lib.primitives.length), 6);
+    expect(summary).not.toBeNull();
+    expect(summary!.count).toBe(lib.primitives.length);
+    // full === parametric here → equal RMS, no net help.
+    expect(summary!.fullRmsM).toBeCloseTo(summary!.paraRmsM, 9);
+    expect(summary!.fullRmsM).toBeCloseTo(1 / Math.sqrt(lib.primitives.length), 6);
     // Parametric-only model → no ensemble → gate never fires.
-    expect(stats!.gateFires).toBe(0);
-    // Worst row is the 1m-offset primitive.
-    expect(stats!.worst[0]!.fullErrM).toBeCloseTo(1.0, 6);
+    expect(summary!.actions.every((a) => a.gate === false)).toBe(true);
+    // Worst action is the 1m-offset one, classified confident-bias (gate off).
+    expect(summary!.actions[0]!.fullErrM).toBeCloseTo(1.0, 6);
+    expect(summary!.actions[0]!.verdict).toBe('confident-bias');
+    // The on-truth actions are accurate.
+    expect(summary!.accurate).toBe(lib.primitives.length - 1);
+    expect(summary!.confidentBias).toBe(1);
   });
 
   it('flags the residual as harmful when it moves endpoints away from truth', () => {
     const { lib: paraLib } = buildLibFromModel(10);
-    // Ground truth sits 0.1m off the parametric endpoints; "full" is 0.5m off
-    // (residual pushed it further away). The residual is strictly worse →
-    // negative help %.
+    // GT 0.1m off parametric; "full" 0.5m off (residual pushed it further).
     const gt: GroundTruthDot[] = paraLib.primitives.map((p, i) => ({
       index: i, dx: p.end.dx + 0.1, dz: p.end.dz,
     }));
     const full = paraLib.primitives.map((p) => ({
-      ...p, end: { ...p.end, dx: p.end.dx + 0.6 }, // 0.5m beyond the GT offset
+      ...p, end: { ...p.end, dx: p.end.dx + 0.6 },
     }));
     const model = buildParametricOnlyModel(DEFAULT_LEARNED_PARAMS_V2, DEFAULT_LEARNABLE_CONFIG);
-    const stats = computePrimitiveComparisonStats({
+    const summary = computeActionComparison({
       full, parametric: paraLib.primitives, groundTruth: gt, model, startSpeed: 10,
     });
-    expect(stats!.paraRmsM).toBeCloseTo(0.1, 6);
-    expect(stats!.fullRmsM).toBeCloseTo(0.5, 6);
-    expect(stats!.residualHelpPct).toBeLessThan(0); // residual hurts
+    expect(summary!.paraRmsM).toBeCloseTo(0.1, 6);
+    expect(summary!.fullRmsM).toBeCloseTo(0.5, 6);
+    expect(summary!.residualHelpPct).toBeLessThan(0); // net harmful
+    // Every action's residual delta is negative (worse than parametric).
+    expect(summary!.actions.every((a) => a.residualDeltaPct < 0)).toBe(true);
   });
 });

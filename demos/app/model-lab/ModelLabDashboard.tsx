@@ -31,16 +31,16 @@ import { PerComponentRmsChart } from '../components/model-lab/PerComponentRmsCha
 import { ScenarioPlayground } from '../components/model-lab/ScenarioPlayground';
 import { PrimitiveFanPlot, type FanPlotGroundTruth, type FanPlotUncertainty } from '../components/PrimitiveFanPlot';
 import {
-  buildKinematicLibrary,
   buildLearnedRaceLibraryV2,
   RACE_START_SPEEDS,
 } from '../lib/race-primitives-scenarios';
 import {
   computeGroundTruthDots,
   computeUncertaintyHalos,
-  computePrimitiveComparisonStats,
-  type PrimitiveComparisonStats,
+  computeActionComparison,
+  type ActionComparisonSummary,
 } from '../lib/fan-plot-ground-truth';
+import { ActionComparisonPanel } from '../components/model-lab/ActionComparisonPanel';
 import { buildParametricOnlyModel } from 'kinocat/agent';
 
 export default function ModelLabDashboard() {
@@ -107,8 +107,8 @@ function DashboardInner() {
         <RoundEvolutionTable rounds={roundHistory} />
       </Section>
 
-      <Section title="Action space at a speed bucket — learned vs parametric vs Rapier"
-        subtitle="Three Stage-2 libraries over the same controls: KINEMATIC (bicycle baseline), PARAMETRIC (the learned analytical floor, residual stripped), and V2 LEARNED (parametric + residual ensemble). White dots are the Rapier ground-truth endpoints; arrows = per-control error; cyan halos = ensemble 1σ. Hit “overlay Rapier ground truth” to compute the dots and the quantitative panel — it reveals where the residual helps, and where it's confidently wrong in a regime the OOD gate misses.">
+      <Section title="How right is the model? — actions graded against the real car"
+        subtitle="Pick a speed, then “compare against real car”: every action the planner can take at that speed is rolled through Rapier, and the model's predicted endpoint is graded against where the chassis actually ends up. Each action gets a plain verdict — accurate, flagged-but-safe, or confidently wrong — so you can see at a glance which primitives the planner can trust and which carry hidden bias.">
         <FanPlotRow
           model={model}
           config={config}
@@ -175,11 +175,10 @@ function FanPlotRow({
 }) {
   const [groundTruth, setGroundTruth] = useState<FanPlotGroundTruth[]>([]);
   const [uncertainty, setUncertainty] = useState<FanPlotUncertainty[]>([]);
-  const [showGT, setShowGT] = useState(false);
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [computing, setComputing] = useState(false);
   const cacheRef = useRef<Map<string, { dx: number; dz: number }>>(new Map());
 
-  const kinematicLib = useMemo(() => buildKinematicLibrary(), []);
   const v2Lib = useMemo(() => (model ? buildLearnedRaceLibraryV2(model) : null), [model]);
   // Parametric-only (residual MLP stripped) — the safety floor the residual is
   // allowed to correct. Same control sets/order as the full v2 library.
@@ -187,16 +186,15 @@ function FanPlotRow({
     () => (model ? buildLearnedRaceLibraryV2(buildParametricOnlyModel(model.params, model.config)) : null),
     [model],
   );
-  const kinAtSpeed = useMemo(() => kinematicLib.lookup(selectedSpeed), [kinematicLib, selectedSpeed]);
   const v2AtSpeed = useMemo(() => (v2Lib ? v2Lib.lookup(selectedSpeed) : null), [v2Lib, selectedSpeed]);
   const paraAtSpeed = useMemo(() => (paraLib ? paraLib.lookup(selectedSpeed) : null), [paraLib, selectedSpeed]);
 
-  // Quantitative comparison vs the Rapier ground truth (only once GT computed).
-  const stats: PrimitiveComparisonStats | null = useMemo(() => {
+  // Per-action comparison vs the Rapier ground truth (only once GT computed).
+  const summary: ActionComparisonSummary | null = useMemo(() => {
     if (!model || !v2AtSpeed || !paraAtSpeed || groundTruth.length === 0) return null;
-    return computePrimitiveComparisonStats({
+    return computeActionComparison({
       full: v2AtSpeed, parametric: paraAtSpeed, groundTruth, model,
-      startSpeed: selectedSpeed, topN: 4,
+      startSpeed: selectedSpeed,
     });
   }, [model, v2AtSpeed, paraAtSpeed, groundTruth, selectedSpeed]);
 
@@ -212,6 +210,7 @@ function FanPlotRow({
   }, [model, config, v2AtSpeed, selectedSpeed]);
 
   // Compute ground truth on demand.
+  const hasGT = groundTruth.length > 0;
   const computeGT = async () => {
     if (!v2AtSpeed) return;
     setComputing(true);
@@ -223,42 +222,29 @@ function FanPlotRow({
         harness: h, cache: cacheRef.current,
       });
       setGroundTruth(gt);
-      setShowGT(true);
     } finally {
       setComputing(false);
     }
   };
 
-  // Reset GT when speed changes (it's bucket-specific).
+  // Reset GT + selection when speed changes (it's bucket-specific).
   useEffect(() => {
     setGroundTruth([]);
-    setShowGT(false);
+    setSelectedIndex(null);
   }, [selectedSpeed]);
 
+  // Extent for the pre-GT "action-space shape" preview (v2 sweeps only).
   const extent = useMemo(() => {
-    let xMin = -1, xMax = 1, zMin = -1, zMax = 1;
-    const consume = (prims: ReadonlyArray<MotionPrimitive>) => {
-      for (const p of prims) for (const s of p.sweep) {
-        if (s.x < xMin) xMin = s.x;
-        if (s.x > xMax) xMax = s.x;
-        if (s.z < zMin) zMin = s.z;
-        if (s.z > zMax) zMax = s.z;
-      }
-    };
-    consume(kinAtSpeed);
-    if (v2AtSpeed) consume(v2AtSpeed);
-    // Also widen for GT dots so arrows stay visible.
-    if (showGT) {
-      for (const g of groundTruth) {
-        if (g.dx < xMin) xMin = g.dx;
-        if (g.dx > xMax) xMax = g.dx;
-        if (g.dz < zMin) zMin = g.dz;
-        if (g.dz > zMax) zMax = g.dz;
-      }
+    let xMin = -2, xMax = 2, zMin = -2, zMax = 2;
+    if (v2AtSpeed) for (const p of v2AtSpeed) for (const s of p.sweep) {
+      if (s.x < xMin) xMin = s.x;
+      if (s.x > xMax) xMax = s.x;
+      if (s.z < zMin) zMin = s.z;
+      if (s.z > zMax) zMax = s.z;
     }
     const pad = 1.5;
     return { xMin: xMin - pad, xMax: xMax + pad, zMin: zMin - pad, zMax: zMax + pad };
-  }, [kinAtSpeed, v2AtSpeed, groundTruth, showGT]);
+  }, [v2AtSpeed]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -286,56 +272,46 @@ function FanPlotRow({
           onClick={computeGT}
           disabled={!v2AtSpeed || computing}
           style={{
-            padding: '4px 10px', borderRadius: 4, cursor: 'pointer',
-            background: showGT ? '#1a2030' : '#0d1119',
-            border: '1px solid #1f2735', color: '#cdd3de',
+            padding: '4px 12px', borderRadius: 4, cursor: v2AtSpeed ? 'pointer' : 'default',
+            background: hasGT ? '#0d1119' : '#13233a',
+            border: `1px solid ${hasGT ? '#1f2735' : '#2a4a6e'}`,
+            color: hasGT ? '#9aa6b2' : '#7fd6ff',
             font: '11px ui-monospace, monospace',
           }}
         >
-          {computing ? 'running Rapier…' : showGT ? 'refresh ground truth' : 'overlay Rapier ground truth'}
+          {computing ? 'running Rapier…' : hasGT ? 'recompute vs Rapier' : '▶ compare against real car (Rapier)'}
         </button>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, opacity: 0.7 }}>
-          <input
-            type="checkbox"
-            checked={showGT}
-            onChange={(e) => setShowGT(e.target.checked)}
-            disabled={groundTruth.length === 0}
-          />
-          show GT
-        </label>
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: 12 }}>
-        <PrimitiveFanPlot
-          primitives={kinAtSpeed}
-          forwardColor="#ff8aa0"
-          title={`KINEMATIC · ${selectedSpeed} m/s`}
-          subtitle={`${kinAtSpeed.length} primitives · bicycle baseline`}
-          fixedExtent={extent}
-          groundTruth={showGT ? groundTruth : undefined}
+
+      {summary ? (
+        <ActionComparisonPanel
+          summary={summary}
+          speed={selectedSpeed}
+          selectedIndex={selectedIndex}
+          onSelectIndex={setSelectedIndex}
         />
-        {paraAtSpeed ? (
-          <PrimitiveFanPlot
-            primitives={paraAtSpeed}
-            forwardColor="#c8b6ff"
-            title={`PARAMETRIC · ${selectedSpeed} m/s`}
-            subtitle={`${paraAtSpeed.length} primitives · residual stripped (safety floor)`}
-            fixedExtent={extent}
-            groundTruth={showGT ? groundTruth : undefined}
-          />
-        ) : <NoModelPanel />}
-        {v2AtSpeed ? (
+      ) : v2AtSpeed ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
           <PrimitiveFanPlot
             primitives={v2AtSpeed}
             forwardColor="#55dcff"
-            title={`V2 LEARNED · ${selectedSpeed} m/s`}
-            subtitle={`${v2AtSpeed.length} primitives · parametric + residual${uncertainty.length > 0 ? ' · σ halos' : ''}`}
+            title={`Action space · ${selectedSpeed} m/s`}
+            subtitle={`${v2AtSpeed.length} primitives the planner can pick from${uncertainty.length > 0 ? ' · σ halos' : ''}`}
             fixedExtent={extent}
-            groundTruth={showGT ? groundTruth : undefined}
             uncertainty={uncertainty}
+            highlightIndex={selectedIndex ?? undefined}
+            onHover={setSelectedIndex}
           />
-        ) : <NoModelPanel />}
-      </div>
-      {stats && <ComparisonStatsPanel stats={stats} speed={selectedSpeed} />}
+          <p style={{ margin: 0, fontSize: 11, opacity: 0.6, lineHeight: 1.5 }}>
+            Each curve is one control held for the full primitive; the dot is where the
+            model predicts the chassis ends up. Click{' '}
+            <strong style={{ color: '#7fd6ff' }}>“compare against real car”</strong>{' '}
+            to roll every action through Rapier and grade how right or wrong the model is.
+          </p>
+        </div>
+      ) : (
+        <NoModelPanel />
+      )}
     </div>
   );
 }
@@ -352,82 +328,6 @@ function NoModelPanel() {
   );
 }
 
-/** Quantitative learned-vs-parametric-vs-Rapier panel — the numbers behind the
- *  fan plots. Surfaces where the residual helps, where it's confidently wrong
- *  (residual active but full error ≥ parametric, OOD gate off), and where the
- *  gate correctly falls back. */
-function ComparisonStatsPanel({ stats, speed }: { stats: PrimitiveComparisonStats; speed: number }) {
-  const residualHurts = stats.residualHelpPct < 0;
-  const helpColor = residualHurts ? '#ff8aa0' : '#7CFFB2';
-  return (
-    <div style={{
-      border: '1px solid #1f2735', borderRadius: 6, padding: '12px 14px',
-      display: 'flex', flexDirection: 'column', gap: 10, background: '#0b0f17',
-    }}>
-      <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', alignItems: 'baseline' }}>
-        <span style={{ fontSize: 12, color: '#7fd6ff' }}>
-          ENDPOINT ERROR vs RAPIER · {speed} m/s · {stats.count} primitives
-        </span>
-        <Stat label="parametric RMS" value={`${stats.paraRmsM.toFixed(3)} m`} color="#c8b6ff" />
-        <Stat label="full learned RMS" value={`${stats.fullRmsM.toFixed(3)} m`} color="#55dcff" />
-        <Stat
-          label={residualHurts ? 'residual HURTS' : 'residual helps'}
-          value={`${stats.residualHelpPct >= 0 ? '−' : '+'}${Math.abs(stats.residualHelpPct).toFixed(0)}%`}
-          color={helpColor}
-        />
-        <Stat label="OOD gate fires" value={`${stats.gateFires}/${stats.count}`} color="#ffd479" />
-        <Stat label="residual active" value={`${stats.residualActive}/${stats.count}`} color="#9aa6b2" />
-      </div>
-      <table style={{ borderCollapse: 'collapse', fontSize: 11, width: '100%', maxWidth: 560 }}>
-        <thead>
-          <tr style={{ color: '#7f8a99', textAlign: 'left' }}>
-            <th style={thStyle}>worst action</th>
-            <th style={thStyle}>full err</th>
-            <th style={thStyle}>para err</th>
-            <th style={thStyle}>ens σ (pos)</th>
-            <th style={thStyle}>gate</th>
-          </tr>
-        </thead>
-        <tbody>
-          {stats.worst.map((w, i) => {
-            const confidentlyWrong = w.fullErrM >= w.paraErrM && !w.gate;
-            return (
-              <tr key={i} style={{ color: confidentlyWrong ? '#ff8aa0' : '#cdd3de' }}>
-                <td style={tdStyle}>
-                  {w.label}
-                  {confidentlyWrong && <span title="residual worse than parametric, OOD gate off"> ⚠</span>}
-                </td>
-                <td style={tdStyle}>{w.fullErrM.toFixed(3)} m</td>
-                <td style={tdStyle}>{w.paraErrM.toFixed(3)} m</td>
-                <td style={tdStyle}>{w.ensSigmaPos.toFixed(3)}</td>
-                <td style={tdStyle}>{w.gate ? 'ON' : 'off'}</td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-      <p style={{ margin: 0, fontSize: 10.5, opacity: 0.6, lineHeight: 1.5, maxWidth: 620 }}>
-        Rows in red ⚠ are the shared-bias failure: the residual pushed the
-        endpoint <em>further</em> from physics than the parametric floor, yet the
-        ensemble agreed (low σ) so the OOD gate never fired — the bias flows
-        straight into the planner library. High-σ rows with the gate ON are the
-        regimes the safety fallback actually protects.
-      </p>
-    </div>
-  );
-}
-
-function Stat({ label, value, color }: { label: string; value: string; color: string }) {
-  return (
-    <span style={{ display: 'inline-flex', flexDirection: 'column' }}>
-      <span style={{ fontSize: 14, color, fontWeight: 600 }}>{value}</span>
-      <span style={{ fontSize: 10, opacity: 0.6 }}>{label}</span>
-    </span>
-  );
-}
-
-const thStyle: React.CSSProperties = { padding: '3px 8px', borderBottom: '1px solid #1f2735', fontWeight: 400 };
-const tdStyle: React.CSSProperties = { padding: '3px 8px', fontVariantNumeric: 'tabular-nums' };
 
 function Section({ title, subtitle, children }: { title?: string; subtitle?: string; children: React.ReactNode }) {
   return (

@@ -34,7 +34,17 @@ export interface UncertaintyHalo {
 }
 
 /** Local-frame end position of running a single-control trial through
- *  Rapier. Returns null on a discarded trial (off-arena / spin etc). */
+ *  Rapier. Returns null on a discarded trial (off-arena / spin etc).
+ *
+ *  IMPORTANT: the harness coasts for ~9 settle ticks (zero controls) after
+ *  the teleport before it starts recording, so by the first recorded sample
+ *  the chassis has already drifted forward by ~startSpeed × 0.15 s (up to
+ *  several metres at race speeds). We therefore express the end pose in the
+ *  frame of the POST-SETTLE start sample — not the world origin — so the
+ *  reported displacement is the true motion under the control, free of the
+ *  settle-coast offset. (Earlier this returned raw world coords, which added
+ *  the coast distance to every error arrow and made the model look far more
+ *  wrong than it is at speed.) */
 function runHeadlessForControl(
   harness: HeadlessTrialHarness,
   startSpeed: number,
@@ -52,15 +62,23 @@ function runHeadlessForControl(
     pose: { x: 0, z: 0, heading: 0 },
     kin: { forwardSpeed: startSpeed },
     controlsTrace: trace,
-    sampleEveryNTicks: ticks, // single end-sample is enough
+    sampleEveryNTicks: ticks, // post-settle start sample + end sample
     id: `gt-${startSpeed}-${controls.join('_')}`,
   });
   if (!result.ok) return null;
-  const last = result.trial.samples[result.trial.samples.length - 1];
-  if (!last) return null;
-  // Trial frame: spawn at (0,0) heading 0. Samples are in world frame
-  // but the harness teleports to origin/heading-0 → world = local.
-  return { dx: last.x, dz: last.z };
+  const samples = result.trial.samples;
+  const start = samples[0];
+  const last = samples[samples.length - 1];
+  if (!start || !last) return null;
+  // Re-express the end in the post-settle start's local frame (origin at the
+  // start sample, +x along its heading) so the settle coast cancels out.
+  const ddx = last.x - start.x;
+  const ddz = last.z - start.z;
+  const h = start.heading;
+  return {
+    dx: ddx * Math.cos(h) + ddz * Math.sin(h),
+    dz: -ddx * Math.sin(h) + ddz * Math.cos(h),
+  };
 }
 
 export interface ComputeGroundTruthOpts {
@@ -112,30 +130,65 @@ export function computeGroundTruthDots(opts: ComputeGroundTruthOpts): GroundTrut
 // runtime gate WOULD fall back to parametric for a given primitive.
 const OOD_STD_THRESHOLD = [0.5, 0.5, 0.1, 1.0, 0.5, 0.5];
 
-export interface PrimitiveComparisonRow {
+// Classification thresholds (kept here, surfaced verbatim in the UI legend so
+// the viewer knows exactly what "accurate" means).
+/** An action is "accurate" if the model endpoint lands within this absolute
+ *  distance of Rapier, OR within ACCURATE_PCT of how far the chassis travelled
+ *  (whichever is more forgiving). The percentage term keeps the bar fair as
+ *  primitives get longer/faster. */
+export const ACCURATE_ABS_M = 0.6;
+export const ACCURATE_PCT = 0.08;
+
+export type Verdict = 'accurate' | 'flagged' | 'confident-bias';
+
+export interface XZ { dx: number; dz: number }
+
+/** Everything the UI needs to render one action's row + map glyph. */
+export interface ActionComparison {
+  /** Index into the (full) primitive array for the bucket. */
+  index: number;
   label: string;
-  fullErrM: number;
-  paraErrM: number;
+  /** Endpoints in the start-local frame (chassis at origin facing +x). */
+  full: XZ; // full learned model
+  para: XZ; // parametric-only floor
+  truth: XZ; // Rapier ground truth
+  /** Full model swept path (start-local) for the map's selected overlay. */
+  sweep: ReadonlyArray<{ x: number; z: number }>;
+  /** Reverse gear (drawn differently on the map). */
+  reverse: boolean;
+  fullErrM: number; // |full − truth|
+  paraErrM: number; // |para − truth|
+  /** Straight-line distance origin→truth — "how far the chassis went". */
+  travelM: number;
+  /** fullErrM / max(travelM, 1) — error as a fraction of travel. */
+  errFrac: number;
+  /** Ensemble 1σ position spread at the first step (the OOD signal). */
   ensSigmaPos: number;
+  /** Would the runtime OOD gate fall back to parametric here? */
   gate: boolean;
+  /** Did the residual actually move the endpoint off the parametric path? */
+  residualActive: boolean;
+  /** (paraErr − fullErr) / paraErr × 100. >0 ⇒ residual pulled toward truth
+   *  (helped); <0 ⇒ pushed away (hurt). */
+  residualDeltaPct: number;
+  verdict: Verdict;
 }
 
-export interface PrimitiveComparisonStats {
+export interface ActionComparisonSummary {
   startSpeed: number;
   count: number;
-  /** Full learned-model endpoint RMS vs Rapier ground truth (m). */
+  /** Full / parametric endpoint RMS vs Rapier (m). */
   fullRmsM: number;
-  /** Parametric-only (residual-stripped) endpoint RMS vs Rapier (m). */
   paraRmsM: number;
-  /** Percentage error reduction the residual buys over parametric.
-   *  Negative ⇒ the residual is net-HARMFUL in this bucket. */
+  /** Net residual help across the bucket (%). Negative ⇒ net harmful. */
   residualHelpPct: number;
-  /** How many primitives the OOD gate would fall back to parametric on. */
-  gateFires: number;
-  /** How many primitives the residual actually moves off the parametric path. */
-  residualActive: number;
-  /** Worst offenders by full-model endpoint error, descending. */
-  worst: PrimitiveComparisonRow[];
+  accurate: number;
+  flagged: number;
+  confidentBias: number;
+  /** Largest single full-model error — used to scale the scorecard bars. */
+  maxErrM: number;
+  /** All actions, sorted worst-first by full error. */
+  actions: ActionComparison[];
 }
 
 function controlLabel(c: ReadonlyArray<number>): string {
@@ -144,38 +197,47 @@ function controlLabel(c: ReadonlyArray<number>): string {
   const brake = c[2] ?? 0;
   const dir = Math.abs(steer) < 1e-6 ? 'straight' : steer > 0 ? 'left' : 'right';
   const eff = brake > 0 ? 'brake' : drive < 0 ? 'reverse' : drive > 0 ? 'drive' : 'coast';
-  return `${eff}-${dir}`;
+  return `${eff} · ${dir}`;
 }
 
-/** Quantify, for the selected start-speed bucket, how the parametric floor and
- *  the full learned model each diverge from the Rapier ground-truth endpoints,
- *  plus where the OOD gate fires. `groundTruth[i].index` indexes into `full`;
- *  `parametric` must be the same control set in the same order. */
-export function computePrimitiveComparisonStats(opts: {
+function classify(fullErrM: number, errFrac: number, gate: boolean): Verdict {
+  const accurate = fullErrM < ACCURATE_ABS_M || errFrac < ACCURATE_PCT;
+  if (accurate) return 'accurate';
+  // Wrong, but the system KNOWS it's unsure → it falls back to the safe
+  // parametric backbone. Honest, not dangerous.
+  if (gate) return 'flagged';
+  // Wrong AND the ensemble was confident → bias flows into the plan.
+  return 'confident-bias';
+}
+
+/** Build the full per-action comparison (verdicts + endpoints + summary) for a
+ *  speed bucket. `groundTruth[i].index` indexes into `full`; `parametric` must
+ *  be the same control set in the same order. */
+export function computeActionComparison(opts: {
   full: ReadonlyArray<MotionPrimitive>;
   parametric: ReadonlyArray<MotionPrimitive>;
   groundTruth: ReadonlyArray<GroundTruthDot>;
   model: LearnedVehicleModel;
   startSpeed: number;
   perStepDt?: number;
-  topN?: number;
-}): PrimitiveComparisonStats | null {
+}): ActionComparisonSummary | null {
   if (opts.groundTruth.length === 0) return null;
   const dt = opts.perStepDt ?? opts.model.residualReferenceDt;
   const hasEnsemble = opts.model.residualEnsemble.length > 0;
-  const rows: PrimitiveComparisonRow[] = [];
+  const actions: ActionComparison[] = [];
   let fullSq = 0;
   let paraSq = 0;
-  let gateFires = 0;
-  let residualActive = 0;
   for (const g of opts.groundTruth) {
     const full = opts.full[g.index];
     const para = opts.parametric[g.index];
     if (!full || !para) continue;
-    const fullErr = Math.hypot(full.end.dx - g.dx, full.end.dz - g.dz);
-    const paraErr = Math.hypot(para.end.dx - g.dx, para.end.dz - g.dz);
-    fullSq += fullErr * fullErr;
-    paraSq += paraErr * paraErr;
+    const truth: XZ = { dx: g.dx, dz: g.dz };
+    const fullErrM = Math.hypot(full.end.dx - truth.dx, full.end.dz - truth.dz);
+    const paraErrM = Math.hypot(para.end.dx - truth.dx, para.end.dz - truth.dz);
+    fullSq += fullErrM * fullErrM;
+    paraSq += paraErrM * paraErrM;
+    const travelM = Math.hypot(truth.dx, truth.dz);
+    const errFrac = fullErrM / Math.max(travelM, 1);
     const state: CarKinematicState = {
       x: 0, z: 0, heading: 0, speed: opts.startSpeed, t: 0, yawRate: 0, lateralVelocity: 0,
     };
@@ -183,19 +245,29 @@ export function computePrimitiveComparisonStats(opts: {
       ? predictWithUncertainty(opts.model, state, full.controls, dt)
       : { std: [0, 0, 0, 0, 0, 0] };
     const gate = pred.std.some((s, i) => s > (OOD_STD_THRESHOLD[i] ?? Infinity));
-    if (gate) gateFires++;
-    const moved = Math.hypot(full.end.dx - para.end.dx, full.end.dz - para.end.dz) > 1e-4;
-    if (moved) residualActive++;
-    rows.push({
+    const residualActive = Math.hypot(full.end.dx - para.end.dx, full.end.dz - para.end.dz) > 1e-4;
+    actions.push({
+      index: g.index,
       label: controlLabel(full.controls),
-      fullErrM: fullErr,
-      paraErrM: paraErr,
+      full: { dx: full.end.dx, dz: full.end.dz },
+      para: { dx: para.end.dx, dz: para.end.dz },
+      truth,
+      sweep: full.sweep.map((s) => ({ x: s.x, z: s.z })),
+      reverse: full.reverse,
+      fullErrM,
+      paraErrM,
+      travelM,
+      errFrac,
       ensSigmaPos: Math.hypot(pred.std[0] ?? 0, pred.std[1] ?? 0),
       gate,
+      residualActive,
+      residualDeltaPct: paraErrM > 1e-6 ? ((paraErrM - fullErrM) / paraErrM) * 100 : 0,
+      verdict: classify(fullErrM, errFrac, gate),
     });
   }
-  const n = rows.length;
+  const n = actions.length;
   if (n === 0) return null;
+  actions.sort((a, b) => b.fullErrM - a.fullErrM);
   const fullRmsM = Math.sqrt(fullSq / n);
   const paraRmsM = Math.sqrt(paraSq / n);
   return {
@@ -204,9 +276,11 @@ export function computePrimitiveComparisonStats(opts: {
     fullRmsM,
     paraRmsM,
     residualHelpPct: paraRmsM > 0 ? (1 - fullRmsM / paraRmsM) * 100 : 0,
-    gateFires,
-    residualActive,
-    worst: [...rows].sort((a, b) => b.fullErrM - a.fullErrM).slice(0, opts.topN ?? 5),
+    accurate: actions.filter((a) => a.verdict === 'accurate').length,
+    flagged: actions.filter((a) => a.verdict === 'flagged').length,
+    confidentBias: actions.filter((a) => a.verdict === 'confident-bias').length,
+    maxErrM: Math.max(...actions.map((a) => a.fullErrM)),
+    actions,
   };
 }
 
