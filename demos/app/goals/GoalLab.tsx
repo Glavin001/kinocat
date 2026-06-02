@@ -25,27 +25,23 @@ import {
   collectScenarioRegions,
   validate,
   type CompiledAutomaton,
+  type ProgressSnapshot,
   type ScenarioState,
 } from 'kinocat/scenario';
 import type { CarKinematicState } from 'kinocat/agent';
 import { hermitePose, densifyPath } from '../lib/path-anim';
 import { goalLabPresets, type GoalPreset } from '../lib/goallab-presets';
+import { GoalProgressPanel } from '../components/GoalProgressPanel';
 
 interface HudState {
   preset: string;
-  q: number;
-  depth: number;
-  maxDepth: number;
-  done: boolean;
-  laps: number;
+  automaton: CompiledAutomaton;
+  snapshot: ProgressSnapshot;
   partial: boolean;
   tracked: boolean;
   cost: number;
   expansions: number;
   diagnostics: string[];
-  transitions: { from: number; to: number; label: string }[];
-  accepting: number[];
-  start: number;
 }
 
 const PRESETS = goalLabPresets();
@@ -200,27 +196,15 @@ export default function GoalLab() {
         const idx = prefixIndex(animClock);
         const prefix: ScenarioState[] = path.slice(0, Math.max(1, idx + 1));
         const p = evaluateProgress(automaton, prefix);
-        const transitions: HudState['transitions'] = [];
-        for (const st of automaton.states) {
-          for (const tr of st.transitions) {
-            transitions.push({ from: st.id, to: tr.target, label: tr.guard.region.kind });
-          }
-        }
         setHud({
           preset: preset?.title ?? '',
-          q: p.q,
-          depth: p.depth,
-          maxDepth: p.maxDepth,
-          done: p.done,
-          laps: p.laps,
+          automaton,
+          snapshot: p,
           partial: planPartial,
           tracked: planTracked,
           cost: planCost,
           expansions: planExpansions,
           diagnostics,
-          transitions,
-          accepting: automaton.accepting,
-          start: automaton.start,
         });
       }
 
@@ -287,10 +271,12 @@ export default function GoalLab() {
         </div>
         {hud && (
           <>
-            <div style={{ color: '#9bd', marginBottom: 6 }}>
-              {PRESETS.find((p) => p.id === presetId)?.description}
-            </div>
-            <ProgressView hud={hud} />
+            <GoalProgressPanel
+              automaton={hud.automaton}
+              snapshot={hud.snapshot}
+              description={PRESETS.find((p) => p.id === presetId)?.description}
+              maxRows={12}
+            />
             <div style={{ marginTop: 6 }}>
               {hud.tracked ? (
                 <>follow controller · {hud.cost.toFixed(1)}s tracked</>
@@ -301,7 +287,6 @@ export default function GoalLab() {
                 </>
               )}
             </div>
-            <AutomatonView hud={hud} />
             {hud.diagnostics.length > 0 && (
               <div style={{ marginTop: 6, color: '#fc8' }}>
                 {hud.diagnostics.map((d, i) => (
@@ -321,32 +306,3 @@ export default function GoalLab() {
   );
 }
 
-function ProgressView({ hud }: { hud: HudState }) {
-  const pct = hud.maxDepth > 0 ? Math.round((hud.depth / hud.maxDepth) * 100) : 0;
-  return (
-    <div>
-      <div>
-        phase <b>{hud.depth}</b> / {hud.maxDepth}
-        {hud.laps > 0 && <> · laps {hud.laps}</>}
-        {hud.done && <span style={{ color: '#6f9' }}> · DONE ✓</span>}
-      </div>
-      <div style={{ height: 8, background: '#1a2330', borderRadius: 4, overflow: 'hidden', marginTop: 3 }}>
-        <div style={{ width: `${pct}%`, height: '100%', background: hud.done ? '#6f9' : '#4df' }} />
-      </div>
-    </div>
-  );
-}
-
-function AutomatonView({ hud }: { hud: HudState }) {
-  // Compact textual automaton with the live state highlighted.
-  return (
-    <div style={{ marginTop: 6, color: '#9ab' }}>
-      <div style={{ color: '#789' }}>automaton (current = q{hud.q}):</div>
-      {hud.transitions.slice(0, 12).map((tr, i) => (
-        <div key={i} style={{ color: tr.from === hud.q ? '#4df' : '#566' }}>
-          q{tr.from} →{tr.to === hud.q ? <b style={{ color: '#4df' }}> q{tr.to}</b> : <> q{tr.to}</>} : {tr.label}
-        </div>
-      ))}
-    </div>
-  );
-}
