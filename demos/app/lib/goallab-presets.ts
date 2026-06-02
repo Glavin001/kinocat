@@ -26,7 +26,7 @@ import {
   deg,
 } from 'kinocat/scenario';
 import type { Scenario, RegionAgent } from 'kinocat/scenario';
-import { authorParkingScenario, authorDraftingHold, planDrafting } from './scenario-goals';
+import { authorParkingScenario, authorDraftingHold } from './scenario-goals';
 import {
   buildParkingScenario,
   PARKING_AGENT,
@@ -296,33 +296,95 @@ function parkingPreset(id: ParkingScenarioId, title: string): GoalPreset {
 }
 
 // --- Drafting (CONTINUOUS close-follow behind a moving car) -----------------
-// Uses the sustained `hold` variant so the visualization shows the ego FIRST
-// reaching the slipstream slot and then CONTINUING to draft (a repeat/progress
-// objective, never "done") — match-pace is `.while`-scoped to the slot.
-function draftingPreset(): GoalPreset {
-  const bounds = { x0: -40, x1: 70, z0: -25, z1: 25 };
-  const lead: RegionAgent = {
+// The lead drives a CLOSED CIRCULAR loop (so it stays on the plane), and we
+// stitch a RECEDING-HORIZON sequence of short "reach the slot ~LOOK seconds
+// ahead" plans into one long trajectory — the ego perpetually drafts ~`gap` m
+// behind the circling lead. This is the spec's MPC-over-the-automaton idea
+// realized for the visualizer: re-plan from the current pose as the target
+// moves, rather than a single finite-horizon plan that ends.
+const DRAFT_BOUNDS = { x0: -32, x1: 32, z0: -32, z1: 32 };
+
+/** A lead car cruising counter-clockwise around a circle of radius R. */
+function circlingLead(R: number, omega: number): RegionAgent {
+  return {
     id: 'lead',
-    predict: (t) => ({ x: 6 + 3 * t, z: 0, heading: 0, speed: 3, t }),
+    predict: (t) => {
+      const a = omega * t;
+      // velocity = d/dt (R cos a, R sin a) = R·omega·(−sin a, cos a)
+      return {
+        x: R * Math.cos(a),
+        z: R * Math.sin(a),
+        heading: Math.atan2(R * omega * Math.cos(a), -R * omega * Math.sin(a)),
+        speed: R * omega,
+        t,
+      };
+    },
   };
-  // Start near the lead's path so the (time-augmented) repeat search reaches
-  // the slot quickly and then holds.
-  const start: CarKinematicState = { x: -2, z: -5, heading: 0, speed: 0, t: 0 };
-  const scenario = authorDraftingHold({ start, lead, gap: 6, tol: 2.5, safe: 2, bounds });
+}
+
+/** Receding-horizon continuous draft: stitch short "drive to the slot the lead
+ *  will occupy in LOOK seconds" plans into one long, smooth following path. */
+function planContinuousDraft(
+  lead: RegionAgent,
+  start: CarKinematicState,
+  bounds: typeof DRAFT_BOUNDS,
+  gap: number,
+  tol: number,
+  /** Stitch until the sim clock reaches this (e.g. one lead loop period). */
+  durationSec: number,
+): ScenarioPlanResult {
+  const { agent, lib } = goalLabVehicle();
+  const world = new InMemoryNavWorld(fieldPolys(bounds), []);
+  const LOOK = 2.0;
+  const MAX_STEPS = 80;
+  let state: CarKinematicState = { ...start, t: 0 };
+  const merged: CarKinematicState[] = [{ ...state }];
+  let firstRaw: ScenarioPlanResult['raw'] | null = null;
+  for (let k = 0; k < MAX_STEPS && state.t < durationSec; k++) {
+    const la = lead.predict(state.t + LOOK);
+    if (!la) break;
+    const slot = { x: la.x - Math.cos(la.heading) * gap, z: la.z - Math.sin(la.heading) * gap };
+    const r = planVehicleScenario({
+      start: state,
+      goal: reach(near(slot, tol)),
+      invariants: [stayInside(field(bounds))],
+      prefer: [minTime(1)],
+      world,
+      agent,
+      lib,
+      envOptions: { posCell: 1, headingBuckets: 24, goalRadius: tol, analyticExpansion: { everyN: 6, step: 0.5 } },
+      deadlineMs: Infinity,
+      maxExpansions: 30_000,
+    });
+    if (!firstRaw) firstRaw = r.raw;
+    if (r.path.length < 2) {
+      state = { ...state, t: state.t + LOOK }; // already in the slot; let the lead advance
+      continue;
+    }
+    merged.push(...r.path.slice(1));
+    state = { ...r.path[r.path.length - 1]! };
+  }
+  return { raw: firstRaw ?? ({ found: merged.length > 1, partial: true } as ScenarioPlanResult['raw']), path: merged };
+}
+
+function draftingPreset(): GoalPreset {
+  const R = 16;
+  const omega = 0.26; // speed ≈ R·omega ≈ 4.2 m/s
+  const lead = circlingLead(R, omega);
+  const gap = 6;
+  const period = (2 * Math.PI) / omega; // one full lead loop ≈ 24 s
+  // Start in the slot behind the lead's t=0 pose (lead at (R,0) heading +z).
+  const start: CarKinematicState = { x: R, z: -gap, heading: Math.PI / 2, speed: 0, t: 0 };
+  const scenario = authorDraftingHold({ start, lead, gap, tol: 2.5, safe: 2, bounds: DRAFT_BOUNDS });
   return {
     id: 'drafting',
     title: 'Drafting (follow a moving car)',
-    description: 'repeat(reach(behind(lead,6))) + hold station — enters the slipstream, then keeps following',
+    description: 'repeat(reach(behind(lead,6))) — receding-horizon: the lead circles the plane, the ego keeps drafting',
     scenario,
-    bounds,
+    bounds: DRAFT_BOUNDS,
     obstacles: [],
     movingTarget: lead,
-    plan: () =>
-      planDrafting({ start, lead, gap: 6, tol: 2.5, safe: 2, bounds }, {
-        hold: true,
-        horizonSeconds: 6,
-        maxExpansions: 55_000,
-      }),
+    plan: () => planContinuousDraft(lead, start, DRAFT_BOUNDS, gap, 2.5, period),
   };
 }
 
