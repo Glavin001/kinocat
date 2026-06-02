@@ -53,11 +53,17 @@ function agentIdOf(region: Region): string | null {
   return m ? m[1]! : null;
 }
 
-/** Parse `at` margins (dx, dz, dheading) from the region key. */
+/** Parse `at` position margins from the key (`...,dx,dz,...` box or `...,r<radius>,...`
+ *  disk) as an effective (dx, dz) for the margins-vs-resolution check. */
 function atMargins(region: Region): { dx: number; dz: number } | null {
   if (region.kind !== 'at') return null;
   const parts = region.key.slice('at:'.length).split(',');
-  const dx = Number(parts[3]);
+  const p3 = parts[3] ?? '';
+  if (p3.startsWith('r')) {
+    const r = Number(p3.slice(1));
+    return Number.isFinite(r) ? { dx: r, dz: r } : null;
+  }
+  const dx = Number(p3);
   const dz = Number(parts[4]);
   if (Number.isFinite(dx) && Number.isFinite(dz)) return { dx, dz };
   return null;

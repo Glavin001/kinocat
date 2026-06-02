@@ -31,7 +31,10 @@ import {
   createCarMeshHelper,
   syncCarMesh,
   createGoalMarkerHelper,
+  createRegionHelper,
+  REGION_COLORS,
 } from 'kinocat/adapters/three';
+import { goalRegions, maintainRegions } from 'kinocat/scenario';
 import {
   PARKING_BOUNDS,
   PARKING_PALETTE as C,
@@ -41,6 +44,7 @@ import {
   buildParkingScenario,
   parkingLibrary,
   parkingCourse,
+  parkingPlannerGoal,
   parkingScenarioOptions,
   evaluateParked,
   type ParkingScenarioId,
@@ -274,6 +278,23 @@ export default function Parking() {
       goalMesh = createGoalMarkerHelper({ color: C.goal, size: 1.5 });
       goalMesh.position.set(s.goal.x, 0.3, s.goal.z);
       scene.add(goalMesh);
+      // Canonical-goal overlay: draw the kinocat/scenario regions this scenario
+      // is described by — the `at(pose)` goal disk (objective) and the
+      // `stayInside(lot)` invariant — so the page visualizes the SAME goal the
+      // planner consumes (the spec's "authored once, read by both").
+      {
+        const spec = parkingPlannerGoal(s);
+        for (const r of goalRegions(spec.goal)) {
+          const g = createRegionHelper(r, { color: REGION_COLORS.objective, y: 0.07 });
+          scene.add(g);
+          scenarioMeshes.push(g);
+        }
+        for (const r of maintainRegions(spec.invariants)) {
+          const g = createRegionHelper(r, { color: 0x556677, y: 0.03 });
+          scene.add(g);
+          scenarioMeshes.push(g);
+        }
+      }
       // Build the shared scenario runner — same code path as the
       // controller-bench CLI.
       // Canonical parking options shared with the CLI bench + Vitest tests

@@ -79,22 +79,34 @@ export function createRegionHelper(region: Region, opts: RegionHelperOptions = {
   }
 
   if (region.kind === 'at') {
-    const [x, z, heading, dx, dz] = nums(k, 'at:');
-    const box: THREE.Vector3[] = [];
-    const corners: [number, number][] = [
-      [dx!, dz!], [-dx!, dz!], [-dx!, -dz!], [dx!, -dz!],
-    ];
-    const c = Math.cos(heading!);
-    const s = Math.sin(heading!);
-    for (const [lx, lz] of corners) {
-      box.push(new THREE.Vector3(x! + lx * c - lz * s, y, z! + lx * s + lz * c));
+    // key: at:x,z,heading,(dx,dz | r<radius>),dheading
+    const parts = k.slice('at:'.length).split(',');
+    const x = Number(parts[0]);
+    const z = Number(parts[1]);
+    const heading = Number(parts[2]);
+    const c = Math.cos(heading);
+    const s = Math.sin(heading);
+    const isDisk = (parts[3] ?? '').startsWith('r');
+    if (isDisk) {
+      const r = Number((parts[3] ?? 'r0').slice(1)) || 0.5;
+      group.add(lineLoop(ringPoints(x, z, r, y), color));
+      group.add(line(
+        [new THREE.Vector3(x, y, z), new THREE.Vector3(x + c * (r + 0.5), y, z + s * (r + 0.5))],
+        color,
+      ));
+    } else {
+      const dx = Number(parts[3]) || 0;
+      const dz = Number(parts[4]) || 0;
+      const box: THREE.Vector3[] = [];
+      for (const [lx, lz] of [[dx, dz], [-dx, dz], [-dx, -dz], [dx, -dz]] as [number, number][]) {
+        box.push(new THREE.Vector3(x + lx * c - lz * s, y, z + lx * s + lz * c));
+      }
+      group.add(lineLoop(box, color));
+      group.add(line(
+        [new THREE.Vector3(x, y, z), new THREE.Vector3(x + c * (dx + 0.5), y, z + s * (dx + 0.5))],
+        color,
+      ));
     }
-    group.add(lineLoop(box, color));
-    // heading tick
-    group.add(line(
-      [new THREE.Vector3(x!, y, z!), new THREE.Vector3(x! + c * (dx! + 0.5), y, z! + s * (dx! + 0.5))],
-      color,
-    ));
     return group;
   }
 
