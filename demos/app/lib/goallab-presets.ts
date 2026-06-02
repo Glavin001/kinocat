@@ -7,7 +7,9 @@ import { InMemoryNavWorld } from 'kinocat/environment';
 import { planVehicleScenario } from 'kinocat/planner';
 import type { ScenarioPlanResult } from 'kinocat/planner';
 import type { VehicleAgent, CarKinematicState } from 'kinocat/agent';
+import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
 import type { MotionPrimitiveLibrary } from 'kinocat/primitives';
+import { characterizeVehicle } from 'kinocat/primitives';
 import {
   defineScenario,
   reach,
@@ -24,9 +26,13 @@ import {
   deg,
 } from 'kinocat/scenario';
 import type { Scenario, RegionAgent } from 'kinocat/scenario';
-import { demoVehicle } from './scenarios';
-import { authorParkingScenario, authorDrafting, planDrafting } from './scenario-goals';
-import { buildParkingScenario, PARKING_AGENT, parkingLibrary } from './parking-scenarios';
+import { authorParkingScenario, authorDraftingHold, planDrafting } from './scenario-goals';
+import {
+  buildParkingScenario,
+  PARKING_AGENT,
+  parkingLibrary,
+  type ParkingScenarioId,
+} from './parking-scenarios';
 
 export interface GoalPreset {
   id: string;
@@ -64,6 +70,57 @@ function boxPoly(x: number, z: number, h: number): [number, number][] {
   ];
 }
 
+/** A finer cruising library for the open-field presets: a chassis that matches
+ *  the rendered 4.8×2.0 m car, with several curvature options at a steady cruise
+ *  speed (and a few reverse) at 0.4 s granularity. Denser + curvier than the
+ *  demo's `startSpeeds:[0]` set, so the visualized path reads as smooth arcs
+ *  rather than straight chords between sparse nodes. */
+function goalLabVehicle(): { agent: VehicleAgent; lib: MotionPrimitiveLibrary } {
+  const agent = defaultVehicleAgent({
+    minTurnRadius: 4,
+    maxSpeed: 8,
+    maxReverseSpeed: 4,
+    footprint: [
+      [2.4, 1.0],
+      [-2.4, 1.0],
+      [-2.4, -1.0],
+      [2.4, -1.0],
+    ],
+  });
+  const k = 1 / agent.minTurnRadius;
+  const cruise = 7;
+  const lib = characterizeVehicle({
+    forwardSim: kinematicForwardSim(agent),
+    controlSets: [
+      [0, cruise],
+      [k, cruise],
+      [-k, cruise],
+      [k / 2, cruise],
+      [-k / 2, cruise],
+      [k / 3, cruise],
+      [-k / 3, cruise],
+      [0, -3],
+      [k, -3],
+      [-k, -3],
+    ],
+    duration: 0.4,
+    substeps: 6,
+    startSpeeds: [0, cruise],
+  });
+  return { agent, lib };
+}
+
+/** Env options for the open-field presets. The analytic Reeds-Shepp shot stays
+ *  ON (it's what makes the goal reliably reachable); the GoalLab renderer
+ *  smooths the resulting sparse path with heading-aware Hermite interpolation,
+ *  so the long shot edge reads as a curve rather than a straight chord. */
+const SMOOTH_ENV = {
+  posCell: 1,
+  headingBuckets: 24,
+  goalRadius: 2,
+  analyticExpansion: { everyN: 6, step: 0.5 },
+};
+
 function planWith(
   scenario: Scenario,
   world: InMemoryNavWorld,
@@ -99,7 +156,7 @@ function pointToPointPreset(): GoalPreset {
     invariants: [stayInside(field(FIELD)), avoid(inside(obstacles[0]!))],
     prefer: [minTime(1)],
   });
-  const { agent, lib } = demoVehicle();
+  const { agent, lib } = goalLabVehicle();
   return {
     id: 'point-to-point',
     title: 'Point-to-point',
@@ -108,11 +165,7 @@ function pointToPointPreset(): GoalPreset {
     bounds: FIELD,
     obstacles,
     plan: () =>
-      planWith(scenario, new InMemoryNavWorld(fieldPolys(FIELD), obstacles), agent, lib, {
-        posCell: 1,
-        headingBuckets: 16,
-        goalRadius: 2,
-      }),
+      planWith(scenario, new InMemoryNavWorld(fieldPolys(FIELD), obstacles), agent, lib, SMOOTH_ENV),
   };
 }
 
@@ -125,7 +178,7 @@ function aOrBPreset(): GoalPreset {
     invariants: [stayInside(field(FIELD))],
     prefer: [minTime(1)],
   });
-  const { agent, lib } = demoVehicle();
+  const { agent, lib } = goalLabVehicle();
   return {
     id: 'a-or-b',
     title: 'A or B (any)',
@@ -134,11 +187,7 @@ function aOrBPreset(): GoalPreset {
     bounds: FIELD,
     obstacles: [],
     plan: () =>
-      planWith(scenario, new InMemoryNavWorld(fieldPolys(FIELD), []), agent, lib, {
-        posCell: 1,
-        headingBuckets: 16,
-        goalRadius: 2,
-      }),
+      planWith(scenario, new InMemoryNavWorld(fieldPolys(FIELD), []), agent, lib, SMOOTH_ENV),
   };
 }
 
@@ -157,7 +206,7 @@ function slalomPreset(): GoalPreset {
     invariants: [stayInside(field(FIELD))],
     prefer: [minTime(1)],
   });
-  const { agent, lib } = demoVehicle();
+  const { agent, lib } = goalLabVehicle();
   return {
     id: 'slalom',
     title: 'Slalom (seq)',
@@ -167,8 +216,7 @@ function slalomPreset(): GoalPreset {
     obstacles: [],
     plan: () =>
       planWith(scenario, new InMemoryNavWorld(fieldPolys(FIELD), []), agent, lib, {
-        posCell: 1,
-        headingBuckets: 16,
+        ...SMOOTH_ENV,
         goalRadius: 2.5,
       }),
   };
@@ -189,7 +237,7 @@ function interceptPreset(): GoalPreset {
     prefer: [minTime(1)],
     agents: [target],
   });
-  const { agent, lib } = demoVehicle({ maxSpeed: 10 });
+  const { agent, lib } = goalLabVehicle();
   return {
     id: 'intercept',
     title: 'Intercept (dynamic)',
@@ -200,20 +248,25 @@ function interceptPreset(): GoalPreset {
     movingTarget: target,
     plan: () =>
       planWith(scenario, new InMemoryNavWorld(fieldPolys(FIELD), []), agent, lib, {
-        posCell: 1,
-        headingBuckets: 16,
+        ...SMOOTH_ENV,
         goalRadius: 2.5,
       }),
   };
 }
 
-// --- Parking (at-pose, stop, aligned) --------------------------------------
-function parkingPreset(): GoalPreset {
-  const s = buildParkingScenario('forward-pullin');
-  const scenario = authorParkingScenario('forward-pullin');
+// --- Parking (at-pose, stop, aligned) — one preset per stall layout --------
+const PARKING_VARIANTS: Array<{ id: ParkingScenarioId; title: string }> = [
+  { id: 'forward-pullin', title: 'Parking — forward pull-in' },
+  { id: 'reverse-perp', title: 'Parking — reverse into bay' },
+  { id: 'parallel', title: 'Parking — parallel' },
+];
+
+function parkingPreset(id: ParkingScenarioId, title: string): GoalPreset {
+  const s = buildParkingScenario(id);
+  const scenario = authorParkingScenario(id);
   return {
-    id: 'parking',
-    title: 'Parking (at + stop)',
+    id: `parking-${id}`,
+    title,
     description: 'reach(at(pose,margins),{speed:{max:0}}) + stayInside(lot) + avoid(cars)',
     scenario,
     bounds: s.bounds,
@@ -242,24 +295,34 @@ function parkingPreset(): GoalPreset {
   };
 }
 
-// --- Drafting (close-follow behind a moving car) ---------------------------
+// --- Drafting (CONTINUOUS close-follow behind a moving car) -----------------
+// Uses the sustained `hold` variant so the visualization shows the ego FIRST
+// reaching the slipstream slot and then CONTINUING to draft (a repeat/progress
+// objective, never "done") — match-pace is `.while`-scoped to the slot.
 function draftingPreset(): GoalPreset {
   const bounds = { x0: -40, x1: 70, z0: -25, z1: 25 };
   const lead: RegionAgent = {
     id: 'lead',
-    predict: (t) => ({ x: 10 + 3 * t, z: 0, heading: 0, speed: 3, t }),
+    predict: (t) => ({ x: 6 + 3 * t, z: 0, heading: 0, speed: 3, t }),
   };
-  const start: CarKinematicState = { x: -10, z: -10, heading: 0, speed: 0, t: 0 };
-  const scenario = authorDrafting({ start, lead, gap: 6, tol: 2, safe: 2, bounds });
+  // Start near the lead's path so the (time-augmented) repeat search reaches
+  // the slot quickly and then holds.
+  const start: CarKinematicState = { x: -2, z: -5, heading: 0, speed: 0, t: 0 };
+  const scenario = authorDraftingHold({ start, lead, gap: 6, tol: 2.5, safe: 2, bounds });
   return {
     id: 'drafting',
     title: 'Drafting (follow a moving car)',
-    description: 'reach(behind(lead, 6)) + maintain(distanceFrom(lead, ≥2)) — dynamic → intercepts the slipstream slot',
+    description: 'repeat(reach(behind(lead,6))) + hold station — enters the slipstream, then keeps following',
     scenario,
     bounds,
     obstacles: [],
     movingTarget: lead,
-    plan: () => planDrafting({ start, lead, gap: 6, tol: 2, safe: 2, bounds }),
+    plan: () =>
+      planDrafting({ start, lead, gap: 6, tol: 2.5, safe: 2, bounds }, {
+        hold: true,
+        horizonSeconds: 6,
+        maxExpansions: 55_000,
+      }),
   };
 }
 
@@ -270,6 +333,6 @@ export function goalLabPresets(): GoalPreset[] {
     aOrBPreset(),
     interceptPreset(),
     draftingPreset(),
-    parkingPreset(),
+    ...PARKING_VARIANTS.map((v) => parkingPreset(v.id, v.title)),
   ];
 }
