@@ -9,6 +9,7 @@ const entry = {
   'agent/index': 'src/agent/index.ts',
   'planner/index': 'src/planner/index.ts',
   'environment/index': 'src/environment/index.ts',
+  'scenario/index': 'src/scenario/index.ts',
   'predict/index': 'src/predict/index.ts',
   'execute/index': 'src/execute/index.ts',
   'learning/index': 'src/learning/index.ts',

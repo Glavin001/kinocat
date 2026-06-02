@@ -195,6 +195,12 @@ const GROUPS: readonly DemoGroup[] = [
         desc: 'Side-by-side fan plots for kinematic vs learned primitives, with overlay endpoints showing exactly which controls the two models disagree about.',
         tags: ['2D', 'Diagnostic'],
       },
+      {
+        href: '/goals',
+        title: 'Goal Lab',
+        desc: 'Author a goal in the canonical scenario AST (reach/seq/all/any/repeat + invariants), watch the planner drive toward it, and see the compiled automaton light up phase-by-phase in real time. Built for debugging + iterating on goals.',
+        tags: ['3D', 'Diagnostic', 'Time-aware'],
+      },
     ],
   },
 ];

@@ -80,6 +80,13 @@ export function plan<State>(
   let seq = 0;
   let expansionsSinceImprovement = 0;
 
+  // Best-progress (anytime) fallback: when the env exposes a `progress` score
+  // and no goal region is ever reached, return the deepest-progress node seen.
+  // The hook is fully gated so non-progress searches stay byte-identical.
+  const trackProgress = typeof env.progress === 'function';
+  let bestProgress = -Infinity;
+  let progressNodes: Node<State>[] | null = null;
+
   // Heap pushes Node refs directly — node.seq breaks f/h ties (FIFO within
   // equal cost). Avoids per-push QItem object allocation (~200k saved on
   // canyon).
@@ -152,6 +159,14 @@ export function plan<State>(
         continue; // keep searching for a better solution (anytime)
       }
 
+      if (trackProgress) {
+        const p = env.progress!(v);
+        if (p > bestProgress + EPS) {
+          bestProgress = p;
+          progressNodes = reconstructNodes(v);
+        }
+      }
+
       stats.expansions++;
       expansionsSinceImprovement++;
 
@@ -217,6 +232,15 @@ export function plan<State>(
     result.cost = omega;
     result.nodes = incumbentNodes;
     result.path = incumbentNodes.map((n) => n.state);
+  } else if (progressNodes && progressNodes.length > 0) {
+    // Best-progress fallback: no goal region reached, but advance as far as the
+    // search got (deepest automaton phase). Flagged `partial` so callers know
+    // the objective was not formally satisfied.
+    result.found = true;
+    result.partial = true;
+    result.cost = progressNodes[progressNodes.length - 1]!.g;
+    result.nodes = progressNodes;
+    result.path = progressNodes.map((n) => n.state);
   }
   if (timingsOn) timings.total = performance.now() - tStart;
   env.attachRecorder?.(NULL_RECORDER);
