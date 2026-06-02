@@ -1222,9 +1222,11 @@ async function setupScene(
       mirrorStatus(learned, r.cars[1]!, now);
       cb.onMetrics(kinematic.metrics, learned.metrics);
       // Feed the eval probes every tick (read-only; cannot affect determinism).
-      // RaceCarStatus is structurally a MonitorSample with a richer plan.
-      kProbe.sample(r.cars[0]!);
-      lProbe.sample(r.cars[1]!);
+      // RaceCarStatus is structurally a MonitorSample with a richer plan. Pass
+      // the real frame dt — the scenario steps physics by this variable amount,
+      // so the probe's finite differences must use it, not a fixed 1/60.
+      kProbe.sample(r.cars[0]!, dt);
+      lProbe.sample(r.cars[1]!, dt);
       // Emit the comparison snapshot in BOTH modes (legacy + v2). The lap-
       // times / sector-deltas are universal; only the per-coef refit fields
       // are legacy-only and get safe defaults when v2 is driving.

@@ -116,15 +116,24 @@ function Column({ entry }: { entry: EvalHUDEntry }) {
               <Row k="hdg err" v={`${fmt(s.headingErrNow)} rad`} />
             </div>
           </div>
-          <Row k="plan util" v={`${fmt(s.planMeanUtil * 100, 0)}% / ${fmt(s.planPeakUtil * 100, 0)}%`} />
+          <Row
+            k="plan util (avg)"
+            v={`${fmt(s.planMeanUtil * 100, 0)}%`}
+            warn={s.planMeanUtil > 1}
+          />
+          <Row
+            k="feasible"
+            v={`${fmt(s.planFeasibleFrac * 100, 0)}% of ${s.plansScored}`}
+            warn={s.planFeasibleFrac < 0.5}
+          />
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 3 }}>
-            <Light ok={s.planFeasible} label="feasible" />
+            <Light ok={s.planFeasibleFrac >= 0.5} label="feasible" />
             <Light ok={s.comfortable} label="comfy" />
           </div>
           <div style={{ marginTop: 5, opacity: 0.85, fontSize: 11 }}>
             <Row k="peak spd" v={`${fmt(s.report.peakSpeed)} m/s`} />
             <Row k="steer rev" v={`${s.report.steerReversals}`} warn={s.report.steerReversals > 40} />
-            <Row k="max jerk" v={`${fmt(s.report.maxJerk, 1)} m/s³`} />
+            <Row k="lat-g rms" v={`${fmt(s.report.lateralAccelRms / 9.81)} g`} />
             <Row k="replans" v={`${s.report.totalReplans} (${fmt(s.report.failedReplanRatio * 100, 0)}% fail)`} />
           </div>
         </>

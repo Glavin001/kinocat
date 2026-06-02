@@ -157,8 +157,12 @@ export interface RunReport {
 }
 
 export interface SimMonitor {
-  /** Call once per tick AFTER scenario.tick(), with that car's status. */
-  sample(s: MonitorSample): void;
+  /** Call once per tick AFTER scenario.tick(), with that car's status.
+   *  `dtSample` overrides the construction `dt` for THIS tick's finite
+   *  differences + elapsed-time accounting — pass the real per-frame dt when
+   *  driving the monitor from a variable-rate rAF loop (the browser HUD); omit
+   *  it for fixed-step harness/test runs. */
+  sample(s: MonitorSample, dtSample?: number): void;
   /** Finalize and read the scalar report (uses the last sample for terminals). */
   summary(): RunReport;
   /** The full recorded telemetry stream. */
@@ -242,9 +246,11 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
 
   let last: MonitorSample | null = null;
   let ticks = 0;
+  let elapsed = 0; // accumulated sim-time (sums per-sample dt; exact under variable dt)
 
-  function sample(s: MonitorSample): void {
-    const t = ticks * dt;
+  function sample(s: MonitorSample, dtSample?: number): void {
+    const sd = dtSample !== undefined && dtSample > 0 ? dtSample : dt;
+    const t = elapsed;
     const sp = Math.abs(s.state.speed);
     peakSpeed = Math.max(peakSpeed, sp);
 
@@ -304,18 +310,18 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
       // Discontinuity: drop the cross-teleport differences entirely.
       prevAccel = NaN;
     } else if (prev) {
-      const accel = (s.state.speed - prev.state.speed) / dt;
+      const accel = (s.state.speed - prev.state.speed) / sd;
       // Skip the first finite-difference (settle/teleport from spawn).
       if (diffCount >= 1) {
         if (Math.abs(accel) > maxAccel) maxAccel = Math.abs(accel);
         if (Number.isFinite(prevAccel)) {
-          const jerk = (accel - prevAccel) / dt;
+          const jerk = (accel - prevAccel) / sd;
           if (Math.abs(jerk) > maxJerk) maxJerk = Math.abs(jerk);
         }
       }
       prevAccel = accel;
 
-      const steerRate = (s.metrics.liveControls.steer - prev.metrics.liveControls.steer) / dt;
+      const steerRate = (s.metrics.liveControls.steer - prev.metrics.liveControls.steer) / sd;
       steerRateSumSq += steerRate * steerRate;
       const sign = steerRate > deadband ? 1 : steerRate < -deadband ? -1 : 0;
       if (sign !== 0) {
@@ -323,7 +329,7 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
         prevSteerRateSign = sign;
       }
 
-      const yawRate = angleDiff(s.state.heading, prev.state.heading) / dt;
+      const yawRate = angleDiff(s.state.heading, prev.state.heading) / sd;
       const latAccel = s.state.speed * yawRate;
       lateralAccelSumSq += latAccel * latAccel;
 
@@ -359,10 +365,11 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
     prev = s;
     last = s;
     ticks++;
+    elapsed += sd;
   }
 
   function summary(): RunReport {
-    const durationSec = ticks * dt;
+    const durationSec = elapsed;
     const total = last?.diagnostics.totalReplans ?? 0;
     const ok = last?.diagnostics.successfulReplans ?? 0;
 

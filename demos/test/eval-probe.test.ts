@@ -29,7 +29,8 @@ describe('createEvalProbe', () => {
     for (const p of plan) probe.sample(sampleAt(p));
     const snap = probe.snapshot();
     expect(snap.crossTrackRmse).toBeLessThan(0.05);
-    expect(snap.planFeasible).toBe(true);
+    expect(snap.plansScored).toBeGreaterThan(0);
+    expect(snap.planFeasibleFrac).toBe(1);
   });
 
   it('reports a constant lateral offset as cross-track error', () => {
