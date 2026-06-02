@@ -48,7 +48,7 @@ export {
 export type { Side } from './regions-dynamic';
 
 // Conditions
-export { lte, gte, inRange, speed, distanceFrom } from './conditions';
+export { lte, gte, inRange, speed, distanceFrom, closingSpeed } from './conditions';
 
 // Builders (sugar)
 export {

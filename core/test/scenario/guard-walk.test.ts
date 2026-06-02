@@ -18,8 +18,10 @@ import {
   stayInside,
   speed,
   distanceFrom,
+  closingSpeed,
   lte,
   gte,
+  inRange,
   deg,
 } from '../../src/scenario/index';
 import type { GuardPredicate } from '../../src/scenario/index';
@@ -108,5 +110,32 @@ describe('distanceFrom condition-region', () => {
   it('treats an unknown predictor horizon as not-violated', () => {
     const gone: RegionAgent = { id: 'gone', predict: () => null };
     expect(distanceFrom(gone, gte(1)).contains(S(0, 0, 0, 0, 99), 99)).toBe(true);
+  });
+});
+
+describe('closingSpeed condition-region', () => {
+  // lead drives +x at 5 m/s; ego sits behind it at the origin, heading +x.
+  const lead: RegionAgent = { id: 'lead', predict: (t) => S(20 + 5 * t, 0, 0, 5, t) };
+
+  it('positive when ego is catching up (closing the gap)', () => {
+    const r = closingSpeed(lead, gte(2));
+    expect(r.contains(S(0, 0, 0, /*speed*/ 8, 0), 0)).toBe(true); // 8 vs 5 -> closing 3
+    expect(closingSpeed(lead, lte(0)).contains(S(0, 0, 0, 8, 0), 0)).toBe(false);
+  });
+
+  it('~zero when matched (holding station / steady draft)', () => {
+    expect(closingSpeed(lead, inRange(-1, 1)).contains(S(0, 0, 0, 5, 0), 0)).toBe(true);
+  });
+
+  it('negative when falling back', () => {
+    expect(closingSpeed(lead, lte(0)).contains(S(0, 0, 0, 2, 0), 0)).toBe(true); // 2 vs 5
+    expect(closingSpeed(lead, gte(0)).contains(S(0, 0, 0, 2, 0), 0)).toBe(false);
+  });
+
+  it('dynamic + non-spatial (costToGo 0); unknown horizon not violated', () => {
+    expect(closingSpeed(lead, gte(0)).dynamic).toBe(true);
+    expect(closingSpeed(lead, gte(0)).costToGo(S(0, 0))).toBe(0);
+    const gone: RegionAgent = { id: 'gone', predict: () => null };
+    expect(closingSpeed(gone, gte(99)).contains(S(0, 0, 0, 0, 5), 5)).toBe(true);
   });
 });

@@ -25,7 +25,7 @@ import {
 } from 'kinocat/scenario';
 import type { Scenario, RegionAgent } from 'kinocat/scenario';
 import { demoVehicle } from './scenarios';
-import { authorParkingScenario } from './scenario-goals';
+import { authorParkingScenario, authorDrafting, planDrafting } from './scenario-goals';
 import { buildParkingScenario, PARKING_AGENT, parkingLibrary } from './parking-scenarios';
 
 export interface GoalPreset {
@@ -242,12 +242,34 @@ function parkingPreset(): GoalPreset {
   };
 }
 
+// --- Drafting (close-follow behind a moving car) ---------------------------
+function draftingPreset(): GoalPreset {
+  const bounds = { x0: -40, x1: 70, z0: -25, z1: 25 };
+  const lead: RegionAgent = {
+    id: 'lead',
+    predict: (t) => ({ x: 10 + 3 * t, z: 0, heading: 0, speed: 3, t }),
+  };
+  const start: CarKinematicState = { x: -10, z: -10, heading: 0, speed: 0, t: 0 };
+  const scenario = authorDrafting({ start, lead, gap: 6, tol: 2, safe: 2, bounds });
+  return {
+    id: 'drafting',
+    title: 'Drafting (follow a moving car)',
+    description: 'reach(behind(lead, 6)) + maintain(distanceFrom(lead, ≥2)) — dynamic → intercepts the slipstream slot',
+    scenario,
+    bounds,
+    obstacles: [],
+    movingTarget: lead,
+    plan: () => planDrafting({ start, lead, gap: 6, tol: 2, safe: 2, bounds }),
+  };
+}
+
 export function goalLabPresets(): GoalPreset[] {
   return [
     pointToPointPreset(),
     slalomPreset(),
     aOrBPreset(),
     interceptPreset(),
+    draftingPreset(),
     parkingPreset(),
   ];
 }

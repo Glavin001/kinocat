@@ -68,3 +68,42 @@ export function distanceFrom(agent: RegionAgent, b: Bound): Region {
     },
   };
 }
+
+/** A condition-region on CLOSING speed against `agent` — the rate at which the
+ *  gap to the agent is shrinking (positive = approaching, negative = falling
+ *  back, ~0 = matched/holding station). Computed as the relative velocity
+ *  projected onto the ego→agent direction, using both poses' speed+heading.
+ *  Dynamic. Use it for "match the lead" (`inRange(-1, 1)`), "approach fast"
+ *  (`gte(12)`), or "don't close" (`lte(0)`). */
+export function closingSpeed(agent: RegionAgent, b: Bound): Region {
+  return {
+    kind: 'cond-closing',
+    key: `cond-closing:${agent.id},${b.min ?? ''},${b.max ?? ''}`,
+    dynamic: true,
+    contains(s, t) {
+      const a = agent.predict(t ?? s.t);
+      if (!a) return true; // unknown horizon -> not violated
+      const dx = a.x - s.x;
+      const dz = a.z - s.z;
+      const dist = Math.hypot(dx, dz);
+      // Relative velocity (ego minus agent), each from speed+heading.
+      const evx = s.speed * Math.cos(s.heading);
+      const evz = s.speed * Math.sin(s.heading);
+      const avx = a.speed * Math.cos(a.heading);
+      const avz = a.speed * Math.sin(a.heading);
+      // Closing = (egoV - agentV) · unit(ego->agent). At zero range, fall back
+      // to the relative speed magnitude (purely closing).
+      const closing =
+        dist < 1e-6
+          ? Math.hypot(evx - avx, evz - avz)
+          : ((evx - avx) * dx + (evz - avz) * dz) / dist;
+      return satisfies(closing, b);
+    },
+    costToGo() {
+      return 0;
+    },
+    representative() {
+      return agent.predict(0) ?? ORIGIN;
+    },
+  };
+}
