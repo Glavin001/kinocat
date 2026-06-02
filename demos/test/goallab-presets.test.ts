@@ -28,7 +28,7 @@ describe('GoalLab presets', () => {
       expect(regions.objective.length).toBeGreaterThan(0);
 
       const result = preset.plan();
-      expect(result.raw.found).toBe(true);
+      expect(result.found).toBe(true);
       expect(result.path.length).toBeGreaterThanOrEqual(2);
     });
   }

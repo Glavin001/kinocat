@@ -39,6 +39,7 @@ interface HudState {
   done: boolean;
   laps: number;
   partial: boolean;
+  tracked: boolean;
   cost: number;
   expansions: number;
   diagnostics: string[];
@@ -98,6 +99,7 @@ export default function GoalLab() {
     let planCost = 0;
     let planExpansions = 0;
     let planPartial = false;
+    let planTracked = false;
     let diagnostics: string[] = [];
 
     function clear(g: THREE.Group) {
@@ -130,10 +132,11 @@ export default function GoalLab() {
       automaton = compile(preset.scenario.goal);
       diagnostics = validate(preset.scenario, { posCell: 0.3 }).map((d) => `[${d.severity}] ${d.check}: ${d.message}`);
       const result = preset.plan();
-      path = result.path; // already projected to inner chassis states
-      planCost = result.raw.cost;
-      planExpansions = result.raw.stats.expansions;
-      planPartial = result.raw.partial ?? false;
+      path = result.path; // chassis states to animate
+      planCost = result.cost;
+      planExpansions = result.expansions;
+      planPartial = result.partial;
+      planTracked = result.tracked ?? false;
 
       if (path.length > 0) content.add(createPlanPathHelper(densifyPath(path), { color: 0x66ffaa, y: 0.12 }));
       targetMarker.visible = !!preset.movingTarget;
@@ -211,6 +214,7 @@ export default function GoalLab() {
           done: p.done,
           laps: p.laps,
           partial: planPartial,
+          tracked: planTracked,
           cost: planCost,
           expansions: planExpansions,
           diagnostics,
@@ -288,8 +292,14 @@ export default function GoalLab() {
             </div>
             <ProgressView hud={hud} />
             <div style={{ marginTop: 6 }}>
-              plan: cost {hud.cost === Infinity ? '∞' : hud.cost.toFixed(1)} · {hud.expansions} exp
-              {hud.partial && <span style={{ color: '#fc6' }}> · best-progress (partial)</span>}
+              {hud.tracked ? (
+                <>follow controller · {hud.cost.toFixed(1)}s tracked</>
+              ) : (
+                <>
+                  plan: cost {hud.cost === Infinity ? '∞' : hud.cost.toFixed(1)} · {hud.expansions} exp
+                  {hud.partial && <span style={{ color: '#fc6' }}> · best-progress (partial)</span>}
+                </>
+              )}
             </div>
             <AutomatonView hud={hud} />
             {hud.diagnostics.length > 0 && (

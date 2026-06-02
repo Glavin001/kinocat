@@ -27,12 +27,36 @@ import {
 } from 'kinocat/scenario';
 import type { Scenario, RegionAgent } from 'kinocat/scenario';
 import { authorParkingScenario, authorDraftingHold } from './scenario-goals';
+import { simulateFollow } from './follow-sim';
 import {
   buildParkingScenario,
   PARKING_AGENT,
   parkingLibrary,
   type ParkingScenarioId,
 } from './parking-scenarios';
+
+/** A viz-oriented plan result: the trajectory to animate plus the HUD stats.
+ *  Most presets derive it from a ScenarioEnvironment plan; the continuous-follow
+ *  preset derives it from a tracking controller (see `tracked`). */
+export interface PresetPlan {
+  path: CarKinematicState[];
+  cost: number;
+  expansions: number;
+  found: boolean;
+  partial: boolean;
+  /** True when produced by a follow CONTROLLER rather than the A* planner. */
+  tracked?: boolean;
+}
+
+function fromScenarioPlan(r: ScenarioPlanResult): PresetPlan {
+  return {
+    path: r.path,
+    cost: r.raw.cost,
+    expansions: r.raw.stats.expansions,
+    found: r.raw.found,
+    partial: r.raw.partial ?? false,
+  };
+}
 
 export interface GoalPreset {
   id: string;
@@ -44,8 +68,8 @@ export interface GoalPreset {
   obstacles: Array<[number, number][]>;
   /** A scripted moving target (for dynamic/intercept presets), if any. */
   movingTarget?: RegionAgent;
-  /** Plan the preset through the ScenarioEnvironment product search. */
-  plan(): ScenarioPlanResult;
+  /** Produce the trajectory to animate + HUD stats. */
+  plan(): PresetPlan;
 }
 
 const FIELD = { x0: -30, x1: 30, z0: -20, z1: 20 };
@@ -128,22 +152,24 @@ function planWith(
   lib: MotionPrimitiveLibrary,
   envOptions: Parameters<typeof planVehicleScenario>[0]['envOptions'],
   extra: Partial<Parameters<typeof planVehicleScenario>[0]> = {},
-): ScenarioPlanResult {
-  return planVehicleScenario({
-    start: scenario.start,
-    goal: scenario.goal,
-    invariants: scenario.invariants,
-    prefer: scenario.prefer,
-    world,
-    agent,
-    lib,
-    envOptions,
-    // Expansion-bounded (not wall-clock) so the plan — and thus the
-    // visualization — is DETERMINISTIC across machines / coverage runs.
-    deadlineMs: Infinity,
-    maxExpansions: 60_000,
-    ...extra,
-  });
+): PresetPlan {
+  return fromScenarioPlan(
+    planVehicleScenario({
+      start: scenario.start,
+      goal: scenario.goal,
+      invariants: scenario.invariants,
+      prefer: scenario.prefer,
+      world,
+      agent,
+      lib,
+      envOptions,
+      // Expansion-bounded (not wall-clock) so the plan — and thus the
+      // visualization — is DETERMINISTIC across machines / coverage runs.
+      deadlineMs: Infinity,
+      maxExpansions: 60_000,
+      ...extra,
+    }),
+  );
 }
 
 // --- Point-to-point --------------------------------------------------------
@@ -296,12 +322,13 @@ function parkingPreset(id: ParkingScenarioId, title: string): GoalPreset {
 }
 
 // --- Drafting (CONTINUOUS close-follow behind a moving car) -----------------
-// The lead drives a CLOSED CIRCULAR loop (so it stays on the plane), and we
-// stitch a RECEDING-HORIZON sequence of short "reach the slot ~LOOK seconds
-// ahead" plans into one long trajectory — the ego perpetually drafts ~`gap` m
-// behind the circling lead. This is the spec's MPC-over-the-automaton idea
-// realized for the visualizer: re-plan from the current pose as the target
-// moves, rather than a single finite-horizon plan that ends.
+// The lead drives a CLOSED CIRCULAR loop (so it stays on the plane). Following a
+// moving target indefinitely is a TRACKING task, not a one-shot plan — the
+// planner expresses/reaches the goal (`reach(behind(lead))`), and a pure-pursuit
+// controller HOLDS the slot as the lead moves. (A min-time A* plan instead
+// rushes each slot + arrives early, and with cruise-only primitives overshoots
+// then reverses — see follow-sim.ts.) So this preset's path comes from the
+// follow controller; the authored scenario AST still drives the HUD/automaton.
 const DRAFT_BOUNDS = { x0: -32, x1: 32, z0: -32, z1: 32 };
 
 /** A lead car cruising counter-clockwise around a circle of radius R. */
@@ -322,51 +349,6 @@ function circlingLead(R: number, omega: number): RegionAgent {
   };
 }
 
-/** Receding-horizon continuous draft: stitch short "drive to the slot the lead
- *  will occupy in LOOK seconds" plans into one long, smooth following path. */
-function planContinuousDraft(
-  lead: RegionAgent,
-  start: CarKinematicState,
-  bounds: typeof DRAFT_BOUNDS,
-  gap: number,
-  tol: number,
-  /** Stitch until the sim clock reaches this (e.g. one lead loop period). */
-  durationSec: number,
-): ScenarioPlanResult {
-  const { agent, lib } = goalLabVehicle();
-  const world = new InMemoryNavWorld(fieldPolys(bounds), []);
-  const LOOK = 2.0;
-  const MAX_STEPS = 80;
-  let state: CarKinematicState = { ...start, t: 0 };
-  const merged: CarKinematicState[] = [{ ...state }];
-  let firstRaw: ScenarioPlanResult['raw'] | null = null;
-  for (let k = 0; k < MAX_STEPS && state.t < durationSec; k++) {
-    const la = lead.predict(state.t + LOOK);
-    if (!la) break;
-    const slot = { x: la.x - Math.cos(la.heading) * gap, z: la.z - Math.sin(la.heading) * gap };
-    const r = planVehicleScenario({
-      start: state,
-      goal: reach(near(slot, tol)),
-      invariants: [stayInside(field(bounds))],
-      prefer: [minTime(1)],
-      world,
-      agent,
-      lib,
-      envOptions: { posCell: 1, headingBuckets: 24, goalRadius: tol, analyticExpansion: { everyN: 6, step: 0.5 } },
-      deadlineMs: Infinity,
-      maxExpansions: 30_000,
-    });
-    if (!firstRaw) firstRaw = r.raw;
-    if (r.path.length < 2) {
-      state = { ...state, t: state.t + LOOK }; // already in the slot; let the lead advance
-      continue;
-    }
-    merged.push(...r.path.slice(1));
-    state = { ...r.path[r.path.length - 1]! };
-  }
-  return { raw: firstRaw ?? ({ found: merged.length > 1, partial: true } as ScenarioPlanResult['raw']), path: merged };
-}
-
 function draftingPreset(): GoalPreset {
   const R = 16;
   const omega = 0.26; // speed ≈ R·omega ≈ 4.2 m/s
@@ -379,12 +361,20 @@ function draftingPreset(): GoalPreset {
   return {
     id: 'drafting',
     title: 'Drafting (follow a moving car)',
-    description: 'repeat(reach(behind(lead,6))) — receding-horizon: the lead circles the plane, the ego keeps drafting',
+    description: 'repeat(reach(behind(lead,6))) — controller holds the slot as the lead circles the plane (continuous follow)',
     scenario,
     bounds: DRAFT_BOUNDS,
     obstacles: [],
     movingTarget: lead,
-    plan: () => planContinuousDraft(lead, start, DRAFT_BOUNDS, gap, 2.5, period),
+    plan: () => {
+      const path = simulateFollow(lead, start, {
+        gap,
+        duration: period,
+        minTurnRadius: 3.5,
+        maxSpeed: 9,
+      });
+      return { path, cost: path[path.length - 1]!.t, expansions: 0, found: true, partial: false, tracked: true };
+    },
   };
 }
 
