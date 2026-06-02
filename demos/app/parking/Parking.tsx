@@ -48,6 +48,7 @@ import {
 } from '../lib/parking-scenarios';
 import {
   createRaceScenario,
+  splitAtGearCusps,
   type RaceScenario,
   type RaceEntry,
 } from '../lib/race-scenario';
@@ -83,6 +84,13 @@ export default function Parking() {
   const [paused, setPaused] = useState(false);
   const [showPath, setShowPath] = useState(true);
   const [showFootprints, setShowFootprints] = useState(false);
+  // Direction-switch cost (the planner's `directionChangePenalty`, in seconds):
+  // how much an A* edge is penalised for flipping forward↔reverse. Higher =>
+  // the planner avoids back-and-fill shunts and prefers smoother, single-gear
+  // maneuvers (at the cost of needing more room). Defaulted to the parking
+  // agent's value so the slider opens showing the live default; changing it
+  // rebuilds the scenario, which re-plans with the new penalty.
+  const [switchCost, setSwitchCost] = useState(PARKING_AGENT.directionChangePenalty);
   const [hud, setHud] = useState('');
   const [status, setStatus] = useState('initialising...');
 
@@ -90,10 +98,12 @@ export default function Parking() {
   const pausedRef = useRef(paused);
   const showPathRef = useRef(showPath);
   const showFootprintsRef = useRef(showFootprints);
+  const switchCostRef = useRef(switchCost);
   scenarioIdRef.current = scenarioId;
   pausedRef.current = paused;
   showPathRef.current = showPath;
   showFootprintsRef.current = showFootprints;
+  switchCostRef.current = switchCost;
 
   useEffect(() => {
     if (!mountRef.current) return;
@@ -269,7 +279,11 @@ export default function Parking() {
       // Canonical parking options shared with the CLI bench + Vitest tests
       // (incl. zero teleportation — no stall/off-track rescue masking a stuck
       // maneuver). The page is a thin view over the exact same config.
-      const instance = await createRaceScenario(parkingScenarioOptions(id, [parkingEntry('ego')]));
+      const instance = await createRaceScenario(
+        parkingScenarioOptions(id, [parkingEntry('ego')], undefined, {
+          directionChangePenalty: switchCostRef.current,
+        }),
+      );
       // A newer build (or unmount) superseded us while we awaited — drop this
       // runner instead of leaking it (and its car mesh) into the scene.
       if (cancelled || myToken !== buildToken) {
@@ -339,8 +353,12 @@ export default function Parking() {
             if (!wp) return NaN;
             return Math.hypot(s.state.x - wp.x, s.state.z - wp.z);
           })();
+          // Forward↔reverse switches in the current committed plan = (number
+          // of single-gear segments − 1). This is the headline number the
+          // switch-cost slider moves: raising the cost should visibly drop it.
+          const switches = s.plan ? Math.max(0, splitAtGearCusps(s.plan).length - 1) : 0;
           setHud(
-            `v=${s.state.speed.toFixed(2)} m/s · goal=${goalDist.toFixed(2)} m · replans=${s.diagnostics.totalReplans} · plan-ms=${s.diagnostics.lastReplanMs.toFixed(0)}`,
+            `v=${s.state.speed.toFixed(2)} m/s · goal=${goalDist.toFixed(2)} m · switches=${switches} · replans=${s.diagnostics.totalReplans} · plan-ms=${s.diagnostics.lastReplanMs.toFixed(0)}`,
           );
           // Honest PARKED status from the shared `evaluateParked` predicate:
           // the car must actually sit inside the stall silhouette, squared up,
@@ -415,6 +433,22 @@ export default function Parking() {
     rebuildRef.current?.(scenarioId);
   }, [scenarioId]);
 
+  // Re-plan when the switch-cost slider moves. Debounced so dragging the
+  // slider coalesces into one rebuild (each rebuild spins up a fresh Rapier
+  // world + re-plans from spawn) rather than firing per pixel. Skips the
+  // mount run — the `[scenarioId]` effect above already builds the initial
+  // scenario, and it reads `switchCostRef.current` so the first plan uses
+  // whatever the slider shows.
+  const switchCostMounted = useRef(false);
+  useEffect(() => {
+    if (!switchCostMounted.current) {
+      switchCostMounted.current = true;
+      return;
+    }
+    const t = setTimeout(() => rebuildRef.current?.(scenarioIdRef.current), 120);
+    return () => clearTimeout(t);
+  }, [switchCost]);
+
   return (
     <div style={{ position: 'relative', width: '100%', height: '100vh' }}>
       <div ref={mountRef} style={{ width: '100%', height: '100%' }} />
@@ -466,6 +500,48 @@ export default function Parking() {
               {PARKING_LABELS[id]}
             </button>
           ))}
+        </div>
+        <div
+          style={{
+            marginTop: 10,
+            padding: '8px',
+            background: '#0e1622',
+            border: '1px solid #1c2840',
+            borderRadius: 4,
+          }}
+        >
+          <label
+            htmlFor="switch-cost"
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'baseline',
+              fontSize: 11,
+            }}
+          >
+            <span>direction-switch cost</span>
+            <span style={{ color: '#55dcff', fontVariantNumeric: 'tabular-nums' }}>
+              {switchCost.toFixed(2)}s
+              {Math.abs(switchCost - PARKING_AGENT.directionChangePenalty) < 1e-9
+                ? ' · default'
+                : ''}
+            </span>
+          </label>
+          <input
+            id="switch-cost"
+            type="range"
+            min={0}
+            max={3}
+            step={0.05}
+            value={switchCost}
+            onChange={(e) => setSwitchCost(+e.target.value)}
+            style={{ width: '100%', marginTop: 6, accentColor: '#55dcff', cursor: 'pointer' }}
+          />
+          <div style={{ marginTop: 4, opacity: 0.55, fontSize: 10, lineHeight: 1.4 }}>
+            penalty the planner pays per forward↔reverse switch. higher ⇒ smoother,
+            fewer shunts (watch <code>switches=</code> drop) but needs more room.
+            moving this re-plans live.
+          </div>
         </div>
         <div style={{ marginTop: 8, display: 'flex', gap: 6, flexWrap: 'wrap', fontSize: 11 }}>
           <button onClick={() => setPaused((p) => !p)}>{`[p] ${paused ? 'paused' : 'running'}`}</button>
