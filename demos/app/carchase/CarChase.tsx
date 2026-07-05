@@ -23,6 +23,7 @@ import {
   planCarChaseAI,
   predictRobberFromState,
   robberGoal,
+  copGoalRegion,
   selectTacticalMode,
   tacticalGoal,
   spawnPoses,
@@ -32,6 +33,7 @@ import {
   type CarChaseCourse,
   type CopTacticalMode,
 } from '../lib/carchase-scenarios';
+import type { Region } from 'kinocat/scenario';
 import { CarChasePlannerHost } from './plannerWorkerHost';
 import {
   CARCHASE_BRAKE_FORCE_N,
@@ -68,6 +70,7 @@ import {
   createCarMeshHelper,
   syncCarMesh as syncCarMeshCore,
   createGoalMarkerHelper,
+  createRegionHelper,
   createInflatedObstacleHelper,
   createNavBoundsHelper,
   createAgentFootprintHelper,
@@ -85,6 +88,9 @@ interface CopAI {
   planStartWall: number;
   mode: CopTacticalMode;
   goal: CarKinematicState | null;
+  // Canonical `kinocat/scenario` goal region this cop is planning toward
+  // (within/ahead/beside the robber). Drawn as an overlay when goals are on.
+  goalRegion: Region | null;
   lastReplanWall: number;
   lastExpansions: number;
   lastBudgetMs: number;
@@ -116,6 +122,7 @@ interface RobberAI {
   planStartWall: number;
   loopIndex: number;
   goal: CarKinematicState | null;
+  goalRegion: Region | null;
   lastReplanWall: number;
   lastExpansions: number;
   lastBudgetMs: number;
@@ -393,6 +400,7 @@ export default function CarChase() {
       planStartWall: performance.now(),
       loopIndex: 0,
       goal: null,
+      goalRegion: null,
       lastReplanWall: -Infinity,
       lastExpansions: 0,
       lastBudgetMs: 0,
@@ -420,6 +428,7 @@ export default function CarChase() {
         planStartWall: performance.now(),
         mode: 'PURSUE',
         goal: null,
+        goalRegion: null,
         lastReplanWall: -Infinity,
         lastExpansions: 0,
         lastBudgetMs: 0,
@@ -482,6 +491,38 @@ export default function CarChase() {
       debugGroup.add(fp);
       return fp;
     });
+
+    // Goal-region overlay: draws each agent's canonical `kinocat/scenario`
+    // goal region (the cop's within/ahead/beside ball, the robber's escape
+    // disc) straight from the region object — the same introspection the Goal
+    // Lab uses. Meshes are rebuilt only when the underlying region changes
+    // (each replan) to avoid per-frame geometry churn.
+    const regionGroup = new THREE.Group();
+    scene.add(regionGroup);
+    function disposeGroup(g: THREE.Group) {
+      g.traverse((o) => {
+        const m = o as THREE.Mesh | THREE.Line;
+        if ((m as THREE.Mesh).geometry) (m as THREE.Mesh).geometry.dispose();
+        const mat = (m as THREE.Mesh).material as THREE.Material | undefined;
+        if (mat) mat.dispose();
+      });
+    }
+    interface RegionHolder {
+      mesh: THREE.Group | null;
+      shown: Region | null;
+    }
+    const robberRegionHolder: RegionHolder = { mesh: null, shown: null };
+    const copRegionHolders: RegionHolder[] = cops.map(() => ({ mesh: null, shown: null }));
+    function updateRegionMesh(holder: RegionHolder, region: Region | null, color: number) {
+      if (region === holder.shown) return;
+      if (holder.mesh) {
+        regionGroup.remove(holder.mesh);
+        disposeGroup(holder.mesh);
+      }
+      holder.mesh = region ? createRegionHelper(region, { color, y: 0.35 }) : null;
+      holder.shown = region;
+      if (holder.mesh) regionGroup.add(holder.mesh);
+    }
 
     // ---- shared planning state -----------------------------------------
     const registry = new PlanRegistry();
@@ -655,6 +696,7 @@ export default function CarChase() {
       );
       robber.loopIndex = pick.nextIndex;
       robber.goal = pick.goal;
+      robber.goalRegion = pick.region;
       const obstacles: ObstacleDescriptor[] = cops.map((co) =>
         dehydrateObstacle(co.id, registry, co.car.readState(now), ROBBER_SEE_COP_R, 4),
       );
@@ -683,6 +725,7 @@ export default function CarChase() {
       const goal = tacticalGoal(robberState, robberPredict, copState, mode, course.buildings, course);
       co.mode = mode;
       co.goal = goal;
+      co.goalRegion = copGoalRegion(robberState, robberPredict, copState, mode);
       const siblingIds = cops
         .filter((o) => o.id !== co.id)
         .map((o) => o.id);
@@ -1030,6 +1073,15 @@ export default function CarChase() {
         const co = cops[i]!;
         copGoalMarks[i]!.visible = showGoalsRef.current && !!co.goal;
         if (co.goal) copGoalMarks[i]!.position.set(co.goal.x, 2, co.goal.z);
+      }
+
+      // Goal-region overlay (rebuilt only when a region changes).
+      regionGroup.visible = showGoalsRef.current;
+      if (showGoalsRef.current) {
+        updateRegionMesh(robberRegionHolder, robber.goalRegion, C.robber);
+        for (let i = 0; i < cops.length; i++) {
+          updateRegionMesh(copRegionHolders[i]!, cops[i]!.goalRegion, cops[i]!.color);
+        }
       }
 
       // Chase camera tracks the robber from behind.

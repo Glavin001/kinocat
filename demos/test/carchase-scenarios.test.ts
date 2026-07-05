@@ -18,7 +18,13 @@ import { describe, it, expect } from 'vitest';
 import {
   buildCarChaseSnapshot,
   CARCHASE_TEST_MAX_EXPANSIONS,
+  copGoalRegion,
+  robberGoal,
+  buildCarChaseCourse,
+  spawnPoses,
 } from '../app/lib/carchase-scenarios';
+import type { CarKinematicState } from 'kinocat/agent';
+import { reach, compile } from 'kinocat/scenario';
 
 // NOTE: pre-existing flake — at the current course tuning two of the three
 // spawn-cops hit the 25000-expansion budget cap before finding a path in
@@ -58,5 +64,70 @@ describe.skip('carchase demo: interactive cops & robbers (pre-existing flake —
     expect(s.course.driftGates.length).toBeGreaterThanOrEqual(2);
     expect(s.course.robberLoop.length).toBeGreaterThanOrEqual(6);
     expect(s.course.buildings.length).toBeGreaterThan(8);
+  });
+});
+
+// The tactical goals are now authored in the `kinocat/scenario` DSL (regions),
+// so we can assert their shape/geometry directly — the "introspectable /
+// debuggable" property. This runs against pure functions (no planner) so it's
+// fast and NOT part of the skipped planner-budget flake above.
+describe('carchase tactical goals are authored as scenario regions', () => {
+  // Robber heading +x (east) at 8 m/s; cop 20 m behind (west).
+  const robber: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 8, t: 0 };
+  const cop: CarKinematicState = { x: -20, z: 0, heading: 0, speed: 0, t: 0 };
+  const robberPredict = (t: number): CarKinematicState => ({
+    x: robber.x + Math.cos(robber.heading) * robber.speed * t,
+    z: robber.z + Math.sin(robber.heading) * robber.speed * t,
+    heading: robber.heading,
+    speed: robber.speed,
+    t,
+  });
+
+  it('INTERCEPT is a `within` ball led ahead of the robber', () => {
+    const r = copGoalRegion(robber, robberPredict, cop, 'INTERCEPT');
+    expect(r.kind).toBe('within');
+    expect(r.dynamic).toBe(true);
+    // Lead pose is ahead of the robber's current x (interception, not tail).
+    expect(r.representative().x).toBeGreaterThan(robber.x + 1);
+  });
+
+  it('CUTOFF is an `ahead` region even further downrange than INTERCEPT', () => {
+    const cut = copGoalRegion(robber, robberPredict, cop, 'CUTOFF');
+    const icept = copGoalRegion(robber, robberPredict, cop, 'INTERCEPT');
+    expect(cut.kind).toBe('ahead');
+    expect(cut.representative().x).toBeGreaterThan(icept.representative().x);
+  });
+
+  it('CONTAIN_LEFT / CONTAIN_RIGHT `beside` regions straddle opposite flanks', () => {
+    const left = copGoalRegion(robber, robberPredict, cop, 'CONTAIN_LEFT');
+    const right = copGoalRegion(robber, robberPredict, cop, 'CONTAIN_RIGHT');
+    expect(left.kind).toBe('beside');
+    expect(right.kind).toBe('beside');
+    // For an east-heading robber, left is +z and right is −z.
+    expect(left.representative().z).toBeGreaterThan(1);
+    expect(right.representative().z).toBeLessThan(-1);
+  });
+
+  it('PURSUE aims at the robber\'s actual pose (no lead)', () => {
+    const r = copGoalRegion(robber, robberPredict, cop, 'PURSUE');
+    expect(r.kind).toBe('within');
+    expect(Math.hypot(r.representative().x - robber.x, r.representative().z - robber.z)).toBeLessThan(1);
+  });
+
+  it('every cop goal region compiles to a reach automaton (introspection)', () => {
+    for (const mode of ['INTERCEPT', 'CUTOFF', 'CONTAIN_LEFT', 'CONTAIN_RIGHT', 'PURSUE'] as const) {
+      const automaton = compile(reach(copGoalRegion(robber, robberPredict, cop, mode)));
+      expect(automaton.accepting.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('the robber evasion goal is a `near` escape region', () => {
+    const course = buildCarChaseCourse();
+    const { robber: rSpawn, cops } = spawnPoses();
+    const pick = robberGoal(rSpawn, course.robberLoop, 0, cops, course.buildings, course);
+    expect(pick.region.kind).toBe('near');
+    // The escape ring is centred on the chosen goal point.
+    const rep = pick.region.representative();
+    expect(Math.hypot(rep.x - pick.goal.x, rep.z - pick.goal.z)).toBeLessThan(1e-6);
   });
 });

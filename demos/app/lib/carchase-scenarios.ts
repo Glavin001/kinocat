@@ -30,6 +30,8 @@ import {
   createJumpAffordance,
 } from 'kinocat/predict';
 import type { Predict, MovingObstacle } from 'kinocat/predict';
+import { within, ahead, beside, near, LEFT, RIGHT } from 'kinocat/scenario';
+import type { Region, RegionAgent, ScenarioState } from 'kinocat/scenario';
 import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
 import type { VehicleAgent, CarKinematicState } from 'kinocat/agent';
 import { characterizeVehicle } from 'kinocat/primitives';
@@ -547,6 +549,65 @@ function nudgeGoalToNavClear(
   return clampGoalToBounds(nudged);
 }
 
+// Tactical goal geometry (metres). Because a cop's objective is now a
+// `kinocat/scenario` Region, "tune a tactic" = change a region argument, and
+// the exact same object can be compiled, validated, and drawn by the Goal-Lab
+// tooling (`createRegionHelper`) — that's the introspection payoff.
+const COP_GOAL_R = 3; // `within` ball radius (INTERCEPT / PURSUE contact)
+const COP_CUTOFF_LEAD = 18; // `ahead` block distance (CUTOFF)
+const COP_CONTAIN_GAP = 9; // `beside` lateral pinch gap (CONTAIN_*)
+const COP_CONTAIN_TOL = 3; // beside/ahead ball tolerance
+const COP_LEAD_MAX_S = 6; // clamp on the interception lead time
+
+/** The canonical GOAL REGION a cop is trying to reach, authored in the
+ *  `kinocat/scenario` DSL against a *lead-shifted* view of the robber — so the
+ *  region is centred on where the robber WILL be at interception, not where it
+ *  is now. Returning the `Region` (not a bare pose) is what makes the tactic
+ *  readable, introspectable and reusable: the same object feeds the goal-pose
+ *  extraction below AND the on-screen region overlay / `validate()`.
+ *
+ *  We deliberately plan to `region.representative()` with the fast pose
+ *  planner rather than handing the dynamic region to `planVehicleScenario`:
+ *  a moving `within` goal disables the Reeds-Shepp analytic shortcut and turns
+ *  every replan into a full time-lattice search (~120 ms vs ~5 ms on this
+ *  course), which the 4-agent real-time loop cannot afford. The lead-shifted
+ *  agent means `representative()` already carries the interception lead. */
+export function copGoalRegion(
+  robber: CarKinematicState,
+  robberPredict: Predict<CarKinematicState>,
+  cop: CarKinematicState,
+  mode: CopTacticalMode,
+): Region {
+  const speed = CARCHASE_AGENT.maxSpeed;
+  const vx = Math.cos(robber.heading) * robber.speed;
+  const vz = Math.sin(robber.heading) * robber.speed;
+  // PURSUE (near-stationary robber) aims at its actual pose; the rest lead.
+  const tti =
+    mode === 'PURSUE'
+      ? 0
+      : Math.min(
+          COP_LEAD_MAX_S,
+          Math.max(0.3, interceptTime(robber.x - cop.x, robber.z - cop.z, vx, vz, speed)),
+        );
+  const lead: RegionAgent = {
+    id: 'robber',
+    predict: (t) => (robberPredict((cop.t ?? 0) + tti + t) ?? robber) as ScenarioState,
+  };
+  switch (mode) {
+    case 'INTERCEPT':
+    case 'PURSUE':
+      return within(lead, COP_GOAL_R);
+    case 'CUTOFF':
+      return ahead(lead, COP_CUTOFF_LEAD, COP_CONTAIN_TOL);
+    case 'CONTAIN_LEFT':
+      return beside(lead, LEFT, COP_CONTAIN_GAP, COP_CONTAIN_TOL);
+    case 'CONTAIN_RIGHT':
+      return beside(lead, RIGHT, COP_CONTAIN_GAP, COP_CONTAIN_TOL);
+  }
+}
+
+/** Concrete goal pose for the fast pose planner, extracted from the tactic's
+ *  canonical goal region via its `representative()` aim point. */
 export function tacticalGoal(
   robber: CarKinematicState,
   robberPredict: Predict<CarKinematicState>,
@@ -555,70 +616,15 @@ export function tacticalGoal(
   buildings?: BuildingSpec[],
   course?: CarChaseCourse,
 ): CarKinematicState {
-  const ahead = (t: number) => robberPredict(t) ?? robber;
-  const speed = CARCHASE_AGENT.maxSpeed;
-  const base = { speed, t: 0 };
-
-  // Time-to-intercept under the constant-velocity model — this is how far
-  // ahead in time we lead the robber. Sampling the robber's *published plan*
-  // at that time (via `robberPredict`) then gives the actual point where the
-  // cop should aim, following curves the plain CV point would miss.
-  const vx = Math.cos(robber.heading) * robber.speed;
-  const vz = Math.sin(robber.heading) * robber.speed;
-  const tti = interceptTime(robber.x - cop.x, robber.z - cop.z, vx, vz, speed);
-  const eta = Math.min(6, Math.max(0.3, tti));
-  const future = ahead(cop.t + eta);
-
-  // Forward / left unit vectors along the robber's travel direction.
-  const fc = Math.cos(future.heading);
-  const fs = Math.sin(future.heading);
-  const lc = -fs; // left = heading + 90°
-  const ls = fc;
-
-  let goal: CarKinematicState;
-  switch (mode) {
-    case 'PURSUE': {
-      // Robber ~stationary: drive straight at its actual pose.
-      goal = { ...base, x: robber.x, z: robber.z, heading: robber.heading };
-      break;
-    }
-    case 'INTERCEPT': {
-      // The collision point — where the cop meets the robber. Aim dead-on;
-      // the robber is only a hair of an obstacle to the cop so the planner
-      // drives all the way in for the arrest.
-      goal = { ...base, x: future.x, z: future.z, heading: future.heading };
-      break;
-    }
-    case 'CONTAIN_LEFT':
-    case 'CONTAIN_RIGHT': {
-      // Pull up ahead-and-to-one-side of the robber's predicted position to
-      // pinch it against the opposite flank. A little ahead (so the cop is
-      // cutting in front, not trailing) plus a lateral offset.
-      const sign = mode === 'CONTAIN_LEFT' ? -1 : 1;
-      const lateral = 9;
-      const ahead2 = 6;
-      goal = {
-        ...base,
-        x: future.x + ahead2 * fc + sign * lateral * lc,
-        z: future.z + ahead2 * fs + sign * lateral * ls,
-        heading: future.heading,
-      };
-      break;
-    }
-    case 'CUTOFF': {
-      // Get well ahead along the robber's travel direction to block the lane.
-      const lead = 18;
-      goal = {
-        ...base,
-        x: future.x + lead * fc,
-        z: future.z + lead * fs,
-        heading: future.heading,
-      };
-      break;
-    }
-  }
-  const clamped = clampGoalToBounds(goal);
-  return nudgeGoalToNavClear(clamped, cop, buildings, course);
+  const rep = copGoalRegion(robber, robberPredict, cop, mode).representative();
+  const goal = clampGoalToBounds({
+    x: rep.x,
+    z: rep.z,
+    heading: rep.heading,
+    speed: CARCHASE_AGENT.maxSpeed,
+    t: 0,
+  });
+  return nudgeGoalToNavClear(goal, cop, buildings, course);
 }
 
 // ---------------------------------------------------------------------------
@@ -717,6 +723,9 @@ function robberFreeDistance(
 /** Pick the robber's escape goal by scoring a fan of candidate headings.
  *  `loop` / `loopIndex` are retained for signature compatibility (the robber
  *  no longer follows the waypoint loop); `nextIndex` is echoed back unused. */
+// Radius of the robber's `near` escape-goal region (also its on-screen ring).
+const ROBBER_GOAL_R = 4;
+
 export function robberGoal(
   robber: CarKinematicState,
   loop: CarChaseCourse['robberLoop'],
@@ -724,7 +733,7 @@ export function robberGoal(
   cops: CarKinematicState[],
   buildings?: BuildingSpec[],
   course?: CarChaseCourse,
-): { goal: CarKinematicState; nextIndex: number } {
+): { goal: CarKinematicState; nextIndex: number; region: Region } {
   // Without course geometry we can't probe openness — fall back to fleeing
   // directly away from the weighted cop centroid.
   if (!course) {
@@ -745,7 +754,7 @@ export function robberGoal(
       speed: CARCHASE_AGENT.maxSpeed,
       t: 0,
     });
-    return { goal, nextIndex: loopIndex };
+    return { goal, nextIndex: loopIndex, region: near({ x: goal.x, z: goal.z }, ROBBER_GOAL_R) };
   }
 
   let bestScore = -Infinity;
@@ -802,9 +811,13 @@ export function robberGoal(
     speed: CARCHASE_AGENT.maxSpeed,
     t: 0,
   });
+  const goal = nudgeGoalToNavClear(clamped, robber, buildings, course);
   return {
-    goal: nudgeGoalToNavClear(clamped, robber, buildings, course),
+    goal,
     nextIndex: loopIndex,
+    // Canonical goal region (introspection / overlay); the evader is a
+    // "reach this open escape point" objective in the scenario DSL.
+    region: near({ x: goal.x, z: goal.z }, ROBBER_GOAL_R),
   };
 }
 
