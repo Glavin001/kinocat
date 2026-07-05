@@ -99,16 +99,30 @@ describe.skipIf(!RAPIER_OK)('applyWheeledControls — native-action shape', () =
     car.dispose();
   });
 
-  it('clamps steer against maxSteerAngle and sign-flips at the Rapier boundary', () => {
+  it('clamps steer, sign-flips at the Rapier boundary, and applies Ackermann per wheel', () => {
     const { car } = makeCar();
     // The wrapper's default maxSteerAngle is 0.6. Pass a kinocat-frame steer
-    // of +0.4 → Rapier wheel steer should be -0.4 after the sign-flip.
+    // of +0.4 -> Rapier bicycle steer is -0.4 after the sign-flip, and each
+    // front wheel gets its Ackermann angle about the shared turn centre:
+    // L = 2*wheelBase = 3.2, w = wheelTrack = 0.85, R = L/tan(0.4).
     car.applyWheeledControls({ steer: 0.4, driveForce: 0, brakeForce: 0 });
-    expect(car.vehicle.wheelSteering(0)).toBeCloseTo(-0.4, 5);
-    expect(car.vehicle.wheelSteering(1)).toBeCloseTo(-0.4, 5);
-    // Clamp on the upper bound.
+    const L = 3.2;
+    const w = 0.85;
+    const R = L / Math.tan(0.4);
+    const inner = Math.atan(L / (R - w));
+    const outer = Math.atan(L / (R + w));
+    // Rapier steer -0.4 turns toward +z => inner is wheel 1 (front-left, +z).
+    expect(car.vehicle.wheelSteering(1)).toBeCloseTo(-inner, 5);
+    expect(car.vehicle.wheelSteering(0)).toBeCloseTo(-outer, 5);
+    // The inner wheel turns harder than the bicycle angle, the outer softer.
+    expect(inner).toBeGreaterThan(0.4);
+    expect(outer).toBeLessThan(0.4);
+    // Clamp on the upper bound applies to the BICYCLE command (the per-wheel
+    // inner angle may legitimately exceed it).
     car.applyWheeledControls({ steer: 99, driveForce: 0, brakeForce: 0 });
-    expect(car.vehicle.wheelSteering(0)).toBeCloseTo(-0.6, 5);
+    const Rc = L / Math.tan(0.6);
+    expect(car.vehicle.wheelSteering(1)).toBeCloseTo(-Math.atan(L / (Rc - w)), 5);
+    expect(car.vehicle.wheelSteering(0)).toBeCloseTo(-Math.atan(L / (Rc + w)), 5);
     car.dispose();
   });
 });

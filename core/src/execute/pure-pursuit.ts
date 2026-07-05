@@ -67,8 +67,12 @@ export function purePursuit(
   // > 0) are exempt so racing is unaffected.
   const reachedEnd = stopsAtEnd && ni >= path.length - 1;
   const atGoal = distToGoal <= config.goalTolerance || reachedEnd;
-  // gear from the planned speed sign just ahead on the path
-  const aheadSpeed = path[Math.min(ni + 1, path.length - 1)]!.speed;
+  // Gear from the planned speed sign just ahead on the path. A stop terminal
+  // (speed ~ 0) carries no direction information — fall back to the nearest
+  // sample's own sign so a reverse approach doesn't flip to forward gear (and
+  // an inverted steering frame) for the final samples before the latch.
+  let aheadSpeed = path[Math.min(ni + 1, path.length - 1)]!.speed;
+  if (Math.abs(aheadSpeed) < 0.05) aheadSpeed = path[ni]!.speed;
   const gear = aheadSpeed < 0 ? -1 : 1;
 
   const Ld = clamp(
@@ -86,6 +90,27 @@ export function purePursuit(
   const dz = lp.z - current.z;
   const yV = -dx * s + dz * c; // lateral offset
   let kappa = (2 * yV) / (Ld * Ld);
+  // Curvature feedforward: signed Menger curvature of the reference polyline
+  // at the nearest sample (sample = execution order), mapped into the
+  // command convention. The vehicle law is dTheta_pose/dt = v * kappa_cmd,
+  // so kappa_cmd = (dTheta_pose/ds) * sign(v) = gear * kappa_menger — the
+  // gear factor matters: a reverse arc's polyline curvature is the NEGATION
+  // of the steering curvature that produces it. With feedforward, the
+  // pursuit term above acts as pure feedback and no longer needs
+  // steady-state cross-track error to hold an arc.
+  if (config.curvatureFeedforward && path.length >= 3) {
+    const i1 = Math.min(Math.max(ni, 1), path.length - 2);
+    const a = path[i1 - 1]!;
+    const b = path[i1]!;
+    const cc = path[i1 + 1]!;
+    const l1 = dist(a.x, a.z, b.x, b.z);
+    const l2 = dist(b.x, b.z, cc.x, cc.z);
+    const l3 = dist(a.x, a.z, cc.x, cc.z);
+    if (l1 > 1e-6 && l2 > 1e-6 && l3 > 1e-6) {
+      const cross = (b.x - a.x) * (cc.z - a.z) - (b.z - a.z) * (cc.x - a.x);
+      kappa += (gear * 2 * cross) / (l1 * l2 * l3);
+    }
+  }
   if (config.minTurnRadius) {
     const kMax = 1 / config.minTurnRadius;
     kappa = clamp(kappa, -kMax, kMax);
@@ -100,12 +125,16 @@ export function purePursuit(
   // actively rotate onto the planned heading, the component pure-pursuit
   // structurally lacks. Self-gating: on a straight run the tangent equals the
   // chassis heading so the term is ~0; it only acts where the plan's heading
-  // diverges from the chassis (the straighten). Forward gear only — the parking
-  // terminal approach is forward, reverse maneuvers already arrive aligned, and
-  // the curvature sign convention differs in reverse. Off (0) for racing.
+  // diverges from the chassis (the straighten). Works in BOTH gears: the
+  // pursuit runs in the travel frame (body frame flipped by pi in reverse),
+  // where d(heading)/dt = |v| * kappa holds regardless of gear — the same
+  // relationship the positional pursuit relies on — and the pose-heading
+  // error equals the travel-frame error (both shift by pi). A reverse-gear
+  // gate used to assume "reverse maneuvers arrive pre-aligned", which stopped
+  // being true once the direction-change penalty was fixed and plans began
+  // terminating on a reverse leg. Off (0) for racing.
   if (
     config.headingGain &&
-    gear > 0 &&
     path.length >= 2 &&
     distToGoal <= (config.headingRadius ?? Infinity)
   ) {
@@ -220,7 +249,7 @@ export function purePursuit(
         vCurve,
         vPreview,
         vPath,
-        Math.max(vGoal, config.lookaheadMin),
+        Math.max(vGoal, config.minApproachSpeed ?? config.lookaheadMin),
       );
   const targetSpeed = gear * speedMag;
 

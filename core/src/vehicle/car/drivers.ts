@@ -91,10 +91,26 @@ export class PlanFollowerCarDriver implements Driver<CarKinematicState, WheeledC
     if (!this.started || this.plan.length === 0) return ZERO;
     const elapsed = simTime - this.planStartTime;
     const cmd = followPlan(state, this.plan, { config: this.opts.config, elapsed });
-    // Convert curvature -> Ackermann steer angle. Negate for Rapier frame.
-    const steerPlanning = Math.atan(cmd.steering * this.opts.wheelBase);
+    // Gear from the tracker's signed target speed. Pure-pursuit reports
+    // throttle as a non-negative magnitude and encodes direction in
+    // targetSpeed's sign; it also computes curvature in the direction of
+    // travel. Driving a chassis therefore needs BOTH corrections the demo
+    // runner applies: signed drive force (reverse maneuvers were silently
+    // impossible here — throttle was clamped to [0, 1]) and the reverse
+    // steer sign flip (an Ackermann chassis produces opposite world-frame
+    // curvature per travel direction).
+    const gear = cmd.targetSpeed < 0 ? -1 : 1;
+    // Convert curvature -> Ackermann steer angle. `wheelBase` here is the
+    // FULL front-to-rear axle spacing (the Rapier adapter's `wheelBase`
+    // option is the half-spacing — pass 2x that). Negate for Rapier frame.
+    // Net applied steer must be -gear * atan(kappa * L): the leading minus is
+    // the kinocat->Rapier frame flip (applied via the outer negation below),
+    // the gear factor is the reverse-travel flip. (A double negation here
+    // once inverted steering for FORWARD drivers — every consumer veered off
+    // instantly; see the sign regression test.)
+    const steerPlanning = gear * Math.atan(cmd.steering * this.opts.wheelBase);
     const steer = Math.max(-this.opts.maxSteerAngle, Math.min(this.opts.maxSteerAngle, -steerPlanning));
-    const driveForce = Math.max(0, Math.min(1, cmd.throttle)) * this.opts.engineForceN;
+    const driveForce = gear * Math.max(0, Math.min(1, cmd.throttle)) * this.opts.engineForceN;
     const brakeForce = Math.max(0, Math.min(1, cmd.brake)) * this.opts.brakeForceN;
     return { steer, driveForce, brakeForce };
   }

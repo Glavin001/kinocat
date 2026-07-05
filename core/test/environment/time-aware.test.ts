@@ -47,7 +47,13 @@ describe('TimeAwareEnvironment: time as a dominance dimension', () => {
   it('coarse level collapses nearby times; fine level separates them', () => {
     const world = new InMemoryNavWorld([rect(1, 0, -10, 10, 10)]);
     const base = new VehicleEnvironment(world, agent, lib);
-    const env = new TimeAwareEnvironment(base, { timeQuantum: 0.2 });
+    // Time participates in hash/dominance only when something is actually
+    // time-varying — a static wrap skips the tags entirely (dedup). Give the
+    // env one (far-away) predicted obstacle so the tagging machinery runs.
+    const env = new TimeAwareEnvironment(base, {
+      timeQuantum: 0.2,
+      obstacles: [{ radius: 0.5, predict: () => ({ x: 999, z: 999, radius: 0.5 }) }],
+    });
     const at = (t: number) =>
       env.createNode({ x: 1, z: 1, heading: 0, speed: 0, t }, null, null);
 
@@ -61,6 +67,22 @@ describe('TimeAwareEnvironment: time as a dominance dimension', () => {
     const fine = env.levels - 1;
     expect(a.index[fine]).not.toBe(c.index[fine]); // fine separates
     expect(a.index[0]).toBe(c.index[0]); // coarse collapses
+  });
+
+  it('a STATIC wrap keeps time out of hash and dominance (dedup preserved)', () => {
+    const world = new InMemoryNavWorld([rect(1, 0, -10, 10, 10)]);
+    // Two-layer contract: the base env drops its own time bucket via
+    // `timeInHash: false` (the plan-vehicle wrappers set this automatically
+    // for requests with no moving obstacles/affordances), and the static
+    // TimeAware wrap adds no @t tag of its own.
+    const base = new VehicleEnvironment(world, agent, lib, { timeInHash: false });
+    const env = new TimeAwareEnvironment(base, { timeQuantum: 0.2 });
+    const at = (t: number) =>
+      env.createNode({ x: 1, z: 1, heading: 0, speed: 0, t }, null, null);
+    // Same pose reached at different times is the SAME search state when the
+    // world has no dynamics — this was a measured 3.8x expansion inflation.
+    expect(at(0).hash).toBe(at(0.5).hash);
+    expect(at(0).hash).toBe(at(3.7).hash);
   });
 
   it('rejects a start that collides with a predicted obstacle', () => {
