@@ -29,8 +29,12 @@ seams instead of three parallel ad-hoc implementations.
 - **`AircraftEnvOptions.timeInHash`** — drop the aircraft env's internal
   time bucket when composing with `TimeAwareEnvironment`.
 - **Docs:** `docs/architecture.md` (the five seams + contract fine print)
-  and `docs/adding-a-domain.md` (eight-step recipe; aircraft as the worked
-  example).
+  and `docs/adding-a-domain.md` — the "define a new controllable motion
+  body" API guide, built around an EXECUTABLE worked example
+  (`core/test/examples/hovercraft.test.ts`): a complete drifting,
+  thrust-vectored hovercraft in one file, proven by the conformance battery
+  with exact fidelity and a body-typed boost affordance. CI runs the
+  example, so the documentation cannot rot.
 - **`checkSuccessorFidelity`** in `kinocat/testing`: re-simulates each
   successor edge from the ACTUAL parent state (harness supplies
   `resimulate` + a tolerance, with `angularFields` compared on the circle)

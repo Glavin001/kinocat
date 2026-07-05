@@ -1,9 +1,12 @@
 # Architecture: the five seams
 
 kinocat is one generic search core behind five named seams. Everything
-domain-specific — cars, humanoids, momentum humanoids, aircraft, and whatever
+body-specific — cars, humanoids, momentum humanoids, aircraft, and whatever
 you add next — lives in implementations of these seams; the planner itself
-(`core/src/planner/ighastar.ts`) never changes.
+(`core/src/planner/ighastar.ts`) never changes. An "agent domain" is the
+package that plugs one **controllable motion body** into the core: its
+state, its envelope, its dynamics, its environment. "Vehicle" is just the
+historical name of the first one.
 
 ```
                  ┌────────────────────────────────────────────┐

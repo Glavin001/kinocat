@@ -1,155 +1,154 @@
-# Adding an agent domain
+# Adding a motion body (agent domain)
 
-kinocat's planner is generic; an "agent domain" is everything else: a state
-type, dynamics, primitives, a collision world, and an `Environment`
-implementation. This is the recipe, with the aircraft
-(`core/src/environment/aircraft-environment.ts` — 3D, attitude, OBB) as the
-richest worked example and the momentum humanoid
-(`core/src/environment/momentum-humanoid-environment.ts`) as the "added with
-zero core edits" proof it works. Read `docs/architecture.md` first for the
-seam map and the contract fine print.
+kinocat's planner is generic; what you add is a **controllable motion body**
+— a car, a person, an aircraft, a hovercraft, anything with state that
+evolves under bounded controls. "Vehicle" is just the historical name of one
+of them; in code the neutral term is an *agent domain*: the package of state
++ envelope + dynamics + environment that plugs a body into the IGHA* core.
 
-## 1. Define the state and agent metadata (`core/src/agent/types.ts`)
+**The canonical worked example is executable**:
+[`core/test/examples/hovercraft.test.ts`](../core/test/examples/hovercraft.test.ts)
+defines a complete new body — inertial, thrust-vectored, drifting, yaw
+decoupled from velocity, unlike anything that ships — in one file, using
+only public seams, and proves it with the conformance battery. This guide
+walks that file; if the code and the doc disagree, the code wins (CI runs
+it). Read `docs/architecture.md` first for the seam map and contract fine
+print.
 
-The state is whatever your dynamics need to be Markov — position, attitude,
-velocities, and absolute time `t`. Ask "do two agents at the same pose with
-different X behave differently going forward?" — if yes, X belongs in the
-state (the momentum humanoid carries `vx/vz` because a sprinting and a
-standing person at the same pose have different futures). The agent metadata
-is the envelope: limits, footprint/half-extents, cost knobs.
+## The API at a glance — five things you define
 
-```ts
-export interface AircraftState {
-  x: number; y: number; z: number;      // y IS searched — genuinely 3D
-  heading: number; pitch: number; roll: number;
-  speed: number; t: number;
-}
-```
+| # | You define | Contract | Hovercraft example |
+|---|---|---|---|
+| 1 | **State** — a plain JSON object | Every dim the dynamics need to be Markov, plus absolute time `t` | `{x, z, heading, vx, vz, t}` |
+| 2 | **Agent** — the body's envelope | Limits and size as data (`maxSpeed`, rates, radius/footprint, cost knobs) | `{radius, maxSpeed, maxThrust, maxYawRate, drag}` |
+| 3 | **`ForwardSim<S>`** — the dynamics | `(state, controls, dt) => state`. Controls are SETPOINTS; state evolves from its current value; clamp to the envelope inside | `[thrustFrac, thrustAngle, yawFrac]` |
+| 4 | **`Environment<State>`** — the planner's view | `createNode / succ / heuristic / checkValidity / reachedGoalRegion` + `levels` | `HovercraftEnvironment`, ~150 lines |
+| 5 | **`DomainHarness`** — the proof | `runConformance(harness)` green defines "this body works" | battery + exact fidelity hook |
 
-## 2. Write (or learn) a `ForwardSim<S>` (`core/src/agent/`)
+Affordances (`Affordance<YourState>`), moving obstacles, goal automata, and
+multi-goal sequences then compose for free through the shared wrappers — no
+per-body code.
 
-A pure function `(state, controls, dt) => state`. Clamp to the envelope
-inside the sim — the planner then cannot ever command the impossible. Treat
-controls as SETPOINTS and every state variable as evolving from its current
-value at bounded rates (the aircraft's `maxRollRate`/`maxPitchRate` pattern):
-the sim is the single definition of what a primitive can express, so
-maneuver timing (begin the roll before the slot; hold the bank between
-nearby slots) falls out of the search instead of being scripted.
+## 1. State
 
-Honor the **equivariance contract** (documented on `characterize()`): output
-must not depend on absolute position or heading, or cached primitives cannot
-be rigidly transformed. Learned models (see `agent/vehicle-model.ts` and the
-`kinocat/learning` pipeline) plug in the same way.
+Ask: *"do two bodies at the same pose with different X behave differently
+going forward?"* If yes, X is state. The hovercraft carries a world-frame
+velocity vector separate from `heading` because it drifts; the momentum
+humanoid does the same because people strafe; the aircraft carries pitch
+and roll because attitude is rate-limited. Always carry absolute `t`.
 
-## 3. Turn the sim into primitives — live rollout or `characterize<S>`
+## 2. Agent (the envelope)
 
-**Decide how `succ()` applies primitives** (see `docs/architecture.md`
-Seam 2): roll the sim LIVE from each node's actual state when the sim is
-cheap next to your collision narrowphase or depends on continuous state
-dims (the aircraft), or pre-characterize per start bucket when rollouts are
-costly and the start-dependence is coarse (car speed buckets, momentum
-humanoid speed × direction buckets). Either way, wire the
-`checkSuccessorFidelity` hook in step 7 so the choice is verified, not
-assumed.
+Plain data describing what the body *can do* — the analog of
+`VehicleAgent` / `AircraftAgent` in `core/src/agent/types.ts`. Rates belong
+here too (`maxRollRate`, `maxYawRate`): they are physical facts like
+`minTurnRadius`, not features.
 
-For the cached strategy (`core/src/primitives/characterize.ts`):
+## 3. ForwardSim — the single definition of what a primitive can express
 
-```ts
-const rolled = characterize<MyState, MyLocalSample>({
-  forwardSim, runs: crossRuns(canonicalStarts, controlSets),
-  duration, substeps,
-  record: (s) => ({ /* local-frame pose + whatever succ needs */ }),
-});
-```
+A **motion primitive is just "hold these control setpoints for T seconds
+through the sim."** Whatever the sim integrates — displacement, attitude,
+drift — is the primitive's effect. Do not script maneuvers or add per-DOF
+special cases in the environment; put the physics in the sim and timing
+falls out of the search (the aircraft begins its knife-edge roll *before*
+the slot purely because `maxRollRate` lives in its sim).
 
-Choose canonical starts to cover the state dims your dynamics care about
-(car: speed buckets; momentum humanoid: speed × velocity-direction buckets;
-aircraft: one canonical start but per-resolution-level control sets via
-`levelControls`). Dedupe primitives whose end states coincide after envelope
-clamping — duplicates burn a collision sweep each and then die in dedup
-anyway. Domains with trivial dynamics can skip caching and generate steps in
-`succ()` directly (the base `HumanoidEnvironment` does).
+Rules of thumb:
+- Clamp to the envelope **inside** the sim — the planner can then never
+  command the impossible.
+- Keep it pure and deterministic (no randomness, no wall clock).
+- Keep it translation- and yaw-equivariant (no absolute-position effects)
+  if you ever want to cache characterized primitives.
+- A learned model (`kinocat/learning`) plugs in as the same function type.
 
-## 4. Pick the world seam
+## 4. Environment
 
-Ground agent on surfaces → `NavWorld`. Free 3D volume → `AirspaceWorld`.
-See `docs/architecture.md` Seam 3. If neither fits, define your own — the
-planner never sees the world type, only your `Environment`.
+The five methods, generic quantization decisions, and one structural choice:
 
-## 5. Implement `Environment<State>` (`core/src/environment/`)
+**How does succ() apply primitives?** (details: architecture doc, Seam 2)
+- **Live rollout** — integrate the sim per substep inside `succ()`, from the
+  node's ACTUAL state. Exact by construction. **Recommended default**: right
+  whenever the sim is cheap next to your collision checks, and mandatory in
+  spirit when the sim depends on continuous dims a cache would quantize
+  (rate-limited attitude). The hovercraft and aircraft do this.
+- **Cached characterization** — `characterize<S>()` + `crossRuns()`
+  (`core/src/primitives/characterize.ts`) roll the sim once from canonical
+  start buckets; `succ()` rigid-transforms the cached sweeps. Right when
+  rollouts are expensive or start-dependence is coarse (car speed buckets,
+  momentum-humanoid speed × direction buckets). The bucket teleport is a
+  declared tolerance in your fidelity hook, not a hidden lie.
 
-The five methods plus `levels`. The non-obvious parts:
+Non-obvious contract points (all enforced by the kit):
+- `succ` sets `g/h/f` on every successor; `edge.cost > 0`; put **enough in
+  `edge.data` to re-simulate the edge** (the hovercraft stores its controls
+  array — zero-allocation, it's the shared action reference).
+- `index.length === levels`; hash every Markov dim; **never hash time in a
+  static environment** (earliest arrival dominates; `TimeAwareEnvironment`
+  adds time when moving obstacles make it meaningful).
+- Heuristic: admissible, ideally consistent. Read the traps in the
+  architecture doc before designing a clever one — speed-rewarding bounds
+  break with bucketed primitives; `distance / maxSpeed` is safe because the
+  sim caps speed.
+- Reuse scratch buffers for footprint placement (`placeFootprintInto`) —
+  collision checks run millions of times per plan.
+- Pick the world seam: `NavWorld` (2.5D surfaces) or `AirspaceWorld`
+  (3D volume); define your own if neither fits — the planner never sees it.
 
-- **`createNode`**: quantize each state dim; build the per-level `index`
-  (coarse → fine) and the exact `hash`. Hash every Markov dim; do NOT hash
-  time in a static env (see architecture doc — the momentum-ladder lesson).
-  Extra state dims can join the COARSE dominance cells at coarser buckets so
-  attitude-equivalent routes collapse early while the finest level keeps
-  them distinct — the aircraft's pitch/roll handling
-  (`aircraft-environment.ts` `createNode`) is the pattern.
-- **`succ`**: look up the primitive bucket, rigid-transform cached sweeps by
-  the node pose, collision-check the sweep, build successors with g/h/f set.
-  Reuse scratch buffers for footprint placement (`placeFootprintInto` +
-  a preallocated array) — collision checks run millions of times per plan.
-  Accept the optional `level` argument if you have per-level primitive sets.
-- **`heuristic`**: admissible, ideally consistent. Read the consistency
-  traps in `docs/architecture.md` BEFORE inventing a clever one — two of the
-  three clever ideas we tried were inconsistent, and the conformance kit is
-  what caught them.
-- **`checkValidity` / `reachedGoalRegion`**: static footprint checks; a
-  radius (+ optional heading tolerance) goal disk.
-
-## 6. Compose the wrappers you need
-
-Moving obstacles / affordances / time: wrap with `TimeAwareEnvironment`
-(any `{x, z, t(, y)}` state). Gate sequences: `MultiGoalEnvironment`. Goal
-automata: `ScenarioEnvironment`. No domain code changes required.
-
-## 7. Prove it with the conformance kit (`kinocat/testing`)
+## 5. Prove it: the conformance battery
 
 ```ts
 import { runConformance, type DomainHarness } from 'kinocat/testing';
 
-const harness: DomainHarness<MyState> = {
-  makeEnv: () => new MyEnvironment(world(), agent),   // fresh + deterministic
-  sampleState: (rand) => ({ /* cover the envelope, seeded rng */ }),
-  scenarios: [{ name: 'open', start, goal, maxExpansions: 120_000 }],
+const harness: DomainHarness<HovercraftState> = {
+  makeEnv: () => new HovercraftEnvironment(world(), AGENT), // deterministic
+  sampleState: (rand) => ({ /* seeded; cover the whole envelope */ }),
+  scenarios: [{ name: 'glide-across', start, goal, maxExpansions: 150_000 }],
+  fidelity: {
+    tolerance: 1e-9,                 // live rollout ⇒ exact
+    angularFields: ['heading'],      // compared on the circle
+    resimulate: (parent, edge) => {  // reconstruct controls from edge.data
+      if (edge.kind !== 'hover') return null;
+      /* roll the sim for primDuration/substeps from `parent` */
+    },
+  },
 };
-const report = runConformance(harness);
-expect(report.failures).toEqual([]);   // failures print with samples
+expect(runConformance(harness).failures).toEqual([]);
 ```
 
-Run it standalone AND wrapped (`TimeAware(MyEnvironment)`) — wrappers must
-conform too. Keep fixture worlds small: the battery replans each scenario
-~8 times, and kinodynamic domains with more exact-hash dims are
-expansion-hungrier than geometric ones.
+The battery checks heuristic consistency + admissibility, successor
+invariants, hash stability, determinism, anytime monotonicity, budgeted
+solvability, and — via your `fidelity` hook — that `succ()` faithfully
+applies the sim from the actual state (exact for live rollout; the
+bucket-teleport bound for cached primitives). Run it standalone AND wrapped
+(`TimeAware(YourEnvironment)`); keep fixture worlds small — the battery
+replans each scenario ~8 times.
 
-Supply the **fidelity hooks** so the battery also proves succ() applies the
-forward sim faithfully: put enough in `edge.data` to reconstruct the edge's
-controls, re-simulate from the actual parent state, and declare the
-tolerance (machine-eps for live rollout; the bucket-teleport bound for
-cached primitives — see the three in-repo harnesses in
-`core/test/conformance/` for both flavors, and `angularFields` for
-heading-like dims that compare on the circle).
+## 6. Compose the shared capabilities
 
-## 8. Ship a demo + headless scenario test
+No new code per body:
+- **Moving obstacles / time**: wrap with `TimeAwareEnvironment` (any
+  `{x, z, t(, y)}` state).
+- **Affordances**: implement `Affordance<YourState>` (jump pads, boosts,
+  teleporters — extra edges with honest costs), register in an
+  `AffordanceRegistry<YourState>`, pass to the wrapper. The hovercraft
+  example's third test crosses a void on a boost affordance.
+- **Gate sequences / goal automata**: `MultiGoalEnvironment` /
+  `ScenarioEnvironment`.
 
-Add `demos/app/<slug>/page.tsx` with the scenario logic in a
-`demos/app/lib/<slug>-scenario.ts` builder (pure, headless-testable — no
-React), register the route card in `demos/app/page.tsx`, and add a headless
-test asserting the shipped config plans within budget. The coverage manifest
-in `demos/test/scenarios.test.ts` (`TESTED_DEMOS`) fails CI until you do.
-The crowd demo (`demos/app/crowd/`, `demos/app/lib/crowd-scenario.ts`) is
-the reference for this step.
+## 7. Ship a demo + headless scenario test
 
-## Worked deltas
+Scenario logic in a pure builder (`demos/app/lib/<slug>-scenario.ts`), the
+route in `demos/app/<slug>/page.tsx`, a card in `demos/app/page.tsx`, and a
+headless test asserting the shipped config plans within budget. The
+coverage manifest in `demos/test/scenarios.test.ts` (`TESTED_DEMOS`) fails
+CI until you do. The crowd demo (`demos/app/crowd/`) is the reference.
 
-| Step | Aircraft | Momentum humanoid |
-|---|---|---|
-| State | 8-dim, altitude+attitude searched | 6-dim, world-frame velocity vector |
-| Sim | `aircraftForwardSim` (turn/climb/roll/speed clamps) | `momentumHumanoidForwardSim` (launch/brake/strafe/turn-degrade) |
-| Primitives | inline via shared harness, per-level `levelControls` | `characterize<S>` over speed × rel-direction buckets |
-| World | `AirspaceWorld` (OBB vs AABB/spheres) | `NavWorld` (octagon footprint) |
-| Heuristic | 3D Euclidean / maxSpeed | 2D Euclidean / maxSpeed (see consistency traps) |
-| Conformance | `core/test/conformance/aircraft.conformance.test.ts` | `.../momentum-humanoid.conformance.test.ts` |
-| Demo | `/plane`, `/dogfight` | `/crowd` |
+## The four shipped bodies as references
+
+| Body | State highlights | Primitive strategy | Files |
+|---|---|---|---|
+| Car | signed speed, gears | cached, speed buckets | `environment/vehicle-environment.ts` |
+| Humanoid (step) | no inertia | generated in succ | `environment/humanoid-environment.ts` |
+| Momentum humanoid | world-frame velocity | cached, speed × direction buckets | `environment/momentum-humanoid-environment.ts` |
+| Aircraft | altitude + rate-limited attitude | live rollout | `environment/aircraft-environment.ts` |
+| **Hovercraft (example)** | drift, decoupled yaw | live rollout | `core/test/examples/hovercraft.test.ts` |
