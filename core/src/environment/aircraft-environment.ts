@@ -13,6 +13,7 @@ import type { Environment, EdgeRef, Node } from './types';
 import type { AirspaceWorld } from './airspace-world';
 import type { AircraftAgent, AircraftState } from '../agent/types';
 import { aircraftForwardSim } from '../agent/aircraft';
+import { characterize } from '../primitives/characterize';
 import type { ForwardSim } from '../primitives/types';
 import { makeNode } from '../planner/node';
 import { wrapAngle, angleDiff } from '../internal/math';
@@ -293,22 +294,50 @@ export class AircraftEnvironment implements Environment<AircraftState> {
 
   /**
    * Pre-characterize each control quad against the kinematic forward sim,
-   * recording substep-by-substep local-frame deltas. At runtime `succ()`
-   * rigid-transforms these by the parent node's heading + position rather
-   * than re-simulating, mirroring `characterizeVehicle()` for vehicles.
+   * recording substep-by-substep local-frame deltas via the shared
+   * `characterize` harness (same one behind `characterizeVehicle`). At
+   * runtime `succ()` rigid-transforms these by the parent node's heading +
+   * position rather than re-simulating.
    *
    * Soundness: `aircraftForwardSim` (in `core/src/agent/aircraft.ts`) is a
    * pure function of input state, control, and dt. The XZ-plane translation
    * depends only on heading + speed + pitch; rotating the world-frame
    * outputs by the parent's heading reproduces the simulated trajectory
    * exactly because the body-axes' yaw appears linearly in (cos h, sin h)
-   * factors. Altitude is heading-independent. If the agent's forward sim is
-   * later swapped for one that depends on global wind or absolute position,
-   * gate this cache on that property.
+   * factors. Altitude is heading-independent. This is exactly the
+   * equivariance contract documented on `characterize` — if the sim gains
+   * global-wind or absolute-position dependence, stop caching.
    */
   private buildPrimitiveCacheFor(quads: ControlQuad[]): CachedPrimitive[] {
-    const out: CachedPrimitive[] = [];
-    const dt = this.primDuration / this.substeps;
+    // Simulate from a canonical start (heading 0, origin, level wings, the
+    // quad's target speed); the world-frame deltas ARE the local-frame ones.
+    const rolled = characterize<AircraftState, LocalSweep>({
+      forwardSim: this.sim,
+      runs: quads.map((c) => ({
+        startState: {
+          x: 0,
+          y: 0,
+          z: 0,
+          heading: 0,
+          pitch: 0,
+          roll: 0,
+          speed: c.v,
+          t: 0,
+        },
+        controls: [c.k, c.climb, c.roll, c.v],
+      })),
+      duration: this.primDuration,
+      substeps: this.substeps,
+      record: (s) => ({
+        dx: s.x,
+        dz: s.z,
+        dy: s.y,
+        dHeading: s.heading,
+        pitch: s.pitch,
+        roll: s.roll,
+        dt: s.t,
+      }),
+    });
     // Orientation-independent bound on the agent OBB: a sphere of radius R
     // contains the OBB at every yaw/pitch/roll. Used to build a swept
     // envelope that's valid for ANY world heading the primitive is applied
@@ -318,26 +347,10 @@ export class AircraftEnvironment implements Environment<AircraftState> {
         this.agent.halfSpan * this.agent.halfSpan +
         this.agent.halfHeight * this.agent.halfHeight,
     );
-    for (const c of quads) {
-      const ctl: readonly [number, number, number, number] = [
-        c.k,
-        c.climb,
-        c.roll,
-        c.v,
-      ];
-      // Simulate from a canonical start (heading 0, origin, level wings),
-      // then store world-frame deltas — they're the local-frame deltas.
-      let s: AircraftState = {
-        x: 0,
-        y: 0,
-        z: 0,
-        heading: 0,
-        pitch: 0,
-        roll: 0,
-        speed: c.v,
-        t: 0,
-      };
-      const samples: LocalSweep[] = [];
+    const out: CachedPrimitive[] = [];
+    for (let qi = 0; qi < quads.length; qi++) {
+      const c = quads[qi]!;
+      const { samples } = rolled[qi]!;
       // Seed the envelope with the start pose (parent origin, heading 0).
       let xmin = -R;
       let xmax = R;
@@ -345,23 +358,13 @@ export class AircraftEnvironment implements Environment<AircraftState> {
       let ymax = R;
       let zmin = -R;
       let zmax = R;
-      for (let i = 0; i < this.substeps; i++) {
-        s = this.sim(s, ctl as unknown as number[], dt);
-        samples.push({
-          dx: s.x,
-          dz: s.z,
-          dy: s.y,
-          dHeading: s.heading,
-          pitch: s.pitch,
-          roll: s.roll,
-          dt: s.t,
-        });
-        if (s.x - R < xmin) xmin = s.x - R;
-        if (s.x + R > xmax) xmax = s.x + R;
-        if (s.y - R < ymin) ymin = s.y - R;
-        if (s.y + R > ymax) ymax = s.y + R;
-        if (s.z - R < zmin) zmin = s.z - R;
-        if (s.z + R > zmax) zmax = s.z + R;
+      for (const sp of samples) {
+        if (sp.dx - R < xmin) xmin = sp.dx - R;
+        if (sp.dx + R > xmax) xmax = sp.dx + R;
+        if (sp.dy - R < ymin) ymin = sp.dy - R;
+        if (sp.dy + R > ymax) ymax = sp.dy + R;
+        if (sp.dz - R < zmin) zmin = sp.dz - R;
+        if (sp.dz + R > zmax) zmax = sp.dz + R;
       }
       const end = samples[samples.length - 1]!;
       const cost =
@@ -371,7 +374,7 @@ export class AircraftEnvironment implements Environment<AircraftState> {
         control: c,
         samples,
         end,
-        ctlArray: ctl,
+        ctlArray: [c.k, c.climb, c.roll, c.v] as const,
         cost,
         edgeData: { k: c.k, climb: c.climb, roll: c.roll },
         sweptLocal: { xmin, xmax, ymin, ymax, zmin, zmax },
