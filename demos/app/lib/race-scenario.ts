@@ -1307,16 +1307,24 @@ export async function createRaceScenario(
           };
         }
       } else {
-        const cmd = wheeledFromNormalized({ steer: 0, throttle: 0.2, brake: 0 }, FORCE_TUNING);
+        // Degenerate live segment (a trivial already-satisfied plan, or a
+        // 1-point stub): HOLD — brake to rest. This is the natural terminal
+        // state after settling: replans from a satisfied pose return the
+        // trivial plan and the chassis simply keeps holding the brake. The
+        // old behavior (creep forward at 0.2 throttle) silently drove a
+        // planless car into whatever was ahead of it.
+        const cmd = wheeledFromNormalized({ steer: 0, throttle: 0, brake: 0.6 }, FORCE_TUNING);
         c.car.applyWheeledControls(cmd);
         c.lastControls = cmd;
-        c.metrics.liveControls = { steer: 0, throttle: 0.2, brake: 0, targetSpeed: 5 };
+        c.metrics.liveControls = { steer: 0, throttle: 0, brake: 0.6, targetSpeed: 0 };
       }
     } else {
-      const cmd = wheeledFromNormalized({ steer: 0, throttle: 0.2, brake: 0 }, FORCE_TUNING);
+      // No plan at all (planner failed / first tick): hold still and wait for
+      // the next replan rather than creeping blind.
+      const cmd = wheeledFromNormalized({ steer: 0, throttle: 0, brake: 0.6 }, FORCE_TUNING);
       c.car.applyWheeledControls(cmd);
       c.lastControls = cmd;
-      c.metrics.liveControls = { steer: 0, throttle: 0.2, brake: 0, targetSpeed: 5 };
+      c.metrics.liveControls = { steer: 0, throttle: 0, brake: 0.6, targetSpeed: 0 };
     }
     stepRaycastVehicle(c.world, [c.car], { dt, substeps: VEHICLE_SUBSTEPS });
     const after = c.car.readState(simTime + dt);
