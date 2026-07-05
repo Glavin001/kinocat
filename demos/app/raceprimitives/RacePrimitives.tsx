@@ -304,6 +304,18 @@ export default function RacePrimitives() {
     const p = loadLearnedParams();
     setParams(p ?? DEFAULT_LEARNED_PARAMS);
     setPhase('ready');
+    // Toggle preference: '1' = explicitly on, '0' = explicitly off,
+    // null = no explicit choice. When the user has never chosen, v2
+    // defaults ON as soon as a trained model is available — otherwise a
+    // fresh visitor watches kinematic vs the legacy 5-param model and
+    // the trained v2 library (the page's whole point) sits unused.
+    let toggle: string | null = null;
+    if (typeof window !== 'undefined') {
+      try {
+        toggle = window.localStorage.getItem('kinocat:v2-toggle:v1');
+      } catch { /* ignore */ }
+    }
+    if (toggle === '1') setUseV2State(true);
     // Try the localStorage cache first — if the user trained or imported
     // a model in a previous session it stays sticky.
     const cached = loadV2Model();
@@ -311,6 +323,7 @@ export default function RacePrimitives() {
     if (cached) {
       setV2Model(cached.model);
       setV2Meta(cached.meta);
+      if (toggle === null) setUseV2State(true);
     }
     // Always probe the preloaded artifact in the background — both so
     // we can light up the "Reset to default" button, and so a fresh
@@ -325,14 +338,9 @@ export default function RacePrimitives() {
       if (!cached) {
         setV2Model(res.model);
         setV2Meta(res.meta);
+        if (toggle === null) setUseV2State(true);
       }
     });
-    if (typeof window !== 'undefined') {
-      try {
-        const v = window.localStorage.getItem('kinocat:v2-toggle:v1');
-        if (v === '1') setUseV2State(true);
-      } catch { /* ignore */ }
-    }
     return () => {
       cancelled = true;
     };
