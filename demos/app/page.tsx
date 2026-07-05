@@ -192,6 +192,14 @@ const DEMOS: readonly Demo[] = [
     level: 'standard',
   },
   {
+    href: '/crowd',
+    title: 'Momentum runner',
+    desc: 'An inertial person — sprint, strafe cap, brake limits — weaves through pedestrians timed to cut its line. Space-time planning, fourth agent domain.',
+    tags: ['2D', 'Time-aware'],
+    category: 'fundamentals',
+    level: 'standard',
+  },
+  {
     href: '/dynamic',
     title: 'Time-aware planning',
     desc: 'A moving obstacle on a time scrubber, plus a second NPC and a jump affordance. Planning across time, not just space.',
@@ -209,6 +217,14 @@ const DEMOS: readonly Demo[] = [
   },
 
   // ── 3D worlds & flight ────────────────────────────────────────────────
+  {
+    href: '/hovercraft',
+    title: 'Hovercraft lagoon',
+    desc: 'A fifth motion body defined entirely outside kinocat: inertial, thrust-vectored, drifting. Tap to retarget mid-drift — momentum and the patrolling floes’ futures carry into every replan.',
+    tags: ['3D', 'Interactive', 'Time-aware'],
+    category: 'spatial',
+    level: 'flagship',
+  },
   {
     href: '/world3d',
     title: '3D navmesh world',

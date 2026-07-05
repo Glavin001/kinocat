@@ -2,10 +2,12 @@
 export type {
   CarKinematicState,
   HumanoidState,
+  MomentumHumanoidState,
   AircraftState,
   AgentState,
   VehicleAgent,
   HumanoidAgent,
+  MomentumHumanoidAgent,
   AircraftAgent,
   AgentModel,
 } from './types';
@@ -17,6 +19,11 @@ export {
 } from './vehicle';
 export type { LearnedVehicleParams } from './vehicle';
 export { defaultHumanoidAgent } from './humanoid';
+export {
+  defaultMomentumHumanoidAgent,
+  momentumHumanoidForwardSim,
+  turnRateAt,
+} from './momentum-humanoid';
 export { defaultAircraftAgent, aircraftForwardSim } from './aircraft';
 
 // Generic wheeled-vehicle action shape + clamp helpers.

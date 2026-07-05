@@ -6,7 +6,11 @@ kinocat is a pure-TypeScript, tree-shakeable, web-native motion planner that
 gives browser-based 3D games F.E.A.R.-grade emergent NPC navigation: reverse
 maneuvers, ballistic jumps, anticipatory routing over *predicted* future world
 states, opportunistic affordance use, and emergent multi-agent cooperation —
-for NPC vehicles **and** humanoids, with the same planner.
+for NPC vehicles, humanoids, **and aircraft**, with the same planner. Four
+agent domains ship today (car, step humanoid, inertial momentum humanoid,
+fixed-wing aircraft in true 3D); adding a fifth is a documented recipe
+([`docs/adding-a-domain.md`](docs/adding-a-domain.md)) proven by a packaged
+conformance kit (`kinocat/testing`).
 
 The planner core is a TypeScript port of **IGHA\*** (Incremental Generalized
 Hybrid A\*, Talia / Salzman / Srinivasa, RA-L 2025), extended with **time as a
@@ -42,9 +46,11 @@ the goal. kinocat finds the physically-feasible trajectory that achieves it.
 - **Kinodynamic planning** for any agent with a characterizable forward model —
   reverse maneuvers and parking pockets fall out of the search, no special-case
   logic.
-- **3D, not 2.5D** — planning on navcat's 3D polygon graph: multi-floor,
-  overhangs, ramps, tilted surfaces. Vehicle state lives *on* polygons; Y is
-  derived from polygon containment.
+- **3D, not 2.5D** — ground agents plan on navcat's 3D polygon graph
+  (multi-floor, overhangs, ramps; Y derived from polygon containment), and
+  aircraft plan through free 3D volume: altitude, pitch, and roll are
+  *searched* dimensions with oriented-box collision (knife-edge through a
+  slot that level wings can't fit).
 - **Time-aware** — `predict(t) → State | null` is the single abstraction for
   everything dynamic. Collisions are hard constraints (infeasible edges pruned
   from the search); affordances are extra edges.
@@ -73,12 +79,13 @@ implemented and tested in `core/src` with zero external runtime.
 | Layer | Subpath | Responsibility |
 |---|---|---|
 | Curves | `kinocat/curves` | Reeds-Shepp & Dubins analytical curves (heuristics + shot-to-goal) |
-| Primitives | `kinocat/primitives` | Motion-primitive library + characterization harness over a `ForwardSim` |
-| Agent | `kinocat/agent` | Vehicle / humanoid kinematic metadata |
+| Primitives | `kinocat/primitives` | Generic `characterize<S>` rollout harness + motion-primitive library |
+| Agent | `kinocat/agent` | Vehicle / humanoid / momentum-humanoid / aircraft metadata + forward sims |
 | Planner | `kinocat/planner` | IGHA\* anytime, time-extended core (agent-agnostic) |
-| Environment | `kinocat/environment` | `Environment` interface, `NavWorld` seam, vehicle / humanoid / time-aware / R² impls |
-| Predict | `kinocat/predict` | `Predict<T>` factories, affordance registry, plan registry |
+| Environment | `kinocat/environment` | `Environment` interface, `NavWorld` + `AirspaceWorld` seams, vehicle / humanoid / momentum-humanoid / aircraft / time-aware / R² impls |
+| Predict | `kinocat/predict` | `Predict<T>` factories, generic `Affordance<S>` registry, plan registry |
 | Execute | `kinocat/execute` | Curvature-aware pure-pursuit tracker + divergence / periodic replan |
+| Testing | `kinocat/testing` | Domain conformance kit — prove any `Environment<State>` satisfies the planner's contract |
 | Adapters | `kinocat/adapters/{navcat,rapier,three}` | Optional-peer integrations |
 
 The IGHA\* search loop never changes; everything kinocat adds —
@@ -123,6 +130,15 @@ navcat / Rapier / three.js integrations live behind optional adapters.
 | 8 — Executor + replanning | done |
 | 9 — Humanoid environment | done |
 | 10 — Polish / docs / examples | in progress (demos shipping) |
+| 11 — Domain convergence: conformance kit (`kinocat/testing`), dynamic-world layer generalized beyond ground vehicles (3D moving obstacles, `Affordance<S>` for any state), shared `characterize<S>` harness, momentum-humanoid as the fourth domain | done |
+
+Four agent domains share the one planner core today — car, humanoid,
+momentum humanoid (inertial person), and a genuinely-3D aircraft (searched
+altitude / pitch / roll, OBB collision). The seams that make that possible,
+and the recipe for adding a fifth, are documented in
+[`docs/architecture.md`](docs/architecture.md) and
+[`docs/adding-a-domain.md`](docs/adding-a-domain.md); a new domain proves
+itself by passing `runConformance` from `kinocat/testing`.
 
 The core never imports navcat: environments consume a kinocat-owned
 `NavWorld` / `PolygonRef` seam, and `InMemoryNavWorld` (polygon soup, zero
@@ -251,6 +267,21 @@ const result = plan(
 Wrap `env` in `TimeAwareEnvironment` to add predicted-obstacle avoidance and
 lazy affordance edges; track the plan with `purePursuit` from
 `kinocat/execute`.
+
+Building your own agent domain? Follow
+[`docs/adding-a-domain.md`](docs/adding-a-domain.md), then prove it:
+
+```ts
+import { runConformance } from 'kinocat/testing';
+
+const report = runConformance({
+  makeEnv: () => new MyEnvironment(world(), agent),
+  sampleState: (rand) => ({ /* seeded valid-state sampler */ }),
+  scenarios: [{ name: 'open', start, goal, maxExpansions: 120_000 }],
+});
+// report.ok — heuristic consistency/admissibility, successor invariants,
+// hash stability, determinism, anytime monotonicity, budgeted solvability
+```
 
 ## References
 
