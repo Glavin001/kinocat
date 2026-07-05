@@ -49,9 +49,24 @@ export function purePursuit(
 ): TrackingCommand {
   const goal = path[path.length - 1]!;
   const distToGoal = dist(current.x, current.z, goal.x, goal.z);
-  const atGoal = distToGoal <= config.goalTolerance;
-
   const ni = nearestIndex(path, current.x, current.z);
+
+  // A plan whose final sample is (near) stopped encodes a real "stop here"
+  // terminal, as opposed to a drive-through waypoint (e.g. a racing loop) whose
+  // last point is just the current planning horizon.
+  const stopsAtEnd = Math.abs(goal.speed) < 0.05;
+
+  // Stop latch. A stop-terminated segment is done once the nearest sample is
+  // its terminal — the vehicle has consumed the whole path it can see. Without
+  // this, a purely distance-based `atGoal` lets a fast approach sail past the
+  // goal, where the symmetric brake-distance term (`vGoal` grows again with
+  // distance) re-commands cruise and the vehicle runs away. Keying on the
+  // nearest-sample index — rather than a final-tangent half-plane test — keeps
+  // it robust on curved parking approaches (a Reeds-Shepp hook bends, so a
+  // half-plane test misfires metres early). Drive-through plans (terminal speed
+  // > 0) are exempt so racing is unaffected.
+  const reachedEnd = stopsAtEnd && ni >= path.length - 1;
+  const atGoal = distToGoal <= config.goalTolerance || reachedEnd;
   // gear from the planned speed sign just ahead on the path
   const aheadSpeed = path[Math.min(ni + 1, path.length - 1)]!.speed;
   const gear = aheadSpeed < 0 ? -1 : 1;
@@ -116,13 +131,20 @@ export function purePursuit(
   if (config.respectPathSpeed) {
     let acc = 0;
     const window = config.lookaheadMax;
-    for (let i = ni; i < path.length - 1 && acc <= window; i++) {
+    let i = ni;
+    for (; i < path.length - 1 && acc <= window; i++) {
       const s2 = Math.abs(path[i]!.speed);
       if (s2 < vPath) vPath = s2;
       acc += dist(path[i]!.x, path[i]!.z, path[i + 1]!.x, path[i + 1]!.z);
     }
-    const last = Math.abs(path[path.length - 1]!.speed);
-    if (last < vPath) vPath = last;
+    // Only fold in the terminal (goal) speed once the goal itself is within the
+    // lookahead window (the loop consumed the whole path). Doing it
+    // unconditionally pins the target to the terminal stop speed (~0) from
+    // arbitrarily far away, so a plan that ends in a stop never starts moving.
+    if (i >= path.length - 1) {
+      const last = Math.abs(path[path.length - 1]!.speed);
+      if (last < vPath) vPath = last;
+    }
     if (!Number.isFinite(vPath)) vPath = Infinity;
   }
 

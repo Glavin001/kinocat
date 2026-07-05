@@ -699,3 +699,8 @@ export function createAgentFootprintHelper(
     new THREE.LineBasicMaterial({ color: opts.color ?? 0xffffff }),
   );
 }
+
+// ---------------------------------------------------------------------------
+// Scenario goal/invariant region overlays (kinocat/scenario visualizer).
+export { createRegionHelper, REGION_COLORS } from './regions';
+export type { RegionHelperOptions } from './regions';
