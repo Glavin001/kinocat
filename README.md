@@ -156,6 +156,45 @@ pulls zero planner/environment code. Peers (`navcat`, `@dimforge/rapier3d-compat
 A headless test (`demos/test/scenarios.test.ts`) asserts the exact shipped demo
 configs always find a plan within budget, so a "no plan" regression fails CI.
 
+### Preview the rich plan (visual debugging)
+
+The planner→controller reference is captured as a rich `Plan`
+(`kinocat/plan`): per-point arc length, signed curvature, target speed /
+accel, feedforward steer, reserved dynamic-state / free-space slots, and the
+single-gear segment / cusp structure. The **Parking demo** renders it as a
+visual-debug overlay:
+
+```sh
+pnpm dev            # builds core, starts Next.js on http://localhost:3000
+```
+
+Open **http://localhost:3000/parking**, then press **`d`** (or the
+`[d] plan-debug` button). The reverse-perp and parallel scenarios (`[2]` /
+`[3]`) show it best, since they have forward↔reverse cusps. The overlay draws:
+
+- **Speed-colored path** — the reference line shaded by `|vRef|` (slow → fast
+  = red → green), so you can *see* where the profile slows for corners and the
+  stall.
+- **Reverse spans in blue** — segments the plan drives in reverse gear.
+- **Cusp markers** (yellow points) — where the chassis stops and flips gear
+  (segment boundaries).
+- **Feedforward-steer ticks** (orange) — `steerFf = atan(L·κ·dir)` at each
+  point, so you can eyeball the steering the plan hands the controller.
+
+The overlay is produced from the live committed plan every tick
+(`buildPlan(smoothed, …)` in `demos/app/lib/race-scenario.ts`), so it updates
+on every replan. It is *produce-but-don't-consume*: the controller still
+tracks the plain path today; a follow-up feeds `Plan.kappa` / `steerFf` into
+the tracker.
+
+**Test it.** The builder is unit-tested (curvature/arc-length/accel,
+feedforward sign in reverse, cusp-boundary placement, round-trip):
+
+```sh
+pnpm test plan/build                            # core/test/plan/build.test.ts
+pnpm test parking-invariants parking-success    # flagship parking still tracks
+```
+
 ## Develop
 
 ```sh
