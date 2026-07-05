@@ -45,10 +45,14 @@ describe.skipIf(!RAPIER_OK)('technical-course closed-loop benchmark (walls, real
       tuning: { plannerBudgetMs: 10_000 },
     });
     for (const r of results) {
+      const q = r.quality;
       console.log(
         `${r.name}: laps=${r.laps.length} best=${r.best.toFixed(1)}s avg=${r.avg.toFixed(1)}s ` +
         `wallStrikes=${r.wallStrikes} offTrack=${r.offTrackEvents} ` +
-        `failedReplans=${r.totalReplans - r.successfulReplans} predErrRms=${r.predErrorRms.toFixed(2)}m`,
+        `failedReplans=${r.totalReplans - r.successfulReplans} predErrRms=${r.predErrorRms.toFixed(2)}m ` +
+        `| dist/lap=${(q.distanceTravelled / Math.max(1, r.laps.length)).toFixed(0)}m ` +
+        `meanSpd=${q.meanSpeed.toFixed(1)} ggMean=${q.ggMeanUtil.toFixed(3)} ` +
+        `stopped=${q.timeStopped.toFixed(1)}s recov=${q.recoveryCount}`,
       );
     }
     const kin = results.find((r) => r.name === 'kinematic')!;
@@ -75,5 +79,16 @@ describe.skipIf(!RAPIER_OK)('technical-course closed-loop benchmark (walls, real
 
     // Head-to-head pace ratchet on the walled course.
     expect(v2.avg).toBeLessThan(kin.avg * V2_VS_KIN_TECH_RATIO);
+
+    // Driving-quality sanity: the accumulators are populated and physical.
+    // (These are the "how well is it driving" measurements beyond lap time:
+    // line efficiency, tire utilization, hesitation.)
+    for (const r of [kin, v2]) {
+      expect(r.quality.distanceTravelled).toBeGreaterThan(300); // ≥ ~1 lap of course
+      expect(r.quality.meanSpeed).toBeGreaterThan(3);
+      expect(r.quality.ggMeanUtil).toBeGreaterThan(0.05);
+      expect(r.quality.ggMeanUtil).toBeLessThan(1.0);
+      expect(r.quality.ggPeakUtil).toBeLessThanOrEqual(1.5); // clamp bound
+    }
   });
 });
