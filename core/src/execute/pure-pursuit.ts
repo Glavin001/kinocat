@@ -122,28 +122,43 @@ export function purePursuit(
     2 * config.maxDecel * Math.max(distToGoal - config.goalTolerance, 0),
   );
 
-  // Optional path-speed cap: when the upstream planner attached a
-  // speed-profile-smoothed plan, the per-sample `speed` already encodes
-  // curvature- and brake-distance-aware targets. Take the min of the
-  // planned speeds in a forward window so the controller actually
-  // consumes that information (without this, the smoother has no effect).
+  // Optional path-speed cap: consume the plan's per-sample speed intent
+  // through the BRAKING ENVELOPE, not a raw window-min. A future planned
+  // speed v_i at arc distance d_i constrains the speed HERE only to
+  // sqrt(v_i² + 2·maxDecel·d_i) — the fastest we can go now and still
+  // brake down to v_i by the time we get there. The previous raw
+  // window-min meant any near-zero sample (a coast-to-stop primitive, a
+  // cusp, a plan terminal) inside the 14 m window pinned the target to
+  // ~0 from far away — measured closed-loop: BOTH race cars crawled to
+  // 0 laps in 100 s with the toggle on, which is why it was disabled.
+  // With the envelope, distant slow-downs bind exactly when physics says
+  // they should, so the planner's honest entry speeds become executable.
   let vPath = Infinity;
   if (config.respectPathSpeed) {
-    let acc = 0;
     const window = config.lookaheadMax;
-    let i = ni;
-    for (; i < path.length - 1 && acc <= window; i++) {
-      const s2 = Math.abs(path[i]!.speed);
-      if (s2 < vPath) vPath = s2;
-      acc += dist(path[i]!.x, path[i]!.z, path[i + 1]!.x, path[i + 1]!.z);
+    // The nearest sample constrains at its true distance — but ONLY when
+    // it lies AHEAD along the direction of travel. At d≈0 it is the
+    // plan's echo of the current state (folding it in pins a stopped car
+    // to 0 — never launches); when BEHIND, it caps the car to a speed it
+    // already passed (race plans have metres between samples, so the
+    // rest-speed spawn node kept the whole field crawling). Samples past
+    // the nearest constrain through their braking envelope regardless.
+    const dxs = path[ni]!.x - current.x;
+    const dzs = path[ni]!.z - current.z;
+    const aheadSigned =
+      (dxs * Math.cos(current.heading) + dzs * Math.sin(current.heading)) * gear;
+    const d0 = dist(current.x, current.z, path[ni]!.x, path[ni]!.z);
+    if (aheadSigned > 0.05) {
+      const s0 = Math.abs(path[ni]!.speed);
+      const allowed0 = Math.sqrt(s0 * s0 + 2 * config.maxDecel * d0);
+      if (allowed0 < vPath) vPath = allowed0;
     }
-    // Only fold in the terminal (goal) speed once the goal itself is within the
-    // lookahead window (the loop consumed the whole path). Doing it
-    // unconditionally pins the target to the terminal stop speed (~0) from
-    // arbitrarily far away, so a plan that ends in a stop never starts moving.
-    if (i >= path.length - 1) {
-      const last = Math.abs(path[path.length - 1]!.speed);
-      if (last < vPath) vPath = last;
+    let acc = aheadSigned > 0 ? d0 : 0;
+    for (let i = ni; i < path.length - 1 && acc <= window; i++) {
+      acc += dist(path[i]!.x, path[i]!.z, path[i + 1]!.x, path[i + 1]!.z);
+      const s2 = Math.abs(path[i + 1]!.speed);
+      const allowed = Math.sqrt(s2 * s2 + 2 * config.maxDecel * acc);
+      if (allowed < vPath) vPath = allowed;
     }
     if (!Number.isFinite(vPath)) vPath = Infinity;
   }
