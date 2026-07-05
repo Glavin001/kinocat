@@ -191,4 +191,86 @@ describe('purePursuit', () => {
       expect(withTerm - base).toBeCloseTo(-0.3, 6);
     });
   });
+
+  // WS-1 — faithful speed execution. These assert the executor stops
+  // discarding the planner's speed decision (phantom horizon braking off,
+  // bang-bang + coast band on).
+  describe('WS-1 phantom horizon braking (noGoalBrakeOnDriveThrough)', () => {
+    // A long straight drive-through plan (terminal speed > 0 = a racing
+    // horizon, not a stop). The chassis is far from the terminal.
+    // Terminal 20 m ahead so the legacy vGoal (sqrt(2·12·~19.5) ≈ 21.6 < 30)
+    // binds below cruise — that is the phantom horizon brake we remove.
+    const straight: PlanPath = [];
+    for (let x = 0; x <= 20; x += 2) {
+      straight.push({ x, z: 0, heading: 0, speed: 30, t: x / 30 });
+    }
+    const fast: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 20, t: 0 };
+    const raceCfg: PurePursuitConfig = {
+      ...cfg, cruiseSpeed: 30, maxLateralAccel: 12, maxDecel: 12, lookaheadMax: 14,
+    };
+
+    it('A1.1a: drive-through plan does not brake toward its terminal', () => {
+      // Legacy: vGoal = sqrt(2·maxDecel·dist) caps the target below cruise far
+      // from the (phantom) end. With the flag, a drive-through plan ignores it.
+      const legacy = purePursuit(fast, straight, raceCfg);
+      const fixed = purePursuit(fast, straight, { ...raceCfg, noGoalBrakeOnDriveThrough: true });
+      expect(Math.abs(fixed.targetSpeed)).toBeGreaterThan(Math.abs(legacy.targetSpeed));
+      // With the fix the car is commanded to full cruise (the planner's speed).
+      expect(Math.abs(fixed.targetSpeed)).toBeCloseTo(30, 5);
+    });
+
+    it('A1.1b: stop-terminated plan still brakes to goal (parking unaffected)', () => {
+      const stopPlan: PlanPath = [];
+      for (let x = 0; x <= 10; x += 1) stopPlan.push({ x, z: 0, heading: 0, speed: x < 10 ? 6 : 0, t: x });
+      stopPlan[stopPlan.length - 1]!.speed = 0;
+      const near: CarKinematicState = { x: 6, z: 0, heading: 0, speed: 6, t: 0 };
+      const withFlag = purePursuit(near, stopPlan, { ...raceCfg, noGoalBrakeOnDriveThrough: true });
+      const without = purePursuit(near, stopPlan, raceCfg);
+      // stopsAtEnd → the flag has no effect; both brake toward the stop.
+      expect(withFlag.targetSpeed).toBeCloseTo(without.targetSpeed, 9);
+    });
+  });
+
+  describe('WS-1 bang-bang throttle + coast band', () => {
+    const straight: PlanPath = [];
+    for (let x = 0; x <= 40; x += 2) straight.push({ x, z: 0, heading: 0, speed: 20, t: x / 20 });
+    const bb: PurePursuitConfig = {
+      ...cfg, cruiseSpeed: 20, maxDecel: 12, lookaheadMax: 14,
+      noGoalBrakeOnDriveThrough: true, bangBangThrottle: true, coastBand: 0.5,
+    };
+
+    it('A1.2: floors it when well below the commanded speed', () => {
+      const slow: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 8, t: 0 };
+      const cmd = purePursuit(slow, straight, bb);
+      expect(cmd.throttle).toBe(1);
+      expect(cmd.brake).toBe(0);
+    });
+
+    it('A1.2: coasts (zero gas, zero brake) just above the command (glide, no brake dither)', () => {
+      // Commanded 20, current 20.3 → within the 0.5 band on the decel side →
+      // glide instead of braking. (Below-target always floors it, so the band
+      // is deceleration-side only — that is what prevents at-rest wedging.)
+      const cruise: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 20.3, t: 0 };
+      const cmd = purePursuit(cruise, straight, bb);
+      expect(cmd.throttle).toBe(0);
+      expect(cmd.brake).toBe(0);
+    });
+
+    it('A1.2: launches from rest even when the planned speed is small (no wedge)', () => {
+      // The at-rest wedge regression: planned speed 0.4 < band, current 0.
+      // Must still throttle (below target ⇒ floor it), not coast.
+      const slowPlan: PlanPath = [];
+      for (let x = 0; x <= 40; x += 2) slowPlan.push({ x, z: 0, heading: 0, speed: 0.4, t: x / 0.4 });
+      const rest: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
+      const cmd = purePursuit(rest, slowPlan, { ...bb, cruiseSpeed: 0.4 });
+      expect(cmd.throttle).toBe(1);
+    });
+
+    it('A1.2: brakes when above the commanded speed by more than the band', () => {
+      const hot: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 26, t: 0 };
+      const cmd = purePursuit(hot, straight, bb);
+      expect(cmd.brake).toBeGreaterThan(0);
+      expect(cmd.throttle).toBe(0);
+    });
+  });
 });

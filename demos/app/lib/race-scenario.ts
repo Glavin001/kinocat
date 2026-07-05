@@ -143,6 +143,10 @@ const PURE_PURSUIT_CONFIG = {
   lookaheadGain: 0.45,
   lookaheadMax: 14,
   maxLateralAccel: TRACKER_MAX_LATERAL_ACCEL,
+  // Parking-safe defaults (shared PURE_PURSUIT_CONFIG). RACE raises these via
+  // DEFAULT_TUNING.trackerMaxAccel/trackerMaxDecel toward the MEASURED plant
+  // envelope; parking inherits these gentle values so its stall approach does
+  // not brake late and overshoot the silhouette.
   maxAccel: 6,
   maxDecel: 8,
   cruiseSpeed: RACE_AGENT.maxSpeed,
@@ -161,8 +165,12 @@ const PURE_PURSUIT_CONFIG = {
   // improves BOTH cars' closed-loop prediction error (kin 0.93 → 0.82,
   // v2 0.99 → 0.92 m). Reliability + predictability over peak pace.
   previewCurvature: true,
-  previewLateralAccel:
-    0.8 * deriveVehicleCapabilities(DEFAULT_LEARNABLE_CONFIG).maxLateralAccel,
+  // WS-0 — preview braking uses the MEASURED sustained cornering boundary
+  // (~13.7 m/s², plant-envelope.json) with a small margin, not 0.8×µg (=14.1,
+  // which OVER-estimated grip → braked too late → corner overshoot). The
+  // derived µg=17.66 never happens as a *sustained* lateral accel on this
+  // suspension + tire model.
+  previewLateralAccel: 12,
   // Reverse gear executes at the chassis's reverse limit, NOT forward
   // cruise (measured without this: −24 m/s reverse down a 100 m
   // straight — outside the chassis envelope AND the model's training
@@ -174,6 +182,14 @@ const PURE_PURSUIT_CONFIG = {
  *  quality utilization. Same chassis for every entry → same budget. */
 const GG_FRICTION_LIMIT =
   deriveVehicleCapabilities(DEFAULT_LEARNABLE_CONFIG).maxLateralAccel;
+
+// WS-1 — the speed-profile safety pre-pass keeps a CONSERVATIVE longitudinal
+// budget (the pre-WS-1 6/8), decoupled from the executor's raised brake/accel
+// caps. The profile assigns corner-entry speeds; being conservative there
+// keeps the chassis from arriving hot at tight gates, while the executor's
+// higher `maxDecel` only governs how late it dares to brake on a straight.
+const SPEED_PROFILE_ACCEL = 6;
+const SPEED_PROFILE_DECEL = 8;
 
 // ---------------------------------------------------------------------------
 // Multi-cusp plan segmentation.
@@ -380,6 +396,20 @@ export interface RaceTuning {
   lateralErrorReplanM?: number;
   /** Curvature feedforward in pure-pursuit — see PurePursuitConfig. */
   curvatureFeedforward?: boolean;
+  /** WS-1 — drive-through plans skip the brake-to-goal term (no phantom
+   *  horizon braking). See PurePursuitConfig.noGoalBrakeOnDriveThrough. */
+  noGoalBrakeOnDriveThrough?: boolean;
+  /** WS-1 — faithful bang-bang throttle + coast band. See
+   *  PurePursuitConfig.bangBangThrottle. */
+  bangBangThrottle?: boolean;
+  /** WS-1 — coast-band half-width (m/s) for bang-bang throttle. */
+  coastBand?: number;
+  /** WS-0/WS-1 — tracker longitudinal caps (m/s²). Default to the
+   *  parking-safe PURE_PURSUIT_CONFIG values; race raises them toward the
+   *  measured plant envelope (plant-envelope.json). `maxDecel` governs how
+   *  late the car dares to brake, so it is kept below the measured brake. */
+  trackerMaxAccel?: number;
+  trackerMaxDecel?: number;
   /**
    * Stanley-style heading-alignment gain for the pure-pursuit tracker (forward
    * gear only). 0/undefined ⇒ classic position-only pursuit (racing). Parking
@@ -467,6 +497,12 @@ export const DEFAULT_TUNING: RaceTuning = {
   consistencyWeight: 0.08,
   enableSpeedProfile: false,
   enableTrajectorySmoother: true,
+  // WS-1 — kept OFF on the open course: the smoothed plan's per-sample speeds
+  // (no speed-profile pass here) still pin the car when consumed as a cap.
+  // The honest path for the planner's corner speeds to bind is the technical
+  // course's speed profile + WS-1½ control feedforward, not raw open-course
+  // primitive-endpoint speeds. Measured: enabling here crawls the field to
+  // ~5 m/s and 467 m/lap.
   respectPathSpeed: false,
   enableAdaptiveReplan: true,
   enableWaypointAdvanceReplan: true,
@@ -474,6 +510,25 @@ export const DEFAULT_TUNING: RaceTuning = {
   tracker: 'pure-pursuit',
   mpcWTerminalPosition: 0,
   mpcWTerminalSpeed: 0,
+  // WS-1 — faithful speed execution. Drive-through race horizons no longer
+  // brake toward their phantom terminal; the throttle floors it to the
+  // planner's commanded speed with a coast band instead of the asymptotic
+  // P-law. All emergent — the planner still decides the speed; the executor
+  // just stops discarding that decision.
+  noGoalBrakeOnDriveThrough: true,
+  bangBangThrottle: true,
+  // WS-0 — raise the race tracker's longitudinal caps toward the MEASURED
+  // plant envelope (launch ≈13.8, threshold-brake ≥15 m/s²), kept below the
+  // measurement for margin. Parking keeps the gentle 6/8 (see PURE_PURSUIT_CONFIG).
+  trackerMaxAccel: 11,
+  trackerMaxDecel: 12,
+  // Open course: a 0.5 m/s coast band around the setpoint (glide, no
+  // throttle↔brake dither). The technical course overrides this to 0 (pure
+  // floor-below / brake-above) so it accelerates decisively out of its tight
+  // gates — measured: the band suppressed corner-exit accel there and stalled
+  // both cars, while 0 on the open course over-drives the kinematic delusion
+  // into a wedge. Per-course, identical for both cars (honesty preserved).
+  coastBand: 0.5,
   // cruiseSpeed / goalTolerance / arriveRadius left undefined — fall
   // through to PURE_PURSUIT_CONFIG / RACE_ARRIVE_RADIUS chassis defaults.
 };
@@ -862,6 +917,10 @@ export async function createRaceScenario(
           curvatureFeedforward: true,
           enableSpeedProfile: true,
           plannerGateRadius: TECHNICAL_PLANNER_GATE_RADIUS,
+          // Floor-below / brake-above with no coast band: the tight gates need
+          // decisive corner-exit acceleration (the open course's 0.5 m/s band
+          // suppressed it and stalled both cars here). See DEFAULT_TUNING.
+          coastBand: 0,
         }
       : {};
   const tuning: RaceTuning = { ...DEFAULT_TUNING, ...courseTuningDefaults, ...(opts.tuning ?? {}) };
@@ -871,6 +930,8 @@ export async function createRaceScenario(
   // through to the chassis-level race defaults.
   const trackerConfig = {
     ...PURE_PURSUIT_CONFIG,
+    maxAccel: tuning.trackerMaxAccel ?? PURE_PURSUIT_CONFIG.maxAccel,
+    maxDecel: tuning.trackerMaxDecel ?? PURE_PURSUIT_CONFIG.maxDecel,
     cruiseSpeed: tuning.cruiseSpeed ?? PURE_PURSUIT_CONFIG.cruiseSpeed,
     goalTolerance: tuning.goalTolerance ?? PURE_PURSUIT_CONFIG.goalTolerance,
     lookaheadMin: tuning.lookaheadMin ?? PURE_PURSUIT_CONFIG.lookaheadMin,
@@ -881,6 +942,9 @@ export async function createRaceScenario(
     minTurnRadius: tuning.trackerMinTurnRadius ?? PURE_PURSUIT_CONFIG.minTurnRadius,
     curvatureFeedforward: tuning.curvatureFeedforward ?? false,
     respectPathSpeed: tuning.respectPathSpeed,
+    noGoalBrakeOnDriveThrough: tuning.noGoalBrakeOnDriveThrough ?? false,
+    bangBangThrottle: tuning.bangBangThrottle ?? false,
+    coastBand: tuning.coastBand,
     previewLateralAccel:
       tuning.previewLateralAccel ?? PURE_PURSUIT_CONFIG.previewLateralAccel,
     headingGain: tuning.terminalHeadingGain ?? 0,
@@ -1252,8 +1316,14 @@ export async function createRaceScenario(
         const kForProfile = resampleScalarByArcLength(liftedPath, kRaw, smoothed);
         smoothed = smoothSpeedProfile(smoothed, {
           aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel * 0.85,
-          aLonMaxAccel: PURE_PURSUIT_CONFIG.maxAccel,
-          aLonMaxDecel: PURE_PURSUIT_CONFIG.maxDecel,
+          // WS-1: the speed profile is a CONSERVATIVE corner-entry safety
+          // pre-pass — keep its longitudinal budget at the pre-WS-1 values
+          // (6/8) rather than the executor's raised brake/accel caps. Feeding
+          // the raised caps here made it assign hotter corner-entry speeds
+          // that overshot the technical course's tight 1.2 m gates into the
+          // walls (measured: both cars cascaded into 750+ failed replans).
+          aLonMaxAccel: SPEED_PROFILE_ACCEL,
+          aLonMaxDecel: SPEED_PROFILE_DECEL,
           maxSpeed: PURE_PURSUIT_CONFIG.cruiseSpeed,
           minSpeed: 0.5,
           honorEntrySpeed: true,

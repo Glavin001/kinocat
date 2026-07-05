@@ -37,17 +37,16 @@ try {
 }
 
 // v2 average lap must be within this factor of kinematic's. History:
-// measured 1.51 → 1.28 (executor fixes) → 1.188 after the grip-saturating
-// brake model landed (the model's biggest open-loop error — a ~10×
-// longitudinal under-brake on the brake-in-turn channel — was fixed, and
-// the regenerated in-bounds artifact's honest braking narrowed the
-// closed-loop lap-time gap on the OPEN course from ~28% to ~19%). Pinned at
-// 1.25 (measured 1.188 + margin for the closed loop's chaotic ±10%
-// sensitivity to 1% parameter nudges). The STABLE model-quality signals are
-// the failed-replan and prediction-error assertions below. Tighten toward
-// < 1.0 as the executor learns to consume the model's speeds (feedforward /
-// MPPI / on-demand primitive rollout); NEVER loosen it to pass a regression.
-const V2_VS_KIN_AVG_RATIO = 1.25;
+// measured 1.51 → 1.28 (executor fixes) → 1.188 (grip-saturating brake) →
+// 1.02 after WS-1 (faithful speed execution: no phantom horizon braking,
+// bang-bang throttle + coast band, envelope-raised brake authority). On the
+// OPEN course (no walls) the kinematic delusion + plant saturation still
+// generates a marginally shorter line, so v2 sits at near-parity here; the
+// v2 WIN shows on the WALLED technical course (see technical-course-benchmark,
+// ratio 0.81) where the delusion strikes walls. Pinned at 1.10 (measured 1.02
+// + margin for the closed loop's chaotic ±10% sensitivity). Tighten toward
+// < 1.0, NEVER loosen it to pass a regression.
+const V2_VS_KIN_AVG_RATIO = 1.1;
 
 describe.skipIf(!RAPIER_OK)('closed-loop head-to-head race benchmark (real Rapier plant)', () => {
   it('trained-v2 library races the kinematic library within the pace ratchet, clean', { timeout: 480_000, retry: 0 }, async () => {
