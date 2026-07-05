@@ -498,15 +498,23 @@ export class InMemoryNavWorld implements NavWorld {
       if (d > dist[i]!) continue;
       const cx = i % w;
       const cz = (i / w) | 0;
-      // Relax: store into the Float32Array first, then push the ROUNDED
-      // read-back value. Pushing the raw float64 sum makes the stale-entry
-      // guard above (`d > dist[i]`) reject the entry after float32 rounding
-      // shrinks dist[i] — the cell then never expands and the wave dies at
-      // diagonal-valued chokepoints.
+      // Relax entirely in float32 space (dist is a Float32Array). Comparing
+      // the raw float64 sum against the stored float32 breaks BOTH ways:
+      //  - pushing the float64 key makes the stale-entry guard above
+      //    (`d > dist[i]`) reject the entry once storage rounds dist[i]
+      //    down — the cell never expands and the wave dies at chokepoints;
+      //  - accepting `nd < dist[ni]` when fround(nd) == dist[ni] makes the
+      //    store a no-op but still pushes — equal-length diag/cardinal route
+      //    combos (equal up to float64 noise below the float32 ULP) then
+      //    re-push each other forever (livelock).
+      // Requiring a strict float32 decrease terminates and keeps the heap
+      // keys exactly equal to stored values. The ≤½-ULP round-up is far
+      // below the √2·cellSize slack the lookup already subtracts.
       const relax = (ni: number, nd: number): void => {
-        if (nd < dist[ni]!) {
-          dist[ni] = nd;
-          heap.push({ i: ni, d: dist[ni]! });
+        const r = Math.fround(nd);
+        if (r < dist[ni]!) {
+          dist[ni] = r;
+          heap.push({ i: ni, d: r });
         }
       };
       // Cardinal neighbours.
