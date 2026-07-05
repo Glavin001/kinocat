@@ -300,49 +300,84 @@ const ALL_TAGS: readonly Tag[] = [
 ];
 
 const FLAGSHIP_DEMOS = DEMOS.filter((d) => d.level === 'flagship');
-const TOOL_COUNT = DEMOS.filter((d) => d.level === 'tool').length;
+const TOOL_DEMOS = DEMOS.filter((d) => d.category === 'tools');
+const TOOL_COUNT = TOOL_DEMOS.length;
 
-function TagChip({
+// Tags shared by every demo in a group are redundant on the cards (the group
+// already communicates them) — we surface those once in the section header and
+// only render the *differentiating* tags on the cards themselves.
+function commonTagsOf(demos: readonly Demo[]): readonly Tag[] {
+  if (demos.length === 0) return [];
+  return ALL_TAGS.filter((t) => demos.every((d) => d.tags.includes(t)));
+}
+
+function TagChip({ token, muted }: { token: Tag; muted?: boolean }) {
+  const c = TAG_COLORS[token];
+  return (
+    <span
+      style={{
+        fontSize: 10.5,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        letterSpacing: 0.3,
+        color: c.fg,
+        background: c.bg,
+        border: `1px solid ${c.bd}`,
+        borderRadius: 999,
+        padding: '2px 8px',
+        whiteSpace: 'nowrap',
+        opacity: muted ? 0.75 : 1,
+      }}
+    >
+      {token}
+    </span>
+  );
+}
+
+function TagFilterChip({
   token,
   active,
-  interactive,
   onClick,
 }: {
   token: Tag;
-  active?: boolean;
-  interactive?: boolean;
-  onClick?: () => void;
+  active: boolean;
+  onClick: () => void;
 }) {
   const c = TAG_COLORS[token];
-  const style: React.CSSProperties = {
-    fontSize: 10.5,
-    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    letterSpacing: 0.3,
-    color: c.fg,
-    background: active ? c.bg.replace(/0\.\d+\)/, '0.22)') : c.bg,
-    border: `1px solid ${active ? c.fg : c.bd}`,
-    borderRadius: 999,
-    padding: '2px 8px',
-    whiteSpace: 'nowrap',
-    cursor: interactive ? 'pointer' : 'default',
-    transition: 'background 120ms ease, border-color 120ms ease',
-  };
-  if (interactive) {
-    return (
-      <button
-        type="button"
-        onClick={onClick}
-        aria-pressed={active}
-        style={{ ...style, lineHeight: 1.5 }}
-      >
-        {token}
-      </button>
-    );
-  }
-  return <span style={style}>{token}</span>;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      style={{
+        fontSize: 10.5,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        letterSpacing: 0.3,
+        color: c.fg,
+        background: active ? c.bg.replace(/0\.\d+\)/, '0.24)') : c.bg,
+        border: `1px solid ${active ? c.fg : c.bd}`,
+        borderRadius: 999,
+        padding: '3px 9px',
+        lineHeight: 1.4,
+        whiteSpace: 'nowrap',
+        cursor: 'pointer',
+        transition: 'background 120ms ease, border-color 120ms ease',
+      }}
+    >
+      {token}
+    </button>
+  );
 }
 
-function DemoCard({ demo, featured = false }: { demo: Demo; featured?: boolean }) {
+function DemoCard({
+  demo,
+  featured = false,
+  hiddenTags,
+}: {
+  demo: Demo;
+  featured?: boolean;
+  hiddenTags?: readonly Tag[];
+}) {
+  const visibleTags = hiddenTags ? demo.tags.filter((t) => !hiddenTags.includes(t)) : demo.tags;
   return (
     <Link
       href={demo.href}
@@ -350,16 +385,61 @@ function DemoCard({ demo, featured = false }: { demo: Demo; featured?: boolean }
       data-featured={featured ? 'true' : undefined}
       data-flagship={demo.level === 'flagship' ? 'true' : undefined}
     >
-      <div className="kc-card-tags">
-        {demo.level === 'flagship' && <span className="kc-flag">★ Flagship</span>}
-        {demo.tags.map((t) => (
-          <TagChip key={t} token={t} />
-        ))}
-      </div>
+      {visibleTags.length > 0 && (
+        <div className="kc-card-tags">
+          {visibleTags.map((t) => (
+            <TagChip key={t} token={t} />
+          ))}
+        </div>
+      )}
       <h3 className="kc-card-title">{demo.title}</h3>
       <p className="kc-card-desc">{demo.desc}</p>
       <span className="kc-card-cta">Open demo →</span>
     </Link>
+  );
+}
+
+function DemoSection({
+  id,
+  heading,
+  blurb,
+  demos,
+  featured = false,
+  showCount = true,
+}: {
+  id?: string;
+  heading: string;
+  blurb: string;
+  demos: readonly Demo[];
+  featured?: boolean;
+  showCount?: boolean;
+}) {
+  const common = commonTagsOf(demos);
+  return (
+    <section id={id} className="kc-section">
+      <header className="kc-section-header">
+        <div className="kc-section-bar" aria-hidden />
+        <div className="kc-section-headtext">
+          <div className="kc-section-titlerow">
+            <h2 className="kc-section-heading">{heading}</h2>
+            {common.map((t) => (
+              <TagChip key={t} token={t} muted />
+            ))}
+          </div>
+          <p className="kc-section-blurb">{blurb}</p>
+        </div>
+        {showCount && (
+          <span className="kc-section-count">
+            {demos.length} {demos.length === 1 ? 'demo' : 'demos'}
+          </span>
+        )}
+      </header>
+      <div className={featured ? 'kc-grid kc-grid-showcase' : 'kc-grid kc-grid-compact'}>
+        {demos.map((d) => (
+          <DemoCard key={d.href} demo={d} featured={featured} hiddenTags={common} />
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -406,14 +486,13 @@ export default function Home() {
             <span className="kc-dot" /> kinocat · {DEMOS.length} demos
           </div>
           <h1 className="kc-title">
-            Kinodynamic planning,
-            <br />
+            Kinodynamic planning,{' '}
             <span className="kc-title-accent">live in your browser.</span>
           </h1>
           <p className="kc-lede">
-            IGHA* with Reeds-Shepp curves and motion primitives — anytime
-            search, time-aware multi-agent planning, affordances, navmesh
-            integration, and learned dynamics. All powered by the{' '}
+            IGHA* with Reeds-Shepp curves and motion primitives — anytime,
+            time-aware, multi-agent planning with affordances, navmesh
+            integration, and learned dynamics. Powered by the{' '}
             <code className="kc-code">kinocat</code> package.
           </p>
         </header>
@@ -435,10 +514,9 @@ export default function Home() {
           </div>
           <div className="kc-facets" role="group" aria-label="Filter by tag">
             {ALL_TAGS.map((t) => (
-              <TagChip
+              <TagFilterChip
                 key={t}
                 token={t}
-                interactive
                 active={activeTags.includes(t)}
                 onClick={() => toggleTag(t)}
               />
@@ -455,8 +533,10 @@ export default function Home() {
           <section className="kc-section" aria-label="Search results">
             <header className="kc-section-header">
               <div className="kc-section-bar" aria-hidden />
-              <div>
-                <h2 className="kc-section-heading">Results</h2>
+              <div className="kc-section-headtext">
+                <div className="kc-section-titlerow">
+                  <h2 className="kc-section-heading">Results</h2>
+                </div>
                 <p className="kc-section-blurb">
                   {filtered.length} {filtered.length === 1 ? 'demo matches' : 'demos match'} your
                   filters.
@@ -471,52 +551,38 @@ export default function Home() {
               </div>
             ) : (
               <p className="kc-empty">
-                No demos match. <button type="button" className="kc-clear" onClick={clearFilters}>Clear filters</button>
+                No demos match.{' '}
+                <button type="button" className="kc-clear" onClick={clearFilters}>
+                  Clear filters
+                </button>
               </p>
             )}
           </section>
         ) : (
           <>
-            {/* Start here: the flagship demos, given the most prominence. */}
-            <section className="kc-section" aria-label="Start here">
-              <header className="kc-section-header">
-                <div className="kc-section-bar" aria-hidden />
-                <div>
-                  <h2 className="kc-section-heading">Start here</h2>
-                  <p className="kc-section-blurb">
-                    The flagship demos — the fastest way to see what kinocat does.
-                  </p>
-                </div>
-              </header>
-              <div className="kc-grid kc-grid-showcase">
-                {FLAGSHIP_DEMOS.map((d) => (
-                  <DemoCard key={d.href} demo={d} featured />
-                ))}
-              </div>
-            </section>
+            {/* Start here: the flagship demos, given the most prominence.
+                The "Start here" heading already signals importance, so the
+                cards carry no separate "flagship" badge. */}
+            <DemoSection
+              heading="Start here"
+              blurb="The flagship demos — the fastest way to see what kinocat does."
+              demos={FLAGSHIP_DEMOS}
+              featured
+              showCount={false}
+            />
 
             {/* Themed categories, excluding the low-level tools. */}
             {CATEGORIES.filter((c) => c.id !== 'tools').map((cat) => {
               const demos = DEMOS.filter((d) => d.category === cat.id);
               if (demos.length === 0) return null;
               return (
-                <section key={cat.id} id={cat.id} className="kc-section">
-                  <header className="kc-section-header">
-                    <div className="kc-section-bar" aria-hidden />
-                    <div>
-                      <h2 className="kc-section-heading">{cat.heading}</h2>
-                      <p className="kc-section-blurb">{cat.blurb}</p>
-                    </div>
-                    <span className="kc-section-count">
-                      {demos.length} {demos.length === 1 ? 'demo' : 'demos'}
-                    </span>
-                  </header>
-                  <div className="kc-grid kc-grid-compact">
-                    {demos.map((d) => (
-                      <DemoCard key={d.href} demo={d} />
-                    ))}
-                  </div>
-                </section>
+                <DemoSection
+                  key={cat.id}
+                  id={cat.id}
+                  heading={cat.heading}
+                  blurb={cat.blurb}
+                  demos={demos}
+                />
               );
             })}
 
@@ -539,8 +605,8 @@ export default function Home() {
               </button>
               {showTools && (
                 <div className="kc-grid kc-grid-compact kc-tools-grid">
-                  {DEMOS.filter((d) => d.category === 'tools').map((d) => (
-                    <DemoCard key={d.href} demo={d} />
+                  {TOOL_DEMOS.map((d) => (
+                    <DemoCard key={d.href} demo={d} hiddenTags={commonTagsOf(TOOL_DEMOS)} />
                   ))}
                 </div>
               )}
@@ -588,22 +654,22 @@ html, body { background: var(--kc-bg); }
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, sans-serif;
   max-width: 1120px;
   margin: 0 auto;
-  padding: clamp(24px, 5vw, 56px) clamp(16px, 4vw, 32px) 80px;
-  line-height: 1.55;
+  padding: clamp(16px, 3vw, 28px) clamp(16px, 4vw, 32px) 72px;
+  line-height: 1.5;
 }
 
-.kc-hero { padding: 24px 0 8px; }
+.kc-hero { padding: 4px 0 0; }
 
 .kc-eyebrow {
   display: inline-flex;
   align-items: center;
   gap: 8px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
-  letter-spacing: 1.2px;
+  font-size: 11px;
+  letter-spacing: 1.1px;
   text-transform: uppercase;
   color: var(--kc-text-dim);
-  padding: 6px 12px;
+  padding: 5px 11px;
   border: 1px solid var(--kc-border);
   background: rgba(20, 24, 35, 0.6);
   border-radius: 999px;
@@ -617,10 +683,10 @@ html, body { background: var(--kc-bg); }
 }
 
 .kc-title {
-  font-size: clamp(32px, 5.5vw, 52px);
-  line-height: 1.05;
+  font-size: clamp(26px, 4vw, 38px);
+  line-height: 1.08;
   letter-spacing: -0.02em;
-  margin: 18px 0 14px;
+  margin: 12px 0 8px;
   font-weight: 600;
 }
 .kc-title-accent {
@@ -632,9 +698,9 @@ html, body { background: var(--kc-bg); }
 
 .kc-lede {
   color: var(--kc-text-dim);
-  font-size: clamp(15px, 1.6vw, 17px);
-  max-width: 720px;
-  margin: 0 0 24px;
+  font-size: clamp(13.5px, 1.4vw, 15px);
+  max-width: 680px;
+  margin: 0;
 }
 .kc-code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -653,20 +719,19 @@ html, body { background: var(--kc-bg); }
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
-  margin: 8px 0 8px;
-  padding: 12px 0;
-  background: linear-gradient(180deg, var(--kc-bg) 70%, rgba(7, 8, 12, 0));
+  gap: 10px 12px;
+  margin: 16px 0 4px;
+  padding: 10px 0;
+  background: linear-gradient(180deg, var(--kc-bg) 72%, rgba(7, 8, 12, 0));
   backdrop-filter: blur(4px);
 }
 .kc-search {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  flex: 1 1 240px;
+  flex: 0 1 300px;
   min-width: 200px;
-  max-width: 340px;
-  padding: 8px 12px;
+  padding: 7px 12px;
   border: 1px solid var(--kc-border);
   border-radius: 10px;
   background: rgba(15, 18, 25, 0.7);
@@ -709,19 +774,26 @@ html, body { background: var(--kc-bg); }
 
 .kc-empty { color: var(--kc-text-dim); font-size: 14px; }
 
-.kc-section { margin-top: 44px; scroll-margin-top: 72px; }
+.kc-section { margin-top: 34px; scroll-margin-top: 68px; }
 
 .kc-section-header {
   display: flex;
   align-items: center;
   gap: 14px;
-  margin-bottom: 18px;
+  margin-bottom: 16px;
 }
 .kc-section-bar {
   width: 3px;
   align-self: stretch;
   background: linear-gradient(180deg, var(--kc-accent), transparent);
   border-radius: 2px;
+}
+.kc-section-headtext { min-width: 0; }
+.kc-section-titlerow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 .kc-section-heading {
   font-size: 20px;
@@ -743,6 +815,7 @@ html, body { background: var(--kc-bg); }
   border-radius: 999px;
   padding: 2px 10px;
   background: rgba(15, 18, 25, 0.7);
+  white-space: nowrap;
 }
 
 .kc-grid { display: grid; gap: 14px; }
@@ -760,8 +833,8 @@ html, body { background: var(--kc-bg); }
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 18px;
+  gap: 9px;
+  padding: 16px;
   border: 1px solid var(--kc-border);
   border-radius: 14px;
   background:
@@ -792,27 +865,18 @@ html, body { background: var(--kc-bg); }
   background: linear-gradient(180deg, rgba(24, 30, 44, 0.9), rgba(17, 21, 30, 0.9));
 }
 .kc-card:hover::before { opacity: 1; }
-.kc-card[data-featured="true"] { padding: 22px; }
+.kc-card[data-featured="true"] { padding: 20px; }
 .kc-card[data-featured="true"] .kc-card-title { font-size: 17px; }
+
+/* Flagship cards keep a subtle warm accent (no text badge — the
+   "Start here" heading already conveys their status). */
 .kc-card[data-flagship="true"] {
-  border-color: rgba(255, 210, 127, 0.3);
+  border-color: rgba(255, 210, 127, 0.28);
   background: linear-gradient(180deg, rgba(28, 27, 34, 0.9), rgba(18, 18, 23, 0.9));
 }
 .kc-card[data-flagship="true"]:hover {
   border-color: rgba(255, 210, 127, 0.55);
   box-shadow: 0 12px 40px -16px rgba(255, 210, 127, 0.35), 0 2px 8px rgba(0, 0, 0, 0.4);
-}
-
-.kc-flag {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 10.5px;
-  letter-spacing: 0.3px;
-  color: #ffd27f;
-  background: rgba(255, 210, 127, 0.12);
-  border: 1px solid rgba(255, 210, 127, 0.4);
-  border-radius: 999px;
-  padding: 2px 8px;
-  white-space: nowrap;
 }
 
 .kc-card-tags { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
@@ -832,7 +896,7 @@ html, body { background: var(--kc-bg); }
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
-.kc-card[data-featured="true"] .kc-card-desc { -webkit-line-clamp: 5; }
+.kc-card[data-featured="true"] .kc-card-desc { -webkit-line-clamp: 4; }
 .kc-card-cta {
   margin-top: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -845,14 +909,14 @@ html, body { background: var(--kc-bg); }
 .kc-card:hover .kc-card-cta { opacity: 1; transform: translateX(2px); }
 
 /* ── Developer tools (de-emphasized) ─────────────────────────── */
-.kc-section-tools { margin-top: 44px; }
+.kc-section-tools { margin-top: 34px; }
 .kc-tools-toggle {
   display: flex;
   align-items: center;
   gap: 12px;
   width: 100%;
   text-align: left;
-  padding: 14px 16px;
+  padding: 13px 16px;
   border: 1px dashed var(--kc-border);
   border-radius: 12px;
   background: rgba(15, 18, 25, 0.4);
@@ -882,7 +946,7 @@ html, body { background: var(--kc-bg); }
 .kc-tools-grid { margin-top: 14px; }
 
 .kc-footer {
-  margin-top: 64px;
+  margin-top: 56px;
   padding-top: 20px;
   border-top: 1px solid var(--kc-border-soft);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
