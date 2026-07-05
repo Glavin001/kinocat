@@ -171,8 +171,15 @@ export const RACE_AGENT: VehicleAgent = defaultVehicleAgent({
     [-2.4, -1.0],
     [2.4, -1.0],
   ],
-  reverseCostMultiplier: 1.4,
-  directionChangePenalty: 0.4,
+  // Reverse is a recovery gear in racing, never a racing line. With the
+  // tracker's reverse cruise now correctly capped at maxReverseSpeed
+  // (6 m/s), a planned 100 m reverse leg costs ~17 s of real time — the
+  // cost prior must reflect that so the planner U-turns instead.
+  // (Measured before this: BOTH libraries planned multi-10 m reverse
+  // legs after corner overshoots, previously masked by the tracker
+  // executing reverse at forward cruise speed.)
+  reverseCostMultiplier: 3.0,
+  directionChangePenalty: 1.0,
 });
 
 /** Race-tuned control set spanning the full speed envelope to chassis
@@ -289,11 +296,27 @@ export function buildLearnedRaceLibraryV2(
   // mapping follows the same physics rationale as the original 4-bucket
   // layout; the denser RACE_START_SPEEDS grid just samples each regime
   // at more start speeds so nearest-bucket quantization stays ≤ 2 m/s.
+  // Duration parity with the kinematic library (0.55 s) once the chassis
+  // is moving: the planner's decision cadence is part of the "identical
+  // system" contract, and longer v2 primitives measurably cost agility
+  // in the slalom (fewer direction changes per second available to the
+  // search). Only the launch bucket keeps a longer window — from rest,
+  // 0.55 s of full throttle covers < 1 m and endpoints barely
+  // differentiate.
   const regimeFor = (v: number): { duration: number; controls: number[][] } => {
+    // Launch bucket keeps 1.5 s: from rest the acceleration phase
+    // dominates and a shorter window collapses the endpoint fan below
+    // the planner-usability floor (primitive-diagnostics asserts
+    // hull ≥ 0.5 m²; 1.0 s measured 0.26 m²).
     if (v < 2) return { duration: 1.5, controls: lowSpeedV2Controls(cfg) };
-    if (v < 14) return { duration: v < 6 ? 1.0 : 0.8, controls: midSpeedV2Controls(cfg) };
-    if (v < 23) return { duration: 0.8, controls: highSpeedV2Controls(cfg) };
-    return { duration: 0.8, controls: topSpeedV2Controls(cfg) };
+    // 4 m/s bucket needs 0.8 s for a non-degenerate endpoint fan
+    // (0.55 s measured hull 0.19 m² < the 0.5 m² usability floor).
+    // (Launch-style controls here were measured WORSE: 21 failed
+    // replans on the flying lap — the coast/brake options matter.)
+    if (v < 6) return { duration: 0.8, controls: midSpeedV2Controls(cfg) };
+    if (v < 14) return { duration: 0.55, controls: midSpeedV2Controls(cfg) };
+    if (v < 23) return { duration: 0.55, controls: highSpeedV2Controls(cfg) };
+    return { duration: 0.55, controls: topSpeedV2Controls(cfg) };
   };
   const buckets: Array<{
     startSpeed: number;
@@ -395,6 +418,10 @@ function topSpeedV2Controls(cfg: CfgLike): number[][] {
   const brk = cfg.maxBrakeForce;
   const st = cfg.maxSteerAngle;
   return [
+    [0, drv, 0],                  // full throttle straight — without this the
+                                  // planner cannot plan sustained acceleration
+                                  // above ~23 m/s (the top-speed regime had no
+                                  // full-power action at all)
     [0, 0.4 * drv, 0],            // accelerate-cruise (small accel)
     [0, 0, 0],                    // coast straight
     [0, 0, 0.3 * brk],            // light brake straight

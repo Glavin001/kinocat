@@ -133,6 +133,48 @@ export function purePursuit(
   // 0 laps in 100 s with the toggle on, which is why it was disabled.
   // With the envelope, distant slow-downs bind exactly when physics says
   // they should, so the planner's honest entry speeds become executable.
+  // Anticipatory curvature braking: cap speed by UPCOMING path curvature
+  // through the braking envelope. `vCurve` above only sees the chord to
+  // the lookahead point, so a plan whose geometry runs straight into a
+  // tight corner is entered at full speed and overshot (measured on the
+  // race track: the v2 car's honest brake-then-turn plan blew through
+  // the 90° corner ~10 m wide and triggered a 3 s failed-replan U-turn).
+  // Pure geometry — works identically for any library.
+  let vPreview = Infinity;
+  if (config.previewCurvature && path.length >= 3) {
+    // Look as far ahead as braking from the CURRENT speed requires —
+    // previewing from cruise speed capped mild curves 50+ m out and
+    // slowed clean laps by ~50% (measured).
+    const v0 = Math.abs(current.speed);
+    const previewHorizon = Math.max(
+      config.lookaheadMax,
+      (v0 * v0) / (2 * config.maxDecel),
+    );
+    let acc = 0;
+    for (let i = Math.max(ni, 1); i < path.length - 1 && acc <= previewHorizon; i++) {
+      acc += dist(path[i - 1]!.x, path[i - 1]!.z, path[i]!.x, path[i]!.z);
+      // Menger curvature through samples i-1, i, i+1.
+      const ax = path[i - 1]!.x, az = path[i - 1]!.z;
+      const bx = path[i]!.x, bz = path[i]!.z;
+      const cx = path[i + 1]!.x, cz = path[i + 1]!.z;
+      const area2 = Math.abs((bx - ax) * (cz - az) - (bz - az) * (cx - ax));
+      const ab = Math.hypot(bx - ax, bz - az);
+      const bc = Math.hypot(cx - bx, cz - bz);
+      const ca = Math.hypot(cx - ax, cz - az);
+      const denom = ab * bc * ca;
+      if (denom < 1e-9) continue;
+      const kappaAt = (2 * area2) / denom;
+      // Only GENUINE corners bind (R ≤ 12.5 m). Replanned chord paths
+      // carry curvature noise on straights; previewing every wiggle
+      // capped both cars well below their clean pace (measured).
+      if (kappaAt < 0.08) continue;
+      const aLatPreview = config.previewLateralAccel ?? config.maxLateralAccel;
+      const vAtCorner2 = aLatPreview / kappaAt;
+      const allowed = Math.sqrt(vAtCorner2 + 2 * config.maxDecel * acc);
+      if (allowed < vPreview) vPreview = allowed;
+    }
+  }
+
   let vPath = Infinity;
   if (config.respectPathSpeed) {
     const window = config.lookaheadMax;
@@ -163,11 +205,20 @@ export function purePursuit(
     if (!Number.isFinite(vPath)) vPath = Infinity;
   }
 
+  // Reverse cruise is capped by BOTH limits: the chassis's reverse
+  // envelope AND the scenario cruise (a parking scenario cruising at
+  // 2 m/s must not back in at the 6 m/s chassis reverse limit —
+  // measured: 5.4 m/s reverse approaches parked 12° crooked).
+  const cruise =
+    gear < 0
+      ? Math.min(config.cruiseSpeed, config.reverseCruiseSpeed ?? config.cruiseSpeed)
+      : config.cruiseSpeed;
   const speedMag = atGoal
     ? 0
     : Math.min(
-        config.cruiseSpeed,
+        cruise,
         vCurve,
+        vPreview,
         vPath,
         Math.max(vGoal, config.lookaheadMin),
       );
