@@ -61,6 +61,30 @@ kinematic car — at 25+ m/s its model error explodes (22.8 m worst-case at
 28 m/s vs v2's 1.5 m) — **but only if the executor actually drives at those
 speeds and trusts the model to pick them.**
 
+### Symptom worth naming: V-shaped plans (sharp waypoint-to-waypoint lines)
+
+Observed on the live demo: plans run near-straight from gate to gate and
+pivot sharply AT the gate, instead of sweeping a curved racing line through
+it. This is the same root cause seen from the planner's side, not a separate
+bug:
+
+- Race gates don't constrain arrival heading (`goalHeadingTol: Infinity` in
+  the race env defaults) — arriving pointed sharply at the next gate is
+  free.
+- The planner minimizes time **under the speeds it expects to drive** —
+  and at today's executed ~9 m/s, a sharp pivot costs almost nothing in
+  either model's worldview (even the honest v2 model can near-pivot at
+  9 m/s). Straight-line-then-pivot genuinely IS time-optimal at low speed.
+- The kinematic library believes it can pivot at ANY speed, so its plans
+  are V-shaped at every pace.
+
+Once the executor drives at capability (Track 1/2 below), the v2 planner's
+honest dynamics make wide entries + late apexes time-optimal *automatically*
+— a curved racing line is what time-optimal planning looks like at speed,
+not something to hand-author. (If plans remain V-shaped after the speed
+fixes, add a gate-heading prior: finite `goalHeadingTol` aligned to the
+gate-to-gate chord — cheap, but try the honest fix first.)
+
 ---
 
 ## 2. Design: model-in-the-loop racing executor (MPPI), with a feedforward fallback
