@@ -67,12 +67,20 @@ export class TimeAwareEnvironment<State extends HasXZT>
   private readonly affordanceRadius: number;
   private readonly bp: ObstacleBound[] | null;
   private rec: PerfRecorder = NULL_RECORDER;
+  /** Present exactly when the base env has a `progress` hook — the planner
+   *  only pays for the best-progress fallback when the method exists, so a
+   *  composing wrapper must forward it without introducing one the base
+   *  doesn't have (contract on Environment.progress). */
+  progress?: (node: Node<State>) => number;
 
   constructor(
     private readonly base: Environment<State>,
     opts: TimeAwareOptions = {},
   ) {
     this.levels = base.levels;
+    if (base.progress) {
+      this.progress = (node) => base.progress!(node);
+    }
     this.obstacles = opts.obstacles ?? [];
     this.agentRadius = opts.agentRadius ?? 0;
     this.timeQuantum = opts.timeQuantum ?? 0.2;
@@ -231,9 +239,16 @@ export class TimeAwareEnvironment<State extends HasXZT>
     return this.augment(this.base.createNode(state, parent, edge));
   }
 
-  succ(node: Node<State>, goal: Node<State>): Node<State>[] {
+  succ(node: Node<State>, goal: Node<State>, level?: number): Node<State>[] {
     const out: Node<State>[] = [];
-    for (const c of this.base.succ(node, goal)) {
+    // Forward `level` so base envs with per-level primitive sets (e.g.
+    // AircraftEnvironment levelControls) keep working under composition —
+    // same pattern as MultiGoalEnvironment / ScenarioEnvironment.
+    const succs =
+      level !== undefined
+        ? this.base.succ(node, goal, level)
+        : this.base.succ(node, goal);
+    for (const c of succs) {
       if (this.collides(c.state)) continue;
       out.push(this.augment(c));
     }
