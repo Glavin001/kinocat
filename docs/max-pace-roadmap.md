@@ -1,21 +1,11 @@
 # Max-pace roadmap: plant envelope, dynamic rollouts, racing MPPI, and a course that demands them
 
 *Successor to `docs/racing-at-the-limit-plan.md`. That document diagnosed WHY
-both cars drive at ~30% of capability and sketched the executor fixes
-(Track 1 = MPPI cost redesign, Track 2 = pure-pursuit speed-policy surgery).
-This document turns it into the full next-phase roadmap, adding the three
-things the executor fixes alone don't cover:*
-
-1. *drive the Rapier `DynamicRayCastVehicleController` at its **measured**
-   limit, not a hand-derived fraction of it — floor it on straights like a
-   human would;*
-2. ***dynamic rollouts in planning** — expand the search from the car's true
-   dynamic state (speed, yaw rate, sideslip) projected through its own
-   forward model, instead of zero-slip table lookups, so the v2 learned
-   model's statefulness is finally used where it matters;*
-3. *a **course that requires an advanced driving AI** — where late braking,
-   corner-entry speed, and line choice are decided by model knowledge and
-   mistakes have physical consequences.*
+both cars drive at ~30% of capability and sketched the executor fixes.
+This document is the implementation plan for the full next phase. Every
+workstream follows the same shape — **What to build → How to build it →
+Acceptance checklist** — so each one is unambiguous about the deliverable
+and mechanically verifiable when done.*
 
 *Status: PLAN. Every file:line reference verified against this branch
 (post-PR #50: grip-saturating brake model, technical course, per-car MPPI
@@ -23,7 +13,40 @@ model wiring, driving-quality metrics).*
 
 ---
 
-## 0. Where we are (measured)
+## 0. Pain points → workstreams (traceability)
+
+Each pain point raised in review, the workstream that resolves it, and the
+checklist items that prove it:
+
+| # | Pain point (as raised) | Resolved by | Proven by |
+|---|---|---|---|
+| P1 | Cars nowhere near max speed; on a straight a human floors it | WS-1 (speed policy), WS-0 (envelope limits) | A1.3, A1.4, A0.3 |
+| P2 | Course not challenging enough to require an advanced driving AI; kinematic's sharp turns pay no overshoot cost | WS-4 (circuit course) | A4.5, A4.6, A4.7 |
+| P3 | Planning must do dynamic rollouts: current state projected out through the model, leveraging v2's statefulness | WS-2 (dynamic rollouts) | A2.1, A2.2, A2.3 |
+| P4 | Better controller/executor — MPPI | WS-3 (racing MPPI) | A3.3, A3.5, A3.6 |
+| P5 | Maximize usage of the Rapier `DynamicRayCastVehicleController` — its true envelope, its native actuators | WS-0 (measured envelope), WS-3 (native-control MPPI) | A0.1, A0.3, A3.4 |
+| P6 | Coasting: zero gas + zero brake (optionally while turning) must be available — braking is far more severe than gliding | v2 library (already has coast primitives, `race-primitives-scenarios.ts:464,487,517,521-522`); WS-1 adds an executor coast band | A1.2 |
+| P7 | Primitive segments may be too long / compose imprecisely (seams) | WS-2 (dynamic state through seams; root rollouts) | A2.1, A2.2, A2.5 |
+| P8 | The plan's rich control knowledge (exact steer/drive/brake per primitive) must actually drive the actuators, not be re-derived from geometry | WS-1½ (control feedforward) | A1½.1–A1½.5 |
+
+**Definition of done for the phase** (the headline claims, all deterministic,
+all ratcheted):
+
+- **D1 — Floor it.** ≥ 95% drive command until the braking point and
+  ≥ 28 m/s peak on the 105 m straight (gate 7→8).
+- **D2 — At the limit.** v2 g-g mean utilization ≥ 0.60 (today 0.44),
+  peak ≥ 0.95, on a clean run.
+- **D3 — Dynamic rollouts.** Root expansions roll the car's own model from
+  the exact live dynamic state; seams carry `yawRate`/`lateralVelocity`.
+- **D4 — Model-in-the-loop executor.** MPPI rolling each car's own model is
+  the race default, having beaten pure-pursuit's lap times.
+- **D5 — The course decides.** On the circuit variant, full v2 stack beats
+  full kinematic stack (`v2.avg < kin.avg`), v2 clean; identical
+  controller + tuning both cars, only the forward model differs.
+- **D6 — No regressions.** `pnpm verify` green; parking/carchase/ramp
+  invariants hold; no ratchet ever loosened.
+
+## 0b. Where we are (measured baseline)
 
 | Signal | Kinematic | v2-trained | Plant capability |
 |---|---|---|---|
@@ -34,404 +57,505 @@ model wiring, driving-quality metrics).*
 | Technical course avg lap | 38.4 s | 43.1 s (ratio 1.12) | — |
 
 The model war is won (9× open-loop advantage, ratcheted); the *pipeline*
-war is not: an executor that never exceeds 0.44 of the friction circle and a
-planner that quantizes away dynamic state price model fidelity at zero. The
-kinematic car wins on line length alone because sharp intent + plant
-saturation is free at 9 m/s.
-
-**Definition of done for this phase** (each measurable, each ratcheted):
-
-- **D1 — Floor it.** On the 105 m straight (gate 7→8), the executed
-  trajectory holds ≥ 95% throttle (or ≥ 95% `maxDriveForce` under MPPI)
-  until the braking point and peaks ≥ 28 m/s. Asserted headlessly.
-- **D2 — At the limit.** g-g mean utilization ≥ 0.60 for the v2 car over a
-  clean 2-lap run (from today's 0.44), peak ≥ 0.95.
-- **D3 — Dynamic rollouts.** Replan expansion at the root uses the car's own
-  forward model rolled from the exact live state (incl. `yawRate`,
-  `lateralVelocity`); verified by a unit test that a mid-corner replan's
-  first primitive endpoint matches a live model rollout within ε, and by a
-  closed-loop predErrorRms drop.
-- **D4 — Model-in-the-loop executor.** MPPI (rolling each car's own model,
-  wiring already landed) is the race-default tracker once it beats
-  pure-pursuit lap times on both courses; both cars complete both courses
-  under it, deterministically.
-- **D5 — The course decides.** On the new circuit variant, the full v2 stack
-  beats the full kinematic stack (`v2.avg < kin.avg`, ratio ratcheted through
-  1.0) with v2 clean; the kinematic stack either strikes walls or laps slower.
-  Identical controller + tuning both cars; only the forward model differs.
-- **D6 — No regressions.** `pnpm verify` green; parking/carchase/ramp
-  invariants hold; existing ratchets never loosened.
+war is not: an executor that never exceeds 0.44 of the friction circle and
+a planner that quantizes away dynamic state price model fidelity at zero.
 
 ---
 
-## 1. WS-0 — Measure the plant envelope (stop guessing what "maximum" is)
+## 1. WS-0 — Measure the plant envelope
 
-**Problem.** Every speed-limiting constant in the executor is hand-set below
-the plant's real limits, and the derived capabilities themselves
-underestimate the measured plant:
+### Problem
 
-- Tracker longitudinal limits `maxAccel: 6`, `maxDecel: 8`
-  (`race-scenario.ts:146-147`) vs derived traction accel **8.83 m/s²** and
-  brake **13.89 m/s²** (`core/test/agent/capabilities.test.ts:26-34`) — and
-  the *measured* brake is stronger still: brakeForce 1000/2000 stops a
-  24 m/s chassis in ~0.8 s ≈ **26 m/s²**, grip-saturated (comment at
-  `core/src/agent/vehicle-model.ts:301-307`).
+Every speed-limiting constant is hand-set below the plant's real limits,
+and the derived capabilities underestimate the measured plant:
+
+- Tracker limits `maxAccel: 6`, `maxDecel: 8` (`race-scenario.ts:146-147`)
+  vs derived traction accel **8.83 m/s²** / brake **13.89 m/s²**
+  (`core/test/agent/capabilities.test.ts:26-34`) — and the *measured*
+  brake is ~**26 m/s²**, grip-saturated (`vehicle-model.ts:301-307`).
 - Lateral budget `TRACKER_MAX_LATERAL_ACCEL = 12` (`race-scenario.ts:91`)
-  and preview at `0.8·µg ≈ 14.1` (`race-scenario.ts:164-165`) vs µg =
-  **17.66 m/s²** — and nobody has measured the true steady-state cornering
-  boundary of the raycast controller (suspension + `frictionSlip: 1.8` +
-  `sideFrictionStiffness` make it non-trivially different from µg).
+  and preview at `0.8·µg ≈ 14.1` vs µg = **17.66 m/s²**; the raycast
+  controller's true cornering boundary has never been measured.
 - Top speed "30 m/s" is documented folklore
   (`race-primitives-scenarios.ts:249-251`), pinned only as an upper bound.
 
-**Work.**
+### What to build
 
-1. Add a **plant-envelope characterization script** on the headless Rapier
-   harness (`core/src/adapters/rapier/headless-trial.ts`):
-   - top speed on flat ground (drive at full force until dv/dt < ε);
-   - 0→vmax time and distance (traction-limited launch curve `a(v)`);
-   - braking distance / decel from a grid of speeds (threshold-brake sweep
-     over brakeForce to find shortest stop without lockup-induced yaw);
-   - steady-state cornering: for a grid of fixed steer angles × entry
-     speeds, measure sustained yaw rate / radius / lateral accel → the
-     real g-g boundary `aLatMax(v)`.
-2. Emit a `PlantEnvelope` record (JSON artifact + in-repo constant) and a
-   regression test pinning it (tolerances, fixed seed) so plant-tuning
-   drift is caught — the same pattern as `capability-drift.test.ts`.
-3. Route executor and planner limits from the envelope with explicit
-   margins, replacing the hand-set numbers above: pure-pursuit
-   `maxAccel/maxDecel/maxLateralAccel/previewLateralAccel`, the speed
-   profile's budgets (`race-scenario.ts:1253-1261`), and
-   `RACE_AGENT.minTurnRadius` (resolve the deliberate 4.5 vs 4.68 inversion,
-   `race-primitives-scenarios.ts:237-248`, flipping
-   `capability-drift.test.ts:33` `it.fails` → `it` once WS-1's feedforward
-   makes feasible-radius plans the fast ones).
+1. `demos/scripts/plant-envelope.ts` — a characterization script on the
+   headless Rapier harness (`core/src/adapters/rapier/headless-trial.ts`).
+2. A `PlantEnvelope` record: `{ vMax, launchCurve: a(v) grid, brakeDecel(v)
+   grid, latAccelBoundary: aLat(v) grid, minTurnRadiusExecuted }` — emitted
+   as `demos/public/models/plant-envelope.json` + an exported constant.
+3. `demos/test/plant-envelope.test.ts` — regression test pinning the
+   envelope (the `capability-drift.test.ts` pattern).
+4. Rewiring: executor + speed-profile + agent limits route from the
+   envelope with explicit named margins.
 
-**Acceptance.** Envelope artifact + test committed; a table in the PR body:
-derived vs measured (vmax, a(0), a(20), brake decel, aLat @ R=10/20/40).
-Executor limits cite the envelope, not literals.
+### How to build it
 
-*Note on "maximizing usage of the raycast controller": MPPI already emits
-native `steer/driveForce/brakeForce` (`core/src/execute/mpc-tracker.ts:38-50`)
-— the plant's own actuator space, no throttle-abstraction loss. WS-0 tells
-us what the actuators can do; WS-1/WS-3 make the stack ask for all of it.*
+- **vMax**: full `driveForce` on flat ground until `dv/dt < 0.01` for 1 s;
+  record terminal speed.
+- **Launch curve**: same run; sample `a(v)` at v = 0, 4, …, 28.
+- **Brake decel**: from each v ∈ {8, 16, 24, 28}, sweep brakeForce over
+  {0.25, 0.5, 0.75, 1.0}·max; record best stopping decel without
+  lockup-yaw (heading deviation < 5°).
+- **Cornering boundary**: grid of fixed steer ∈ {0.15, 0.3, 0.45, 0.6} ×
+  entry v ∈ {8, 12, …, 28}; hold 3 s; record sustained yaw rate, radius,
+  aLat at steady state → the boundary is the max sustained aLat per speed.
+- All runs deterministic (fixed spawn, no RNG); JSON written with sorted
+  keys so re-runs diff clean.
+- Rewire: replace literals in `PURE_PURSUIT_CONFIG`
+  (`race-scenario.ts:141-171`), the speed-profile budgets
+  (`race-scenario.ts:1253-1261`), and `RACE_AGENT.minTurnRadius`
+  (`race-primitives-scenarios.ts:248`) with envelope-derived constants ×
+  named margin factors.
+
+### Acceptance checklist
+
+- [ ] **A0.1** `pnpm tsx demos/scripts/plant-envelope.ts` writes
+  `plant-envelope.json`; running twice produces byte-identical output.
+- [ ] **A0.2** `plant-envelope.test.ts` pins: vMax within ±0.5 m/s of the
+  recorded value; brake decel and aLat boundary each within ±5% at every
+  grid point; fails if plant tuning drifts.
+- [ ] **A0.3** No hand-set speed/accel literals remain in the executor
+  path: `PURE_PURSUIT_CONFIG.{maxAccel,maxDecel,maxLateralAccel,
+  previewLateralAccel}` and the speed-profile budgets reference the
+  envelope (code review + a grep-style test asserting the constants'
+  provenance comments).
+- [ ] **A0.4** PR table: derived vs measured (vMax, a(0), a(20), brake
+  decel @24, aLat @ R=10/20/40).
+- [ ] **A0.5** `capability-drift.test.ts:33` `it.fails` (minTurnRadius
+  inversion) either flips to `it` or its deferral is re-justified against
+  the measured `minTurnRadiusExecuted`.
+- [ ] **A0.6** `pnpm verify` green.
 
 ---
 
-## 2. WS-1 — Floor it: the speed-policy surgery (Track 2, made concrete)
+## 2. WS-1 — Floor it: speed-policy surgery on pure-pursuit
 
-The five model-agnostic brakes in `purePursuit`
-(`core/src/execute/pure-pursuit.ts:245-253`) and their fixes, in order:
+### Problem
 
-1. **Kill phantom horizon braking.** `vGoal = √(2·maxDecel·distToGoal)`
-   (`pure-pursuit.ts:150-152`) must apply **only** when the plan genuinely
-   stops (`stopsAtEnd`, already computed at line 57) or the gate is a true
-   finish. Drive-through horizons get `vGoal = ∞`. Today the car is
-   permanently decelerating toward the end of a 2-gate replanning window
-   (`PLAN_LOOKAHEAD_COUNT = 2`, `race-scenario.ts:90`) that the next replan
-   extends. This is the single biggest straightaway killer.
-2. **Bang-bang throttle with braking-envelope timing.** Replace the
-   proportional law `throttle = Δv/maxAccel` (`pure-pursuit.ts:260-272`)
-   with: full throttle while `v < vBind − hysteresis`, where `vBind` is the
-   binding cap propagated backward through the braking envelope; brake at
-   the envelope-computed point, at envelope decel. A human floors it until
-   the braking point; so should we. (Keep the P-law for parking — gear on
-   `stopsAtEnd` or scenario tuning.)
-3. **Separate feedback error from path curvature.** `vCurve` uses the
-   pursuit-chord κ = 2y/Ld² (`pure-pursuit.ts:149`), which conflates
-   cross-track error with real corners → phantom braking on straights. Use
-   the rich `Plan.kappa` (`core/src/plan/build.ts:45-119`, built at
-   `race-scenario.ts:1277` and currently produce-but-don't-consume) for the
-   speed law and preview; keep chord κ only for steering feedback. This
-   also supersedes the noisy Menger preview over replanned chords
-   (`pure-pursuit.ts:183-204`).
-4. **`respectPathSpeed: true` everywhere** (currently off on the open
-   course, `DEFAULT_TUNING.respectPathSpeed: false`,
-   `race-scenario.ts:470`) with plan speeds as a **cap** through the
-   existing braking-envelope semantics (`pure-pursuit.ts:207-235`). With
-   WS-2's honest plan speeds this is the cheap channel for v2 knowledge to
-   reach the wheels under pure-pursuit.
-5. **Raise the limits to the WS-0 envelope** (accel 6→~8.8, decel
-   8→measured threshold-brake value, lateral 12→measured boundary with a
-   margin). Conservative-limit "safety" is currently doing the model's job
-   for both cars, which is exactly what equalizes them.
+`purePursuit` commands the minimum of five caps, all model-agnostic
+(`core/src/execute/pure-pursuit.ts:245-253`): phantom horizon braking
+(`vGoal` treats the 2-gate replanning horizon end as a stop target,
+lines 150-152), phantom corner braking (pursuit-chord κ conflates tracking
+error with curvature, line 149), a proportional throttle that never floors
+it (lines 260-272), and the one model-carrying cap (`respectPathSpeed`)
+disabled on the open course (`race-scenario.ts:470`).
 
-**Acceptance** (deterministic, `retry: 0`, open course): D1 holds
-(≥ 95% throttle to the braking point, peak ≥ 28 m/s on the straight — new
-assertion in `closed-loop-race-benchmark.test.ts`); both cars' mean speed
-≥ +40%; laps beat today's 33.0/39.2 s; 0 off-track; determinism
-bit-identical; parking untouched (all changes gated on drive-through
-plans / race tuning).
+### What to build
 
-### 2b. WS-1½ — Control feedforward: stop re-deriving actuators from geometry
+1. `vGoal` gating: applies **only** when `stopsAtEnd` (already computed,
+   `pure-pursuit.ts:57`) or the gate is a true finish; drive-through
+   horizons get `vGoal = ∞`.
+2. Plan-curvature speed law: `vCurve`/preview use the rich `Plan.kappa`
+   (built at `race-scenario.ts:1277`, currently unread) instead of chord
+   κ / Menger-over-chords; chord κ remains for steering feedback only.
+3. Bang-bang throttle with an explicit **coast band** (P6): full throttle
+   while `v < vBind − h`; **zero throttle, zero brake** while
+   `|v − vBind| ≤ h` (glide); brake only when the braking envelope to the
+   next binding cap requires it. Hysteresis `h` ≈ 0.5 m/s. The P-law stays
+   for stop-terminated (parking) plans.
+4. `respectPathSpeed: true` as the open-course default (envelope-cap
+   semantics already implemented, `pure-pursuit.ts:207-235`).
+5. Limits raised to WS-0 envelope values (with named margins).
 
-**Problem.** The stack plans in actuator space, flattens to geometry, then
-re-derives actuator commands from geometry — destroying the plan's control
-knowledge twice:
+### How to build it
+
+- All changes inside `purePursuit` + `PurePursuitConfig`, gated so
+  stop-terminated plans keep today's behavior exactly (parking
+  untouched). New config fields: `goalBrakeOnlyAtStops: boolean`,
+  `planCurvature?: (i: number) => number` (or pass the `Plan` alongside
+  the polyline), `coastBandMs: number`.
+- Wire `richPlan` through `race-scenario.ts` tick → tracker call
+  (`race-scenario.ts:1570` region) so the tracker can read per-sample
+  kappa. This makes the rich Plan consumed for the first time.
+- Update `DEFAULT_TUNING` (`race-scenario.ts:465-479`):
+  `respectPathSpeed: true`; keep every change per-scenario-gated.
+
+### Acceptance checklist
+
+- [ ] **A1.1** Unit tests in `core/test/execute/pure-pursuit.test.ts`:
+  (a) drive-through plan (terminal speed > 0.05) → `vGoal` does not bind
+  at any distance; (b) stop-terminated plan → braking behavior identical
+  to today (snapshot); (c) straight plan with 1 m cross-track error →
+  no `vCurve` slowdown (plan-kappa is zero even though chord κ isn't).
+- [ ] **A1.2** Coast-band unit test (P6): current speed within hysteresis
+  of the binding cap → command is exactly `throttle = 0, brake = 0`;
+  above the band → brake per envelope; below → throttle = 1.
+- [ ] **A1.3** (D1, P1) New assertion in
+  `closed-loop-race-benchmark.test.ts`: on the gate 7→8 straight, drive
+  command ≥ 0.95 for ≥ 60% of the straight's arc length AND peak speed
+  ≥ 28 m/s, for BOTH cars.
+- [ ] **A1.4** Open-course benchmark: both cars' mean speed ≥ 12.5 m/s
+  (≥ +40% over 8.8/9.3); avg laps < 33.0 s (kin) and < 39.2 s (v2);
+  0 off-track; failed replans ≤ 2; determinism test bit-identical.
+- [ ] **A1.5** Parking invariants, `race-invariants.test.ts`, carchase and
+  ramp suites unchanged/green (`pnpm verify`).
+- [ ] **A1.6** Ratchets tightened to the new measured values (never
+  loosened): lap-time bounds and `V2_VS_KIN_AVG_RATIO` re-pinned.
+
+---
+
+## 3. WS-1½ — Control feedforward: the plan's controls reach the actuators
+
+### Problem (P8)
+
+The stack plans in actuator space, flattens to geometry, then re-derives
+actuator commands from geometry — destroying its own control knowledge
+twice:
 
 - Every primitive stores the exact `[steer, driveForce, brakeForce]` that
-  produced it (`characterize.ts:129`) and every plan edge remembers its
+  produced it (`characterize.ts:129`); every plan edge remembers its
   primitive (`primId`, `vehicle-environment.ts:343`) — but plan extraction
-  keeps only the state polyline; nothing downstream reads `primId` or
-  `.controls` (verified: zero references in `race-scenario.ts`).
-- The rich `Plan`'s `steerFf`/`accelFf` are *re-derived* from the
-  already-smoothed geometry (`buildPlan`, `race-scenario.ts:1277`) — a
-  reconstruction of what was discarded — and even that is unread.
+  keeps only the state polyline. Zero downstream references to `primId` or
+  `.controls` exist (verified in `race-scenario.ts`).
+- The rich `Plan.steerFf/accelFf` are re-*derived* from already-smoothed
+  geometry (`buildPlan`, `core/src/plan/build.ts:45-119`) — and unread.
 - On the technical course, `smoothSpeedProfile` **overwrites** the plan's
-  model-honest per-sample speeds with a generic curvature formula at the
-  conservative hand-set limits (`race-scenario.ts:1253-1261`) — the v2
-  planner's corner-speed knowledge is erased before the tracker sees it.
+  model-honest speeds with a generic curvature formula at conservative
+  hand-set limits (`race-scenario.ts:1253-1261`).
 
-**Work.**
+### What to build
 
-1. Thread `primId → MotionPrimitive.controls` through plan extraction so
-   each plan sample carries the baked control vector alongside the pose
-   (time-aligned; smoothing moves geometry, controls stay keyed by `t`).
-2. Feedforward + feedback execution: the tracker emits the plan's controls
-   as the feedforward term and adds a bounded geometric correction on top
-   (pure open-loop replay would drift — the baked controls are only exact
-   from the state they were baked at; FF+FB is the standard shape).
-3. Speed profile becomes a **safety clamp, not a rewrite**: keep the plan's
-   model-derived speeds; only reduce a sample's speed when it exceeds the
-   envelope-backed friction/braking bound. (Today's pass replaces v2's
-   honest speeds with model-agnostic math — an own-goal for the fidelity
-   experiment.)
-4. MPPI warm-start from the plan's control sequence (instead of only the
-   shifted previous solution) — the plan's control knowledge becomes the
-   sampling prior that MPPI refines, unifying this workstream with WS-3.
+1. Plan extraction preserves per-edge controls: each plan sample carries
+   `{ steer, driveForce, brakeForce }` from its generating primitive,
+   time-aligned by `t` (smoothing moves geometry; controls stay keyed to
+   time).
+2. FF+FB tracking mode in pure-pursuit: command = plan feedforward controls
+   + bounded geometric feedback correction (pure open-loop replay drifts —
+   the baked controls are exact only from the state they were baked at).
+3. Speed profile demoted from rewrite to **clamp**: never raise a sample's
+   speed; lower it only where it exceeds the envelope-backed bound.
+4. MPPI warm-start option: seed the prior from the plan's control sequence
+   (instead of only the shifted previous solution), unifying with WS-3.
 
-**Acceptance.** Steering/throttle traces on a corner-entry segment show the
-feedforward term carrying most of the command (feedback correction small
-and zero-mean); v2 lap times improve more than kinematic's (its baked
-controls encode true-plant knowledge; kinematic's encode delusion — this
-change is honestly asymmetric); tracking error (predErrorRms) does not
-regress; parking unaffected (FF gated to drive-through plans).
+### How to build it
 
----
+- Extend the multi-goal planner's result (`plan-vehicle-multi.ts`) to
+  surface per-edge `primId`; resolve to `MotionPrimitive.controls` at plan
+  assembly in `replanCar` (`race-scenario.ts:1209-1282`); store as a
+  parallel `controls[]` on the committed plan (or extend `Plan`).
+- FF term: interpolate controls by plan time; FB term: today's pursuit
+  correction, clamped to a fraction of actuator range (start: ±30% steer,
+  ±40% force).
+- Clamp-only speed profile: new option in `smoothSpeedProfile`
+  (`core/src/execute/speed-profile.ts:152-223`): `mode: 'clamp'` skips the
+  forward-accel pass's speed raises and applies only cap/brake passes.
+- MPPI warm start: map plan controls at the horizon's time offsets into
+  the prior buffer (`mpc-tracker.ts:334-343`) behind
+  `warmStartFromPlan: boolean`.
 
-## 3. WS-2 — Dynamic rollouts: plan from the true dynamic state (the new workstream)
+### Acceptance checklist
 
-**Problem, precisely.** The replanner starts from the live continuous state
-— `startState = { ...c.car.readState(simTime), t: 0 }`
-(`race-scenario.ts:1086-1088`), and `readState` supplies exact signed speed,
-heading, `yawRate`, and `lateralVelocity`
-(`core/src/adapters/rapier/raycast-vehicle.ts:278-297`). But the search then
-throws that dynamic state away:
-
-- Expansion is a **table lookup**: `this.lib.lookup(st.speed)` snaps to the
-  nearest 4 m/s start-speed bucket (`vehicle-environment.ts:319`,
-  `core/src/primitives/library.ts:20-37`, `RACE_START_SPEEDS`
-  `race-primitives-scenarios.ts:327`).
-- The baked primitives were characterized from **zero-slip canonical
-  states** `{x:0, z:0, heading:0, speed, t:0}` — no `yawRate`, no
-  `lateralVelocity` (`core/src/primitives/characterize.ts:119`).
-- Successor states **drop the dynamic dims** entirely — `next` carries only
-  `x/z/heading/speed/t` (`vehicle-environment.ts:324-330`).
-
-So a car sweeping through a corner at 20 m/s with a large yaw rate and
-sideslip replans as if it were rolling straight at 20 m/s with zero slip.
-The v2 model is *stateful in exactly these dims* (`parametricForwardV2`
-integrates `yawRate` through `yawRateTau` and `lateralVelocity` through
-`lateralDamping`, `core/src/agent/vehicle-model.ts:286-394`; the residual
-MLP takes both as inputs, `vehicle-model.ts:535-576`) — the planner
-quantizes away the very state the learned model exists to exploit. The
-kinematic model, memoryless by construction, loses nothing to this
-quantization. **The current lattice is rigged in the kinematic model's
-favor.** The characterize contract even anticipates the fix: *"characterize
-at plan time from the actual state instead of caching"*
-(`characterize.ts:46-52`).
-
-**Work.**
-
-1. **Root dynamic rollouts.** Extend `VehicleEnv` with an optional live
-   expansion hook: for the **root node only**, roll the entry's own forward
-   model (`RaceEntry.forwardModel` — same model MPPI rolls,
-   `race-scenario.ts:1040`) from the exact live state across the race
-   control sets, producing primitives (endpoint + sweep samples) on the
-   fly. Cost per replan: |controlSets| ≈ 19 × 6 substeps ≈ 114 model steps
-   (~200 ns each) — negligible. Collision sweeps come straight from the
-   rollout samples, same `sweepClear` path. The committed first ~0.55 s of
-   every plan becomes exactly model-consistent with the car's dynamic
-   state; deeper nodes keep the baked lattice (their states are primitive
-   endpoints, which are near-canonical by construction).
-2. **Carry `yawRate`/`lateralVelocity` through successor states** where the
-   generating model provides them (v2 primitive `end` states can bake
-   terminal `yawRate`/`lateralVelocity` per bucket; kinematic stays zero —
-   honest, since that's its worldview). Optional depth-1+ dynamic rollouts
-   behind an expansion budget if root-only proves insufficient — measure
-   first.
-3. **Commit-window forward projection.** `commitWindowMs: 0` today because
-   the linear plan-sampling predictor diverged
-   (`race-scenario.ts:447-453`). At 30 m/s a 300 ms replan cadence
-   (`REPLAN_INTERVAL_MS`, `race-scenario.ts:89`) means the car moves ~9 m
-   during/after planning. Re-enable the commit window, but project the
-   start state forward by rolling the car's **own model** over the
-   currently-committed controls for the window — plan from where the car
-   *will be*, not where it was. This is the second half of "current state,
-   projected out."
-4. **Keep determinism.** Model rollouts are pure; no RNG. The dedup hash
-   (`speedQuant: 4`, `vehicle-environment.ts:245-251`) is unchanged — it
-   only dedups, never mutates state.
-
-**Acceptance.**
-
-- Unit test: build a mid-corner state (v=18, yawRate=0.8, lateralVelocity=1.2),
-  plan one expansion, assert the root primitive endpoints equal a direct
-  model rollout within 1e-9 (and differ measurably from the baked lookup).
-- Closed-loop: predErrorRms drops for the v2 car (it finally predicts from
-  the state it's actually in); failed replans at speed don't increase.
-- Benchmark laps: v2 improves ≥ kinematic (this change should be
-  asymmetric by design — that's the point); ratchets tightened.
+- [ ] **A1½.1** Unit test: for a 3-primitive plan, the extracted plan's
+  `controls[]` at each sample time equals the generating primitive's
+  control vector (exact match; no interpolation across primitive
+  boundaries).
+- [ ] **A1½.2** FF-dominance evidence: on the deterministic benchmark's
+  90° corner entry, log |FF| vs |FB| per tick — feedforward carries
+  ≥ 70% of the steering command magnitude; FB correction is zero-mean
+  (|mean| < 10% of RMS). Logged by the benchmark, asserted loosely.
+- [ ] **A1½.3** Clamp-only speed profile test: given a v2 plan whose
+  model-honest speeds are lower than the curvature formula's, output
+  speeds are UNCHANGED; given speeds exceeding the envelope bound, output
+  is reduced to the bound; speeds are never raised.
+- [ ] **A1½.4** Honest asymmetry (the point of the exercise): with FF+FB
+  on for both cars, v2's lap improves ≥ kinematic's improvement
+  (kinematic's baked controls encode delusion; measure and record both).
+- [ ] **A1½.5** MPPI warm-start behind a flag; MPC determinism test still
+  bit-identical with it on.
+- [ ] **A1½.6** `predErrorRms` does not regress for either car; parking
+  suite green (FF gated to drive-through plans).
 
 ---
 
-## 4. WS-3 — MPPI as the racing executor (Track 1, unchanged scope, gated rollout)
+## 4. WS-2 — Dynamic rollouts: plan from the true dynamic state
 
-Scope as specified in `docs/racing-at-the-limit-plan.md` §Track 1 — kept
-here as the dependency spine, since D2/D4/D5 all hang off it:
+### Problem (P3, P7)
 
-1. **Progress-reward cost**: replace position-tracking with
-   `cost −= wProgress·(arc-length advanced)` + lateral-corridor penalty
-   (half-width from course metadata; the Williams 2016 racing shape),
-   fixing progress starvation in `buildReference`/`scoreRollout`
-   (`mpc-tracker.ts:158-263`).
-2. **Reference extension** past the plan end (extrapolate the last segment)
-   so the horizon end is attractive, never a stop target.
-3. **Substep the model**: 3 × 1/60 s model steps per 0.05 s MPPI step
-   (64 samples × 10 steps × 3 ≈ 1920 model steps/tick, < 1 ms) to close
-   the dt gap vs the 1/240 s plant.
-4. **Per-car model** is already wired (`race-scenario.ts:1040`,
-   `headless-race.ts` kinematic → `KINEMATIC_NATIVE_PARAMS`, v2 →
-   `learnedForwardSimV2`); keep it — this is the honesty contract.
-5. **Determinism test in MPC mode** (LCG seeding already in place,
-   `createMPCTrackerState`, `mpc-tracker.ts:125-130`).
-6. **Gated default flip**: `tracker: 'mpc'` becomes the race default per
-   course only when its deterministic lap times beat pure-pursuit's there.
-   Parking keeps pure-pursuit until separately tuned.
+The replanner reads the live continuous state — `startState =
+{ ...c.car.readState(simTime), t: 0 }` (`race-scenario.ts:1086-1088`),
+including exact `yawRate` and `lateralVelocity`
+(`raycast-vehicle.ts:278-297`) — then throws the dynamics away:
 
-**Acceptance**: completes 2 laps on open + technical + circuit, both cars,
-0 off-track; D2 (g-g ≥ 0.60 mean for v2); the headline ratchet
-`v2.avg < kin.avg` on the technical/circuit courses.
+- Expansion is a table lookup snapped to the nearest 4 m/s bucket
+  (`vehicle-environment.ts:319`, `library.ts:20-37`).
+- Primitives were baked from zero-slip canonical states
+  (`characterize.ts:119`).
+- Successors drop `yawRate`/`lateralVelocity` entirely
+  (`vehicle-environment.ts:324-330`) — so every seam between primitives
+  resets slip to zero (P7: imprecise composition).
 
----
+The v2 model is stateful in exactly these dims
+(`vehicle-model.ts:286-394`); the kinematic model is memoryless. The
+current lattice is rigged in the kinematic model's favor. The characterize
+contract anticipates the fix: *"characterize at plan time from the actual
+state instead of caching"* (`characterize.ts:46-52`).
 
-## 5. WS-4 — A course that requires an advanced driving AI
+### What to build
 
-**Problem.** The technical variant only guards *overshoot zones* (9 walls,
-`race-primitives-scenarios.ts:199-219`); pure-pursuit's conservative
-preview braking keeps the delusional car clean too, so walls rarely bind
-and the kinematic car keeps its shorter-line edge (ratio 1.12). Meanwhile
-the open course's 105 m straight (gate 7→8) can already host vmax — from
-rest the plant needs ~51 m to reach 30 m/s at traction-limited accel — so
-the course is not what caps speed today; the executor is (WS-1). Once WS-1
-lands, the course must be the thing that separates the models.
+1. **Root dynamic rollouts**: for the root node, roll the entry's own
+   forward model (`RaceEntry.forwardModel`, same model MPPI rolls,
+   `race-scenario.ts:1040`) live from the exact current state across the
+   control sets → primitives (endpoint + sweep) on the fly.
+2. **Dynamic state through seams**: primitive `end` states bake terminal
+   `yawRate`/`lateralVelocity` (v2; kinematic stays 0 — honest); successors
+   carry them forward.
+3. **Commit-window forward projection**: re-enable `commitWindowMs > 0`
+   with the start state projected by rolling the car's own model over the
+   committed controls for the window (the old failure was *linear* plan
+   sampling, `race-scenario.ts:447-453`). At 30 m/s and 300 ms cadence the
+   car moves ~9 m per replan — planning from where the car *will be* is
+   mandatory at speed.
 
-**Design principles** (each feature targets a specific model-knowledge gap,
-with the speed-differentiating numbers from WS-0's envelope):
+### How to build it
 
-1. **Heavy braking zone**: keep the long straight, then a hairpin
-   (R ≈ 6–8 m) with an outside wall at corner exit. Entry from ~30 m/s;
-   braking distance is the model question — the grip-saturating brake
-   knowledge (v2) vs naive `F/m` (kinematic) decides the braking point.
-   Late braking = wall.
-2. **High-speed sweeper**: constant-radius R ≈ 35 m corner, walled on the
-   outside. Takeable at `√(aLat·R)` ≈ 20 m/s at the measured boundary; the
-   kinematic worldview says any speed. This is where 22.8 m of open-loop
-   error at 28 m/s becomes a wall strike instead of a diagnostic.
-3. **Decreasing-radius corner** (R 20 → 10 m): the classic
-   fidelity-separator — requires trailing off entry speed *before* the
-   tightening is visible in the pursuit chord; only plan-level model
-   knowledge (or MPPI rollouts) gets it right.
-4. **Chicane at speed**: keep the existing x=10/−12 staggered pinch
-   (`race-primitives-scenarios.ts:217-218`).
-5. **Full corridor**: a `'circuit'` variant walling **both** sides
-   everywhere — wide corridors on straights (~14 m), tight in technical
-   sections (~6 m vs the 4.8 × 2 m footprint). No free run-off anywhere;
-   every line error costs. Built with the existing dual-layer pattern
-   (2D inflated obstacle polygons for the planner + Rapier box colliders +
-   rendered walls, `RACE_WALL_INFLATE`, `race-primitives-scenarios.ts:101`).
-6. **Consequences dialed up**: wall strikes already count
-   (`wallStrikes`); add a benchmark mode where a strike voids the lap
-   (assert winner has 0), so "graze the wall, keep the time" cannot pay.
-7. **Gate-heading prior fallback** for V-shaped plans stays in reserve as
-   per the previous doc: finite `goalHeadingTol` aligned to the
-   gate-to-gate chord, only if V-shapes persist after WS-1/WS-2 raise plan
-   speeds (at high plan speed a pivot prices itself out organically).
+- Add an optional `rootExpand?: (state) => MotionPrimitive[]` to
+  `VehicleEnvOptions`; `succ()` uses it when `node.parent == null`.
+  Implementation: run `characterize()` inline with `runs =
+  [{ startState: liveState, controls }]` per control set — ~19 sets × 6
+  substeps ≈ 114 model steps (~200 ns each) per replan; collision sweeps
+  come from the rollout samples through the existing `sweepClear` path.
+- Extend `MotionPrimitive.end` with optional `yawRate`/`lateralVelocity`;
+  populate in `characterizeVehicle` (`characterize.ts:126-140`); copy in
+  `succ()` (`vehicle-environment.ts:324-330`). Dedup hash unchanged
+  (`speedQuant` stays a dedup-only key).
+- Commit-window projection: in `replanCar`, replace `samplePlanAt` linear
+  sampling with an N-step rollout of the committed plan's controls
+  (WS-1½'s `controls[]`) through `entry.forwardModel`.
 
-**Exposure**: `buildRaceCourse('circuit')`; `/raceprimitives?course=circuit`
-selector; `pnpm run race -- --course=circuit` (`demos/scripts/race.ts:56,92`);
-a geometry/solvability test mirroring `technical-course.test.ts` (every
-gate reachable by the v2 library with honest speeds — the course must be
-hard, not impossible).
+### Acceptance checklist
 
-**Acceptance**: D5 — on the circuit, full v2 stack beats full kinematic
-stack with v2 clean; kinematic strikes walls or laps slower at matched
-aggression; demo renders the circuit; video walkthrough artifact.
+- [ ] **A2.1** (D3) Unit test: from a mid-corner state (v = 18,
+  yawRate = 0.8, lateralVelocity = 1.2), root expansion endpoints equal a
+  direct model rollout within 1e-9 — and differ from the baked
+  zero-slip lookup by a measurable margin (assert > 0.3 m for at least
+  one control).
+- [ ] **A2.2** (P7) Seam test: chaining two hard-corner v2 primitives via
+  successor states reproduces a continuous 2-primitive model rollout
+  within a tolerance that the old zero-slip seam violates (record both
+  errors in the test).
+- [ ] **A2.3** Commit-window test: with `commitWindowMs: 200`, the
+  planning start state equals the model rollout of the committed controls
+  at +200 ms (not the linear sample); closed-loop off-track events do not
+  increase vs `commitWindowMs: 0`.
+- [ ] **A2.4** Closed-loop: v2 `predErrorRms` drops (record before/after);
+  failed replans do not increase; benchmark lap ratchets re-pinned (v2
+  expected to gain more than kinematic — record both).
+- [ ] **A2.5** Determinism test still bit-identical (rollouts are pure);
+  replan CPU budget: expansion count per replan within 5% of before
+  (root rollouts add ~114 model steps, no search-space change).
+- [ ] **A2.6** `pnpm verify` green; parking unaffected.
 
 ---
 
-## 6. WS-5 — Measurement, ratchets, and honesty rails
+## 5. WS-3 — MPPI as the racing executor
 
-- **New assertions** (all deterministic, expansion-capped, `retry: 0`):
-  - straightaway: peak speed ≥ 28 m/s AND sustained ≥ 95% drive command on
-    the straight (D1);
-  - g-g mean ≥ 0.60 / peak ≥ 0.95 for the v2 car (D2), via the existing
-    `DrivingQuality` plumbing (`race-scenario.ts:552-568, 1790-1797`);
-  - dynamic-rollout consistency unit test (D3);
-  - MPC determinism (D4);
-  - circuit ratchet `v2.avg < kin.avg` (D5) — tighten
-    `V2_VS_KIN_AVG_RATIO` (open, currently 1.25/measured 1.188) and
-    `V2_VS_KIN_TECH_RATIO` (currently 1.25/measured 1.12) monotonically as
-    each workstream lands; never loosen.
-- **Honesty rails** (unchanged): identical controller + tuning both cars;
-  the only per-car difference is the forward model (planner primitives,
-  root rollouts, MPPI rollouts, commit-window projection — all roll the
-  car's own model). Any tuning change applies to both.
-- **Per-workstream benchmark runs**: `pnpm run race -- --seed=42 --laps=3`
-  on open + technical + circuit after every landing; table goes in the PR.
-- **Full gate**: `pnpm verify` (typecheck + ~840 tests + build + size);
-  parking/carchase/ramp invariants; GUI QA on `/raceprimitives` per course
-  (walls render, HUD updates, no console errors), with the video artifact
-  from the circuit as the hero.
+### Problem (P4, P5)
+
+MPPI exists, rolls each car's own model (wiring landed,
+`race-scenario.ts:1040`), and emits the plant's native actuator space
+(`mpc-tracker.ts:38-50`) — but both cars DNF under `tracker: 'mpc'`:
+position-tracking cost starves progress (`buildReference` advances a
+reference the samples must chase, `mpc-tracker.ts:158-216`), the horizon
+end acts as a stop target, and the 0.05 s model step mismatches the
+1/240 s plant.
+
+### What to build
+
+1. **Progress-reward cost**: `cost −= wProgress · (arc length advanced
+   along the plan)` + lateral **corridor** penalty (quadratic outside
+   half-width; from course metadata, default 3 m) replacing exact position
+   tracking. The Williams 2016 racing shape.
+2. **Reference extension**: extrapolate the plan's last segment when the
+   plan is shorter than the horizon (the horizon end becomes attractive,
+   never a stop).
+3. **Model substepping**: 3 × 1/60 s model steps per 0.05 s MPPI step
+   (64 × 10 × 3 ≈ 1920 steps/tick, < 1 ms).
+4. **Completion + determinism tests**, then a **gated default flip** to
+   `tracker: 'mpc'` per course, only where its deterministic lap times
+   beat pure-pursuit's. Parking keeps pure-pursuit.
+
+### How to build it
+
+- New cost path in `scoreRollout` behind `costMode: 'progress' | 'track'`
+  (default `'track'` so parking is untouched); progress measured by
+  arc-length projection of each rollout state onto the plan polyline.
+- Substepping inside the rollout loop (`mpc-tracker.ts:371-375`): step the
+  model 3× at dt/3 per horizon step.
+- Keep λ, sampling stds, and the seeded LCG as-is (determinism preserved,
+  `createMPCTrackerState`, `mpc-tracker.ts:125-130`).
+- New `demos/test/mppi-race-completion.test.ts`; extend
+  `determinism.test.ts` with an MPC-mode case.
+
+### Acceptance checklist
+
+- [ ] **A3.1** Cost unit test: of two synthetic rollouts on a straight
+  plan, the one advancing farther scores strictly lower cost; a rollout
+  outside the corridor scores higher than one inside at equal progress.
+- [ ] **A3.2** Reference-extension unit test: plan shorter than horizon →
+  reference extends beyond the last sample along its tangent; no terminal
+  speed drop for drive-through plans.
+- [ ] **A3.3** (D4) `mppi-race-completion.test.ts`: 2 laps on open AND
+  technical AND circuit, both cars, `tracker: 'mpc'`, `retry: 0`,
+  0 off-track, 0 DNF.
+- [ ] **A3.4** (P5) Per-tick MPPI compute < 1 ms measured in the benchmark
+  (log + assert); commands are native `steer/driveForce/brakeForce`
+  reaching `setWheelBrake`/engine-force paths unchanged.
+- [ ] **A3.5** (D2) v2 g-g mean utilization ≥ 0.60, peak ≥ 0.95 on a clean
+  2-lap technical run under MPPI.
+- [ ] **A3.6** MPC determinism: two runs bit-identical (ε = 1e-9,
+  matching `determinism.test.ts:35`).
+- [ ] **A3.7** Default flip evidence: recorded lap-time table
+  pure-pursuit vs MPPI per course; `tracker: 'mpc'` becomes default only
+  for courses where MPPI wins; tuning identical for both cars.
+- [ ] **A3.8** Headline ratchet: `v2.avg < kin.avg` on the technical
+  course under MPPI (`V2_VS_KIN_TECH_RATIO` through 1.0).
 
 ---
 
-## 7. Sequencing (each step independently verifiable, benchmark after each)
+## 6. WS-4 — A course that requires an advanced driving AI
 
-1. **WS-0** plant envelope (unblocks honest limits everywhere; small,
-   self-contained).
-2. **WS-1** speed-policy surgery (both cars get fast; D1 lands; fidelity
-   starts being priced).
+### Problem (P2)
+
+The technical variant only guards overshoot zones (9 walls,
+`race-primitives-scenarios.ts:199-219`); conservative preview braking
+keeps the delusional car clean too, so walls rarely bind (ratio 1.12).
+The 105 m straight already supports vMax (~51 m to reach 30 m/s) — the
+executor was the cap (WS-1), so post-WS-1 the course must be what
+separates the models.
+
+### What to build
+
+`buildRaceCourse('circuit')` — same dual-layer pattern as `technical`
+(planner-inflated 2D obstacles + Rapier box colliders + rendered walls,
+`RACE_WALL_INFLATE`, `race-primitives-scenarios.ts:101`), with features
+that each target a specific model-knowledge gap:
+
+1. **Heavy braking zone**: hairpin (R ≈ 6–8 m) at the end of the long
+   straight, outside wall at corner exit. Entry ~30 m/s; the braking point
+   is decided by brake-model knowledge (v2's grip-saturating brake vs
+   kinematic's instant-speed delusion). Late braking = wall.
+2. **High-speed sweeper**: constant R ≈ 35 m, walled outside. Takeable at
+   `√(aLat·R)` ≈ 20 m/s at the measured boundary; the kinematic worldview
+   says any speed — 22.8 m of open-loop error at 28 m/s becomes a strike.
+3. **Decreasing-radius corner** (R 20 → 10 m): requires slowing before the
+   tightening is visible to a chord-based tracker; only model-level
+   knowledge (plan speeds or MPPI rollouts) gets it right.
+4. **Chicane at speed**: keep the existing x = 10/−12 staggered pinch.
+5. **Full corridor**: both sides walled everywhere — ~14 m wide on
+   straights, ~6 m in technical sections (footprint 4.8 × 2 m). No free
+   run-off; every line error costs.
+6. **Strict mode**: benchmark option where a wall strike voids the lap
+   (winner must have 0 strikes).
+
+### How to build it
+
+- Extend `RaceCourseVariant` union + `buildRaceCourse`
+  (`race-primitives-scenarios.ts:160-231`); wall list per feature above;
+  waypoints re-authored for the circuit (the open-course gates don't fit a
+  corridor circuit).
+- Expose: `/raceprimitives?course=circuit` (course selector already parses
+  `course=technical`); `pnpm run race -- --course=circuit`
+  (`demos/scripts/race.ts:56,92`).
+- New `demos/test/circuit-course.test.ts` mirroring
+  `technical-course.test.ts`: geometry, planner-solvability per feature
+  (each corner segment plannable by the v2 library at honest speeds —
+  hard, not impossible), wall/obstacle dual-layer consistency.
+- Benchmark: extend `technical-course-benchmark.test.ts` pattern into
+  `circuit-benchmark.test.ts` with strict mode on.
+
+### Acceptance checklist
+
+- [ ] **A4.1** `buildRaceCourse('circuit')` returns all six features;
+  dual-layer consistency test (every wall has matching inflated obstacle
+  polygon; inflation = `RACE_WALL_INFLATE`).
+- [ ] **A4.2** Solvability: every gate-to-gate segment plannable with the
+  v2 library under the expansion cap (deterministic test) — the course is
+  hard, not impossible.
+- [ ] **A4.3** Demo: `/raceprimitives?course=circuit` renders walls, both
+  cars drive, HUD updates, no console errors (manual GUI QA; screenshot
+  artifact).
+- [ ] **A4.4** CLI: `pnpm run race -- --course=circuit --seed=42 --laps=3`
+  completes and prints the standard table incl. wall strikes and
+  driving-quality columns.
+- [ ] **A4.5** (D5, P2) `circuit-benchmark.test.ts`, deterministic,
+  `retry: 0`, strict mode: v2 completes clean (0 strikes); AND
+  (`v2.avg < kin.avg` OR kinematic strikes > 0) — the course separates
+  the models. Target ratchet: `v2.avg < kin.avg` outright.
+- [ ] **A4.6** The kinematic car's failure mode is *visible*: benchmark
+  records per-car wall strikes and off-track; PR includes the table.
+- [ ] **A4.7** Video walkthrough artifact of the circuit (both cars,
+  split viewport) as the PR hero.
+- [ ] **A4.8** Open + technical course benchmarks unchanged/green.
+
+---
+
+## 7. WS-5 — Ratchets, honesty rails, and final verification
+
+### What to build
+
+The measurement layer that locks every claim in place.
+
+### Acceptance checklist
+
+- [ ] **A5.1** All new assertions live in deterministic, expansion-capped,
+  `retry: 0` benchmarks; no lap-time claim exists without one.
+- [ ] **A5.2** Ratchet ledger in the PR: every ratchet constant
+  (`V2_VS_KIN_AVG_RATIO`, `V2_VS_KIN_TECH_RATIO`, circuit ratio, lap-time
+  bounds, mean-speed floors, g-g floors, fidelity budgets) with
+  before → after values; each only ever tightened.
+- [ ] **A5.3** Honesty rail asserted in code review: identical controller
+  + tuning for both cars in every benchmark; the only per-car difference
+  is the forward model (planner primitives, root rollouts, MPPI rollouts,
+  commit-window projection, FF controls).
+- [ ] **A5.4** `pnpm verify` green (typecheck + full test suite + build +
+  size); parking/carchase/ramp invariant suites untouched.
+- [ ] **A5.5** Per-workstream benchmark runs recorded:
+  `pnpm run race -- --seed=42 --laps=3` on open + technical + circuit
+  after each workstream lands; tables in each PR.
+
+---
+
+## 8. Sequencing
+
+1. **WS-0** plant envelope (small, self-contained; parameterizes
+   everything after it).
+2. **WS-1** speed-policy surgery (both cars get fast; D1; fidelity starts
+   being priced).
 3. **WS-1½** control feedforward (plan controls reach the actuators;
-   speed profile demoted to a clamp; sets up the MPPI warm-start prior).
-4. **WS-2** dynamic rollouts (root rollouts → successor dyn-state →
-   commit-window projection; D3 lands; v2's statefulness finally counts).
+   speed profile demoted to clamp; MPPI warm-start prior ready).
+4. **WS-2** dynamic rollouts (root rollouts → seams → commit-window
+   projection; D3; v2's statefulness finally counts).
 5. **WS-3** MPPI cost redesign + substepping + gated default flip (D2/D4).
 6. **WS-4** circuit course (D5's arena; walls bind now that speeds are
    real).
 7. **WS-5** ratchet tightening through 1.0 + final artifacts.
 
-Rationale for the order: speed first (fidelity is priced at zero at
-9 m/s), then model-in-the-loop planning/execution (converts the priced
-fidelity into commands), then the course (measures it), then the ratchet
-(locks it). WS-0 precedes everything because WS-1's bang-bang and WS-4's
-braking-zone geometry are both parameterized by the measured envelope.
+Rationale: speed first (fidelity is priced at zero at 9 m/s), then
+model-in-the-loop planning/execution (converts priced fidelity into
+commands), then the course (measures it), then the ratchet (locks it).
+WS-0 precedes everything because WS-1's bang-bang and WS-4's braking-zone
+geometry are both parameterized by the measured envelope.
 
-## 8. Risk register
+## 9. Risk register
 
 | Risk | Mitigation |
 |---|---|
 | Faster driving destabilizes pure-pursuit before MPPI is ready | WS-1 raises caps only through envelope-backed braking math; preview keeps binding on genuine corners; wall-strike/off-track ratchets guard every landing |
-| Root dynamic rollouts introduce planner nondeterminism or perf cost | rollouts are pure + seedless; ~114 model steps/replan measured budget; root-only scope until data says otherwise |
-| Commit-window projection re-creates the old divergence bug | projection now uses the model (the old failure was linear sampling, `race-scenario.ts:447-453`); adaptive lateral-drift replan trigger stays as the safety net |
-| MPPI progress-reward cost cuts corners through walls | corridor penalty is part of the same cost; circuit solvability test keeps a feasible corridor; wall strikes assert 0 for the winner |
-| Circuit too hard → both cars DNF, benchmark says nothing | course solvability test with the v2 library at honest speeds is a landing precondition; corridor widths start generous and tighten with measured clearance |
-| Kinematic car improves too (WS-1 helps both) | expected and desired — the claim is *relative*: v2 wins because its extra speed is placed where the plant can actually deliver it; if kinematic still wins on the circuit, the course (or the model) needs another iteration, and the benchmark will say which (wall strikes vs lap time) |
+| Root dynamic rollouts introduce planner nondeterminism or perf cost | rollouts are pure + seedless; ~114 model steps/replan measured budget (A2.5); root-only scope until data says otherwise |
+| Commit-window projection re-creates the old divergence bug | projection now uses the model (the old failure was linear sampling, `race-scenario.ts:447-453`); adaptive lateral-drift replan trigger stays as the safety net; A2.3 asserts no off-track increase |
+| FF replay drifts (controls exact only from their baked start state) | FF is paired with bounded FB correction (A1½.2 asserts FB stays small AND zero-mean — drift would show as bias); replan-from-live-state every 300 ms bounds accumulation |
+| MPPI progress-reward cost cuts corners through walls | corridor penalty in the same cost; circuit solvability test keeps a feasible corridor; A4.5 asserts 0 strikes for the winner |
+| Circuit too hard → both cars DNF, benchmark says nothing | A4.2 solvability precondition; corridor widths start generous and tighten with measured clearance |
+| Kinematic car improves too (WS-1 helps both) | expected and desired — the claim is relative: v2 wins because its extra speed is placed where the plant can deliver it; if kinematic still wins on the circuit, the benchmark's strike/lap split (A4.6) says whether the course or the model needs iteration |
 
-## 9. Non-goals
+## 10. Non-goals
 
 - No model retraining or architecture changes in this phase (body-frame
   residuals, dynamic-bicycle backbone, residual-dt alignment remain queued
   behind it — current fidelity is sufficient for the pipeline to reward).
 - No new dependencies (no JAX; everything stays in-repo and deterministic).
-- No changes to parking/carchase behavior (tuning stays per-scenario).
+- No changes to parking/carchase behavior (tuning stays per-scenario;
+  every executor change is gated on drive-through plans or race tuning).
