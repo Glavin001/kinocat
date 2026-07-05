@@ -33,7 +33,15 @@ import {
   type CarChaseCourse,
   type CopTacticalMode,
 } from '../lib/carchase-scenarios';
-import type { Region } from 'kinocat/scenario';
+import {
+  compile,
+  evaluateProgress,
+  reach,
+  type Region,
+  type CompiledAutomaton,
+  type ProgressSnapshot,
+} from 'kinocat/scenario';
+import { GoalProgressPanel } from '../components/GoalProgressPanel';
 import { CarChasePlannerHost } from './plannerWorkerHost';
 import {
   CARCHASE_BRAKE_FORCE_N,
@@ -216,6 +224,14 @@ export default function CarChase() {
   const [robberStatus, setRobberStatus] = useState('');
   const [score, setScore] = useState<Score>({ busts: 0, round: 1 });
   const [banner, setBanner] = useState<Banner | null>(null);
+  // Live goal-visualizer state for the camera-followed robber: its compiled
+  // scenario-goal automaton + deterministic progress along the committed plan
+  // (the same `GoalProgressPanel` the Goal Lab uses).
+  const [goalViz, setGoalViz] = useState<{
+    automaton: CompiledAutomaton;
+    snapshot: ProgressSnapshot;
+    label: string;
+  } | null>(null);
 
   const pausedRef = useRef(paused);
   const chaseRef = useRef(chase);
@@ -1096,6 +1112,25 @@ export default function CarChase() {
       // HUD throttle (~10 Hz to avoid React thrash).
       if (now - lastHudWall > 100) {
         lastHudWall = now;
+
+        // Goal visualizer: compile the camera-followed robber's scenario goal
+        // and evaluate deterministic progress along its committed plan prefix —
+        // the planner's objective state, made visible (same evaluator + panel
+        // as the Goal Lab). Only meaningful while the AI drives the robber.
+        if (!playerDrivingRef.current && robber.goalRegion && robber.plan && robber.plan.length > 1) {
+          const automaton = compile(reach(robber.goalRegion));
+          const elapsed = (now - robber.planStartWall) / 1000;
+          const prefix = robber.plan.filter((s) => s.t <= elapsed);
+          const traj = prefix.length > 0 ? prefix : [robber.plan[0]!];
+          setGoalViz({
+            automaton,
+            snapshot: evaluateProgress(automaton, traj),
+            label: 'robber · reach(near escape)',
+          });
+        } else {
+          setGoalViz(null);
+        }
+
         const v = Math.abs(robberStateAfter.speed).toFixed(1);
         const hdg = ((robberStateAfter.heading * 180) / Math.PI).toFixed(0);
         setHud(
@@ -1194,6 +1229,22 @@ export default function CarChase() {
         <div style={{ opacity: 0.7, marginTop: 6 }}>
           busts: {score.busts} · round: {score.round}
         </div>
+        {showGoals && goalViz && (
+          <div
+            style={{
+              marginTop: 8,
+              paddingTop: 8,
+              borderTop: '1px solid #1f2735',
+            }}
+          >
+            <GoalProgressPanel
+              automaton={goalViz.automaton}
+              snapshot={goalViz.snapshot}
+              description={goalViz.label}
+              maxRows={4}
+            />
+          </div>
+        )}
         <div
           style={{
             display: 'flex',
