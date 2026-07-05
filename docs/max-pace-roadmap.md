@@ -94,6 +94,48 @@ gives ~0.09 s in-plan switch granularity at zero extra model-rollout cost.
 
 ---
 
+## 0d. Expected end state (behavior contract)
+
+What the stack looks like when every checklist item is green — the
+before/after this plan is accountable to:
+
+**Observable behavior.** Launch at the traction limit; straights floored
+(≥ 95% drive command) to 28–30 m/s; braking held to the model-computed
+braking point, executed at the measured grip ceiling; trail-brake entries
+at model-certified speeds; coast-band glides instead of brake dither; wide
+entries and late apexes emerging from time-optimal planning at speed (the
+V-shapes price themselves out — no hand-authored racing line). The two
+cars finally *behave differently*: under per-car-model MPPI, the v2 car
+rides the true limit while the kinematic car's delusion — free at 9 m/s —
+costs wall strikes and recovery time at 28 m/s on the circuit.
+
+**Current → committed floor → predicted:**
+
+| Signal | Today | Committed | Predicted |
+|---|---|---|---|
+| Mean speed (open) | 8.8–9.3 m/s | ≥ 12.5 (A1.4) | 15–18 m/s |
+| Peak on straight | ~27 m/s brief | ≥ 28, floored (A1.3) | 29–30 sustained |
+| g-g mean util (v2) | 0.44 | ≥ 0.60 (A3.5) | 0.65–0.75 |
+| Technical/circuit ratio | 1.12 | < 1.0 (A3.8/A4.5) | 0.85–0.95 + kin strikes |
+| v2 pred err | 0.92 m | not regressed (A1½.6) | drops |
+
+**Unlocked.** (1) The payoff mechanism: prediction accuracy feeds every
+command (MPPI rollouts, plan-speed caps, FF controls, dynamic root
+expansions) — "better model → better lap" becomes a CI-enforced fact.
+(2) Five self-inflicted wounds closed: phantom horizon braking, phantom
+corner braking, produce-but-don't-consume plans, speed-profile overwrite,
+zero-slip seams. (3) A standard hierarchical architecture (lattice =
+topology, MPPI = timing, FF = control knowledge) future work inherits.
+(4) A pinned plant envelope replacing folklore constants. (5) A course
+where delusion has a permanent price.
+
+**Falsifiability.** The predicted column is hypothesis until the
+deterministic benchmarks confirm it; if the kinematic car still wins on
+the circuit after WS-0…WS-4, the strike/lap-time split (A4.6) identifies
+whether the course or the model iterates next.
+
+---
+
 ## 1. WS-0 — Measure the plant envelope
 
 ### Problem
