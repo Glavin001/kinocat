@@ -75,6 +75,33 @@ export function createCarChaseWorld(course: CarChaseCourse): CarChaseWorld {
     createGroundCollider(world, { bounds: CARCHASE_BOUNDS, pad: 20, friction: 1.5 }).handle,
   );
 
+  // Perimeter walls flush with CARCHASE_BOUNDS. The ground slab extends 20 m
+  // past the bounds (pad) with nothing to stop a car, so a vehicle that drifts
+  // to the edge under execution used to roll straight off and fall (triggering
+  // an auto-reset teleport). These invisible walls sit just OUTSIDE the bounds
+  // — the planner already keeps every plan's footprint inside the bounds with
+  // clearance, so valid plans never touch them; they only catch overshoot.
+  {
+    const b = CARCHASE_BOUNDS;
+    const t = 1; // wall half-thickness
+    const h = 3; // wall half-height
+    const midX = (b.x0 + b.x1) / 2;
+    const midZ = (b.z0 + b.z1) / 2;
+    const halfX = (b.x1 - b.x0) / 2;
+    const halfZ = (b.z1 - b.z0) / 2;
+    const walls: Array<{ x: number; z: number; hx: number; hz: number }> = [
+      { x: b.x0 - t, z: midZ, hx: t, hz: halfZ + 2 * t }, // west
+      { x: b.x1 + t, z: midZ, hx: t, hz: halfZ + 2 * t }, // east
+      { x: midX, z: b.z0 - t, hx: halfX + 2 * t, hz: t }, // south
+      { x: midX, z: b.z1 + t, hx: halfX + 2 * t, hz: t }, // north
+    ];
+    for (const w of walls) {
+      staticHandles.push(
+        createBoxCollider(world, { x: w.x, y: h, z: w.z, hx: w.hx, hy: h, hz: w.hz }).handle,
+      );
+    }
+  }
+
   for (const r of course.ramps) {
     // Pad the heightfield ~6 m past the ramp footprint so the lateral
     // skirt / back-slope are fully captured. The pad keeps the
