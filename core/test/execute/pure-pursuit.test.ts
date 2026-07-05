@@ -159,15 +159,24 @@ describe('purePursuit', () => {
       expect(Math.abs(cmd.steering)).toBeLessThanOrEqual(kMax + 1e-9);
     });
 
-    it('does not apply in reverse gear (term is forward-only)', () => {
+    it('applies in reverse gear with the same formula (travel-frame law)', () => {
+      // The pursuit runs in the travel frame (body frame flipped by pi when
+      // reversing), where d(heading)/dt = |v| * kappa holds for both gears and
+      // the pose-heading error equals the travel-frame error. So the heading
+      // term is gain * wrapAngle(tangent - heading) in reverse too. (It used
+      // to be gated forward-only on the assumption that reverse maneuvers
+      // arrive pre-aligned — false once the direction-change penalty fix made
+      // plans legitimately terminate on a reverse leg.)
       const revPath: PlanPath = [
         { x: 0, z: 0, heading: 0, speed: -1, t: 0 },
         { x: -1, z: 0, heading: 0, speed: -1, t: 1 },
         { x: -2, z: 0, heading: 0, speed: -1, t: 2 },
       ];
-      const base = purePursuit(offHeading, revPath, cfg).steering;
-      const withTerm = purePursuit(offHeading, revPath, { ...cfg, headingGain: 1.0 }).steering;
-      expect(withTerm).toBeCloseTo(base, 9);
+      const noClamp: PurePursuitConfig = { ...cfg, minTurnRadius: undefined };
+      const base = purePursuit(offHeading, revPath, noClamp).steering;
+      const withTerm = purePursuit(offHeading, revPath, { ...noClamp, headingGain: 1.0 }).steering;
+      // offHeading has heading +0.3 vs path tangent 0 -> term adds 1.0 * (0 - 0.3).
+      expect(withTerm - base).toBeCloseTo(-0.3, 6);
     });
   });
 });

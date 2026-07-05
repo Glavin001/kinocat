@@ -291,8 +291,17 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     const st = node.state;
     const c = Math.cos(st.heading);
     const s = Math.sin(st.heading);
+    // Gear of the edge that PRODUCED this node; `undefined` = no history (a
+    // true root), which charges no direction-change penalty on the first move.
+    // NOTE the null-guard: `node.edge && ...` evaluates to `null` for roots,
+    // and `null !== undefined` made EVERY successor of an edge-less node pay
+    // the flip penalty — in scenario/multi-goal bridge mode (which used to
+    // rebuild inner nodes without their edge) that taxed every single edge,
+    // making actual gear flips relatively FREE and shuffle plans cheap.
     const parentReverse =
-      node.edge && (node.edge.data as DriveEdgeData | undefined)?.reverse === true;
+      node.edge != null
+        ? (node.edge.data as DriveEdgeData | undefined)?.reverse === true
+        : undefined;
     const out: Node<CarKinematicState>[] = [];
 
     for (const prim of this.lib.lookup(st.speed)) {

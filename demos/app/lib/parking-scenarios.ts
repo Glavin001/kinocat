@@ -140,7 +140,13 @@ function pose(x: number, z: number, heading: number): CarKinematicState {
 // sub-meter-clearance stall.
 
 export const PARKING_AGENT: VehicleAgent = defaultVehicleAgent({
-  minTurnRadius: 3.5,
+  // MUST be >= what the chassis can physically TRACK. The parking chassis
+  // steers to 0.75 rad with true Ackermann per-wheel angles (see the rapier
+  // adapter) -> kinematic R = 3.2/tan(0.75) ~ 3.44 m; planning at 4.0 leaves
+  // the tracker ~15% curvature authority to converge onto max-radius arcs.
+  // (Without Ackermann, parallel-steered fronts scrub past ~0.6 rad and the
+  // chassis plows wide -- do not raise the envelope without it.)
+  minTurnRadius: 4.0,
   // Cap at 2 m/s. Pure-pursuit drift on a Rapier raycast vehicle scales
   // roughly with speed; at 3-4 m/s the chassis cuts the inside of a
   // tight Reeds-Shepp arc by 20-30 cm and clips a parked car, even
@@ -166,6 +172,24 @@ export const PARKING_AGENT: VehicleAgent = defaultVehicleAgent({
   reverseCostMultiplier: 1.05,
   directionChangePenalty: 0.15,
 });
+
+/** Planning-time clearance margin (m) reserved for closed-loop tracking
+ *  error. The PLANNER collision-checks an inflated footprint so every plan
+ *  keeps at least this much air between the real chassis and the obstacles;
+ *  the monitor / `evaluateParked` keep judging the TRUE footprint. Without
+ *  it, a collision-free plan can pass within ~0 cm of a block corner and the
+ *  ~5-10 cm the tracker actually drifts mid-swing becomes a touch. */
+export const PARKING_PLAN_MARGIN = 0.25;
+
+function inflateFootprint(
+  fp: ReadonlyArray<readonly [number, number]>,
+  m: number,
+): Array<[number, number]> {
+  return fp.map(([x, z]) => [
+    x + Math.sign(x) * m,
+    z + Math.sign(z) * m,
+  ]) as Array<[number, number]>;
+}
 
 export function buildParkingPrimitives(
   agent: VehicleAgent = PARKING_AGENT,
@@ -700,8 +724,32 @@ export const PARKING_RACE_TUNING: Partial<RaceTuning> = {
   terminalHeadingRadius: 2.0,
   plannerPosCell: 0.3,
   plannerHeadingBuckets: 36,
-  plannerGoalRadius: 0.35,
-  plannerGoalHeadingTol: 0.2,
+  plannerGoalRadius: 0.2,
+  // Terminal heading tolerance MUST be tighter than the success predicate's
+  // headingTol (0.14): the planner stops improving at its own tolerance edge,
+  // so a 0.2 bound let plans terminate ~11.5° off and fail the 8° success bar.
+  // (Surfaced when the direction-change penalty was fixed: a correctly-priced
+  // final straightening shunt is only planned if the goal test demands it.)
+  plannerGoalHeadingTol: 0.06,
+  // Parking-scale tracking. The race lookahead floor (3 m) exceeds most
+  // parking segments (0.5-3 m), collapsing pure-pursuit to "aim at the
+  // endpoint" — it could never remove lateral error (the frozen ~0.3 m
+  // offset). Speed-scaled lookahead 0.8-3 m tracks the planner's actual
+  // curve geometry. `minApproachSpeed` replaces the historic lookaheadMin
+  // unit-bug floor so the brake-to-goal ramp engages below cruise: the
+  // terminal approach decelerates smoothly instead of braking open-loop from
+  // 2 m/s at the 0.08 m tolerance ring (the 0.1-0.5 m skid scatter).
+  lookaheadMin: 0.5,
+  lookaheadGain: 0.35,
+  lookaheadMax: 2.5,
+  minApproachSpeed: 0.35,
+  // Match the plant/library reverse envelope (maxReverseSpeed 1.5): without
+  // this cap pure-pursuit reversed at forward cruise (~1.9 m/s), over-sped
+  // the planned reverse arcs, saturated curvature authority and drifted
+  // ~0.45 m wide into the neighboring stall block.
+  reverseCruiseSpeed: 1.2,
+  trackerMinTurnRadius: 3.44,
+  maxSteerAngle: 0.75,
   plannerBudgetMs: 500,
   plannerMaxExpansions: 80_000,
   mpcWTerminalPosition: 50,
@@ -741,14 +789,16 @@ export function parkingPlannerGoal(s: ParkingScenario): {
     [s.bounds.x0, s.bounds.z1],
   ];
   return {
-    // Disk (radius 0.35) + heading (0.2) matches the legacy planner's goal test
-    // (goalRadius / goalHeadingTol), plus a terminal STOP so the reached node is
-    // at rest and the lifted plan ends at speed 0 (the tracker brakes to a halt
-    // in the stall — reverse-perp needs this to settle). No `prefer` cost terms:
-    // VehicleEnvironment's edge cost is already time-based, so the bridge's
-    // search stays equivalent to legacy planRace.
+    // Disk (radius 0.35) + heading matches the legacy planner's goal test
+    // (goalRadius / plannerGoalHeadingTol), plus a terminal STOP so the reached
+    // node is at rest and the lifted plan ends at speed 0 (the tracker brakes
+    // to a halt in the stall — reverse-perp needs this to settle). The heading
+    // band must stay TIGHTER than the success predicate's 0.14: the planner
+    // stops improving at its own tolerance edge, and the tracker adds ~2-3° on
+    // top. No `prefer` cost terms: VehicleEnvironment's edge cost is already
+    // time-based, so the bridge's search stays equivalent to legacy planRace.
     goal: reach(
-      at({ x: s.goal.x, z: s.goal.z, heading: s.goal.heading }, { radius: 0.35, dheading: 0.2 }),
+      at({ x: s.goal.x, z: s.goal.z, heading: s.goal.heading }, { radius: 0.2, dheading: 0.1 }),
       stopped(),
     ),
     invariants: [stayInside(lot)],
@@ -805,9 +855,13 @@ export function parkingScenarioOptions(
   // `minTurnRadius`/`maxSpeed`, not on the cost weights, so it stays valid).
   agentOverride?: Partial<VehicleAgent>,
 ): RaceScenarioOptions {
+  const planningAgent: VehicleAgent = {
+    ...PARKING_AGENT,
+    footprint: inflateFootprint(PARKING_AGENT.footprint, PARKING_PLAN_MARGIN),
+  };
   const agent: VehicleAgent = agentOverride
-    ? { ...PARKING_AGENT, ...agentOverride }
-    : PARKING_AGENT;
+    ? { ...planningAgent, ...agentOverride }
+    : planningAgent;
   return {
     // Pin every parking entry to PARKING_AGENT so the planner's heuristic +
     // footprint + turn radius match the parking primitive library. Without

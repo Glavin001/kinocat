@@ -300,13 +300,40 @@ export function createRaycastVehicle(
   // Which wheel indices take engine torque, per drive-train choice.
   const driveIdx = D.driveTrain === 'fwd' ? [0, 1] : D.driveTrain === 'awd' ? [0, 1, 2, 3] : [2, 3];
 
+
+  // --- Ackermann front-wheel geometry -------------------------------------
+  // `steer` commands are BICYCLE-equivalent angles (virtual wheel at the
+  // front-axle centre). Steering both physical wheels to that same angle
+  // (parallel steering) makes the inner wheel understeer and the outer wheel
+  // oversteer its ideal track; the error grows quadratically with lock and
+  // by ~0.7 rad the front tires fight each other, the raycast friction model
+  // saturates, and the chassis PLOWS sideways off the kinematic arc (~0.3 m
+  // per parking swing). True Ackermann angles keep both contact patches on
+  // circles about the shared turn centre so full-lock parking maneuvers
+  // track the bicycle model at low speed.
+  // Geometry: axle spacing L = 2*wheelBase; half-track w = wheelTrack.
+  // Rapier steer > 0 turns +x toward -z, so the turn centre sits on the -z
+  // (front-RIGHT, wheel 0) side for s > 0.
+  function ackermannSteer(bicycle: number): [number, number] {
+    const s = clamp(bicycle, -D.maxSteerAngle, D.maxSteerAngle);
+    if (Math.abs(s) < 1e-4) return [s, s];
+    const L = 2 * D.wheelBase;
+    const w = D.wheelTrack;
+    const R = L / Math.tan(Math.abs(s));
+    const inner = Math.atan(L / Math.max(R - w, 0.15));
+    const outer = Math.atan(L / (R + w));
+    const sign = Math.sign(s);
+    // wheel 0 = front-right (-z) is inner for s > 0; wheel 1 for s < 0.
+    return s > 0 ? [sign * inner, sign * outer] : [sign * outer, sign * inner];
+  }
+
   function applyControls(c: { steer: number; throttle: number; brake: number }) {
-    const steer = clamp(c.steer, -D.maxSteerAngle, D.maxSteerAngle);
     const throttle = clamp(c.throttle, -1, 1);
     const brake = clamp(c.brake, 0, 1);
-    // Front-wheel steering (indices 0,1).
-    vehicle.setWheelSteering(0, steer);
-    vehicle.setWheelSteering(1, steer);
+    // Front-wheel steering (indices 0,1) with Ackermann geometry.
+    const [s0, s1] = ackermannSteer(c.steer);
+    vehicle.setWheelSteering(0, s0);
+    vehicle.setWheelSteering(1, s1);
     const engineForce = throttle * D.engineForce;
     for (let i = 0; i < 4; i++) {
       vehicle.setWheelEngineForce(i, driveIdx.includes(i) ? engineForce : 0);
@@ -320,11 +347,11 @@ export function createRaycastVehicle(
     // +curvature rotates +X toward +Z; Rapier yaw rotates +X toward -Z.
     // The `steer` field here is in the kinocat planning-frame sense;
     // negate at the Rapier boundary.
-    const steer = clamp(-c.steer, -D.maxSteerAngle, D.maxSteerAngle);
     const driveForce = clamp(c.driveForce, -D.engineForce, D.engineForce);
     const brakeForce = clamp(c.brakeForce, 0, D.brakeForce);
-    vehicle.setWheelSteering(0, steer);
-    vehicle.setWheelSteering(1, steer);
+    const [s0, s1] = ackermannSteer(-c.steer);
+    vehicle.setWheelSteering(0, s0);
+    vehicle.setWheelSteering(1, s1);
     for (let i = 0; i < 4; i++) {
       vehicle.setWheelEngineForce(i, driveIdx.includes(i) ? driveForce : 0);
     }

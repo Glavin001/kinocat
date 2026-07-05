@@ -191,7 +191,10 @@ export class ScenarioEnvironment<S extends ScenarioState>
     if (!st || st.transitions.length === 0) return [];
 
     const rep = this.repByState[q]![0] ?? null;
-    const innerNode = this.base.createNode(node.state.inner, null, null);
+    // Preserve the edge that produced this node: the base env reads gear
+    // history from it (direction-change penalty). Rebuilding with a null edge
+    // made every node look like a root and mispriced every gear decision.
+    const innerNode = this.base.createNode(node.state.inner, null, node.edge);
     innerNode.g = node.g;
     const innerGoal = this.base.createNode(
       rep ? this.asInner(node.state.inner, rep) : node.state.inner,

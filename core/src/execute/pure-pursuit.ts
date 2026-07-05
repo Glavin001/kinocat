@@ -67,8 +67,12 @@ export function purePursuit(
   // > 0) are exempt so racing is unaffected.
   const reachedEnd = stopsAtEnd && ni >= path.length - 1;
   const atGoal = distToGoal <= config.goalTolerance || reachedEnd;
-  // gear from the planned speed sign just ahead on the path
-  const aheadSpeed = path[Math.min(ni + 1, path.length - 1)]!.speed;
+  // Gear from the planned speed sign just ahead on the path. A stop terminal
+  // (speed ~ 0) carries no direction information — fall back to the nearest
+  // sample's own sign so a reverse approach doesn't flip to forward gear (and
+  // an inverted steering frame) for the final samples before the latch.
+  let aheadSpeed = path[Math.min(ni + 1, path.length - 1)]!.speed;
+  if (Math.abs(aheadSpeed) < 0.05) aheadSpeed = path[ni]!.speed;
   const gear = aheadSpeed < 0 ? -1 : 1;
 
   const Ld = clamp(
@@ -100,12 +104,16 @@ export function purePursuit(
   // actively rotate onto the planned heading, the component pure-pursuit
   // structurally lacks. Self-gating: on a straight run the tangent equals the
   // chassis heading so the term is ~0; it only acts where the plan's heading
-  // diverges from the chassis (the straighten). Forward gear only — the parking
-  // terminal approach is forward, reverse maneuvers already arrive aligned, and
-  // the curvature sign convention differs in reverse. Off (0) for racing.
+  // diverges from the chassis (the straighten). Works in BOTH gears: the
+  // pursuit runs in the travel frame (body frame flipped by pi in reverse),
+  // where d(heading)/dt = |v| * kappa holds regardless of gear — the same
+  // relationship the positional pursuit relies on — and the pose-heading
+  // error equals the travel-frame error (both shift by pi). A reverse-gear
+  // gate used to assume "reverse maneuvers arrive pre-aligned", which stopped
+  // being true once the direction-change penalty was fixed and plans began
+  // terminating on a reverse leg. Off (0) for racing.
   if (
     config.headingGain &&
-    gear > 0 &&
     path.length >= 2 &&
     distToGoal <= (config.headingRadius ?? Infinity)
   ) {
@@ -148,13 +156,15 @@ export function purePursuit(
     if (!Number.isFinite(vPath)) vPath = Infinity;
   }
 
+  const cruise =
+    gear < 0 ? (config.reverseCruiseSpeed ?? config.cruiseSpeed) : config.cruiseSpeed;
   const speedMag = atGoal
     ? 0
     : Math.min(
-        config.cruiseSpeed,
+        cruise,
         vCurve,
         vPath,
-        Math.max(vGoal, config.lookaheadMin),
+        Math.max(vGoal, config.minApproachSpeed ?? config.lookaheadMin),
       );
   const targetSpeed = gear * speedMag;
 
