@@ -62,6 +62,9 @@ import {
   type TransitionSample,
 } from '../lib/learn-primitives';
 import { ModelLab } from '../components/ModelLab';
+import { EvalHUD } from '../components/EvalHUD';
+import { createEvalProbe, type EvalSnapshot } from '../lib/eval-probe';
+import { limitsFromAgent } from 'kinocat/eval';
 import { useIsMobile } from '../lib/use-is-mobile';
 import {
   loadV2Model,
@@ -260,6 +263,10 @@ export default function RacePrimitives() {
     learned: RaceMetrics;
   }>({ kinematic: emptyMetrics(), learned: emptyMetrics() });
   const [learner, setLearner] = useState<LearnerSnapshot | null>(null);
+  const [evalSnap, setEvalSnap] = useState<{
+    kinematic: EvalSnapshot | null;
+    learned: EvalSnapshot | null;
+  }>({ kinematic: null, learned: null });
   const [winner, setWinner] = useState<'kinematic' | 'learned' | 'tie' | null>(null);
   // v2 model state (Phase-2 addition). When `useV2 && v2Model != null`, the
   // learned car's library is built from v2 instead of legacy.
@@ -364,6 +371,7 @@ export default function RacePrimitives() {
         const setup = await setupScene(mount, params, {
           onMetrics: (km, lm) => setMetrics({ kinematic: km, learned: lm }),
           onLearner: (snap) => setLearner(snap),
+          onEval: (k, l) => setEvalSnap({ kinematic: k, learned: l }),
           onFinish: (w) => {
             setWinner(w);
             setPhase('finished');
@@ -603,6 +611,14 @@ export default function RacePrimitives() {
         {(phase === 'racing' || phase === 'finished') && learner && (
           <LearnerPanel snap={learner} v2Active={v2Active} v2Meta={v2Meta} isMobile={isMobile} />
         )}
+        {(phase === 'racing' || phase === 'finished') && !isMobile && (
+          <EvalHUD
+            entries={[
+              { label: 'kinematic', color: C.kinematic, snap: evalSnap.kinematic },
+              { label: 'learned', color: C.learned, snap: evalSnap.learned },
+            ]}
+          />
+        )}
         {phase === 'learning' && (
           <PretrainOverlay progress={learnProgress} />
         )}
@@ -714,6 +730,7 @@ function PretrainOverlay({
 interface SceneCallbacks {
   onMetrics: (k: RaceMetrics, l: RaceMetrics) => void;
   onLearner: (state: LearnerSnapshot) => void;
+  onEval: (k: EvalSnapshot, l: EvalSnapshot) => void;
   onFinish: (w: 'kinematic' | 'learned' | 'tie') => void;
 }
 
@@ -974,6 +991,20 @@ async function setupScene(
   let running = false;
   let raceStartWall = 0;
 
+  // ---- Eval probes (read-only observability; never feed back into the sim) ----
+  // Score each car's plan-vs-execution with the SAME kinocat/eval functions the
+  // CLI harness + tests use. `frictionLimit` is the race tracker's lateral-accel
+  // budget so the friction-circle reading matches the controller's envelope.
+  const evalLimits = limitsFromAgent(RACE_AGENT, {
+    frictionLimit: TRACKER_MAX_LATERAL_ACCEL,
+    maxAccel: 6,
+    maxDecel: 8,
+  });
+  const makeProbe = () =>
+    createEvalProbe({ footprint: RACE_AGENT.footprint, dt: PHYSICS_DT, limits: evalLimits });
+  let kProbe = makeProbe();
+  let lProbe = makeProbe();
+
   function resetCar(car: CarRuntime) {
     // Race START is the only allowed teleport — both cars are placed on the
     // start line at rest, then physically driven by their planner from there.
@@ -1190,11 +1221,18 @@ async function setupScene(
       mirrorStatus(kinematic, r.cars[0]!, now);
       mirrorStatus(learned, r.cars[1]!, now);
       cb.onMetrics(kinematic.metrics, learned.metrics);
+      // Feed the eval probes every tick (read-only; cannot affect determinism).
+      // RaceCarStatus is structurally a MonitorSample with a richer plan. Pass
+      // the real frame dt — the scenario steps physics by this variable amount,
+      // so the probe's finite differences must use it, not a fixed 1/60.
+      kProbe.sample(r.cars[0]!, dt);
+      lProbe.sample(r.cars[1]!, dt);
       // Emit the comparison snapshot in BOTH modes (legacy + v2). The lap-
       // times / sector-deltas are universal; only the per-coef refit fields
       // are legacy-only and get safe defaults when v2 is driving.
       if (now - lastLearnerEmit > 250) {
         lastLearnerEmit = now;
+        cb.onEval(kProbe.snapshot(), lProbe.snapshot());
         const lz = learned.learner;
         cb.onLearner({
           params: lz?.params ?? DEFAULT_LEARNED_PARAMS,
@@ -1263,6 +1301,9 @@ async function setupScene(
     start() {
       resetCar(kinematic);
       resetCar(learned);
+      // Fresh probes per race so rolling RMSE / peaks don't carry over.
+      kProbe = makeProbe();
+      lProbe = makeProbe();
       // Reset learner state on a new race: clear samples but KEEP the most
       // recently fitted params so re-races can carry over what was learned.
       if (learned.learner) {
@@ -1282,6 +1323,8 @@ async function setupScene(
       running = false;
       resetCar(kinematic);
       resetCar(learned);
+      kProbe = makeProbe();
+      lProbe = makeProbe();
       // Full reset wipes the learner so the demo starts honestly identical.
       if (learned.learner) {
         learned.learner.samples = [];

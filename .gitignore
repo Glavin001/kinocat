@@ -9,3 +9,7 @@ node_modules/
 .env
 .env.*
 !.env.example
+
+# Machine-generated eval / bench history artifacts (regenerate with pnpm run eval:json / controller-bench:json)
+demos/docs/eval-results/
+demos/docs/controller-bench/
