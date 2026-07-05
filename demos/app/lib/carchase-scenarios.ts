@@ -386,64 +386,133 @@ export function carChaseAffordances(course: CarChaseCourse): AffordanceRegistry 
 // Tactical layer — ground-2D port of dogfight-scenarios.ts:405 / :432. The
 // planner gets a goal pose; this picks WHICH pose from observable geometry.
 
+// ---------------------------------------------------------------------------
+// Cop tactical roles. The squad is a *pursuit* team, so the roles are about
+// closing time-to-capture and cutting off escape rather than the old
+// "sit at an offset from the robber" modes (which had the fatal bug that a
+// cop already behind the robber was told to drive to a point *further*
+// behind it — i.e. away).
+//
+//   INTERCEPT      — drive to the point where this cop, at cruise speed,
+//                    will meet the robber travelling at its current
+//                    velocity (the classic lead-pursuit collision point).
+//                    Assigned to the single cop with the shortest
+//                    time-to-intercept — the one already best placed to
+//                    make the arrest.
+//   CONTAIN_LEFT   — a supporting cop pulls up ahead-and-to-one-side of the
+//   CONTAIN_RIGHT    robber's predicted position to hem it in / pinch it
+//                    against a sibling on the opposite flank.
+//   CUTOFF         — get well ahead along the robber's travel direction to
+//                    block the escape lane (used for a spare 3rd+ cop).
+//   PURSUE         — degenerate case: robber is (nearly) stationary, so
+//                    every cop just converges on its actual pose.
 export type CopTacticalMode =
-  | 'PURSUE'
   | 'INTERCEPT'
-  | 'FLANK_LEFT'
-  | 'FLANK_RIGHT'
+  | 'CONTAIN_LEFT'
+  | 'CONTAIN_RIGHT'
   | 'CUTOFF'
-  | 'REGROUP';
+  | 'PURSUE';
 
-function wrapPi(a: number): number {
-  let r = ((a + Math.PI) % (2 * Math.PI)) - Math.PI;
-  if (r < -Math.PI) r += 2 * Math.PI;
-  return r;
+// Below this robber speed the lead point of any interception collapses onto
+// the robber itself, so every cop just drives straight at it (PURSUE).
+const LEAD_MIN_SPEED = 2.0; // m/s
+
+/** Solve for the time at which a cop travelling at `copSpeed` intercepts a
+ *  target moving at constant velocity `(vx, vz)` from relative position
+ *  `(rx, rz)` = target − cop. Returns the smallest strictly-positive root of
+ *  the collision quadratic, or a straight-line fallback (`dist / copSpeed`)
+ *  when the target is uncatchable under the constant-velocity model (e.g.
+ *  moving directly away at ≥ cop speed). This is the standard
+ *  lead-pursuit / missile-intercept solve. */
+function interceptTime(
+  rx: number,
+  rz: number,
+  vx: number,
+  vz: number,
+  copSpeed: number,
+): number {
+  const a = vx * vx + vz * vz - copSpeed * copSpeed;
+  const b = 2 * (rx * vx + rz * vz);
+  const c = rx * rx + rz * rz;
+  const dist = Math.sqrt(c);
+  const fallback = copSpeed > 1e-6 ? dist / copSpeed : 6;
+  // Near-linear (robber at ~cop speed): a ≈ 0 → b t + c = 0.
+  if (Math.abs(a) < 1e-6) {
+    if (Math.abs(b) < 1e-9) return fallback;
+    const t = -c / b;
+    return t > 1e-3 ? t : fallback;
+  }
+  const disc = b * b - 4 * a * c;
+  if (disc < 0) return fallback;
+  const sq = Math.sqrt(disc);
+  const t1 = (-b - sq) / (2 * a);
+  const t2 = (-b + sq) / (2 * a);
+  // Smallest strictly-positive root.
+  const cands = [t1, t2].filter((t) => t > 1e-3).sort((p, q) => p - q);
+  return cands.length > 0 ? cands[0]! : fallback;
 }
 
-/** Cop tactic from robber-relative geometry. Spread by cop index so the
- *  squad fans out instead of stacking.
- *
- *  Two important "collapse to PURSUE" cases:
- *  - **Slow robber.** INTERCEPT/CUTOFF/FLANK lead the robber along its
- *    *current* heading. If the robber is stationary the lead point is just
- *    empty space ahead of it — the cop drives there and parks, never
- *    doubling back. Below `LEAD_MIN_SPEED` ignore tactics and head
- *    straight at the robber.
- *  - **Cop already close.** Once a cop is within `CLOSE_RANGE`, leading
- *    by 10–20 m past the robber actively makes things worse (the cop
- *    overshoots its target and drives away). Collapse to PURSUE so the
- *    closing cop commits to the arrest. */
-const LEAD_MIN_SPEED = 3.0; // m/s — robber slower than this → pursue
-const CLOSE_RANGE = 18; // m — cop closer than this → pursue regardless
+/** Signed lateral position of `cop` relative to the robber's travel
+ *  direction: negative = to the robber's left, positive = to its right.
+ *  Used to hand each supporting cop the flank it is already nearest to. */
+function copSide(robber: CarKinematicState, cop: CarKinematicState): number {
+  // Perpendicular (to the left) of the robber heading.
+  const px = -Math.sin(robber.heading);
+  const pz = Math.cos(robber.heading);
+  return (cop.x - robber.x) * px + (cop.z - robber.z) * pz;
+}
 
+/** Assign a coordinated role to every cop from the current squad geometry.
+ *  Unlike the old index-keyed scheme this looks at *all* the cops together
+ *  so the arrest job goes to whoever is genuinely best placed, and the
+ *  supporting cops split to opposite flanks instead of stacking. */
+export function assignCopModes(
+  robber: CarKinematicState,
+  cops: ReadonlyArray<CarKinematicState>,
+): CopTacticalMode[] {
+  const n = cops.length;
+  if (n === 0) return [];
+  // Slow robber: no meaningful lead — everyone converges on its pose.
+  if (Math.abs(robber.speed) < LEAD_MIN_SPEED) return cops.map(() => 'PURSUE');
+
+  const speed = CARCHASE_AGENT.maxSpeed;
+  const vx = Math.cos(robber.heading) * robber.speed;
+  const vz = Math.sin(robber.heading) * robber.speed;
+  const times = cops.map((c) =>
+    interceptTime(robber.x - c.x, robber.z - c.z, vx, vz, speed),
+  );
+  // Primary = shortest time-to-intercept.
+  let primary = 0;
+  for (let i = 1; i < n; i++) if (times[i]! < times[primary]!) primary = i;
+
+  const modes: CopTacticalMode[] = cops.map(() => 'CUTOFF');
+  modes[primary] = 'INTERCEPT';
+
+  // Supporting cops, ordered left→right by their current side, take the
+  // outermost flanks; any middle cop blocks the escape lane ahead.
+  const rest = cops
+    .map((c, i) => ({ i, side: copSide(robber, c) }))
+    .filter((r) => r.i !== primary)
+    .sort((a, b) => a.side - b.side);
+  if (rest.length === 1) {
+    modes[rest[0]!.i] = rest[0]!.side < 0 ? 'CONTAIN_LEFT' : 'CONTAIN_RIGHT';
+  } else if (rest.length >= 2) {
+    modes[rest[0]!.i] = 'CONTAIN_LEFT';
+    modes[rest[rest.length - 1]!.i] = 'CONTAIN_RIGHT';
+    for (let k = 1; k < rest.length - 1; k++) modes[rest[k]!.i] = 'CUTOFF';
+  }
+  return modes;
+}
+
+/** Back-compat single-cop wrapper: derive the whole squad's roles from the
+ *  shared geometry and return this cop's. Callers that have all cop states
+ *  should prefer `assignCopModes` and index into it once. */
 export function selectTacticalMode(
   robber: CarKinematicState,
-  cop: CarKinematicState,
+  cops: ReadonlyArray<CarKinematicState>,
   copIndex: number,
 ): CopTacticalMode {
-  const dx = robber.x - cop.x;
-  const dz = robber.z - cop.z;
-  const dist = Math.hypot(dx, dz);
-  // Bearing from cop to robber (signed off cop's nose).
-  const bearing = wrapPi(Math.atan2(dz, dx) - cop.heading);
-  // Stationary / slow robber → tactics with a lead distance just park the
-  // cop in empty space ahead of where the robber WAS heading. Pursue
-  // directly so the cop always converges on the robber's actual pose.
-  if (Math.abs(robber.speed) < LEAD_MIN_SPEED) return 'PURSUE';
-  // Already close — commit to the arrest, don't try to lead past it.
-  if (dist < CLOSE_RANGE) return 'PURSUE';
-  // Far away — regroup at a wider arc.
-  if (dist > 80) return 'REGROUP';
-  // Robber inside cop's forward cone at close range → just chase.
-  if (dist < 30 && Math.abs(bearing) < Math.PI / 6) return 'PURSUE';
-  // Mid distance — pick INTERCEPT for cop 0, CUTOFF (ahead-of) for cop 1,
-  // flanks for the rest. Gives every cop a distinct goal so the registry's
-  // moving-obstacle test doesn't force them onto one route.
-  if (dist > 45) {
-    if (copIndex === 0) return 'INTERCEPT';
-    if (copIndex === 1) return 'CUTOFF';
-  }
-  return copIndex % 2 === 0 ? 'FLANK_LEFT' : 'FLANK_RIGHT';
+  return assignCopModes(robber, cops)[copIndex] ?? 'PURSUE';
 }
 
 /** Translate a cop tactic into a goal `CarKinematicState`. The planner uses a
@@ -487,83 +556,63 @@ export function tacticalGoal(
   course?: CarChaseCourse,
 ): CarKinematicState {
   const ahead = (t: number) => robberPredict(t) ?? robber;
-  const dist = Math.hypot(robber.x - cop.x, robber.z - cop.z);
-  const eta = Math.min(6, Math.max(0.8, dist / CARCHASE_AGENT.maxSpeed));
-  const future = ahead(cop.t + eta);
   const speed = CARCHASE_AGENT.maxSpeed;
   const base = { speed, t: 0 };
 
-  // Lead distance scales with how fast the robber is actually moving.
-  // At cruise (≥8 m/s) we use the full nominal lead; below that we
-  // smoothly collapse toward 0 so a coasting robber doesn't leave the
-  // cop chasing empty pavement. (`selectTacticalMode` already promotes
-  // very-slow robbers to PURSUE; this handles the in-between band.)
-  const leadFrac = Math.min(1, Math.abs(robber.speed) / 8);
+  // Time-to-intercept under the constant-velocity model — this is how far
+  // ahead in time we lead the robber. Sampling the robber's *published plan*
+  // at that time (via `robberPredict`) then gives the actual point where the
+  // cop should aim, following curves the plain CV point would miss.
+  const vx = Math.cos(robber.heading) * robber.speed;
+  const vz = Math.sin(robber.heading) * robber.speed;
+  const tti = interceptTime(robber.x - cop.x, robber.z - cop.z, vx, vz, speed);
+  const eta = Math.min(6, Math.max(0.3, tti));
+  const future = ahead(cop.t + eta);
+
+  // Forward / left unit vectors along the robber's travel direction.
+  const fc = Math.cos(future.heading);
+  const fs = Math.sin(future.heading);
+  const lc = -fs; // left = heading + 90°
+  const ls = fc;
 
   let goal: CarKinematicState;
   switch (mode) {
     case 'PURSUE': {
-      const c = Math.cos(future.heading);
-      const s = Math.sin(future.heading);
-      goal = {
-        ...base,
-        x: future.x - 8 * c * leadFrac,
-        z: future.z - 8 * s * leadFrac,
-        heading: future.heading,
-      };
+      // Robber ~stationary: drive straight at its actual pose.
+      goal = { ...base, x: robber.x, z: robber.z, heading: robber.heading };
       break;
     }
     case 'INTERCEPT': {
-      const c = Math.cos(future.heading);
-      const s = Math.sin(future.heading);
-      const lead = 10 * leadFrac;
+      // The collision point — where the cop meets the robber. Aim dead-on;
+      // the robber is only a hair of an obstacle to the cop so the planner
+      // drives all the way in for the arrest.
+      goal = { ...base, x: future.x, z: future.z, heading: future.heading };
+      break;
+    }
+    case 'CONTAIN_LEFT':
+    case 'CONTAIN_RIGHT': {
+      // Pull up ahead-and-to-one-side of the robber's predicted position to
+      // pinch it against the opposite flank. A little ahead (so the cop is
+      // cutting in front, not trailing) plus a lateral offset.
+      const sign = mode === 'CONTAIN_LEFT' ? -1 : 1;
+      const lateral = 9;
+      const ahead2 = 6;
       goal = {
         ...base,
-        x: future.x + lead * c,
-        z: future.z + lead * s,
-        heading: future.heading + Math.PI,
+        x: future.x + ahead2 * fc + sign * lateral * lc,
+        z: future.z + ahead2 * fs + sign * lateral * ls,
+        heading: future.heading,
       };
       break;
     }
     case 'CUTOFF': {
-      const c = Math.cos(future.heading);
-      const s = Math.sin(future.heading);
-      const lead = 20 * leadFrac;
+      // Get well ahead along the robber's travel direction to block the lane.
+      const lead = 18;
       goal = {
         ...base,
-        x: future.x + lead * c,
-        z: future.z + lead * s,
+        x: future.x + lead * fc,
+        z: future.z + lead * fs,
         heading: future.heading,
-      };
-      break;
-    }
-    case 'FLANK_LEFT':
-    case 'FLANK_RIGHT': {
-      const sign = mode === 'FLANK_LEFT' ? -1 : 1;
-      const phi = future.heading + (sign * Math.PI) / 2;
-      const c = Math.cos(phi);
-      const s = Math.sin(phi);
-      // Flanks still keep a lateral offset (otherwise all cops stack on
-      // the robber), but shrink with robber speed too.
-      const lateral = 14 * Math.max(0.35, leadFrac);
-      goal = {
-        ...base,
-        x: future.x + lateral * c,
-        z: future.z + lateral * s,
-        heading: future.heading,
-      };
-      break;
-    }
-    case 'REGROUP': {
-      // Approach from a wide arc behind the robber. Distance is small enough
-      // to stay inside the course bounds even when the robber is near a wall.
-      const c = Math.cos(robber.heading);
-      const s = Math.sin(robber.heading);
-      goal = {
-        ...base,
-        x: robber.x - 25 * c,
-        z: robber.z - 25 * s,
-        heading: robber.heading,
       };
       break;
     }
@@ -573,32 +622,99 @@ export function tacticalGoal(
 }
 
 // ---------------------------------------------------------------------------
-// Robber AI — picks the next waypoint on the course loop. Adds a small bias
-// AWAY from the nearest cop's predicted position so it isn't a fixed track.
+// Robber AI — an actual *evader*. Instead of chasing a fixed waypoint loop
+// (the old behaviour, which happily drove past cops), the robber scores a fan
+// of candidate escape headings and picks the one that best trades off three
+// things a fleeing driver actually cares about:
+//
+//   1. OPENNESS   — how far it can run down that heading before a wall / the
+//                   map edge stops it. This is what keeps it from fleeing
+//                   into a dead-end or pinning itself in a corner.
+//   2. COP CLEAR  — how much the heading points *away* from the cops, with
+//                   nearer cops weighted much more heavily. A heading that
+//                   splits two pursuers (drives between them) is penalised
+//                   because it points toward both.
+//   3. MOMENTUM   — a mild bonus for not reversing direction every tick, so
+//                   the car commits to an escape lane instead of dithering.
+//
+// The chosen heading is projected out to a far goal; the kinocat planner then
+// finds the feasible kinodynamic path there and still routes around the cops'
+// predicted trajectories (they're passed as moving obstacles).
 
-// Don't aim at a waypoint that has a cop sitting on top of it — driving
-// straight into the arrest is the robber's worst move. If the *next*
-// scheduled waypoint is inside this radius of any cop, skip forward
-// through the loop until we find one that isn't.
-const ROBBER_AVOID_COP_RADIUS = 22; // m
-// Cap waypoint look-ahead so an unlucky cop placement (cops surround the
-// whole loop) doesn't infinite-loop. After this many skips we accept the
-// blocked waypoint and rely on the planner's moving-obstacle avoidance.
-const ROBBER_MAX_WP_SKIPS = 3;
+// How far a ray probes for free space, and how far out we plant the goal.
+const ROBBER_LOOK = 55; // m — raycast probe length
+const ROBBER_GOAL_DIST = 38; // m — nominal goal projection distance
+const ROBBER_MIN_GOAL_DIST = 10; // m — never plant the goal on our bumper
+// Cop influence falls off to ~0 past this range.
+const ROBBER_THREAT_RANGE = 75; // m
+// Extra clearance kept from inflated building faces when probing openness.
+const ROBBER_WALL_MARGIN = 3.5; // m
+// Number of candidate headings in the fan.
+const ROBBER_RAYS = 24;
+// Score weights (openness is normalised to [0,1] by ROBBER_LOOK first).
+const ROBBER_W_OPEN = 1.0;
+const ROBBER_W_COP = 1.6;
+const ROBBER_W_MOM = 0.35;
 
-function waypointBlockedByCop(
-  wp: { x: number; z: number },
-  cops: ReadonlyArray<CarKinematicState>,
-  radius: number,
-): boolean {
-  for (const c of cops) {
-    const dx = wp.x - c.x;
-    const dz = wp.z - c.z;
-    if (dx * dx + dz * dz < radius * radius) return true;
+/** Distance from `(x,z)` along unit direction `(dx,dz)` until the ray leaves
+ *  the course bounds or enters an inflated building footprint. Capped at
+ *  `maxDist`. Pure ray-vs-AABB slab tests — cheap enough to run for every
+ *  candidate heading every replan. */
+function robberFreeDistance(
+  x: number,
+  z: number,
+  dx: number,
+  dz: number,
+  course: CarChaseCourse,
+  maxDist: number,
+): number {
+  let best = maxDist;
+  const b = CARCHASE_BOUNDS;
+  const m = 4; // matches clampGoalToBounds margin
+  // Bounds: distance to each wall the ray is heading toward.
+  if (dx > 1e-6) best = Math.min(best, (b.x1 - m - x) / dx);
+  else if (dx < -1e-6) best = Math.min(best, (b.x0 + m - x) / dx);
+  if (dz > 1e-6) best = Math.min(best, (b.z1 - m - z) / dz);
+  else if (dz < -1e-6) best = Math.min(best, (b.z0 + m - z) / dz);
+  best = Math.max(0, best);
+
+  for (const bld of course.buildings) {
+    const hx = bld.hx + ROBBER_WALL_MARGIN;
+    const hz = bld.hz + ROBBER_WALL_MARGIN;
+    // Slab test for the inflated box centred at (bld.x, bld.z).
+    let tmin = 0;
+    let tmax = best;
+    // X slab.
+    if (Math.abs(dx) < 1e-6) {
+      if (x < bld.x - hx || x > bld.x + hx) continue; // parallel & outside
+    } else {
+      let t1 = (bld.x - hx - x) / dx;
+      let t2 = (bld.x + hx - x) / dx;
+      if (t1 > t2) [t1, t2] = [t2, t1];
+      tmin = Math.max(tmin, t1);
+      tmax = Math.min(tmax, t2);
+      if (tmin > tmax) continue;
+    }
+    // Z slab.
+    if (Math.abs(dz) < 1e-6) {
+      if (z < bld.z - hz || z > bld.z + hz) continue;
+    } else {
+      let t1 = (bld.z - hz - z) / dz;
+      let t2 = (bld.z + hz - z) / dz;
+      if (t1 > t2) [t1, t2] = [t2, t1];
+      tmin = Math.max(tmin, t1);
+      tmax = Math.min(tmax, t2);
+      if (tmin > tmax) continue;
+    }
+    // Ray enters the box at tmin ≥ 0 within [0,best] → openness stops there.
+    if (tmax >= 0 && tmin >= 0 && tmin < best) best = tmin;
   }
-  return false;
+  return Math.max(0, best);
 }
 
+/** Pick the robber's escape goal by scoring a fan of candidate headings.
+ *  `loop` / `loopIndex` are retained for signature compatibility (the robber
+ *  no longer follows the waypoint loop); `nextIndex` is echoed back unused. */
 export function robberGoal(
   robber: CarKinematicState,
   loop: CarChaseCourse['robberLoop'],
@@ -607,62 +723,81 @@ export function robberGoal(
   buildings?: BuildingSpec[],
   course?: CarChaseCourse,
 ): { goal: CarKinematicState; nextIndex: number } {
-  // 1. Advance to the next waypoint well before reaching the current one.
-  //    At maxSpeed 14 m/s, 20 m gives ~1.4 s of lead time — enough for a
-  //    full replan cycle (~440 ms worst case) so the robber never pauses.
-  const ROBBER_WP_ADVANCE_DIST = 20;
-  const wp = loop[loopIndex]!;
-  const reach = Math.hypot(robber.x - wp.x, robber.z - wp.z);
-  let useIdx = reach < ROBBER_WP_ADVANCE_DIST ? (loopIndex + 1) % loop.length : loopIndex;
-
-  // 2. Skip forward through the loop past any waypoint a cop is camping
-  //    on. Bounded by ROBBER_MAX_WP_SKIPS so we don't spin forever when
-  //    the squad surrounds the loop.
-  for (let skip = 0; skip < ROBBER_MAX_WP_SKIPS; skip++) {
-    const candidate = loop[useIdx]!;
-    if (!waypointBlockedByCop(candidate, cops, ROBBER_AVOID_COP_RADIUS)) break;
-    useIdx = (useIdx + 1) % loop.length;
+  // Without course geometry we can't probe openness — fall back to fleeing
+  // directly away from the weighted cop centroid.
+  if (!course) {
+    let ax = 0;
+    let az = 0;
+    for (const c of cops) {
+      const dx = robber.x - c.x;
+      const dz = robber.z - c.z;
+      const d = Math.max(1, Math.hypot(dx, dz));
+      ax += dx / (d * d);
+      az += dz / (d * d);
+    }
+    const mag = Math.hypot(ax, az) || 1;
+    const goal = clampGoalToBounds({
+      x: robber.x + (ax / mag) * ROBBER_GOAL_DIST,
+      z: robber.z + (az / mag) * ROBBER_GOAL_DIST,
+      heading: Math.atan2(az, ax),
+      speed: CARCHASE_AGENT.maxSpeed,
+      t: 0,
+    });
+    return { goal, nextIndex: loopIndex };
   }
-  const target = loop[useIdx]!;
 
-  // 3. Compute a per-tick avoidance offset: project the (robber - cop)
-  //    vector onto the perpendicular of the target heading, signed so we
-  //    nudge AWAY from the cop. Clamped to ±5 m so the offset stays
-  //    inside the downtown avenue (avenue half-width is ~8 m after
-  //    building inflation) and never pushes the goal into a wall.
-  let nearestDx = 0;
-  let nearestDz = 0;
-  let nearestD2 = Infinity;
-  for (const c of cops) {
-    const dx = robber.x - c.x;
-    const dz = robber.z - c.z;
-    const d2 = dx * dx + dz * dz;
-    if (d2 < nearestD2) {
-      nearestD2 = d2;
-      nearestDx = dx;
-      nearestDz = dz;
+  let bestScore = -Infinity;
+  let bestAngle = robber.heading;
+  let bestOpen = ROBBER_MIN_GOAL_DIST;
+
+  for (let i = 0; i < ROBBER_RAYS; i++) {
+    const ang = (i / ROBBER_RAYS) * 2 * Math.PI;
+    const dx = Math.cos(ang);
+    const dz = Math.sin(ang);
+    const open = robberFreeDistance(robber.x, robber.z, dx, dz, course, ROBBER_LOOK);
+
+    // Cop term: sum of how much this heading points AT each cop, weighted by
+    // closeness. Positive dot = toward the cop = bad.
+    let copTerm = 0;
+    for (const c of cops) {
+      const cx = c.x - robber.x;
+      const cz = c.z - robber.z;
+      const cd = Math.hypot(cx, cz);
+      if (cd < 1e-3 || cd > ROBBER_THREAT_RANGE) continue;
+      const toward = (dx * cx + dz * cz) / cd; // cos(angle to cop) ∈ [-1,1]
+      const w = 1 - cd / ROBBER_THREAT_RANGE; // nearer cops dominate
+      copTerm += w * toward;
+    }
+
+    const momentum = Math.cos(ang - robber.heading);
+    const score =
+      ROBBER_W_OPEN * (open / ROBBER_LOOK) -
+      ROBBER_W_COP * copTerm +
+      ROBBER_W_MOM * momentum;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestAngle = ang;
+      bestOpen = open;
     }
   }
-  const perpC = Math.cos(target.heading + Math.PI / 2);
-  const perpS = Math.sin(target.heading + Math.PI / 2);
-  let offset = 0;
-  if (nearestD2 < 50 * 50) {
-    const dot = nearestDx * perpC + nearestDz * perpS;
-    offset = Math.max(-5, Math.min(5, dot));
-  }
+
+  // Plant the goal along the winning heading, but never past the free
+  // distance we just measured (minus a margin) so it stays reachable.
+  const dist = Math.max(
+    ROBBER_MIN_GOAL_DIST,
+    Math.min(ROBBER_GOAL_DIST, bestOpen - ROBBER_WALL_MARGIN),
+  );
   const clamped = clampGoalToBounds({
-    x: target.x + offset * perpC,
-    z: target.z + offset * perpS,
-    heading: target.heading,
+    x: robber.x + Math.cos(bestAngle) * dist,
+    z: robber.z + Math.sin(bestAngle) * dist,
+    heading: bestAngle,
     speed: CARCHASE_AGENT.maxSpeed,
     t: 0,
   });
   return {
-    // `nudgeGoalToNavClear` pushes the goal out of any inflated obstacle
-    // footprint — combined with the cop-skip above, the robber should
-    // never plan straight at a wall OR at a cop.
     goal: nudgeGoalToNavClear(clamped, robber, buildings, course),
-    nextIndex: useIdx,
+    nextIndex: loopIndex,
   };
 }
 
@@ -700,6 +835,18 @@ export interface CarChasePlanRequest {
   deadlineMs?: number;
   maxExpansions?: number;
 }
+
+// Moving-obstacle inflation radii (metres) for the multi-agent plans.
+//   • ROBBER_SEE_COP_R — a fleeing robber routes generously around the cops.
+//   • COP_SEE_ROBBER_R — a chasing cop treats the robber as barely an
+//     obstacle so its plan drives right up to the arrest instead of orbiting
+//     a fat exclusion disc around the target (the old radius left the cop
+//     unable to close the final few metres, so captures only ever happened
+//     via the dumb-pursuit fallback).
+//   • COP_COP_R — cops still keep clear of each other.
+export const ROBBER_SEE_COP_R = 2.6;
+export const COP_SEE_ROBBER_R = 0.6;
+export const COP_COP_R = 2.6;
 
 export const CARCHASE_REPLAN_BUDGET_MS = 120;
 export const CARCHASE_MAX_EXPANSIONS = 25000;
@@ -841,7 +988,7 @@ export function buildCarChaseSnapshot(): CarChaseSnapshot {
   for (let i = 0; i < SPAWN_COPS.length; i++) {
     const id = `cop${i}`;
     const cop = SPAWN_COPS[i]!;
-    const mode = selectTacticalMode(SPAWN_ROBBER, cop, i);
+    const mode = selectTacticalMode(SPAWN_ROBBER, SPAWN_COPS, i);
     // Predict the robber from its published plan when available; fall back
     // to constant-velocity. Either way, asObstacle wraps it.
     const robberPredict: Predict<CarKinematicState> = (t) => {
@@ -853,11 +1000,13 @@ export function buildCarChaseSnapshot(): CarChaseSnapshot {
       (_, j) => j !== i,
     );
     const obstacles: MovingObstacle[] = [
-      asObstacle(robberPredict, 2.6),
+      // Robber is barely an obstacle to a cop — we WANT the cop to drive all
+      // the way in for the arrest, not swerve around it (see COP_SEE_ROBBER_R).
+      asObstacle(robberPredict, COP_SEE_ROBBER_R),
       ...siblingIds.map((sid) =>
         asObstacle(
           registry.predictNPC(sid) as Predict<{ x: number; z: number }>,
-          2.6,
+          COP_COP_R,
         ),
       ),
     ];

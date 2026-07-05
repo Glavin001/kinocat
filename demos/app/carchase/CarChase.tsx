@@ -26,6 +26,9 @@ import {
   selectTacticalMode,
   tacticalGoal,
   spawnPoses,
+  ROBBER_SEE_COP_R,
+  COP_SEE_ROBBER_R,
+  COP_COP_R,
   type CarChaseCourse,
   type CopTacticalMode,
 } from '../lib/carchase-scenarios';
@@ -64,7 +67,6 @@ import {
   createDriftGateHelper,
   createCarMeshHelper,
   syncCarMesh as syncCarMeshCore,
-  createWaypointLoopHelper,
   createGoalMarkerHelper,
   createInflatedObstacleHelper,
   createNavBoundsHelper,
@@ -370,7 +372,8 @@ export default function CarChase() {
     for (const g of course.driftGates) {
       affordanceGroup.add(createDriftGateHelper({ x: g.x, z: g.z, heading: g.heading }));
     }
-    affordanceGroup.add(createWaypointLoopHelper(course.robberLoop));
+    // The robber is now a free evader (no fixed waypoint loop), so the loop
+    // overlay is intentionally not drawn.
 
     // ---- rapier debug wireframe ----
     const rapierDebug = createRapierDebugRenderer();
@@ -653,7 +656,7 @@ export default function CarChase() {
       robber.loopIndex = pick.nextIndex;
       robber.goal = pick.goal;
       const obstacles: ObstacleDescriptor[] = cops.map((co) =>
-        dehydrateObstacle(co.id, registry, co.car.readState(now), 2.6, 4),
+        dehydrateObstacle(co.id, registry, co.car.readState(now), ROBBER_SEE_COP_R, 4),
       );
       return {
         npcId: 'robber',
@@ -671,7 +674,8 @@ export default function CarChase() {
     } {
       const robberState = robber.car.readState(now);
       const copState = co.car.readState(now);
-      const mode = selectTacticalMode(robberState, copState, copIndex);
+      const copStates = cops.map((c) => c.car.readState(now));
+      const mode = selectTacticalMode(robberState, copStates, copIndex);
       const robberPredict: Predict<CarKinematicState> = (t) => {
         const p = registry.predictNPC('robber')(t) as CarKinematicState | null;
         return p ?? predictRobberFromState(robberState, 8)(t);
@@ -683,10 +687,10 @@ export default function CarChase() {
         .filter((o) => o.id !== co.id)
         .map((o) => o.id);
       const obstacles: ObstacleDescriptor[] = [
-        dehydrateObstacle('robber', registry, robberState, 2.6, 8),
+        dehydrateObstacle('robber', registry, robberState, COP_SEE_ROBBER_R, 8),
         ...siblingIds.map((sid) => {
           const sibCop = cops.find((c) => c.id === sid)!;
-          return dehydrateObstacle(sid, registry, sibCop.car.readState(now), 2.6, 4);
+          return dehydrateObstacle(sid, registry, sibCop.car.readState(now), COP_COP_R, 4);
         }),
       ];
       return {
