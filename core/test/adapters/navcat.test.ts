@@ -160,6 +160,31 @@ describe.skipIf(!CLR_OK)('grid-Dijkstra goal lower bound (Opt 2)', () => {
   });
 });
 
+describe.skipIf(!NAVMESH_OK)('region distance field over the CHF (ETA oracle seam)', () => {
+  it('cross-island region is unreachable; same-island bound is admissible', () => {
+    const w = new NavcatWorld(built!.navMesh);
+    w.attachClearanceField(built!.compactHeightfield);
+    // Disk region on island B (x∈[14,22]).
+    const lb = w.buildRegionLowerBound!(
+      (x, z) => Math.hypot(x - 18, z - 5) <= 2,
+    );
+    expect(lb).not.toBeNull();
+    expect(lb!(4, 5)).toBeNull(); // island A: no route across the gap
+    const near = lb!(15, 5); // island B, ~1m from the region edge
+    expect(near).not.toBeNull();
+    expect(near!).toBeGreaterThanOrEqual(0);
+    expect(near!).toBeLessThanOrEqual(1 + 1e-6); // lower bound, never over
+    expect(lb!(-50, -50)).toBeNull(); // off-grid
+  });
+
+  it('returns null for a region covering no walkable column', () => {
+    const w = new NavcatWorld(built!.navMesh);
+    w.attachClearanceField(built!.compactHeightfield);
+    // The inter-island gap (x∈(8,14)) has no walkable spans.
+    expect(w.buildRegionLowerBound!((x, z) => Math.hypot(x - 11, z - 5) <= 0.5)).toBeNull();
+  });
+});
+
 // Phase-1 integration: swapNavMesh + region-scoped markTileRebuilt. Fresh
 // NavcatWorlds are constructed from the fixtures' already-generated meshes
 // (no regeneration) so mutation stays isolated per test.

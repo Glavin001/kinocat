@@ -57,6 +57,19 @@ export interface NavWorld {
     gz: number,
     gy?: number,
   ): ((x: number, z: number, y?: number) => number | null) | null;
+
+  /** Optional REGION variant of `buildGoalLowerBound`: a multi-source
+   *  distance field seeded from every walkable cell whose centre passes
+   *  `containsXZ`. The predicate receives the grid's cell HALF-DIAGONAL as a
+   *  third argument so callers can conservatively accept cells for regions
+   *  smaller than a cell (which would otherwise fall between cell centres).
+   *  The returned function gives an admissible lower bound on the
+   *  obstacle-avoiding distance from (x,z) to the NEAREST point of the
+   *  region, or null off-grid / when the region is unreachable. UNMEMOIZED —
+   *  one field build per call; callers (the ETA oracle) own caching. */
+  buildRegionLowerBound?(
+    containsXZ: (x: number, z: number, cellHalfDiag?: number) => boolean,
+  ): ((x: number, z: number, y?: number) => number | null) | null;
 }
 
 export interface NavPolygon {
@@ -406,7 +419,7 @@ export class InMemoryNavWorld implements NavWorld {
     if (gcx < 0 || gcx >= w || gcz < 0 || gcz >= h) return null;
     const goalIdx = gcx + gcz * w;
     if (this.h_goalKey !== goalIdx || !this.h_goalDist) {
-      this.h_goalDist = this.dijkstraFrom(goalIdx);
+      this.h_goalDist = this.dijkstraMulti([goalIdx]);
       this.h_goalKey = goalIdx;
     }
     const dist = this.h_goalDist;
@@ -422,11 +435,50 @@ export class InMemoryNavWorld implements NavWorld {
     };
   }
 
-  /** 8-connected Dijkstra from a single source cell over the heuristic grid,
+  /** Region variant of `buildGoalLowerBound`: multi-source field seeded from
+   *  every UNBLOCKED grid cell whose centre passes `containsXZ` — lookups
+   *  give the obstacle-avoiding distance to the nearest point of the region.
+   *  Unmemoized (callers own caching); null when the region covers no
+   *  unblocked cell. */
+  buildRegionLowerBound(
+    containsXZ: (x: number, z: number, cellHalfDiag?: number) => boolean,
+  ): ((x: number, z: number, y?: number) => number | null) | null {
+    this.ensureHeuristicGrid();
+    if (!this.h_blocked) return null;
+    const cs = this.h_cellSize;
+    const w = this.h_width;
+    const h = this.h_height;
+    const blocked = this.h_blocked;
+    const halfDiag = (cs * Math.SQRT2) / 2;
+    const seeds: number[] = [];
+    for (let cz = 0; cz < h; cz++) {
+      for (let cx = 0; cx < w; cx++) {
+        const i = cx + cz * w;
+        if (blocked[i]) continue;
+        const x = this.h_originX + (cx + 0.5) * cs;
+        const z = this.h_originZ + (cz + 0.5) * cs;
+        if (containsXZ(x, z, halfDiag)) seeds.push(i);
+      }
+    }
+    if (seeds.length === 0) return null;
+    const dist = this.dijkstraMulti(seeds);
+    const slack = Math.SQRT2 * cs;
+    return (x: number, z: number) => {
+      const cx = Math.floor((x - this.h_originX) / cs);
+      const cz = Math.floor((z - this.h_originZ) / cs);
+      if (cx < 0 || cx >= w || cz < 0 || cz >= h) return null;
+      const d = dist[cx + cz * w]!;
+      if (!Number.isFinite(d)) return null;
+      const lb = d - slack;
+      return lb > 0 ? lb : 0;
+    };
+  }
+
+  /** 8-connected Dijkstra from the source cells over the heuristic grid,
    *  treating blocked cells as walls. Diagonal moves cost √2·cellSize.
    *  Diagonals through a blocked cardinal neighbour are disallowed so the
    *  bound never "cuts a corner" through an obstacle. */
-  private dijkstraFrom(source: number): Float32Array {
+  private dijkstraMulti(sources: ReadonlyArray<number>): Float32Array {
     const w = this.h_width;
     const h = this.h_height;
     const cs = this.h_cellSize;
@@ -434,8 +486,10 @@ export class InMemoryNavWorld implements NavWorld {
     const dist = new Float32Array(w * h);
     dist.fill(Infinity);
     const heap = new BinaryHeap<{ i: number; d: number }>((a, b) => a.d - b.d);
-    dist[source] = 0;
-    heap.push({ i: source, d: 0 });
+    for (const s of sources) {
+      dist[s] = 0;
+      heap.push({ i: s, d: 0 });
+    }
     const diag = Math.SQRT2 * cs;
     while (!heap.isEmpty()) {
       const top = heap.pop()!;
@@ -444,50 +498,41 @@ export class InMemoryNavWorld implements NavWorld {
       if (d > dist[i]!) continue;
       const cx = i % w;
       const cz = (i / w) | 0;
+      // Relax: store into the Float32Array first, then push the ROUNDED
+      // read-back value. Pushing the raw float64 sum makes the stale-entry
+      // guard above (`d > dist[i]`) reject the entry after float32 rounding
+      // shrinks dist[i] — the cell then never expands and the wave dies at
+      // diagonal-valued chokepoints.
+      const relax = (ni: number, nd: number): void => {
+        if (nd < dist[ni]!) {
+          dist[ni] = nd;
+          heap.push({ i: ni, d: dist[ni]! });
+        }
+      };
       // Cardinal neighbours.
       const cardOpen = [false, false, false, false]; // -x, +x, -z, +z
       if (cx > 0 && !blocked[i - 1]) {
         cardOpen[0] = true;
-        const nd = d + cs;
-        if (nd < dist[i - 1]!) { dist[i - 1] = nd; heap.push({ i: i - 1, d: nd }); }
+        relax(i - 1, d + cs);
       }
       if (cx + 1 < w && !blocked[i + 1]) {
         cardOpen[1] = true;
-        const nd = d + cs;
-        if (nd < dist[i + 1]!) { dist[i + 1] = nd; heap.push({ i: i + 1, d: nd }); }
+        relax(i + 1, d + cs);
       }
       if (cz > 0 && !blocked[i - w]) {
         cardOpen[2] = true;
-        const nd = d + cs;
-        if (nd < dist[i - w]!) { dist[i - w] = nd; heap.push({ i: i - w, d: nd }); }
+        relax(i - w, d + cs);
       }
       if (cz + 1 < h && !blocked[i + w]) {
         cardOpen[3] = true;
-        const nd = d + cs;
-        if (nd < dist[i + w]!) { dist[i + w] = nd; heap.push({ i: i + w, d: nd }); }
+        relax(i + w, d + cs);
       }
       // Diagonals — require both adjacent cardinals to be open so we never
       // squeeze through a corner. Keeps the bound admissible.
-      if (cardOpen[0] && cardOpen[2] && !blocked[i - 1 - w]) {
-        const ni = i - 1 - w;
-        const nd = d + diag;
-        if (nd < dist[ni]!) { dist[ni] = nd; heap.push({ i: ni, d: nd }); }
-      }
-      if (cardOpen[1] && cardOpen[2] && !blocked[i + 1 - w]) {
-        const ni = i + 1 - w;
-        const nd = d + diag;
-        if (nd < dist[ni]!) { dist[ni] = nd; heap.push({ i: ni, d: nd }); }
-      }
-      if (cardOpen[0] && cardOpen[3] && !blocked[i - 1 + w]) {
-        const ni = i - 1 + w;
-        const nd = d + diag;
-        if (nd < dist[ni]!) { dist[ni] = nd; heap.push({ i: ni, d: nd }); }
-      }
-      if (cardOpen[1] && cardOpen[3] && !blocked[i + 1 + w]) {
-        const ni = i + 1 + w;
-        const nd = d + diag;
-        if (nd < dist[ni]!) { dist[ni] = nd; heap.push({ i: ni, d: nd }); }
-      }
+      if (cardOpen[0] && cardOpen[2] && !blocked[i - 1 - w]) relax(i - 1 - w, d + diag);
+      if (cardOpen[1] && cardOpen[2] && !blocked[i + 1 - w]) relax(i + 1 - w, d + diag);
+      if (cardOpen[0] && cardOpen[3] && !blocked[i - 1 + w]) relax(i - 1 + w, d + diag);
+      if (cardOpen[1] && cardOpen[3] && !blocked[i + 1 + w]) relax(i + 1 + w, d + diag);
     }
     return dist;
   }

@@ -23,3 +23,9 @@ export {
   type Affordance,
   type AffordanceUseResult,
 } from './affordance-registry';
+export {
+  createEtaOracle,
+  type EtaOracle,
+  type EtaOracleOptions,
+  type EtaResult,
+} from './eta-oracle';

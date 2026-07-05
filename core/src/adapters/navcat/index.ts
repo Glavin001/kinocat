@@ -159,6 +159,19 @@ export class NavcatWorld implements NavWorld {
     return (x: number, z: number, y?: number) => f.lookup(x, z, y);
   }
 
+  /** Multi-source obstacle-aware distance field seeded from every walkable
+   *  CHF column inside the region. UNMEMOIZED — one Dijkstra per call;
+   *  callers (the ETA oracle) own caching. Null when no CHF is attached or
+   *  the region covers no walkable column. */
+  buildRegionLowerBound(
+    containsXZ: (x: number, z: number, cellHalfDiag?: number) => boolean,
+  ): ((x: number, z: number, y?: number) => number | null) | null {
+    if (!this.rawChf) return null;
+    const field = ChfGoalDistanceField.fromRegion(this.rawChf, containsXZ);
+    if (!field) return null;
+    return (x: number, z: number, y?: number) => field.lookup(x, z, y);
+  }
+
   polygonAt(x: number, z: number): PolygonRef | null {
     const r = findNearestPoly(
       this.npResult,
