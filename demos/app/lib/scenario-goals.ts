@@ -13,7 +13,7 @@ import { InMemoryNavWorld } from 'kinocat/environment';
 import { planVehicleScenario } from 'kinocat/planner';
 import type { ScenarioPlanResult } from 'kinocat/planner';
 import type { CarKinematicState } from 'kinocat/agent';
-import {
+import { stopped,
   defineScenario,
   reach,
   seq,
@@ -69,7 +69,7 @@ export function authorParkingScenario(id: ParkingScenarioId): Scenario {
     start: s.spawn,
     goal: reach(
       at({ x: s.goal.x, z: s.goal.z, heading: s.goal.heading }, { dx: 0.35, dz: 0.35, dheading: deg(12) }),
-      { speed: { max: 0 } },
+      stopped(),
     ),
     invariants: [stayInside(boundsPoly(s.bounds)), ...s.obstacles.map((o) => avoid(inside(o)))],
     prefer: [minTime(1), smooth(0.4)],

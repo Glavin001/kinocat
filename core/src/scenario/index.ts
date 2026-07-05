@@ -53,6 +53,7 @@ export { lte, gte, inRange, speed, distanceFrom, closingSpeed } from './conditio
 // Builders (sugar)
 export {
   reach,
+  stopped,
   seq,
   all,
   any,

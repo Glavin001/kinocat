@@ -7,6 +7,33 @@ export interface PurePursuitConfig {
   lookaheadGain: number;
   /** Maximum lookahead distance. */
   lookaheadMax: number;
+  /**
+   * Floor for the commanded approach speed toward a stop terminal (m/s).
+   * Keeps the brake-to-goal ramp from asymptoting to zero far from the goal.
+   * When unset, falls back to `lookaheadMin` — a historic unit bug (a DISTANCE
+   * used as a speed) that races happened to tune around; parking must set a
+   * real value (~0.3-0.5 m/s) or the ramp never engages below cruise and the
+   * terminal approach is bang-bang with a 0.1-0.5 m brake skid.
+   */
+  minApproachSpeed?: number;
+  /**
+   * Cruise cap while in REVERSE gear (m/s). Without it `cruiseSpeed` applies
+   * to both gears, so a chassis whose reverse envelope is lower (agents
+   * typically back up at 60-75% of forward speed) is commanded to reverse at
+   * forward cruise — it over-speeds the planned reverse arcs, saturates its
+   * curvature authority, and drifts wide. Defaults to `cruiseSpeed`.
+   */
+  reverseCruiseSpeed?: number;
+  /**
+   * Feed the reference path's local curvature forward into the steering
+   * command (kappa = kappa_ff + pursuit feedback). Without it, pure pursuit
+   * must ACCUMULATE cross-track error to generate the curvature of an arc —
+   * on max-curvature parking swings that steady-state error is 0.1-0.3 m,
+   * exactly the clearance margin the plan reserved. With feedforward the
+   * feedback term only corrects disturbances. Off by default (race tuning
+   * predates it); parking enables it.
+   */
+  curvatureFeedforward?: boolean;
   /** Curvature-aware speed cap: v = sqrt(maxLateralAccel / |κ|). */
   maxLateralAccel: number;
   maxAccel: number;

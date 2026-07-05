@@ -47,6 +47,8 @@ import {
   mpcTrack,
   createMPCTrackerState,
   type MPCTrackerState,
+  createSettleLatch,
+  type SettleLatch,
 } from 'kinocat/execute';
 import {
   parametricForwardV2,
@@ -202,6 +204,7 @@ export function splitAtGearCusps(plan: CarKinematicState[]): CarKinematicState[]
 export function liftAnalyticPath(
   res: PlanResult<CarKinematicState>,
   speedMag: number,
+  reverseSpeedMag: number = speedMag,
 ): CarKinematicState[] {
   const nodes = res.nodes;
   if (!nodes || nodes.length === 0) return res.path;
@@ -233,7 +236,12 @@ export function liftAnalyticPath(
           // Last sample lands on the goal pose — adopt its (zero) speed so the
           // tracker brakes to rest there; interior samples carry the gear sign
           // so reverse segments are driven in reverse.
-          speed: j === m - 1 ? st.speed : (p.reverse ? -speedMag : speedMag),
+          // Reverse legs are capped at the agent's reverse envelope — tagging
+          // them with the forward maxSpeed made the plan's timeline (and the
+          // commit-window predicted start states, and the tracker's reverse
+          // target speed) ~33% faster than the plant can actually back up,
+          // injecting ~0.4 m of lateral error at every mid-swing replan.
+          speed: j === m - 1 ? st.speed : (p.reverse ? -reverseSpeedMag : speedMag),
           t: startT + (endT - startT) * frac,
         });
       }
@@ -323,6 +331,29 @@ export interface RaceTuning {
   cruiseSpeed?: number;
   goalTolerance?: number;
   arriveRadius?: number;
+  /**
+   * Pure-pursuit lookahead overrides. The chassis defaults (3/0.45/14) are
+   * race-scale; parking segments are 0.5-3 m, where a 3 m minimum lookahead
+   * degenerates the tracker to "aim at the path endpoint" (it can never
+   * remove lateral error). Parking supplies ~0.8/0.5/3.
+   */
+  lookaheadMin?: number;
+  lookaheadGain?: number;
+  lookaheadMax?: number;
+  /** Approach-speed floor toward stop terminals (m/s) — see PurePursuitConfig. */
+  minApproachSpeed?: number;
+  /** Tracker curvature clamp (m). Align with the PLANT's real turn envelope. */
+  trackerMinTurnRadius?: number;
+  /** Chassis steering envelope (rad). Plant turn radius = axleSpacing/tan(this). */
+  maxSteerAngle?: number;
+  /** Reverse-gear cruise cap (m/s) — see PurePursuitConfig.reverseCruiseSpeed. */
+  reverseCruiseSpeed?: number;
+  /** Adaptive-replan lateral threshold (m). Race default 2.0; precision
+   *  maneuvers should correct early (~0.35) — mid-swing drift toward an
+   *  obstacle corner consumes the plan's clearance margin. */
+  lateralErrorReplanM?: number;
+  /** Curvature feedforward in pure-pursuit — see PurePursuitConfig. */
+  curvatureFeedforward?: boolean;
   /**
    * Stanley-style heading-alignment gain for the pure-pursuit tracker (forward
    * gear only). 0/undefined ⇒ classic position-only pursuit (racing). Parking
@@ -510,6 +541,22 @@ export interface RaceScenarioOptions {
   /** Stop ticking + mark each car `finished` after this many laps. When
    *  omitted the scenario runs indefinitely (web demo). */
   targetLaps?: number;
+  /**
+   * TRUE goal-completion semantics (parking-class scenarios). When present,
+   * `finished` latches ONLY when this predicate has held continuously at
+   * rest for `holdSeconds` (a settle latch) — waypoint arrival keeps its
+   * bookkeeping role but can no longer terminate the goal loop. Without
+   * this, the runner's position-only 0.25 m arrival disk declared courses
+   * complete while the actual goal (in-stall, square, centered, stopped)
+   * was unsatisfied — so the corrective replans that would have fixed a
+   * crooked park (shunt, or pull out and re-enter) were never attempted:
+   * the car just held the brake, visibly mis-parked, forever.
+   */
+  goalSettle?: {
+    predicate: (state: CarKinematicState) => boolean;
+    holdSeconds: number;
+    speedTol: number;
+  };
   /** Hold the leader at the lap line until every car finishes the lap, so
    *  every car starts the next lap head-to-head. Web demo: true. CLI race:
    *  false (cars race independently). */
@@ -569,6 +616,8 @@ interface CarInternal {
   currentLapSectors: number[];
   raceTime: number;
   lapStartSimTime: number;
+  /** Settle latch driving `finished` when opts.goalSettle is present. */
+  goalLatch: SettleLatch | null;
   waypointsCleared: number;
   plan: CarKinematicState[] | null;
   planStartSimTime: number;
@@ -660,6 +709,13 @@ export async function createRaceScenario(
     ...PURE_PURSUIT_CONFIG,
     cruiseSpeed: tuning.cruiseSpeed ?? PURE_PURSUIT_CONFIG.cruiseSpeed,
     goalTolerance: tuning.goalTolerance ?? PURE_PURSUIT_CONFIG.goalTolerance,
+    lookaheadMin: tuning.lookaheadMin ?? PURE_PURSUIT_CONFIG.lookaheadMin,
+    lookaheadGain: tuning.lookaheadGain ?? PURE_PURSUIT_CONFIG.lookaheadGain,
+    lookaheadMax: tuning.lookaheadMax ?? PURE_PURSUIT_CONFIG.lookaheadMax,
+    minApproachSpeed: tuning.minApproachSpeed,
+    reverseCruiseSpeed: tuning.reverseCruiseSpeed,
+    minTurnRadius: tuning.trackerMinTurnRadius ?? PURE_PURSUIT_CONFIG.minTurnRadius,
+    curvatureFeedforward: tuning.curvatureFeedforward ?? false,
     respectPathSpeed: tuning.respectPathSpeed,
     headingGain: tuning.terminalHeadingGain ?? 0,
     // The runner gates the heading term on distance to the TRUE goal (see the
@@ -744,6 +800,11 @@ export async function createRaceScenario(
       position: { x: spawn.x, z: spawn.z },
       heading: spawn.heading,
       ...VEHICLE_TUNING,
+      // Steering envelope is scenario-tunable: parking chassis steer sharper
+      // (0.75 rad -> R ~ 3.44 m) so the PLANT can actually drive the tight
+      // arcs the parking planner needs in stall-sized geometry; racing keeps
+      // the stable 0.6 rad envelope.
+      maxSteerAngle: tuning.maxSteerAngle ?? VEHICLE_TUNING.maxSteerAngle,
     });
     const navWorld = new InMemoryNavWorld(course.polygons, course.obstacles);
     return {
@@ -756,6 +817,12 @@ export async function createRaceScenario(
       currentLapSectors: [],
       raceTime: 0,
       lapStartSimTime: 0,
+      goalLatch: opts.goalSettle
+        ? createSettleLatch({
+            holdSeconds: opts.goalSettle.holdSeconds,
+            speedTol: opts.goalSettle.speedTol,
+          })
+        : null,
       waypointsCleared: 0,
       plan: null,
       planStartSimTime: 0,
@@ -934,8 +1001,20 @@ export async function createRaceScenario(
         });
     const replanMs = performance.now() - tStart;
     c.diagnostics.lastReplanMs = replanMs;
-    c.diagnostics.lastReplanFound = res.found && res.path.length > 1;
+    // A found 1-point path is the planner saying "the start already satisfies
+    // the goal" (start-state acceptance) — a SUCCESS with nothing to drive,
+    // not a planner failure. Count it as found (so failedReplanRatio stays
+    // honest) but skip the commit: the degenerate-plan brake-hold keeps the
+    // chassis at rest and the settle latch finishes the course.
+    const trivial = res.found && res.path.length === 1 && res.cost === 0;
+    c.diagnostics.lastReplanFound = res.found && (res.path.length > 1 || trivial);
     c.diagnostics.totalReplans += 1;
+    if (trivial) {
+      c.diagnostics.successfulReplans += 1;
+      c.diagnostics.consecutiveFailedReplans = 0;
+      c.lastReplanSimTime = simTime;
+      return;
+    }
     if (c.diagnostics.lastReplanFound) {
       // Two-stage post-process pipeline (Apollo / Autoware shape), each
       // stage individually toggleable for ablation:
@@ -961,7 +1040,11 @@ export async function createRaceScenario(
       // forward-only race controller can't execute — collapsing it to the
       // straight chord (res.path) is what keeps racing flowing.
       const liftedPath = isParking
-        ? liftAnalyticPath(res, (c.entry.agent ?? RACE_AGENT).maxSpeed)
+        ? liftAnalyticPath(
+            res,
+            (c.entry.agent ?? RACE_AGENT).maxSpeed,
+            (c.entry.agent ?? RACE_AGENT).maxReverseSpeed ?? (c.entry.agent ?? RACE_AGENT).maxSpeed,
+          )
         : res.path;
       let smoothed = liftedPath;
       const kRaw = tuning.enableSpeedProfile ? curvaturePerSample(liftedPath) : null;
@@ -1031,10 +1114,17 @@ export async function createRaceScenario(
    *  chassis has drifted from the reference too far for the controller
    *  alone to recover comfortably. */
   function lateralFromPlan(c: CarInternal, x: number, z: number): number {
-    if (!c.plan || c.plan.length < 2) return Infinity;
-    const elapsed = Math.max(0, simTime - c.planStartSimTime);
-    const tail = trimPlan(c.plan, elapsed);
-    if (tail.length < 2) return Infinity;
+    // GEOMETRIC divergence, measured against the ACTIVE SEGMENT — the exact
+    // polyline the tracker is following. Two prior designs both misfired:
+    //  - time-trimmed tails read plan-time lag as "divergence" (segments now
+    //    genuinely DWELL at cusp rest samples, so the chassis is always
+    //    behind plan-time near a cusp — that is not an error);
+    //  - whole-plan minimum distance under-reports on multi-cusp plans whose
+    //    legs pass near each other (the pose matches a PAST leg).
+    // Plan exhaustion is a separate, progress-based condition in the cadence
+    // gate — pretending it is infinite lateral error caused replan storms.
+    const tail = c.segments[c.activeSegIdx] ?? c.plan;
+    if (!tail || tail.length < 2) return Infinity;
     let best = Infinity;
     for (let i = 0; i < tail.length - 1; i++) {
       const ax = tail[i]!.x;
@@ -1071,7 +1161,7 @@ export async function createRaceScenario(
     if (sinceLastMs < MIN_TIME_BETWEEN_REPLANS_MS) return false;
     // Trigger: large lateral error from the plan.
     const dLat = lateralFromPlan(c, state.x, state.z);
-    if (dLat > LATERAL_ERROR_REPLAN_M) return true;
+    if (dLat > (tuning.lateralErrorReplanM ?? LATERAL_ERROR_REPLAN_M)) return true;
     // Trigger: consecutive failures — keep trying. Cadence already
     // does this every 300ms but events let us retry earlier.
     if (c.diagnostics.consecutiveFailedReplans >= 2) return true;
@@ -1094,12 +1184,57 @@ export async function createRaceScenario(
     // trigger checks rate-limit themselves so a degenerate state can't
     // thrash the planner.
     const cadenceDue = simTime - c.lastReplanSimTime >= replanIntervalSec;
-    if (cadenceDue || shouldEarlyReplan(c, stateBefore)) {
+    // A cadence replan is only worth taking when the committed plan is no
+    // longer serving: the chassis has drifted off it, it is near exhaustion,
+    // or planning has been failing. Unconditionally re-planning every cycle
+    // re-rolls the maneuver from mid-execution poses — on parking approaches
+    // each re-roll re-threads the SAME gap from a slightly worse pose and
+    // progressively commits thinner-clearance plans (0.55 m -> 0.39 m
+    // observed) until execution noise turns margin into contact. A healthy,
+    // on-track plan is left alone. (Multi-waypoint racing keeps the horizon
+    // fresh: its plans chase moving gates, so staleness there IS drift/
+    // exhaustion and the same conditions fire naturally.)
+    let cadenceUseful = true;
+    // While the goal predicate holds at rest, the settle hold is in progress:
+    // planning is pure churn (it returns the trivial plan) and any commit
+    // could only disturb the hold. Let the latch finish.
+    if (c.goalLatch?.state.holding) cadenceUseful = false;
+    if (cadenceUseful && cadenceDue && c.plan && c.plan.length > 1) {
+      const dLat = lateralFromPlan(c, stateBefore.x, stateBefore.z);
+      // Exhaustion by PROGRESS, not by clock: cusp dwells and decel ramps put
+      // the chassis behind the plan's timeline by design, so elapsed-time
+      // exhaustion re-planned mid-maneuver on every cusp (the post-merge
+      // 102-replan churn). The plan is spent when the chassis is tracking
+      // its FINAL segment and has consumed most of it.
+      let nearExhaustion = false;
+      const seg = c.segments[c.activeSegIdx];
+      if (!seg || c.activeSegIdx >= c.segments.length - 1) {
+        const tail = seg ?? c.plan;
+        let ni = 0;
+        let bd = Infinity;
+        for (let i = 0; i < tail.length; i++) {
+          const d = Math.hypot(stateBefore.x - tail[i]!.x, stateBefore.z - tail[i]!.z);
+          if (d < bd) {
+            bd = d;
+            ni = i;
+          }
+        }
+        nearExhaustion = ni >= (tail.length - 1) * 0.8;
+      }
+      const failing = c.diagnostics.consecutiveFailedReplans > 0;
+      cadenceUseful = dLat > 0.25 || nearExhaustion || failing;
+    }
+    if ((cadenceDue && cadenceUseful) || shouldEarlyReplan(c, stateBefore)) {
       replanCar(c);
     }
     // Waypoint advance + lap detection (60Hz so lap times aren't quantized
-    // to the replan cadence).
-    if (!c.holdingForSync) {
+    // to the replan cadence). Single-waypoint goal-settle courses (parking)
+    // skip this entirely: the lone waypoint can only wrap onto itself, so
+    // every crossing of the arrive disk read as an "advance" — firing the
+    // waypoint-advance replan trigger every rate-limit window (5+/s) while
+    // the car shunted near the goal, and stamping phantom laps. Completion
+    // is the settle latch's job there.
+    if (!c.holdingForSync && !(opts.goalSettle && course.waypoints.length === 1)) {
       const pick = pickNextWaypoint(
         { ...stateBefore, t: 0 },
         course.waypoints,
@@ -1138,7 +1273,11 @@ export async function createRaceScenario(
             : dur;
           c.lapStartSimTime = lapEnd;
           c.currentLapSectors = [];
-          if (targetLaps !== undefined && c.laps.length >= targetLaps) {
+          if (targetLaps !== undefined && c.laps.length >= targetLaps && !opts.goalSettle) {
+            // Lap-count completion is a RACE concept. Goal-settle courses
+            // (parking) latch `finished` from the settle oracle below —
+            // a position-only arrival must not stop the goal loop while the
+            // true goal (square, centered, at rest) is unsatisfied.
             c.finished = true;
           } else if (syncHold) {
             c.holdingForSync = true;
@@ -1262,19 +1401,48 @@ export async function createRaceScenario(
           };
         }
       } else {
-        const cmd = wheeledFromNormalized({ steer: 0, throttle: 0.2, brake: 0 }, FORCE_TUNING);
+        // Degenerate live segment (a trivial already-satisfied plan, or a
+        // 1-point stub): HOLD — brake to rest. This is the natural terminal
+        // state after settling: replans from a satisfied pose return the
+        // trivial plan and the chassis simply keeps holding the brake. The
+        // old behavior (creep forward at 0.2 throttle) silently drove a
+        // planless car into whatever was ahead of it.
+        const cmd = wheeledFromNormalized({ steer: 0, throttle: 0, brake: 0.6 }, FORCE_TUNING);
         c.car.applyWheeledControls(cmd);
         c.lastControls = cmd;
-        c.metrics.liveControls = { steer: 0, throttle: 0.2, brake: 0, targetSpeed: 5 };
+        c.metrics.liveControls = { steer: 0, throttle: 0, brake: 0.6, targetSpeed: 0 };
       }
     } else {
-      const cmd = wheeledFromNormalized({ steer: 0, throttle: 0.2, brake: 0 }, FORCE_TUNING);
+      // No plan at all (planner failed / first tick): hold still and wait for
+      // the next replan rather than creeping blind.
+      const cmd = wheeledFromNormalized({ steer: 0, throttle: 0, brake: 0.6 }, FORCE_TUNING);
       c.car.applyWheeledControls(cmd);
       c.lastControls = cmd;
-      c.metrics.liveControls = { steer: 0, throttle: 0.2, brake: 0, targetSpeed: 5 };
+      c.metrics.liveControls = { steer: 0, throttle: 0, brake: 0.6, targetSpeed: 0 };
     }
     stepRaycastVehicle(c.world, [c.car], { dt, substeps: VEHICLE_SUBSTEPS });
     const after = c.car.readState(simTime + dt);
+    // TRUE goal completion (goal-settle courses): `finished` latches only
+    // when the goal predicate has held continuously at rest — the same
+    // settle semantics the bench/tests/HUD measure. Until then the goal
+    // loop stays live: a mis-parked car keeps replanning (shunt, or pull
+    // out and re-enter) instead of holding the brake on a crooked pose.
+    if (c.goalLatch && opts.goalSettle) {
+      c.goalLatch.update(
+        { ok: opts.goalSettle.predicate(after), speed: after.speed },
+        dt,
+      );
+      if (c.goalLatch.state.settled && !c.finished) {
+        c.finished = true;
+        if (c.laps.length === 0) {
+          // Record the completion for HUD/bench timing parity: duration is
+          // the honest time-to-settled, not the transient arrival instant.
+          const t = c.goalLatch.state.timeToSettled ?? simTime + dt;
+          c.laps.push({ lap: 1, simTime: simTime + dt, duration: t, sectors: [] });
+          c.metrics.laps = 1;
+        }
+      }
+    }
     // Prediction-error metric.
     if (c.predictedEnd && simTime + dt >= c.predictedEnd.dueSimTime) {
       const p = c.predictedEnd.state;

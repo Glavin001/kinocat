@@ -109,6 +109,11 @@ export function plan<State>(
     const gExact = new Map<string, number>();
     const dom = new DominanceTable(env.levels);
 
+    // Per-pass stagnation: without this reset, a coarse pass that broke at
+    // threshold+band leaves the counter high and every subsequent non-finest
+    // pass breaks after its FIRST expansion — the multi-resolution ladder
+    // degenerates to "coarsest then finest" (measured perPass [32, 1, 2967]).
+    expansionsSinceImprovement = 0;
     const startNode = env.createNode(start, null, null);
     startNode.g = 0;
     const th = timingsOn ? performance.now() : 0;
@@ -232,7 +237,7 @@ export function plan<State>(
     result.cost = omega;
     result.nodes = incumbentNodes;
     result.path = incumbentNodes.map((n) => n.state);
-  } else if (progressNodes && progressNodes.length > 0) {
+  } else if (progressNodes && progressNodes.length > 1) {
     // Best-progress fallback: no goal region reached, but advance as far as the
     // search got (deepest automaton phase). Flagged `partial` so callers know
     // the objective was not formally satisfied.

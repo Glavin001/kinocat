@@ -44,6 +44,15 @@ export interface VehicleEnvOptions {
    */
   heuristicTable?: false | { posCell?: number; headingBuckets?: number };
   /**
+   * Whether the time bucket participates in the exact dedup hash. REQUIRED
+   * for time-varying worlds (moving obstacles, affordances) where the same
+   * pose at different times genuinely differs. In STATIC worlds it only
+   * prevents deduplication — measured 3.8x expansion inflation (83,968 vs
+   * 22,220 for an identical parking query) — so wrappers disable it when the
+   * request carries no dynamics. Default: true (safe for any world).
+   */
+  timeInHash?: boolean;
+  /**
    * O(1) clearance broadphase (Opt 1, spec §10.2). When the `NavWorld`
    * provides a `clearanceAt` oracle (e.g. a `NavcatWorld` built with
    * `clearanceField`), skip the expensive exact footprint check at any sweep
@@ -101,6 +110,7 @@ export interface AnalyticEdgeData {
 export class VehicleEnvironment implements Environment<CarKinematicState> {
   readonly levels: number;
   private readonly posCell: number;
+  private readonly timeInHash: boolean;
   private readonly headingBuckets: number;
   private readonly speedQuant: number;
   private readonly divisors: number[];
@@ -142,6 +152,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     opts: VehicleEnvOptions = {},
   ) {
     this.posCell = opts.posCell ?? 0.5;
+    this.timeInHash = opts.timeInHash ?? true;
     this.headingBuckets = opts.headingBuckets ?? 16;
     this.speedQuant = opts.speedQuant ?? 2;
     this.divisors = opts.levelDivisors ?? [4, 2, 1];
@@ -232,7 +243,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     const iz = Math.round(state.z / this.posCell);
     const ih = this.headingBucket(state.heading);
     const isp = Math.round(state.speed / this.speedQuant);
-    const it = Math.round(state.t / 0.25);
+    const it = this.timeInHash ? Math.round(state.t / 0.25) : 0;
     const index: string[] = [];
     for (const d of this.divisors) {
       index.push(pack3(Math.floor(ix / d), Math.floor(iz / d), ih));
@@ -292,8 +303,17 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     const st = node.state;
     const c = Math.cos(st.heading);
     const s = Math.sin(st.heading);
+    // Gear of the edge that PRODUCED this node; `undefined` = no history (a
+    // true root), which charges no direction-change penalty on the first move.
+    // NOTE the null-guard: `node.edge && ...` evaluates to `null` for roots,
+    // and `null !== undefined` made EVERY successor of an edge-less node pay
+    // the flip penalty — in scenario/multi-goal bridge mode (which used to
+    // rebuild inner nodes without their edge) that taxed every single edge,
+    // making actual gear flips relatively FREE and shuffle plans cheap.
     const parentReverse =
-      node.edge && (node.edge.data as DriveEdgeData | undefined)?.reverse === true;
+      node.edge != null
+        ? (node.edge.data as DriveEdgeData | undefined)?.reverse === true
+        : undefined;
     const out: Node<CarKinematicState>[] = [];
 
     for (const prim of this.lib.lookup(st.speed)) {

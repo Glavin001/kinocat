@@ -22,6 +22,15 @@ import type { Pt } from '../internal/geom';
 export function reach(region: Region, accept?: Acceptance): Goal {
   return accept ? { kind: 'reach', region, accept } : { kind: 'reach', region };
 }
+/**
+ * Acceptance for "at rest": a SYMMETRIC speed band `{min: -eps, max: eps}`.
+ * `ScenarioState.speed` is signed, so the tempting `{speed: {max: 0}}` is a
+ * footgun — any reverse motion satisfies it (a car backing through the goal
+ * at -1.5 m/s counts as "stopped"). Use `reach(region, stopped())`.
+ */
+export function stopped(eps = 0.05): Acceptance {
+  return { speed: { min: -eps, max: eps } };
+}
 export function seq(...goals: Goal[]): Goal {
   return { kind: 'seq', goals };
 }

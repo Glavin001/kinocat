@@ -115,7 +115,9 @@ export class MultiGoalEnvironment<S> implements Environment<MultiGoalState<S>> {
     if (node.state.gateIndex >= this.gates.length) return [];
     // Build an inner-state pseudo-node and an inner-state goal node so the
     // base env's heuristic / analytic-shot can focus on the CURRENT gate.
-    const innerNode = this.base.createNode(node.state.inner, null, null);
+    // Preserve the producing edge so the base env's gear-history pricing
+    // (direction-change penalty) survives the wrapper (see scenario-environment).
+    const innerNode = this.base.createNode(node.state.inner, null, node.edge);
     innerNode.g = node.g;
     const currentGate = this.gates[node.state.gateIndex]!;
     const innerGoal = this.base.createNode(currentGate, null, null);

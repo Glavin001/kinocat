@@ -107,7 +107,13 @@ export function planVehicleMultiGoal(
     };
   }
   const envOpts = { ...DEFAULT_ENV_OPTIONS, ...(req.envOptions ?? {}) };
-  const baseEnv = new VehicleEnvironment(req.world, req.agent, req.lib, envOpts);
+  // Static request => keep time out of the dedup hash (see plan-vehicle.ts).
+  const hasDynamics =
+    (req.movingObstacles?.length ?? 0) > 0 || req.affordances !== undefined;
+  const baseEnv = new VehicleEnvironment(req.world, req.agent, req.lib, {
+    timeInHash: hasDynamics,
+    ...envOpts,
+  });
   let rCirc = 0;
   for (const [vx, vz] of req.agent.footprint) {
     const r = Math.hypot(vx, vz);
