@@ -112,6 +112,11 @@ export class InMemoryNavWorld implements NavWorld {
   // entry survives until the next `setObstacles` or a different goal cell.
   private h_goalKey = -1;
   private h_goalDist: Float32Array | null = null;
+  // Set by `setObstacles`; the grid rebuild is deferred to the next consumer
+  // (`clearanceAt` / `buildGoalLowerBound`) so a live tile update only pays
+  // for the oracles it actually uses — the rebuild is the dominant cost of
+  // an obstacle swap and would otherwise land on the replan latency path.
+  private h_dirty = false;
 
   constructor(
     private polygons: NavPolygon[],
@@ -371,6 +376,7 @@ export class InMemoryNavWorld implements NavWorld {
    *  cell_diagonal closer (half-cell at each end), so we subtract the full
    *  diagonal to keep the answer a true lower bound. */
   clearanceAt(x: number, z: number): number | null {
+    this.ensureHeuristicGrid();
     if (!this.h_clearance) return null;
     const cs = this.h_cellSize;
     const cx = Math.floor((x - this.h_originX) / cs);
@@ -390,6 +396,7 @@ export class InMemoryNavWorld implements NavWorld {
     gx: number,
     gz: number,
   ): ((x: number, z: number, y?: number) => number | null) | null {
+    this.ensureHeuristicGrid();
     if (!this.h_blocked) return null;
     const cs = this.h_cellSize;
     const w = this.h_width;
@@ -681,8 +688,19 @@ export class InMemoryNavWorld implements NavWorld {
     this.obstacles = obstacles;
     this.obstacleAABBs = buildAABBs(obstacles);
     this.rebuildIndex();
-    this.buildHeuristicGrid();
+    // Defer the heuristic-grid rebuild to its next consumer; collision
+    // queries only need the spatial index rebuilt above. Drop the goal memo
+    // now so nothing reads a stale field before the rebuild happens.
+    this.h_dirty = true;
+    this.h_goalKey = -1;
+    this.h_goalDist = null;
     this._revision++;
+  }
+
+  private ensureHeuristicGrid(): void {
+    if (!this.h_dirty) return;
+    this.h_dirty = false;
+    this.buildHeuristicGrid();
   }
 }
 
