@@ -21,6 +21,7 @@ import {
 import {
   buildLearnedRaceLibraryV2,
   buildKinematicLibrary,
+  type RaceCourse,
 } from './race-primitives-scenarios';
 import {
   buildParametricOnlyModel,
@@ -46,6 +47,9 @@ export interface RaceResult {
   finished: boolean;
   /** How many times the chassis left the arena / rolled. */
   offTrackEvents: number;
+  /** How many distinct times the chassis struck a course wall (0 on the
+   *  open course; the key model-fidelity signal on the technical course). */
+  wallStrikes: number;
   /** RMS prediction error at primitive boundary (m). The honest
    *  "how accurate is the model the planner uses" metric. */
   predErrorRms: number;
@@ -69,6 +73,9 @@ export interface RunRaceOptions {
   progressEverySec?: number;
   /** Per-feature toggles for ablation studies. Defaults to all-on. */
   tuning?: Partial<RaceTuning>;
+  /** Course to race on. Defaults to the open course (`buildRaceCourse()`).
+   *  Pass `buildRaceCourse('technical')` for the walled variant. */
+  course?: RaceCourse;
 }
 
 /** Race every entry against each other in independent Rapier worlds
@@ -86,6 +93,7 @@ export async function runHeadlessRace(
     syncHold: opts.syncHold ?? false,
     offTrackRecovery: 'spawn',
     tuning: opts.tuning,
+    course: opts.course,
   });
   let nextProgressAt = progressEvery;
   while (scenario.simTime() < maxSimTime) {
@@ -121,6 +129,7 @@ export async function runHeadlessRace(
       totalSimTime: finalSimTime,
       finished: c.laps.length >= targetLaps,
       offTrackEvents: c.offTrackEvents,
+      wallStrikes: c.wallStrikes,
       predErrorRms: c.diagnostics.predErrorRms,
       totalReplans: c.diagnostics.totalReplans,
       successfulReplans: c.diagnostics.successfulReplans,

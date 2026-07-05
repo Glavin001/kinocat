@@ -25,6 +25,7 @@ import RAPIER from '@dimforge/rapier3d-compat';
 import {
   createRaycastVehicle,
   createGroundCollider,
+  createBoxCollider,
   ensureRapier,
   stepRaycastVehicle,
   type CarHandle,
@@ -532,6 +533,9 @@ export interface RaceCarStatus {
   finished: boolean;
   holdingForSync: boolean;
   offTrackEvents: number;
+  /** Number of distinct times the chassis footprint touched a course wall
+   *  (rising-edge counted, like `offTrackEvents`). 0 on the open course. */
+  wallStrikes: number;
   diagnostics: RaceCarDiagnostics;
   metrics: RaceMetrics;
   /** Latest plan (lifted to a sequence of state samples for visualization). */
@@ -688,6 +692,10 @@ interface CarInternal {
   holdingForSync: boolean;
   finished: boolean;
   offTrackEvents: number;
+  // Wall-strike counter (technical course). Rising-edge counted.
+  wallStrikes: number;
+  // Whether the footprint was touching a wall on the previous tick.
+  lastTouchingWall: boolean;
   // Stall guard (diagnostics only — no teleport rescue).
   lastMoveSimTime: number;
   lastPos: { x: number; z: number };
@@ -703,6 +711,42 @@ interface CarInternal {
 
 // ---------------------------------------------------------------------------
 // Public factory
+
+/** Contact margin (m) added to a wall's physical half-extents when testing
+ *  whether the chassis footprint is touching it. The Rapier collider prevents
+ *  actual penetration, so the footprint hovers just outside the wall on
+ *  contact — the margin makes that hover register as a strike. */
+const WALL_CONTACT_MARGIN = 0.5;
+
+/** True iff the (oriented) chassis footprint overlaps any course wall,
+ *  approximated by testing the footprint's world-space corners and its
+ *  center against each wall's axis-aligned box (inflated by the contact
+ *  margin). Cheap and robust enough for a rising-edge strike counter. */
+function footprintTouchesWall(
+  state: CarKinematicState,
+  footprint: ReadonlyArray<readonly [number, number]>,
+  walls: ReadonlyArray<{ x: number; z: number; hx: number; hz: number }>,
+): boolean {
+  if (walls.length === 0) return false;
+  const cosH = Math.cos(state.heading);
+  const sinH = Math.sin(state.heading);
+  // Body frame: x forward, z to the side. World = rotate by heading.
+  const pts: Array<[number, number]> = [[0, 0]];
+  for (const [bx, bz] of footprint) {
+    pts.push([
+      state.x + bx * cosH - bz * sinH,
+      state.z + bx * sinH + bz * cosH,
+    ]);
+  }
+  for (const w of walls) {
+    const hx = w.hx + WALL_CONTACT_MARGIN;
+    const hz = w.hz + WALL_CONTACT_MARGIN;
+    for (const [px, pz] of pts) {
+      if (Math.abs(px - w.x) <= hx && Math.abs(pz - w.z) <= hz) return true;
+    }
+  }
+  return false;
+}
 
 export async function createRaceScenario(
   opts: RaceScenarioOptions,
@@ -810,6 +854,20 @@ export async function createRaceScenario(
       pad: 20,
       friction: 1.5,
     });
+    // Technical-course walls: fixed cuboid colliders so overshoot is a
+    // real physical strike (the plant bounces / stalls), not a free
+    // diagnostic. The planner sees the matching inflated `course.obstacles`
+    // holes; the demo renders `course.walls` with createBuildingHelper.
+    for (const w of course.walls ?? []) {
+      createBoxCollider(world, {
+        x: w.x,
+        y: w.height / 2,
+        z: w.z,
+        hx: w.hx,
+        hy: w.height / 2,
+        hz: w.hz,
+      });
+    }
     const offset = (i - (opts.entries.length - 1) / 2) * spacing;
     const spawn = {
       x: course.spawn.x,
@@ -871,6 +929,8 @@ export async function createRaceScenario(
       holdingForSync: false,
       finished: false,
       offTrackEvents: 0,
+      wallStrikes: 0,
+      lastTouchingWall: false,
       lastMoveSimTime: 0,
       lastPos: { x: spawn.x, z: spawn.z },
       lastInBounds: true,
@@ -1514,6 +1574,15 @@ export async function createRaceScenario(
       if (wasInBounds && !inBounds) c.offTrackEvents++;
       c.lastInBounds = inBounds;
     }
+    // Wall-strike tracking (technical course) — diagnostics only, no rescue.
+    // Rising-edge counted so a car scraping along a wall for several ticks
+    // registers one strike per contact, not one per frame.
+    const walls = course.walls ?? [];
+    if (walls.length > 0) {
+      const touching = footprintTouchesWall(after, c.entry.agent?.footprint ?? RACE_AGENT.footprint, walls);
+      if (touching && !c.lastTouchingWall) c.wallStrikes++;
+      c.lastTouchingWall = touching;
+    }
   }
 
   function buildStatus(c: CarInternal): RaceCarStatus {
@@ -1526,6 +1595,7 @@ export async function createRaceScenario(
       finished: c.finished,
       holdingForSync: c.holdingForSync,
       offTrackEvents: c.offTrackEvents,
+      wallStrikes: c.wallStrikes,
       diagnostics: c.diagnostics,
       metrics: c.metrics,
       plan: c.plan,
@@ -1564,6 +1634,8 @@ export async function createRaceScenario(
       c.holdingForSync = false;
       c.finished = false;
       c.offTrackEvents = 0;
+      c.wallStrikes = 0;
+      c.lastTouchingWall = false;
       c.lastMoveSimTime = 0;
       c.lastPos = { x: c.spawn.x, z: c.spawn.z };
       c.lastInBounds = true;
