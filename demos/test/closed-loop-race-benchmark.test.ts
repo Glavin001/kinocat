@@ -36,16 +36,18 @@ try {
   RAPIER_OK = false;
 }
 
-// v2 average lap must be within this factor of kinematic's. Initial pin:
-// measured 1.28 on the shipping config (down from 1.51 before this
-// branch's fixes), plus a small margin because the closed loop is
-// deterministic but chaotically sensitive — a 1% parameter nudge swings
-// lap times ±10%, and near-identical configs measured anywhere in
-// 1.00–1.28. The STABLE model-quality signals are the failed-replan and
-// prediction-error assertions below, which v2 won in every measured
-// run. Tighten this toward < 1.0 as feedforward / MPPI / on-demand
-// primitive rollout land; never loosen it to pass a regression.
-const V2_VS_KIN_AVG_RATIO = 1.35;
+// v2 average lap must be within this factor of kinematic's. History:
+// measured 1.51 → 1.28 (executor fixes) → 1.188 after the grip-saturating
+// brake model landed (the model's biggest open-loop error — a ~10×
+// longitudinal under-brake on the brake-in-turn channel — was fixed, and
+// the regenerated in-bounds artifact's honest braking narrowed the
+// closed-loop lap-time gap on the OPEN course from ~28% to ~19%). Pinned at
+// 1.25 (measured 1.188 + margin for the closed loop's chaotic ±10%
+// sensitivity to 1% parameter nudges). The STABLE model-quality signals are
+// the failed-replan and prediction-error assertions below. Tighten toward
+// < 1.0 as the executor learns to consume the model's speeds (feedforward /
+// MPPI / on-demand primitive rollout); NEVER loosen it to pass a regression.
+const V2_VS_KIN_AVG_RATIO = 1.25;
 
 describe.skipIf(!RAPIER_OK)('closed-loop head-to-head race benchmark (real Rapier plant)', () => {
   it('trained-v2 library races the kinematic library within the pace ratchet, clean', { timeout: 480_000, retry: 0 }, async () => {

@@ -775,7 +775,17 @@ export async function createRaceScenario(
   void opts.offTrackRecovery;
   void opts.stallTimeoutMs;
   const spacing = opts.spawnSpacingZ ?? 3;
-  const tuning: RaceTuning = { ...DEFAULT_TUNING, ...(opts.tuning ?? {}) };
+  // Technical-course default: enable curvature feedforward + the
+  // friction-circle speed profile (respectPathSpeed). Near walls the raw
+  // geometry-only pure-pursuit overshoots corners and the chassis wedges
+  // (a failed-replan storm → DNF); the speed profile brakes into corners so
+  // BOTH cars thread the walls cleanly. The open course keeps the leaner
+  // default (measured faster there). Explicit `opts.tuning` still wins.
+  const courseTuningDefaults: Partial<RaceTuning> =
+    course.variant === 'technical'
+      ? { respectPathSpeed: true, curvatureFeedforward: true, enableSpeedProfile: true }
+      : {};
+  const tuning: RaceTuning = { ...DEFAULT_TUNING, ...courseTuningDefaults, ...(opts.tuning ?? {}) };
   // Tracker config derives from the tuning bundle so a single
   // `createRaceScenario` instance handles racing or parking based on
   // the scenario's per-tuning overrides. Anything not set falls
