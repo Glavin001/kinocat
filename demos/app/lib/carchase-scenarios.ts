@@ -651,9 +651,11 @@ const ROBBER_THREAT_RANGE = 75; // m
 const ROBBER_WALL_MARGIN = 3.5; // m
 // Number of candidate headings in the fan.
 const ROBBER_RAYS = 24;
-// Score weights (openness is normalised to [0,1] by ROBBER_LOOK first).
-const ROBBER_W_OPEN = 1.0;
-const ROBBER_W_COP = 1.6;
+// Score weights. Cop-avoidance is *coupled* to openness (see scoring below):
+// a heading you can't actually drive down is worthless as an escape no matter
+// how far it points from the cops, so it can't lure the robber into a wall.
+const ROBBER_W_OPEN = 1.2;
+const ROBBER_W_COP = 1.3;
 const ROBBER_W_MOM = 0.35;
 
 /** Distance from `(x,z)` along unit direction `(dx,dz)` until the ray leaves
@@ -770,9 +772,14 @@ export function robberGoal(
     }
 
     const momentum = Math.cos(ang - robber.heading);
+    // Openness gates the whole "is this a good escape" judgement: the value
+    // of running away from the cops down this heading is proportional to how
+    // far we can actually run. A wall-facing heading (open ≈ 0) therefore
+    // scores ≈ momentum only and can never win just because it points away
+    // from a nearby pursuer — which is what used to pin the robber in corners.
+    const openFrac = open / ROBBER_LOOK;
     const score =
-      ROBBER_W_OPEN * (open / ROBBER_LOOK) -
-      ROBBER_W_COP * copTerm +
+      openFrac * (ROBBER_W_OPEN - ROBBER_W_COP * copTerm) +
       ROBBER_W_MOM * momentum;
 
     if (score > bestScore) {
