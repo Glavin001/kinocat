@@ -299,7 +299,6 @@ const ALL_TAGS: readonly Tag[] = [
   'Diagnostic',
 ];
 
-const FLAGSHIP_DEMOS = DEMOS.filter((d) => d.level === 'flagship');
 const TOOL_DEMOS = DEMOS.filter((d) => d.category === 'tools');
 const TOOL_COUNT = TOOL_DEMOS.length;
 
@@ -370,23 +369,22 @@ function TagFilterChip({
 
 function DemoCard({
   demo,
-  featured = false,
   hiddenTags,
 }: {
   demo: Demo;
-  featured?: boolean;
   hiddenTags?: readonly Tag[];
 }) {
+  const isFlagship = demo.level === 'flagship';
   const visibleTags = hiddenTags ? demo.tags.filter((t) => !hiddenTags.includes(t)) : demo.tags;
   return (
     <Link
       href={demo.href}
       className="kc-card"
-      data-featured={featured ? 'true' : undefined}
-      data-flagship={demo.level === 'flagship' ? 'true' : undefined}
+      data-flagship={isFlagship ? 'true' : undefined}
     >
-      {visibleTags.length > 0 && (
+      {(isFlagship || visibleTags.length > 0) && (
         <div className="kc-card-tags">
+          {isFlagship && <span className="kc-flag">★ Start here</span>}
           {visibleTags.map((t) => (
             <TagChip key={t} token={t} />
           ))}
@@ -404,15 +402,11 @@ function DemoSection({
   heading,
   blurb,
   demos,
-  featured = false,
-  showCount = true,
 }: {
   id?: string;
   heading: string;
   blurb: string;
   demos: readonly Demo[];
-  featured?: boolean;
-  showCount?: boolean;
 }) {
   const common = commonTagsOf(demos);
   return (
@@ -428,15 +422,13 @@ function DemoSection({
           </div>
           <p className="kc-section-blurb">{blurb}</p>
         </div>
-        {showCount && (
-          <span className="kc-section-count">
-            {demos.length} {demos.length === 1 ? 'demo' : 'demos'}
-          </span>
-        )}
+        <span className="kc-section-count">
+          {demos.length} {demos.length === 1 ? 'demo' : 'demos'}
+        </span>
       </header>
-      <div className={featured ? 'kc-grid kc-grid-showcase' : 'kc-grid kc-grid-compact'}>
+      <div className="kc-grid kc-grid-compact">
         {demos.map((d) => (
-          <DemoCard key={d.href} demo={d} featured={featured} hiddenTags={common} />
+          <DemoCard key={d.href} demo={d} hiddenTags={common} />
         ))}
       </div>
     </section>
@@ -493,7 +485,8 @@ export default function Home() {
             IGHA* with Reeds-Shepp curves and motion primitives — anytime,
             time-aware, multi-agent planning with affordances, navmesh
             integration, and learned dynamics. Powered by the{' '}
-            <code className="kc-code">kinocat</code> package.
+            <code className="kc-code">kinocat</code> package. New here? Look for
+            the <span className="kc-lede-flag">★ Start here</span> demos.
           </p>
         </header>
 
@@ -560,18 +553,11 @@ export default function Home() {
           </section>
         ) : (
           <>
-            {/* Start here: the flagship demos, given the most prominence.
-                The "Start here" heading already signals importance, so the
-                cards carry no separate "flagship" badge. */}
-            <DemoSection
-              heading="Start here"
-              blurb="The flagship demos — the fastest way to see what kinocat does."
-              demos={FLAGSHIP_DEMOS}
-              featured
-              showCount={false}
-            />
-
-            {/* Themed categories, excluding the low-level tools. */}
+            {/* Themed categories, most important first, excluding the
+                low-level tools. Each demo appears exactly once; the
+                recommended starting points carry a "★ Start here" marker
+                in place rather than being duplicated into a separate
+                section. */}
             {CATEGORIES.filter((c) => c.id !== 'tools').map((cat) => {
               const demos = DEMOS.filter((d) => d.category === cat.id);
               if (demos.length === 0) return null;
@@ -865,11 +851,10 @@ html, body { background: var(--kc-bg); }
   background: linear-gradient(180deg, rgba(24, 30, 44, 0.9), rgba(17, 21, 30, 0.9));
 }
 .kc-card:hover::before { opacity: 1; }
-.kc-card[data-featured="true"] { padding: 20px; }
-.kc-card[data-featured="true"] .kc-card-title { font-size: 17px; }
 
-/* Flagship cards keep a subtle warm accent (no text badge — the
-   "Start here" heading already conveys their status). */
+/* Flagship / recommended cards keep a subtle warm accent plus a small
+   "★ Start here" marker, so they stand out in place instead of being
+   duplicated into a separate section. */
 .kc-card[data-flagship="true"] {
   border-color: rgba(255, 210, 127, 0.28);
   background: linear-gradient(180deg, rgba(28, 27, 34, 0.9), rgba(18, 18, 23, 0.9));
@@ -877,6 +862,24 @@ html, body { background: var(--kc-bg); }
 .kc-card[data-flagship="true"]:hover {
   border-color: rgba(255, 210, 127, 0.55);
   box-shadow: 0 12px 40px -16px rgba(255, 210, 127, 0.35), 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+.kc-flag {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.3px;
+  color: #ffd27f;
+  background: rgba(255, 210, 127, 0.12);
+  border: 1px solid rgba(255, 210, 127, 0.42);
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+.kc-lede-flag {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.86em;
+  color: #ffd27f;
+  white-space: nowrap;
 }
 
 .kc-card-tags { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
