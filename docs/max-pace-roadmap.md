@@ -163,6 +163,50 @@ assertion in `closed-loop-race-benchmark.test.ts`); both cars' mean speed
 bit-identical; parking untouched (all changes gated on drive-through
 plans / race tuning).
 
+### 2b. WS-1½ — Control feedforward: stop re-deriving actuators from geometry
+
+**Problem.** The stack plans in actuator space, flattens to geometry, then
+re-derives actuator commands from geometry — destroying the plan's control
+knowledge twice:
+
+- Every primitive stores the exact `[steer, driveForce, brakeForce]` that
+  produced it (`characterize.ts:129`) and every plan edge remembers its
+  primitive (`primId`, `vehicle-environment.ts:343`) — but plan extraction
+  keeps only the state polyline; nothing downstream reads `primId` or
+  `.controls` (verified: zero references in `race-scenario.ts`).
+- The rich `Plan`'s `steerFf`/`accelFf` are *re-derived* from the
+  already-smoothed geometry (`buildPlan`, `race-scenario.ts:1277`) — a
+  reconstruction of what was discarded — and even that is unread.
+- On the technical course, `smoothSpeedProfile` **overwrites** the plan's
+  model-honest per-sample speeds with a generic curvature formula at the
+  conservative hand-set limits (`race-scenario.ts:1253-1261`) — the v2
+  planner's corner-speed knowledge is erased before the tracker sees it.
+
+**Work.**
+
+1. Thread `primId → MotionPrimitive.controls` through plan extraction so
+   each plan sample carries the baked control vector alongside the pose
+   (time-aligned; smoothing moves geometry, controls stay keyed by `t`).
+2. Feedforward + feedback execution: the tracker emits the plan's controls
+   as the feedforward term and adds a bounded geometric correction on top
+   (pure open-loop replay would drift — the baked controls are only exact
+   from the state they were baked at; FF+FB is the standard shape).
+3. Speed profile becomes a **safety clamp, not a rewrite**: keep the plan's
+   model-derived speeds; only reduce a sample's speed when it exceeds the
+   envelope-backed friction/braking bound. (Today's pass replaces v2's
+   honest speeds with model-agnostic math — an own-goal for the fidelity
+   experiment.)
+4. MPPI warm-start from the plan's control sequence (instead of only the
+   shifted previous solution) — the plan's control knowledge becomes the
+   sampling prior that MPPI refines, unifying this workstream with WS-3.
+
+**Acceptance.** Steering/throttle traces on a corner-entry segment show the
+feedforward term carrying most of the command (feedback correction small
+and zero-mean); v2 lap times improve more than kinematic's (its baked
+controls encode true-plant knowledge; kinematic's encode delusion — this
+change is honestly asymmetric); tracking error (predErrorRms) does not
+regress; parking unaffected (FF gated to drive-through plans).
+
 ---
 
 ## 3. WS-2 — Dynamic rollouts: plan from the true dynamic state (the new workstream)
@@ -358,12 +402,14 @@ aggression; demo renders the circuit; video walkthrough artifact.
    self-contained).
 2. **WS-1** speed-policy surgery (both cars get fast; D1 lands; fidelity
    starts being priced).
-3. **WS-2** dynamic rollouts (root rollouts → successor dyn-state →
+3. **WS-1½** control feedforward (plan controls reach the actuators;
+   speed profile demoted to a clamp; sets up the MPPI warm-start prior).
+4. **WS-2** dynamic rollouts (root rollouts → successor dyn-state →
    commit-window projection; D3 lands; v2's statefulness finally counts).
-4. **WS-3** MPPI cost redesign + substepping + gated default flip (D2/D4).
-5. **WS-4** circuit course (D5's arena; walls bind now that speeds are
+5. **WS-3** MPPI cost redesign + substepping + gated default flip (D2/D4).
+6. **WS-4** circuit course (D5's arena; walls bind now that speeds are
    real).
-6. **WS-5** ratchet tightening through 1.0 + final artifacts.
+7. **WS-5** ratchet tightening through 1.0 + final artifacts.
 
 Rationale for the order: speed first (fidelity is priced at zero at
 9 m/s), then model-in-the-loop planning/execution (converts the priced
