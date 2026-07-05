@@ -98,14 +98,36 @@ describe('carchase tactical goals are authored as scenario regions', () => {
     expect(cut.representative().x).toBeGreaterThan(icept.representative().x);
   });
 
-  it('CONTAIN_LEFT / CONTAIN_RIGHT `beside` regions straddle opposite flanks', () => {
-    const left = copGoalRegion(robber, robberPredict, cop, 'CONTAIN_LEFT');
-    const right = copGoalRegion(robber, robberPredict, cop, 'CONTAIN_RIGHT');
+  it('CONTAIN is a `beside` region on the flank the cop is nearest', () => {
+    // Cop to the robber's LEFT (east-heading robber → left is +z).
+    const leftCop: CarKinematicState = { x: -20, z: 10, heading: 0, speed: 0, t: 0 };
+    const rightCop: CarKinematicState = { x: -20, z: -10, heading: 0, speed: 0, t: 0 };
+    const left = copGoalRegion(robber, robberPredict, leftCop, 'CONTAIN');
+    const right = copGoalRegion(robber, robberPredict, rightCop, 'CONTAIN');
     expect(left.kind).toBe('beside');
     expect(right.kind).toBe('beside');
-    // For an east-heading robber, left is +z and right is −z.
+    // The pinch slot sits on the cop's own side of the robber.
     expect(left.representative().z).toBeGreaterThan(1);
     expect(right.representative().z).toBeLessThan(-1);
+  });
+
+  it('AMBUSH is a `near` region at the robber\'s predicted escape point', () => {
+    const course = buildCarChaseCourse();
+    const { robber: rSpawn, cops } = spawnPoses();
+    const ambusher = cops[3]!;
+    const r = copGoalRegion(rSpawn, robberPredict, ambusher, 'AMBUSH', {
+      cops,
+      buildings: course.buildings,
+      course,
+    });
+    expect(r.kind).toBe('near');
+    // The trap is planted away from the robber's current pose (an escape point).
+    expect(Math.hypot(r.representative().x - rSpawn.x, r.representative().z - rSpawn.z)).toBeGreaterThan(5);
+  });
+
+  it('AMBUSH falls back to a `within` intercept without squad context', () => {
+    const r = copGoalRegion(robber, robberPredict, cop, 'AMBUSH');
+    expect(r.kind).toBe('within');
   });
 
   it('PURSUE aims at the robber\'s actual pose (no lead)', () => {
@@ -115,7 +137,7 @@ describe('carchase tactical goals are authored as scenario regions', () => {
   });
 
   it('every cop goal region compiles to a reach automaton (introspection)', () => {
-    for (const mode of ['INTERCEPT', 'CUTOFF', 'CONTAIN_LEFT', 'CONTAIN_RIGHT', 'PURSUE'] as const) {
+    for (const mode of ['INTERCEPT', 'CUTOFF', 'CONTAIN', 'AMBUSH', 'PURSUE'] as const) {
       const automaton = compile(reach(copGoalRegion(robber, robberPredict, cop, mode)));
       expect(automaton.accepting.length).toBeGreaterThan(0);
     }

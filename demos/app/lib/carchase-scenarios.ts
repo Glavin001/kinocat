@@ -389,31 +389,41 @@ export function carChaseAffordances(course: CarChaseCourse): AffordanceRegistry 
 // planner gets a goal pose; this picks WHICH pose from observable geometry.
 
 // ---------------------------------------------------------------------------
-// Cop tactical roles. The squad is a *pursuit* team, so the roles are about
-// closing time-to-capture and cutting off escape rather than the old
-// "sit at an offset from the robber" modes (which had the fatal bug that a
-// cop already behind the robber was told to drive to a point *further*
-// behind it — i.e. away).
+// Cop tactical roles. Rather than swap roles by geometry every tick (which
+// made the squad's behaviour hard to read), each cop now has a FIXED,
+// distinct persona — four genuinely different pursuit heuristics that are
+// interesting to watch play off each other. All four are authored as
+// `kinocat/scenario` goal regions (see `copGoalRegion`).
 //
-//   INTERCEPT      — drive to the point where this cop, at cruise speed,
-//                    will meet the robber travelling at its current
-//                    velocity (the classic lead-pursuit collision point).
-//                    Assigned to the single cop with the shortest
-//                    time-to-intercept — the one already best placed to
-//                    make the arrest.
-//   CONTAIN_LEFT   — a supporting cop pulls up ahead-and-to-one-side of the
-//   CONTAIN_RIGHT    robber's predicted position to hem it in / pinch it
-//                    against a sibling on the opposite flank.
-//   CUTOFF         — get well ahead along the robber's travel direction to
-//                    block the escape lane (used for a spare 3rd+ cop).
-//   PURSUE         — degenerate case: robber is (nearly) stationary, so
-//                    every cop just converges on its actual pose.
+//   INTERCEPT (Hunter)   — pure lead-pursuit: solve the collision quadratic
+//                          and drive to the point where the cop meets the
+//                          robber at cruise speed. Relentless direct chase.
+//                          Region: `within(lead)`.
+//   CUTOFF (Blocker)     — the "cut it off" role: don't chase the meeting
+//                          point, race PAST it — well ahead along the
+//                          robber's travel direction — to slam a roadblock
+//                          across its escape lane. Because the cop then sits
+//                          on the robber's forward path (and the robber
+//                          treats cops as obstacles) it forces a detour.
+//                          Region: `ahead(lead, big)`.
+//   CONTAIN (Shepherd)   — pull up alongside on the robber's flank (the side
+//                          the cop is already nearest) to herd / pin it,
+//                          denying lateral escape. Region: `beside(lead)`.
+//   AMBUSH (Predator)    — the clever one: run the robber's OWN escape
+//                          heuristic to predict where it will flee next, then
+//                          race to that escape point and spring the trap
+//                          before the robber arrives. Region: `near(escape)`.
+//   PURSUE               — degenerate fallback: robber (nearly) stationary,
+//                          so leading is meaningless; converge on its pose.
 export type CopTacticalMode =
   | 'INTERCEPT'
-  | 'CONTAIN_LEFT'
-  | 'CONTAIN_RIGHT'
   | 'CUTOFF'
+  | 'CONTAIN'
+  | 'AMBUSH'
   | 'PURSUE';
+
+// The four personas, in cop-index order. Cop i takes COP_PERSONAS[i % 4].
+const COP_PERSONAS: CopTacticalMode[] = ['INTERCEPT', 'CUTOFF', 'CONTAIN', 'AMBUSH'];
 
 // Below this robber speed the lead point of any interception collapses onto
 // the robber itself, so every cop just drives straight at it (PURSUE).
@@ -464,46 +474,16 @@ function copSide(robber: CarKinematicState, cop: CarKinematicState): number {
   return (cop.x - robber.x) * px + (cop.z - robber.z) * pz;
 }
 
-/** Assign a coordinated role to every cop from the current squad geometry.
- *  Unlike the old index-keyed scheme this looks at *all* the cops together
- *  so the arrest job goes to whoever is genuinely best placed, and the
- *  supporting cops split to opposite flanks instead of stacking. */
+/** Each cop's fixed persona by index (cycled if there are >4 cops). A robber
+ *  that is nearly stationary collapses every cop to PURSUE, since none of the
+ *  lead-based tactics mean anything against a parked target. Kept as an
+ *  array-returning function so callers can index into it once per squad. */
 export function assignCopModes(
   robber: CarKinematicState,
   cops: ReadonlyArray<CarKinematicState>,
 ): CopTacticalMode[] {
-  const n = cops.length;
-  if (n === 0) return [];
-  // Slow robber: no meaningful lead — everyone converges on its pose.
   if (Math.abs(robber.speed) < LEAD_MIN_SPEED) return cops.map(() => 'PURSUE');
-
-  const speed = CARCHASE_AGENT.maxSpeed;
-  const vx = Math.cos(robber.heading) * robber.speed;
-  const vz = Math.sin(robber.heading) * robber.speed;
-  const times = cops.map((c) =>
-    interceptTime(robber.x - c.x, robber.z - c.z, vx, vz, speed),
-  );
-  // Primary = shortest time-to-intercept.
-  let primary = 0;
-  for (let i = 1; i < n; i++) if (times[i]! < times[primary]!) primary = i;
-
-  const modes: CopTacticalMode[] = cops.map(() => 'CUTOFF');
-  modes[primary] = 'INTERCEPT';
-
-  // Supporting cops, ordered left→right by their current side, take the
-  // outermost flanks; any middle cop blocks the escape lane ahead.
-  const rest = cops
-    .map((c, i) => ({ i, side: copSide(robber, c) }))
-    .filter((r) => r.i !== primary)
-    .sort((a, b) => a.side - b.side);
-  if (rest.length === 1) {
-    modes[rest[0]!.i] = rest[0]!.side < 0 ? 'CONTAIN_LEFT' : 'CONTAIN_RIGHT';
-  } else if (rest.length >= 2) {
-    modes[rest[0]!.i] = 'CONTAIN_LEFT';
-    modes[rest[rest.length - 1]!.i] = 'CONTAIN_RIGHT';
-    for (let k = 1; k < rest.length - 1; k++) modes[rest[k]!.i] = 'CUTOFF';
-  }
-  return modes;
+  return cops.map((_, i) => COP_PERSONAS[i % COP_PERSONAS.length]!);
 }
 
 /** Back-compat single-cop wrapper: derive the whole squad's roles from the
@@ -554,10 +534,21 @@ function nudgeGoalToNavClear(
 // the exact same object can be compiled, validated, and drawn by the Goal-Lab
 // tooling (`createRegionHelper`) — that's the introspection payoff.
 const COP_GOAL_R = 3; // `within` ball radius (INTERCEPT / PURSUE contact)
-const COP_CUTOFF_LEAD = 18; // `ahead` block distance (CUTOFF)
-const COP_CONTAIN_GAP = 9; // `beside` lateral pinch gap (CONTAIN_*)
-const COP_CONTAIN_TOL = 3; // beside/ahead ball tolerance
+const COP_CUTOFF_LEAD = 13; // `ahead` roadblock distance past the lead point (CUTOFF)
+const COP_CUTOFF_TOL = 3.5; // CUTOFF ball tolerance
+const COP_CONTAIN_GAP = 6; // `beside` lateral pinch gap (CONTAIN)
+const COP_CONTAIN_TOL = 3; // beside ball tolerance
+const COP_AMBUSH_R = 4; // `near` escape-trap radius (AMBUSH)
 const COP_LEAD_MAX_S = 6; // clamp on the interception lead time
+
+/** Extra context a couple of the personas need beyond the robber prediction:
+ *  the full cop roster + course, so `AMBUSH` can run the robber's own escape
+ *  heuristic to predict where it will flee. */
+export interface CopContext {
+  cops?: CarKinematicState[];
+  buildings?: BuildingSpec[];
+  course?: CarChaseCourse;
+}
 
 /** The canonical GOAL REGION a cop is trying to reach, authored in the
  *  `kinocat/scenario` DSL against a *lead-shifted* view of the robber — so the
@@ -577,6 +568,7 @@ export function copGoalRegion(
   robberPredict: Predict<CarKinematicState>,
   cop: CarKinematicState,
   mode: CopTacticalMode,
+  ctx?: CopContext,
 ): Region {
   const speed = CARCHASE_AGENT.maxSpeed;
   const vx = Math.cos(robber.heading) * robber.speed;
@@ -598,11 +590,32 @@ export function copGoalRegion(
     case 'PURSUE':
       return within(lead, COP_GOAL_R);
     case 'CUTOFF':
-      return ahead(lead, COP_CUTOFF_LEAD, COP_CONTAIN_TOL);
-    case 'CONTAIN_LEFT':
-      return beside(lead, LEFT, COP_CONTAIN_GAP, COP_CONTAIN_TOL);
-    case 'CONTAIN_RIGHT':
-      return beside(lead, RIGHT, COP_CONTAIN_GAP, COP_CONTAIN_TOL);
+      // Race PAST the meeting point, down the robber's travel direction, to
+      // block its escape lane.
+      return ahead(lead, COP_CUTOFF_LEAD, COP_CUTOFF_TOL);
+    case 'CONTAIN': {
+      // Flank on whichever side the cop is already nearest, so it slides
+      // alongside instead of cutting across the robber's nose.
+      const side = copSide(robber, cop) >= 0 ? LEFT : RIGHT;
+      return beside(lead, side, COP_CONTAIN_GAP, COP_CONTAIN_TOL);
+    }
+    case 'AMBUSH': {
+      // Predict where the robber will FLEE (its own escape heuristic) and set
+      // a trap there. Needs the roster + course; without them, fall back to a
+      // straight intercept so the persona still does something sensible.
+      if (ctx?.cops && ctx.course) {
+        const escape = robberGoal(
+          robber,
+          ctx.course.robberLoop,
+          0,
+          ctx.cops,
+          ctx.buildings,
+          ctx.course,
+        ).goal;
+        return near({ x: escape.x, z: escape.z }, COP_AMBUSH_R);
+      }
+      return within(lead, COP_GOAL_R);
+    }
   }
 }
 
@@ -613,10 +626,9 @@ export function tacticalGoal(
   robberPredict: Predict<CarKinematicState>,
   cop: CarKinematicState,
   mode: CopTacticalMode,
-  buildings?: BuildingSpec[],
-  course?: CarChaseCourse,
+  ctx?: CopContext,
 ): CarKinematicState {
-  const rep = copGoalRegion(robber, robberPredict, cop, mode).representative();
+  const rep = copGoalRegion(robber, robberPredict, cop, mode, ctx).representative();
   const goal = clampGoalToBounds({
     x: rep.x,
     z: rep.z,
@@ -624,7 +636,7 @@ export function tacticalGoal(
     speed: CARCHASE_AGENT.maxSpeed,
     t: 0,
   });
-  return nudgeGoalToNavClear(goal, cop, buildings, course);
+  return nudgeGoalToNavClear(goal, cop, ctx?.buildings, ctx?.course);
 }
 
 // ---------------------------------------------------------------------------
@@ -986,9 +998,10 @@ const SPAWN_ROBBER: CarKinematicState = {
 };
 
 const SPAWN_COPS: CarKinematicState[] = [
-  { x: 95, z: 70, heading: Math.PI, speed: 0, t: 0 },
-  { x: 50, z: -80, heading: Math.PI / 2, speed: 0, t: 0 },
-  { x: -100, z: 0, heading: 0, speed: 0, t: 0 },
+  { x: 95, z: 70, heading: Math.PI, speed: 0, t: 0 }, // NE — Hunter
+  { x: 50, z: -80, heading: Math.PI / 2, speed: 0, t: 0 }, // S — Blocker
+  { x: -100, z: 0, heading: 0, speed: 0, t: 0 }, // W — Shepherd
+  { x: -80, z: 75, heading: 0, speed: 0, t: 0 }, // NW — Ambusher
 ];
 
 export function spawnPoses() {
@@ -1042,7 +1055,11 @@ export function buildCarChaseSnapshot(): CarChaseSnapshot {
       const fromPlan = registry.predictNPC('robber')(t) as CarKinematicState | null;
       return fromPlan ?? predictRobberFromState(SPAWN_ROBBER, 4)(t);
     };
-    const goal = tacticalGoal(SPAWN_ROBBER, robberPredict, cop, mode, course.buildings, course);
+    const goal = tacticalGoal(SPAWN_ROBBER, robberPredict, cop, mode, {
+      cops: SPAWN_COPS,
+      buildings: course.buildings,
+      course,
+    });
     const siblingIds = SPAWN_COPS.map((_, j) => `cop${j}`).filter(
       (_, j) => j !== i,
     );

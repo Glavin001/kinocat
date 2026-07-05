@@ -160,7 +160,7 @@ interface Banner {
   untilWall: number;
 }
 
-const NUM_COPS = 3;
+const NUM_COPS = 4;
 const CAPTURE_DISTANCE = 4.5;
 // Maximum vertical separation (world Y) for a capture to count. Without this
 // a cop sitting directly under a robber mid-air over the jump ramp registers
@@ -205,7 +205,9 @@ const RESET_FLIP_UP_Y = 0.5;
 const RESET_FALL_Y = -10;
 const RESET_COOLDOWN_MS = 5000;
 
-const COP_COLORS = [0xff5566, 0xffaa44, 0xff66dd];
+// One color per persona: Hunter (red), Blocker (amber), Shepherd (pink),
+// Ambusher (violet). Index order matches COP_PERSONAS in carchase-scenarios.
+const COP_COLORS = [0xff5566, 0xffaa44, 0xff66dd, 0xaa77ff];
 
 export default function CarChase() {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -742,10 +744,11 @@ export default function CarChase() {
         const p = registry.predictNPC('robber')(t) as CarKinematicState | null;
         return p ?? predictRobberFromState(robberState, 8)(t);
       };
-      const goal = tacticalGoal(robberState, robberPredict, copState, mode, course.buildings, course);
+      const copCtx = { cops: copStates, buildings: course.buildings, course };
+      const goal = tacticalGoal(robberState, robberPredict, copState, mode, copCtx);
       co.mode = mode;
       co.goal = goal;
-      co.goalRegion = copGoalRegion(robberState, robberPredict, copState, mode);
+      co.goalRegion = copGoalRegion(robberState, robberPredict, copState, mode, copCtx);
       const siblingIds = cops
         .filter((o) => o.id !== co.id)
         .map((o) => o.id);
