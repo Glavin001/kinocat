@@ -98,7 +98,20 @@ cusp maneuvering, ~102 s of pure termination-layer limit cycle.**
 
 ## 2. Open PR reviews
 
-Verdict summary (details per PR below):
+> **Status update (2026-07-05, later the same day):** PR **#37** was merged
+> into main (`4edc567`) after a review-fixes commit. PR **#36** was reworked
+> on-branch exactly along the lines below (`7e43b9a`: center-aware
+> `evaluateParked` + true-goal gating of the heading term, main merged in)
+> and re-verified independently: full suite 685 passed / 0 failed on the
+> branch head, controller bench **6/6** including parking-parallel
+> (17.4 s, 86 % in stall, 5° heading error — previously FAIL at 16°).
+> The #36 verdict below is therefore superseded: **ready to merge**.
+> Known follow-up from the #37 integration: the bench's new
+> "plan N % feasible" annotation still reports 0 % for multi-cusp/racing
+> plans (the cusp phantom-curvature issue, §2.2 fix 1) — advisory only,
+> does not gate pass/fail.
+
+Verdict summary as of the original review (details per PR below):
 
 | PR | Title (short) | Importance | Verdict |
 |---|---|---|---|
