@@ -26,6 +26,7 @@ interface Pose {
 
 async function runRamp(maxTicks: number, affordance: boolean) {
   const scenario = await createRampScenario({ affordance });
+  const car = scenario.getCar();
   const goal = scenario.status().goal;
   const monitor = createSimMonitor({
     footprint: RAMP_AGENT.footprint,
@@ -37,12 +38,16 @@ async function runRamp(maxTicks: number, affordance: boolean) {
   const poses: Pose[] = [];
   let everUsedAffordance = false;
   let reached = false;
+  let maxAirborneY = -Infinity; // peak chassis height — how high the car flew
+  let maxLateral = 0; // peak |z| excursion — detour swings wide, jump hugs z≈0
   for (let i = 0; i < maxTicks; i++) {
     scenario.tick();
     const st = scenario.status();
     monitor.sample(st);
     poses.push({ x: st.state.x, z: st.state.z, heading: st.state.heading, speed: st.state.speed });
     if (st.diagnostics.usedAffordance) everUsedAffordance = true;
+    maxAirborneY = Math.max(maxAirborneY, car.chassis.translation().y);
+    maxLateral = Math.max(maxLateral, Math.abs(st.state.z));
     if (Math.hypot(st.state.x - goal.x, st.state.z - goal.z) < 3) {
       reached = true;
       break;
@@ -50,7 +55,7 @@ async function runRamp(maxTicks: number, affordance: boolean) {
   }
   const report = monitor.summary();
   scenario.dispose();
-  return { report, poses, everUsedAffordance, reached };
+  return { report, poses, everUsedAffordance, reached, maxAirborneY, maxLateral };
 }
 
 describe.skipIf(!RAPIER_OK)('ramp invariants', () => {
@@ -66,6 +71,31 @@ describe.skipIf(!RAPIER_OK)('ramp invariants', () => {
   it('takes the jump affordance when it is enabled', { timeout: 90000, retry: 0 }, async () => {
     const a = await runRamp(900, true);
     expect(a.everUsedAffordance, `\n${formatReport(a.report)}`).toBe(true);
+  });
+
+  it('PHYSICALLY flies the jump — airborne + centreline, never detours around the gap', { timeout: 90000, retry: 0 }, async () => {
+    // The regression the planner-flag test above could not see: even with the
+    // planner reporting "affordance used", the car used to physically drive
+    // AROUND the gap (|z| ~17 m, wheels never leaving the ground). Assert the
+    // real trajectory — a genuine ballistic launch, hugging the z=0 centreline.
+    const a = await runRamp(900, true);
+    const ctx = `maxAirborneY=${a.maxAirborneY.toFixed(2)} maxLateral=${a.maxLateral.toFixed(2)} reached=${a.reached}`;
+    expect(a.reached, ctx).toBe(true);
+    // Chassis resting height is ~0.8 m; a real launch clears well above that.
+    expect(a.maxAirborneY, ctx).toBeGreaterThan(1.5);
+    // The gap is ~30 m wide (half-width 15). Detour swings |z|>15; the jump
+    // stays on the ramp centreline. A generous bound cleanly separates them.
+    expect(a.maxLateral, ctx).toBeLessThan(6);
+  });
+
+  it('WITHOUT the affordance it detours around the gap instead of flying', { timeout: 90000, retry: 0 }, async () => {
+    // Contrast: disabling the affordance must produce the opposite trajectory —
+    // a wide ground detour, no launch. Proves the jump test above is measuring
+    // the affordance choice, not some incidental always-true behaviour.
+    const a = await runRamp(1400, false);
+    const ctx = `maxAirborneY=${a.maxAirborneY.toFixed(2)} maxLateral=${a.maxLateral.toFixed(2)} reached=${a.reached}`;
+    expect(a.maxLateral, ctx).toBeGreaterThan(10);
+    expect(a.maxAirborneY, ctx).toBeLessThan(1.5);
   });
 
   it('is bit-for-bit reproducible across two independent runs', { timeout: 90000, retry: 0 }, async () => {
