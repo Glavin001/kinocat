@@ -29,6 +29,7 @@ import { compile } from '../scenario/index';
 import type { Goal, Invariant, CostTerm } from '../scenario/index';
 import { plan } from './ighastar';
 import type { PlanResult, PlannerOptions } from './types';
+import type { Node } from '../environment/types';
 
 export interface PlanVehicleScenarioRequest {
   start: CarKinematicState;
@@ -121,4 +122,32 @@ export function planVehicleScenario(
   );
 
   return { raw, path: raw.path.map((s) => s.inner) };
+}
+
+/** Like {@link planVehicleScenario}, but returns a flat
+ *  `PlanResult<CarKinematicState>` — the augmented `{inner, q}` nodes are
+ *  unwrapped to their inner chassis state while PRESERVING each edge (incl. the
+ *  Reeds-Shepp analytic-shot `data`). This is the drop-in replacement for
+ *  `planVehicleOnce`/`planVehicleMultiGoal` in runtimes whose post-processing
+ *  (analytic-shot lifting, smoothing, pure-pursuit) consumes `result.nodes`. */
+export function planVehicleScenarioCar(
+  req: PlanVehicleScenarioRequest,
+): PlanResult<CarKinematicState> {
+  const { raw } = planVehicleScenario(req);
+  // Consumers (analytic-shot lifting) read only `state` + `edge`; the parent
+  // chain is dropped (re-typed to null) since the augmented parents don't match.
+  const nodes: Node<CarKinematicState>[] = raw.nodes.map((n) => ({
+    ...n,
+    state: n.state.inner,
+    parent: null,
+  }));
+  return {
+    found: raw.found,
+    ...(raw.partial !== undefined ? { partial: raw.partial } : {}),
+    cost: raw.cost,
+    path: raw.path.map((s) => s.inner),
+    nodes,
+    stats: raw.stats,
+    solutionHistory: raw.solutionHistory.map((h) => h.map((s) => s.inner)),
+  };
 }

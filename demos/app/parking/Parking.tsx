@@ -31,7 +31,12 @@ import {
   createCarMeshHelper,
   syncCarMesh,
   createGoalMarkerHelper,
+  createRegionHelper,
+  REGION_COLORS,
 } from 'kinocat/adapters/three';
+import { goalRegions, maintainRegions, compile, stepAutomaton } from 'kinocat/scenario';
+import type { CompiledAutomaton, ProgressSnapshot } from 'kinocat/scenario';
+import { GoalProgressPanel } from '../components/GoalProgressPanel';
 import {
   PARKING_BOUNDS,
   PARKING_PALETTE as C,
@@ -41,6 +46,7 @@ import {
   buildParkingScenario,
   parkingLibrary,
   parkingCourse,
+  parkingPlannerGoal,
   parkingScenarioOptions,
   evaluateParked,
   type ParkingScenarioId,
@@ -93,6 +99,10 @@ export default function Parking() {
   const [switchCost, setSwitchCost] = useState(PARKING_AGENT.directionChangePenalty);
   const [hud, setHud] = useState('');
   const [status, setStatus] = useState('initialising...');
+  const [goalViz, setGoalViz] = useState<{
+    automaton: CompiledAutomaton;
+    snapshot: ProgressSnapshot;
+  } | null>(null);
 
   const scenarioIdRef = useRef(scenarioId);
   const pausedRef = useRef(paused);
@@ -137,6 +147,13 @@ export default function Parking() {
     let carMesh: ReturnType<typeof createCarMeshHelper> | null = null;
     let goalMesh: THREE.Mesh | null = null;
     let raceScenario: RaceScenario | null = null;
+    // Live goal-progress automaton (the deterministic scenario-goal visualizer):
+    // the compiled parking objective + the current automaton state, stepped
+    // incrementally from the ego trajectory each frame.
+    let goalAutomaton: CompiledAutomaton | null = null;
+    let goalQ = 0;
+    let prevGoalPose: { x: number; z: number; heading: number; speed: number; t: number } | null = null;
+    let lastGoalHudMs = 0;
     // Current scenario geometry — held so the frame loop can read `targetStall`
     // for the shared `evaluateParked` "in-the-stall" check that drives the HUD.
     let currentScenario: ParkingScenario | null = null;
@@ -274,6 +291,29 @@ export default function Parking() {
       goalMesh = createGoalMarkerHelper({ color: C.goal, size: 1.5 });
       goalMesh.position.set(s.goal.x, 0.3, s.goal.z);
       scene.add(goalMesh);
+      // Canonical-goal overlay: draw the kinocat/scenario regions this scenario
+      // is described by — the `at(pose)` goal disk (objective) and the
+      // `stayInside(lot)` invariant — so the page visualizes the SAME goal the
+      // planner consumes (the spec's "authored once, read by both").
+      {
+        const spec = parkingPlannerGoal(s);
+        // Compile the goal automaton for the live progress visualizer + reset
+        // its tracked state for the new scenario.
+        goalAutomaton = compile(spec.goal);
+        goalQ = goalAutomaton.start;
+        prevGoalPose = null;
+        setGoalViz(null);
+        for (const r of goalRegions(spec.goal)) {
+          const g = createRegionHelper(r, { color: REGION_COLORS.objective, y: 0.07 });
+          scene.add(g);
+          scenarioMeshes.push(g);
+        }
+        for (const r of maintainRegions(spec.invariants)) {
+          const g = createRegionHelper(r, { color: 0x556677, y: 0.03 });
+          scene.add(g);
+          scenarioMeshes.push(g);
+        }
+      }
       // Build the shared scenario runner — same code path as the
       // controller-bench CLI.
       // Canonical parking options shared with the CLI bench + Vitest tests
@@ -341,6 +381,27 @@ export default function Parking() {
         const s = raceScenario.status()[0];
         if (s && carMesh) {
           syncCarMesh(carMesh.group, s.state);
+          // Advance the goal automaton from the ego trajectory (O(1)/frame) and
+          // surface the deterministic progress snapshot to the HUD (~8 Hz).
+          if (goalAutomaton) {
+            if (prevGoalPose) goalQ = stepAutomaton(goalAutomaton, goalQ, prevGoalPose, s.state);
+            prevGoalPose = s.state;
+            if (now - lastGoalHudMs >= 120) {
+              lastGoalHudMs = now;
+              const stq = goalAutomaton.states[goalQ];
+              setGoalViz({
+                automaton: goalAutomaton,
+                snapshot: {
+                  q: goalQ,
+                  depth: stq?.depth ?? 0,
+                  maxDepth: goalAutomaton.states.reduce((m, st2) => Math.max(m, st2.depth), 0),
+                  done: goalAutomaton.accepting.includes(goalQ),
+                  laps: 0,
+                  trace: [],
+                },
+              });
+            }
+          }
           if (egoFpLine && showFootprintsRef.current) {
             egoFpLine.geometry.setFromPoints(
               placeFootprintXZ(PARKING_AGENT.footprint, s.state.x, s.state.z, s.state.heading),
@@ -501,6 +562,23 @@ export default function Parking() {
             </button>
           ))}
         </div>
+        {goalViz && (
+          <div
+            style={{
+              marginTop: 10,
+              padding: '8px',
+              background: '#0e1622',
+              border: '1px solid #1c2840',
+              borderRadius: 4,
+            }}
+          >
+            <GoalProgressPanel
+              automaton={goalViz.automaton}
+              snapshot={goalViz.snapshot}
+              description="goal: reach(at(stall), stop) · stayInside(lot)"
+            />
+          </div>
+        )}
         <div
           style={{
             marginTop: 10,

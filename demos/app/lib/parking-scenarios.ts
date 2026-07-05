@@ -17,6 +17,8 @@ import { planVehicleOnce } from 'kinocat/planner';
 import type { PlanResult } from 'kinocat/planner';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavPolygon, NavWorld } from 'kinocat/environment';
+import { reach, at, stayInside } from 'kinocat/scenario';
+import type { Goal, Invariant } from 'kinocat/scenario';
 import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
 import type { VehicleAgent, CarKinematicState } from 'kinocat/agent';
 import {
@@ -648,18 +650,67 @@ export const PARKING_RACE_TUNING: Partial<RaceTuning> = {
   enableTrajectorySmoother: false,
 };
 
-/** Convert a parking scenario to the `createRaceScenario` course shape: the
- *  single goal pose (speed 0 ⇒ "terminal pose intent" to the planner) becomes
- *  the sole waypoint; obstacles + bounds carry over directly. */
+/** The parking goal expressed in the canonical `kinocat/scenario` AST:
+ *  "reach the stall pose (within the planner's position + heading tolerance),
+ *  staying inside the lot." This is the planner's objective — the terminal
+ *  STOP (speed 0) is the tracker's job (MPC terminal-speed weight), matching
+ *  the legacy planner/controller split. Parked-car clearance is enforced by the
+ *  world's static-obstacle collision check (so it is not duplicated as `avoid`
+ *  invariants here). The full goal incl. `{speed:{max:0}}` is authored for
+ *  visualization/scoring in `scenario-goals.ts`. */
+export function parkingPlannerGoal(s: ParkingScenario): {
+  goal: Goal;
+  invariants: Invariant[];
+} {
+  const lot: [number, number][] = [
+    [s.bounds.x0, s.bounds.z0],
+    [s.bounds.x1, s.bounds.z0],
+    [s.bounds.x1, s.bounds.z1],
+    [s.bounds.x0, s.bounds.z1],
+  ];
+  return {
+    // Disk (radius 0.35) + heading (0.2) matches the legacy planner's goal test
+    // (goalRadius / goalHeadingTol), plus a terminal STOP so the reached node is
+    // at rest and the lifted plan ends at speed 0 (the tracker brakes to a halt
+    // in the stall — reverse-perp needs this to settle). No `prefer` cost terms:
+    // VehicleEnvironment's edge cost is already time-based, so the bridge's
+    // search stays equivalent to legacy planRace.
+    goal: reach(
+      at({ x: s.goal.x, z: s.goal.z, heading: s.goal.heading }, { radius: 0.35, dheading: 0.2 }),
+      { speed: { max: 0 } },
+    ),
+    invariants: [stayInside(lot)],
+  };
+}
+
+/** Scenarios whose planning is routed through the new ScenarioEnvironment
+ *  bridge (canonical goal). `parallel` is intentionally EXCLUDED for now: the
+ *  bridge reaches a slightly different terminal maneuver in the cramped
+ *  two-car slot that the pure-pursuit tracker grazes on (legacy stays
+ *  collision-free), so until the bridge matches that case it keeps the proven
+ *  legacy single-goal planner. forward-pullin + reverse-perp are at parity. */
+const BRIDGE_PARKING: ReadonlySet<ParkingScenarioId> = new Set<ParkingScenarioId>([
+  'forward-pullin',
+  'reverse-perp',
+]);
+
+/** Convert a parking scenario to the `createRaceScenario` course shape. The
+ *  single goal pose stays as the sole waypoint (rendering + arrival check). For
+ *  the bridge-enabled scenarios the canonical `goal`/`invariants` also drive the
+ *  planner through the ScenarioEnvironment; otherwise the runtime falls back to
+ *  the legacy single-goal planner. */
 export function parkingCourse(id: ParkingScenarioId): NonNullable<RaceScenarioOptions['course']> {
   const s = buildParkingScenario(id);
-  return {
+  const base = {
     bounds: { x0: s.bounds.x0, x1: s.bounds.x1, z0: s.bounds.z0, z1: s.bounds.z1 },
     polygons: s.polygons,
     obstacles: s.obstacles,
     waypoints: [{ ...s.goal, speed: 0, t: 0 }],
     spawn: { ...s.spawn, speed: 0, t: 0 },
   };
+  if (!BRIDGE_PARKING.has(id)) return base;
+  const spec = parkingPlannerGoal(s);
+  return { ...base, goal: spec.goal, invariants: spec.invariants };
 }
 
 /** The COMPLETE, canonical `createRaceScenario` options for a parking scenario
