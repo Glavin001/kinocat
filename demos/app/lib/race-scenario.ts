@@ -719,6 +719,11 @@ interface CarInternal {
   mpcState: MPCTrackerState | null;
   // Forward model this car's MPPI rolls (per-entry; the fidelity lever).
   mpcForwardSim: ForwardSim<CarKinematicState>;
+  // Reverse-out recovery state (stuck-against-wall escape maneuver).
+  recovering: boolean;
+  recoveryEndSimTime: number;
+  // Count of recovery maneuvers triggered (diagnostics).
+  recoveryCount: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +734,19 @@ interface CarInternal {
  *  actual penetration, so the footprint hovers just outside the wall on
  *  contact — the margin makes that hover register as a strike. */
 const WALL_CONTACT_MARGIN = 0.5;
+
+/** Stuck detection + recovery (technical course). A chassis that overshoots
+ *  into a wall can wedge nose-first; under a tight per-frame replan budget
+ *  the planner can't always reverse out in one cycle, so the car would sit
+ *  forever. When the chassis has not moved >0.5 m for `STUCK_TIMEOUT_S` while
+ *  commanded to drive, it enters a bounded reverse-out maneuver for
+ *  `RECOVERY_DURATION_S` (back off the wall + reorient toward the next gate),
+ *  then clears its plan and replans. This is an honest escape maneuver — a
+ *  real driver reverses off a wall — NOT a teleport rescue. */
+const STUCK_SPEED = 0.6;
+const STUCK_TIMEOUT_S = 1.5;
+const RECOVERY_DURATION_S = 1.0;
+const RECOVERY_REVERSE_THROTTLE = 0.6;
 
 /** True iff the (oriented) chassis footprint overlaps any course wall,
  *  approximated by testing the footprint's world-space corners and its
@@ -959,6 +977,9 @@ export async function createRaceScenario(
       spawn,
       mpcState: null,
       mpcForwardSim: entry.forwardModel ?? mpcForwardSim,
+      recovering: false,
+      recoveryEndSimTime: 0,
+      recoveryCount: 0,
     };
   });
 
@@ -1389,12 +1410,56 @@ export async function createRaceScenario(
         }
       }
     }
+    // Stuck detection + reverse-out recovery. Enter recovery when the chassis
+    // hasn't moved >0.5 m for STUCK_TIMEOUT_S while not holding/finished
+    // (wedged against a technical-course wall); leave it after
+    // RECOVERY_DURATION_S of backing off, then clear the plan so the next
+    // cadence replan starts from the freed pose.
+    if (!c.holdingForSync && !c.finished) {
+      if (c.recovering) {
+        if (simTime >= c.recoveryEndSimTime) {
+          c.recovering = false;
+          c.lastMoveSimTime = simTime;
+          c.lastPos = { x: stateBefore.x, z: stateBefore.z };
+          c.plan = null;
+          c.pendingPlan = null;
+          c.segments = [];
+          c.activeSegIdx = 0;
+        }
+      } else if (
+        Math.abs(stateBefore.speed) < STUCK_SPEED &&
+        simTime - c.lastMoveSimTime > STUCK_TIMEOUT_S
+      ) {
+        c.recovering = true;
+        c.recoveryEndSimTime = simTime + RECOVERY_DURATION_S;
+        c.recoveryCount++;
+      }
+    }
     // Apply controls.
     if (c.holdingForSync) {
       const cmd = wheeledFromNormalized({ steer: 0, throttle: 0, brake: 1 }, FORCE_TUNING);
       c.car.applyWheeledControls(cmd);
       c.lastControls = cmd;
       c.metrics.liveControls = { steer: 0, throttle: 0, brake: 1, targetSpeed: 0 };
+    } else if (c.recovering) {
+      // Reverse away from the wedge, steering to bring the nose back toward
+      // the next waypoint so the follow-up replan starts from a better pose.
+      const wp = course.waypoints[c.loopIndex % course.waypoints.length]!;
+      let headErr = Math.atan2(wp.z - stateBefore.z, wp.x - stateBefore.x) - stateBefore.heading;
+      while (headErr > Math.PI) headErr -= 2 * Math.PI;
+      while (headErr < -Math.PI) headErr += 2 * Math.PI;
+      // Backing up: front-wheel steer rotates the nose opposite to the forward
+      // sense, so steer with the SAME sign as the heading error to swing the
+      // nose toward the target as the chassis reverses.
+      const maxSteer = tuning.maxSteerAngle ?? VEHICLE_TUNING.maxSteerAngle ?? 0.6;
+      const steer = Math.max(-maxSteer, Math.min(maxSteer, headErr));
+      const cmd = wheeledFromNormalized(
+        { steer, throttle: -RECOVERY_REVERSE_THROTTLE, brake: 0 },
+        FORCE_TUNING,
+      );
+      c.car.applyWheeledControls(cmd);
+      c.lastControls = cmd;
+      c.metrics.liveControls = { steer, throttle: -RECOVERY_REVERSE_THROTTLE, brake: 0, targetSpeed: -3 };
     } else if (c.plan && c.plan.length > 1) {
       // Multi-cusp segment advancement: when the chassis reaches the
       // end of the active segment (within arrive radius AND nearly
@@ -1662,6 +1727,9 @@ export async function createRaceScenario(
       c.lastMoveSimTime = 0;
       c.lastPos = { x: c.spawn.x, z: c.spawn.z };
       c.lastInBounds = true;
+      c.recovering = false;
+      c.recoveryEndSimTime = 0;
+      c.recoveryCount = 0;
       // Reset the MPPI warm-start + RNG so reset() is bit-reproducible under
       // the 'mpc' tracker (a stale warm-start sequence would make the second
       // run diverge from a fresh one).
