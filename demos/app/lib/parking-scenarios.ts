@@ -17,7 +17,7 @@ import { planVehicleOnce } from 'kinocat/planner';
 import type { PlanResult } from 'kinocat/planner';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavPolygon, NavWorld } from 'kinocat/environment';
-import { reach, at, stayInside } from 'kinocat/scenario';
+import { reach, at, stayInside, stopped } from 'kinocat/scenario';
 import type { Goal, Invariant } from 'kinocat/scenario';
 import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
 import type { VehicleAgent, CarKinematicState } from 'kinocat/agent';
@@ -749,7 +749,7 @@ export function parkingPlannerGoal(s: ParkingScenario): {
     // search stays equivalent to legacy planRace.
     goal: reach(
       at({ x: s.goal.x, z: s.goal.z, heading: s.goal.heading }, { radius: 0.35, dheading: 0.2 }),
-      { speed: { max: 0 } },
+      stopped(),
     ),
     invariants: [stayInside(lot)],
   };

@@ -119,6 +119,24 @@ export function validate(scenario: Scenario, opts: ValidateOptions = {}): Diagno
         message: `dynamic region '${region.kind}' references agent '${aid}' which is not in scenario.agents`,
       });
     }
+    // Signed-stop footgun: `speed: { max: 0 }` (or any max ≤ 0 with no min)
+    // compares SIGNED speed, so a car reversing at -1.5 m/s "satisfies" the
+    // stop. This exact bug latched the /parking goal automaton to DONE
+    // mid-reverse and let the planner accept mid-reverse terminal states.
+    if (
+      g.kind === 'reach' &&
+      g.accept?.speed &&
+      g.accept.speed.max !== undefined &&
+      g.accept.speed.max <= 0 &&
+      g.accept.speed.min === undefined
+    ) {
+      diags.push({
+        check: 'signed-stop',
+        severity: 'warning',
+        path,
+        message: `acceptance speed {max: ${g.accept.speed.max}} bounds SIGNED speed — any reverse motion satisfies it; a stop condition needs a symmetric band, e.g. {min: -0.05, max: 0.05}`,
+      });
+    }
     // Coarse time feasibility for deadlines.
     if (g.kind === 'reach' && g.accept?.by !== undefined) {
       const dist = region.costToGo(scenario.start);
