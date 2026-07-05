@@ -90,15 +90,18 @@ export interface PlanDebugOptions {
   /** Speed magnitude (m/s) mapped to the "fast" end of the color ramp.
    *  Default 12. */
   maxSpeed?: number;
-  /** Draw short feedforward-steer ticks at each point. Default true. */
+  /** Draw sparse feedforward-steer wheel glyphs. Default true. */
   showSteer?: boolean;
-  /** Tick length (m) for a steer angle of ±45°. Default 0.6. */
-  steerTickLength?: number;
+  /** Arc-length spacing (m) between steer glyphs. Default 1.5 (sparse — a
+   *  glyph at every sample reads as a comb, not as steering). */
+  steerSpacing?: number;
+  /** Length (m) of each fixed-size steer glyph. Default 1.0. */
+  steerGlyphLength?: number;
 }
 
 /** Rich-plan debug overlay: a speed-colored path (slow → fast = red → green,
  *  reverse spans in blue), cusp markers where the chassis stops and flips
- *  gear, and optional feedforward-steer ticks. Returns a `THREE.Group` the
+ *  gear, and sparse feedforward-steer wheel glyphs. Returns a `THREE.Group` the
  *  caller owns (add/remove/dispose like any other helper). Consumes the
  *  `kinocat/plan` `Plan` shape structurally so this adapter need not import
  *  the plan module at type-check time. */
@@ -153,22 +156,35 @@ export function createPlanDebugHelper(
     }
   }
 
-  // Feedforward-steer ticks: a short segment at each point rotated off the
-  // heading by the feedforward steer angle (falls back to atan of curvature
-  // when steerFf is absent).
+  // Feedforward-steer glyphs. Each is a short, FIXED-length segment centered on
+  // the path and rotated to the wheel direction (heading + steerFf), sampled
+  // sparsely by arc length. This reads as "the wheel points this way here" — a
+  // direction, not a magnitude. (Encoding magnitude as glyph length at every
+  // sample produced a dense unreadable comb; steer *magnitude* belongs on the
+  // 2-D profile plot, where a scalar-vs-arc-length curve is legible.)
   if (opts.showSteer ?? true) {
-    const len = opts.steerTickLength ?? 0.6;
-    const tickPts: THREE.Vector3[] = [];
-    for (const p of pts) {
-      const steer = p.steerFf ?? Math.atan(p.kappa);
-      const ang = p.heading + steer;
-      const scale = len * (steer / (Math.PI / 4)); // signed, ±45° ⇒ ±len
-      const dx = Math.cos(ang) * scale;
-      const dz = Math.sin(ang) * scale;
-      tickPts.push(new THREE.Vector3(p.x, y, p.z), new THREE.Vector3(p.x + dx, y, p.z + dz));
+    const spacing = Math.max(opts.steerSpacing ?? 1.5, 0.1);
+    const half = (opts.steerGlyphLength ?? 1.0) / 2;
+    const glyphPts: THREE.Vector3[] = [];
+    let acc = spacing; // emit at the first point
+    for (let i = 0; i < pts.length; i++) {
+      if (i > 0) {
+        acc += Math.hypot(pts[i]!.x - pts[i - 1]!.x, pts[i]!.z - pts[i - 1]!.z);
+      }
+      const isEnd = i === 0 || i === pts.length - 1;
+      if (acc < spacing && !isEnd) continue;
+      acc = 0;
+      const p = pts[i]!;
+      const ang = p.heading + (p.steerFf ?? Math.atan(p.kappa));
+      const dx = Math.cos(ang) * half;
+      const dz = Math.sin(ang) * half;
+      glyphPts.push(
+        new THREE.Vector3(p.x - dx, y, p.z - dz),
+        new THREE.Vector3(p.x + dx, y, p.z + dz),
+      );
     }
-    const tickGeo = new THREE.BufferGeometry().setFromPoints(tickPts);
-    group.add(new THREE.LineSegments(tickGeo, new THREE.LineBasicMaterial({ color: 0xffaa33 })));
+    const glyphGeo = new THREE.BufferGeometry().setFromPoints(glyphPts);
+    group.add(new THREE.LineSegments(glyphGeo, new THREE.LineBasicMaterial({ color: 0xffaa33 })));
   }
 
   return group;

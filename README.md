@@ -170,22 +170,29 @@ pnpm dev            # builds core, starts Next.js on http://localhost:3000
 
 Open **http://localhost:3000/parking**, then press **`d`** (or the
 `[d] plan-debug` button). The reverse-perp and parallel scenarios (`[2]` /
-`[3]`) show it best, since they have forward↔reverse cusps. The overlay draws:
+`[3]`) show it best, since they have forward↔reverse cusps. It has two halves,
+each in the medium that fits the data:
+
+**3-D overlay — the spatial story (where/how it drives):**
 
 - **Speed-colored path** — the reference line shaded by `|vRef|` (slow → fast
-  = red → green), so you can *see* where the profile slows for corners and the
-  stall.
+  = red → green), so you can *see* where the profile slows for the stall.
 - **Reverse spans in blue** — segments the plan drives in reverse gear.
-- **Cusp markers** (yellow points) — where the chassis stops and flips gear
-  (segment boundaries).
-- **Feedforward-steer ticks** (orange) — `steerFf = atan(L·κ·dir)` at each
-  point, so you can eyeball the steering the plan hands the controller.
+- **Cusp/stop markers** (yellow) — where the chassis stops and flips gear.
+- **Feedforward-steer wheel glyphs** (orange) — sparse, fixed-length marks
+  rotated to the wheel direction (`heading + steerFf`); they show *which way*
+  the wheel points, not a magnitude.
 
-The overlay is produced from the live committed plan every tick
-(`buildPlan(smoothed, …)` in `demos/app/lib/race-scenario.ts`), so it updates
-on every replan. It is *produce-but-don't-consume*: the controller still
-tracks the plain path today; a follow-up feeds `Plan.kappa` / `steerFf` into
-the tracker.
+**2-D profile strip — the quantitative story (the reference signals):**
+`vRef`, `steerFf`, and `aRef` plotted against **arc length** (a 1-D signal is
+legible as a curve, unreadable as 3-D glyphs), with cusps as vertical dashed
+lines. This is where you read the reference precisely — and the natural place
+to later overlay planned-vs-executed for MPC/LQR tuning.
+
+Both are built from the live committed plan (`buildPlan(smoothed, …)` in
+`demos/app/lib/race-scenario.ts`), so they update on every replan. It is
+*produce-but-don't-consume*: the controller still tracks the plain path today;
+a follow-up feeds `Plan.kappa` / `steerFf` into the tracker.
 
 **Test it.** The builder is unit-tested (curvature/arc-length/accel,
 feedforward sign in reverse, cusp-boundary placement, round-trip):
