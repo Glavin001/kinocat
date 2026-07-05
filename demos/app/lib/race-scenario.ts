@@ -47,6 +47,8 @@ import {
   mpcTrack,
   createMPCTrackerState,
   type MPCTrackerState,
+  createSettleLatch,
+  type SettleLatch,
 } from 'kinocat/execute';
 import {
   parametricForwardV2,
@@ -533,6 +535,22 @@ export interface RaceScenarioOptions {
   /** Stop ticking + mark each car `finished` after this many laps. When
    *  omitted the scenario runs indefinitely (web demo). */
   targetLaps?: number;
+  /**
+   * TRUE goal-completion semantics (parking-class scenarios). When present,
+   * `finished` latches ONLY when this predicate has held continuously at
+   * rest for `holdSeconds` (a settle latch) — waypoint arrival keeps its
+   * bookkeeping role but can no longer terminate the goal loop. Without
+   * this, the runner's position-only 0.25 m arrival disk declared courses
+   * complete while the actual goal (in-stall, square, centered, stopped)
+   * was unsatisfied — so the corrective replans that would have fixed a
+   * crooked park (shunt, or pull out and re-enter) were never attempted:
+   * the car just held the brake, visibly mis-parked, forever.
+   */
+  goalSettle?: {
+    predicate: (state: CarKinematicState) => boolean;
+    holdSeconds: number;
+    speedTol: number;
+  };
   /** Hold the leader at the lap line until every car finishes the lap, so
    *  every car starts the next lap head-to-head. Web demo: true. CLI race:
    *  false (cars race independently). */
@@ -592,6 +610,8 @@ interface CarInternal {
   currentLapSectors: number[];
   raceTime: number;
   lapStartSimTime: number;
+  /** Settle latch driving `finished` when opts.goalSettle is present. */
+  goalLatch: SettleLatch | null;
   waypointsCleared: number;
   plan: CarKinematicState[] | null;
   planStartSimTime: number;
@@ -781,6 +801,12 @@ export async function createRaceScenario(
       currentLapSectors: [],
       raceTime: 0,
       lapStartSimTime: 0,
+      goalLatch: opts.goalSettle
+        ? createSettleLatch({
+            holdSeconds: opts.goalSettle.holdSeconds,
+            speedTol: opts.goalSettle.speedTol,
+          })
+        : null,
       waypointsCleared: 0,
       plan: null,
       planStartSimTime: 0,
@@ -958,8 +984,20 @@ export async function createRaceScenario(
         });
     const replanMs = performance.now() - tStart;
     c.diagnostics.lastReplanMs = replanMs;
-    c.diagnostics.lastReplanFound = res.found && res.path.length > 1;
+    // A found 1-point path is the planner saying "the start already satisfies
+    // the goal" (start-state acceptance) — a SUCCESS with nothing to drive,
+    // not a planner failure. Count it as found (so failedReplanRatio stays
+    // honest) but skip the commit: the degenerate-plan brake-hold keeps the
+    // chassis at rest and the settle latch finishes the course.
+    const trivial = res.found && res.path.length === 1 && res.cost === 0;
+    c.diagnostics.lastReplanFound = res.found && (res.path.length > 1 || trivial);
     c.diagnostics.totalReplans += 1;
+    if (trivial) {
+      c.diagnostics.successfulReplans += 1;
+      c.diagnostics.consecutiveFailedReplans = 0;
+      c.lastReplanSimTime = simTime;
+      return;
+    }
     if (c.diagnostics.lastReplanFound) {
       // Two-stage post-process pipeline (Apollo / Autoware shape), each
       // stage individually toggleable for ablation:
@@ -1131,7 +1169,11 @@ export async function createRaceScenario(
     // fresh: its plans chase moving gates, so staleness there IS drift/
     // exhaustion and the same conditions fire naturally.)
     let cadenceUseful = true;
-    if (cadenceDue && c.plan && c.plan.length > 1) {
+    // While the goal predicate holds at rest, the settle hold is in progress:
+    // planning is pure churn (it returns the trivial plan) and any commit
+    // could only disturb the hold. Let the latch finish.
+    if (c.goalLatch?.state.holding) cadenceUseful = false;
+    if (cadenceUseful && cadenceDue && c.plan && c.plan.length > 1) {
       const dLat = lateralFromPlan(c, stateBefore.x, stateBefore.z);
       const elapsed = simTime - c.planStartSimTime;
       const planDur = c.plan[c.plan.length - 1]!.t - c.plan[0]!.t;
@@ -1183,7 +1225,11 @@ export async function createRaceScenario(
             : dur;
           c.lapStartSimTime = lapEnd;
           c.currentLapSectors = [];
-          if (targetLaps !== undefined && c.laps.length >= targetLaps) {
+          if (targetLaps !== undefined && c.laps.length >= targetLaps && !opts.goalSettle) {
+            // Lap-count completion is a RACE concept. Goal-settle courses
+            // (parking) latch `finished` from the settle oracle below —
+            // a position-only arrival must not stop the goal loop while the
+            // true goal (square, centered, at rest) is unsatisfied.
             c.finished = true;
           } else if (syncHold) {
             c.holdingForSync = true;
@@ -1328,6 +1374,27 @@ export async function createRaceScenario(
     }
     stepRaycastVehicle(c.world, [c.car], { dt, substeps: VEHICLE_SUBSTEPS });
     const after = c.car.readState(simTime + dt);
+    // TRUE goal completion (goal-settle courses): `finished` latches only
+    // when the goal predicate has held continuously at rest — the same
+    // settle semantics the bench/tests/HUD measure. Until then the goal
+    // loop stays live: a mis-parked car keeps replanning (shunt, or pull
+    // out and re-enter) instead of holding the brake on a crooked pose.
+    if (c.goalLatch && opts.goalSettle) {
+      c.goalLatch.update(
+        { ok: opts.goalSettle.predicate(after), speed: after.speed },
+        dt,
+      );
+      if (c.goalLatch.state.settled && !c.finished) {
+        c.finished = true;
+        if (c.laps.length === 0) {
+          // Record the completion for HUD/bench timing parity: duration is
+          // the honest time-to-settled, not the transient arrival instant.
+          const t = c.goalLatch.state.timeToSettled ?? simTime + dt;
+          c.laps.push({ lap: 1, simTime: simTime + dt, duration: t, sectors: [] });
+          c.metrics.laps = 1;
+        }
+      }
+    }
     // Prediction-error metric.
     if (c.predictedEnd && simTime + dt >= c.predictedEnd.dueSimTime) {
       const p = c.predictedEnd.state;

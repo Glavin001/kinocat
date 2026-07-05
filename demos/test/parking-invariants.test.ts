@@ -172,15 +172,16 @@ describe.skipIf(!RAPIER_OK)('parking invariants', () => {
   // CENTRED (terminalPosError < 0.6 m) — the centering that the terminal heading
   // term + the `evaluateParked` centering bound now guarantee. Squareness is
   // asserted separately below.
-  // KNOWN GAP (kept red on purpose): parallel's committed plans terminate at
-  // the exact goal pose (analytic Reeds-Shepp shots), but executing the tight
-  // in-slot S leaves ~0.20 m lateral and ~10 degrees heading that pure-pursuit
-  // structurally cannot remove without room to maneuver — the slot allows
-  // ~1 m legs and a 0.2 m lateral fix needs ~1.7 m at the plant's turn
-  // radius. Candidate fixes: a dedicated terminal alignment micro-maneuver
-  // (plan a shunt pair when settled-but-misaligned), or curvature feedforward
-  // (PR #34 follow-up) to cut the in-slot tracking error at the source.
-  it.fails('parallel: reaches the slot cleanly under a healthy planner (no storm, no graze)', OPTS, async () => {
+  // FIXED by closing the goal loop: `finished` now latches from the settle
+  // oracle (the TRUE parked predicate held at rest), not from the
+  // position-only waypoint disk — so a first attempt that lands crooked no
+  // longer terminates the course. The runner keeps replanning; with
+  // start-state acceptance the planner sees "goal not satisfied" from the
+  // crooked pose and plans a corrective maneuver (pull forward, re-enter).
+  // The per-scenario direction-change penalty (0.8 s for parallel) makes the
+  // decisive re-park cheaper than grinding in-slot micro-shunts, so it
+  // squares up in a couple of attempts: ~93% coverage, ~2 degrees.
+  it('parallel: reaches the slot cleanly under a healthy planner (no storm, no graze)', OPTS, async () => {
     const run = await park('parallel', 3600);
     const { report } = run;
     const ctx = `\n${formatReport(report)}`;
@@ -207,7 +208,7 @@ describe.skipIf(!RAPIER_OK)('parking invariants', () => {
   // the parked cars. (An earlier free-space smooth pose-regulator was rejected:
   // its own kinematic tests showed it over-rotates / limit-cycles. This works
   // because it follows the planner's collision-free path tangent instead.)
-  it.fails('parallel: ends square with the curb — fits squarely inside the stall', OPTS, async () => {
+  it('parallel: ends square with the curb — fits squarely inside the stall', OPTS, async () => {
     const run = await park('parallel', 3600);
     const { report, status } = run;
     const ev = evaluateParked(status.state, buildParkingScenario('parallel'));

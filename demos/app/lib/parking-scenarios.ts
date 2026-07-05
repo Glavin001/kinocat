@@ -862,7 +862,29 @@ export function parkingScenarioOptions(
   const agent: VehicleAgent = agentOverride
     ? { ...planningAgent, ...agentOverride }
     : planningAgent;
+  const parkScenario = buildParkingScenario(id);
+  // Per-scenario shunt economics. `parallel` corrects itself by RE-PARKING
+  // (pull out, re-enter) when the first attempt lands crooked; with a cheap
+  // flip penalty the planner instead grinds out dozens of in-slot
+  // micro-shunts (117 replans / 33 gear flips observed) that take ~50 s and
+  // shave the neighbors. A 0.8 s penalty makes the decisive maneuver the
+  // cheap one: it re-parks square in ~2 attempts. The open-aisle scenarios
+  // keep the 0.15 base — their proven swing plans use mid-course flips that
+  // a heavy penalty would distort.
+  const scenarioAgent: VehicleAgent =
+    id === 'parallel' ? { ...agent, directionChangePenalty: 0.8 } : agent;
   return {
+    // TRUE completion: the course is finished only when the shared parked
+    // predicate has HELD at rest (settle latch) — the same oracle the HUD,
+    // bench, and tests measure. Waypoint arrival (a position-only disk) no
+    // longer terminates the goal loop, so a car that arrives crooked keeps
+    // replanning — shunting, or pulling out and re-entering — until it is
+    // genuinely parked.
+    goalSettle: {
+      predicate: (state) => evaluateParked(state, parkScenario).parked,
+      holdSeconds: PARKING_SETTLE.holdSeconds,
+      speedTol: PARKING_SETTLE.speedTol,
+    },
     // Pin every parking entry to PARKING_AGENT so the planner's heuristic +
     // footprint + turn radius match the parking primitive library. Without
     // this the runner planned parking with RACE_AGENT (30 m/s, 4.5 m turn
@@ -871,7 +893,7 @@ export function parkingScenarioOptions(
     // that A* degenerated into near-breadth-first search — the reverse-perp /
     // parallel replan-failure storm. Callers don't need to know the agent;
     // they just pass `{ name, lib: parkingLibrary() }`.
-    entries: entries.map((e) => ({ ...e, agent })),
+    entries: entries.map((e) => ({ ...e, agent: scenarioAgent })),
     targetLaps: 1,
     syncHold: false,
     offTrackRecovery: 'none',
