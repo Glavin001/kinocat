@@ -83,7 +83,13 @@ const DEFAULT_MAX_EXPANSIONS = 25000;
  *  every interactive AI needs. */
 export function planVehicleOnce(req: PlanVehicleRequest): PlanResult<CarKinematicState> {
   const envOpts = { ...DEFAULT_ENV_OPTIONS, ...(req.envOptions ?? {}) };
-  const baseEnv = new VehicleEnvironment(req.world, req.agent, req.lib, envOpts);
+  // Time participates in the dedup hash only when something is actually
+  // time-varying; in static worlds it inflates the search ~3.8x for nothing.
+  const hasDynamics = (req.movingObstacles?.length ?? 0) > 0 || req.affordances !== undefined;
+  const baseEnv = new VehicleEnvironment(req.world, req.agent, req.lib, {
+    timeInHash: hasDynamics,
+    ...envOpts,
+  });
 
   // Agent circumscribed radius (Euclidean from origin to the farthest
   // footprint vertex) — used to inflate moving-obstacle radii so the

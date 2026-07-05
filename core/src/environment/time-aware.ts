@@ -62,6 +62,7 @@ export class TimeAwareEnvironment<State extends HasXZT>
   private readonly obstacles: MovingObstacle[];
   private readonly agentRadius: number;
   private readonly timeQuantum: number;
+  private readonly hasDynamics: boolean;
   private readonly divisors: number[];
   private readonly affordances?: AffordanceRegistry;
   private readonly affordanceRadius: number;
@@ -81,6 +82,7 @@ export class TimeAwareEnvironment<State extends HasXZT>
       Array.from({ length: this.levels }, (_, L) => 2 ** (this.levels - 1 - L));
     this.affordances = opts.affordances;
     this.affordanceRadius = opts.affordanceRadius ?? 15;
+    this.hasDynamics = this.obstacles.length > 0 || this.affordances !== undefined;
     const bpo = opts.broadphase;
     this.bp =
       bpo !== undefined && bpo !== false
@@ -162,6 +164,9 @@ export class TimeAwareEnvironment<State extends HasXZT>
   }
 
   private augment(node: Node<State>): Node<State> {
+    // Nothing time-varying => the same pose at different times is the same
+    // search state; tagging it with a time bucket only defeats dedup.
+    if (!this.hasDynamics) return node;
     const tb = Math.round(node.state.t / this.timeQuantum);
     // In-place mutation: createNode just allocated `node.index`, we own it.
     const idx = node.index;

@@ -271,11 +271,15 @@ export class ScenarioEnvironment<S extends ScenarioState>
   }
 
   /** Best-progress score: automaton depth (+ laps for progress objectives),
-   *  with a tiny g penalty so cheaper plans win at equal depth. */
+   *  tie-broken by heuristic distance-to-goal. The old tie-break (-g) picked
+   *  the CHEAPEST node at equal depth — for a single-phase goal every
+   *  non-accepting node has depth 0 and the cheapest is the START (g = 0),
+   *  so a deadline-hit returned the spawn as a "best-progress" plan. Closer
+   *  to the goal (smaller h) is what progress actually means. */
   progress(node: Node<ScenarioAugState<S>>): number {
     const depth = this.automaton.states[node.state.q]?.depth ?? 0;
     const laps = node.state.laps ?? 0;
-    return depth + laps * (this.maxDepth + 1) - node.g * 1e-6;
+    return depth + laps * (this.maxDepth + 1) - node.h * 1e-3;
   }
 }
 
@@ -284,9 +288,28 @@ export function scenarioStart<S extends ScenarioState>(
   start: S,
   automaton: CompiledAutomaton,
 ): ScenarioAugState<S> {
-  return automaton.progress
-    ? { inner: start, q: automaton.start, laps: 0 }
-    : { inner: start, q: automaton.start };
+  // Fire any transitions the start state ALREADY satisfies (guards evaluated
+  // on the zero-length edge start->start). Without this, a start inside the
+  // goal region can never be accepting — transitions only fire on edges, so
+  // the search is forced to MOVE to satisfy a goal it has already met.
+  // Observed failure: replanning while parked returned "reverse 0.75 m and
+  // come back" (cost 1.05) instead of a trivial already-satisfied plan,
+  // which re-shuffled a settled car on every replan cadence.
+  let q = automaton.start;
+  for (let steps = 0; steps < automaton.states.length + 1; steps++) {
+    const cur = automaton.states[q];
+    if (!cur) break;
+    let advanced = false;
+    for (const tr of cur.transitions) {
+      if (guardSatisfied(tr.guard, start, start)) {
+        q = tr.target;
+        advanced = true;
+        break;
+      }
+    }
+    if (!advanced) break;
+  }
+  return automaton.progress ? { inner: start, q, laps: 0 } : { inner: start, q };
 }
 
 /** A terminal node for the planner's `goal` argument. ScenarioEnvironment's
