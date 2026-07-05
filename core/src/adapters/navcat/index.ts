@@ -54,10 +54,11 @@ export class NavcatWorld implements NavWorld {
   private readonly qy: number;
   private chf?: ChfClearanceField;
   private rawChf?: CompactHeightfield;
+  private chfOpts: ClearanceFieldOptions = {};
   private goalLB?: { key: string; field: ChfGoalDistanceField };
 
   constructor(
-    private readonly navMesh: NavMesh,
+    private navMesh: NavMesh,
     opts: NavcatWorldOptions = {},
   ) {
     this.filter = opts.queryFilter ?? DEFAULT_QUERY_FILTER;
@@ -70,13 +71,56 @@ export class NavcatWorld implements NavWorld {
     return this._revision;
   }
 
-  /** Tile-rebuild hook: invalidate caches and bump the revision counter. */
+  /** Tile-rebuild hook: invalidate caches and bump the revision counter. The
+   *  memoised goal field is dropped eagerly — a stale grid lower bound is
+   *  INADMISSIBLE after additive changes (a new bridge shortens true paths
+   *  below the old bound), not merely suboptimal. */
   bumpRevision(): void {
     this._revision++;
+    this.goalLB = undefined;
   }
 
   addOffLink(link: OffMeshLink): void {
     this.offLinks.push(link);
+  }
+
+  /** Swap in a rebuilt navmesh (e.g. after destroying terrain) without
+   *  reconstructing the world. Live queries (`polygonAt`/`segmentClear`) read
+   *  the new mesh immediately; the revision bump invalidates derived caches.
+   *
+   *  Pass the regenerated CompactHeightfield to keep `clearanceAt` /
+   *  `buildGoalLowerBound` available. When `chf` is omitted both oracles are
+   *  CLEARED, not kept: the clearance field is an early-ACCEPT broadphase, so
+   *  a stale one can approve footprints over destroyed ground. The planner
+   *  falls back to the Reeds-Shepp heuristic (still admissible).
+   *
+   *  Off-mesh links are re-resolved against the new mesh (polygon node ids
+   *  change per mesh); links whose endpoints are no longer on the mesh are
+   *  dropped. Note navcat-side `addOffMeshConnection`s live inside the mesh
+   *  object — a caller regenerating a mesh re-runs `annotateJumpLinks`; this
+   *  heals only the adapter's mirror. */
+  swapNavMesh(
+    navMesh: NavMesh,
+    chf?: CompactHeightfield,
+    chfOpts?: ClearanceFieldOptions,
+  ): void {
+    this.navMesh = navMesh;
+    if (chf) {
+      this.attachClearanceField(chf, chfOpts ?? this.chfOpts);
+    } else {
+      this.chf = undefined;
+      this.rawChf = undefined;
+    }
+    this.bumpRevision();
+    // Re-resolve mirrored off-mesh links against the new mesh.
+    const kept: OffMeshLink[] = [];
+    for (const link of this.offLinks) {
+      const from = this.polygonAt(link.start[0], link.start[2]);
+      const to = this.polygonAt(link.end[0], link.end[2]);
+      if (from && to) kept.push({ ...link, from, to });
+    }
+    this.offLinks.length = 0;
+    this.offLinks.push(...kept);
   }
 
   /** Attach a CompactHeightfield clearance field (from the generator's
@@ -87,6 +131,7 @@ export class NavcatWorld implements NavWorld {
   ): void {
     this.chf = new ChfClearanceField(chf, opts);
     this.rawChf = chf;
+    this.chfOpts = opts;
   }
 
   /** O(1) lower-bound clearance, or null when no field is attached / the
@@ -104,7 +149,7 @@ export class NavcatWorld implements NavWorld {
     gy?: number,
   ): ((x: number, z: number, y?: number) => number | null) | null {
     if (!this.rawChf) return null;
-    const key = `${gx},${gz},${gy ?? ''}`;
+    const key = `${this._revision}|${gx},${gz},${gy ?? ''}`;
     if (!this.goalLB || this.goalLB.key !== key) {
       const field = new ChfGoalDistanceField(this.rawChf, gx, gz, gy);
       if (!field.available) return null;

@@ -160,6 +160,93 @@ describe.skipIf(!CLR_OK)('grid-Dijkstra goal lower bound (Opt 2)', () => {
   });
 });
 
+// Phase-1 integration: swapNavMesh + region-scoped markTileRebuilt. Fresh
+// NavcatWorlds are constructed from the fixtures' already-generated meshes
+// (no regeneration) so mutation stays isolated per test.
+describe.skipIf(!NAVMESH_OK || !CLR_OK)('swapNavMesh + region-scoped invalidation', () => {
+  const TRIGGER = { divergenceThresholdMeters: 1, refreshIntervalMs: 500 };
+
+  it('live queries and the revision-keyed goal field see the new geometry', () => {
+    const w = new NavcatWorld(built!.navMesh);
+    w.attachClearanceField(built!.compactHeightfield);
+    // Pre-swap (two islands): the gap is off-mesh and island B is
+    // unreachable from island A.
+    expect(w.polygonAt(11, 5)).toBeNull();
+    const lb0 = w.buildGoalLowerBound!(18, 5);
+    expect(lb0).not.toBeNull();
+    expect(lb0!(4, 5)).toBeNull(); // cross-gap: unreachable
+    // Swap in the single 30×20 plane. Same goal coords — with the old
+    // revision-blind memo this would keep serving the stale field.
+    w.swapNavMesh(clr!.navMesh, clr!.compactHeightfield);
+    expect(w.polygonAt(11, 5)).not.toBeNull();
+    const lb1 = w.buildGoalLowerBound!(18, 5);
+    expect(lb1).not.toBeNull();
+    const d = lb1!(4, 5);
+    expect(d).not.toBeNull();
+    expect(d!).toBeGreaterThan(0);
+    expect(d!).toBeLessThanOrEqual(14 + 1e-6); // straight-line truth = 14
+  });
+
+  it('omitting the CHF clears both oracles instead of keeping stale ones', () => {
+    const w = new NavcatWorld(built!.navMesh);
+    w.attachClearanceField(built!.compactHeightfield);
+    expect(w.clearanceAt(4, 5)).not.toBeNull();
+    w.swapNavMesh(clr!.navMesh); // no chf
+    expect(w.clearanceAt(15, 10)).toBeNull();
+    expect(w.buildGoalLowerBound!(18, 5)).toBeNull();
+  });
+
+  it('re-resolves mirrored off-mesh links and drops off-mesh endpoints', () => {
+    const w = new NavcatWorld(clr!.navMesh); // single plane
+    const mk = (sx: number, sz: number, ex: number, ez: number) => ({
+      from: w.polygonAt(sx, sz)!,
+      to: w.polygonAt(ex, ez)!,
+      start: [sx, 0, sz] as const,
+      end: [ex, 0, ez] as const,
+      kind: 'jump' as const,
+      cost: 2,
+    });
+    w.addOffLink(mk(4, 5, 18, 5)); // both endpoints survive on the islands
+    w.addOffLink(mk(11, 5, 18, 5)); // (11,5) lands in the islands' gap
+    w.swapNavMesh(built!.navMesh);
+    const from = w.polygonAt(4, 5)!;
+    const links = w.offMeshFrom(from);
+    expect(links.length).toBe(1);
+    expect(links[0]!.from.id).toBe(from.id); // ref rewritten to the new mesh
+    expect(links[0]!.to.id).toBe(w.polygonAt(18, 5)!.id);
+  });
+
+  it('markTileRebuilt(region) marks only crossing agents and returns them', () => {
+    const w = new NavcatWorld(built!.navMesh);
+    const crossing = new ReplanState(TRIGGER);
+    crossing.setPlan(
+      [
+        { x: 0, z: 5, heading: 0, speed: 4, t: 0 },
+        { x: 10, z: 5, heading: 0, speed: 4, t: 2.5 },
+      ],
+      0,
+    );
+    const far = new ReplanState(TRIGGER);
+    far.setPlan(
+      [
+        { x: 0, z: 0.5, heading: 0, speed: 4, t: 0 },
+        { x: 10, z: 0.5, heading: 0, speed: 4, t: 2.5 },
+      ],
+      0,
+    );
+    const before = w.revision;
+    const marked = markTileRebuilt(w, { x0: 4, z0: 4, x1: 6, z1: 6 }, [
+      { replan: crossing },
+      { replan: far },
+    ]);
+    expect(w.revision).toBe(before + 1);
+    expect(marked).toEqual([crossing]);
+    const at = { x: 1, z: 5, heading: 0, speed: 4, t: 0.25 };
+    expect(crossing.shouldReplan(at, 1)).toBe(true);
+    expect(far.shouldReplan({ ...at, z: 0.5 }, 1)).toBe(false);
+  });
+});
+
 it('reports navmesh availability', () => {
   // Surfaces in CI logs whether the real-navcat path ran or was skipped.
   expect(typeof NAVMESH_OK).toBe('boolean');
