@@ -4,7 +4,10 @@ import {
   referencePoseAt,
   referenceLength,
 } from '../../src/eval/reference-trajectory';
-import { arcPath, straightLine } from '../../src/eval/reference-shapes';
+import { arcPath, straightLine, reversePark } from '../../src/eval/reference-shapes';
+import { curvaturePerSample } from '../../src/execute/speed-profile';
+import { checkFeasibility } from '../../src/eval/feasibility';
+import type { CarKinematicState } from '../../src/agent/types';
 
 describe('toReferenceTrajectory', () => {
   it('accumulates arc-length monotonically', () => {
@@ -49,6 +52,45 @@ describe('toReferenceTrajectory', () => {
     for (let i = 1; i < ref.length - 1; i++) {
       expect(ref[i]!.a).toBeGreaterThan(0);
     }
+  });
+});
+
+describe('gear-cusp curvature', () => {
+  it('does NOT emit a phantom curvature spike at a Reeds-Shepp cusp', () => {
+    // Drive forward to (2,0), then reverse backing up-and-left. The Menger
+    // triple straddling the reversal has a collapsed far side |C−A| ≈ 0.05 m,
+    // so the raw formula reports a huge curvature there.
+    const path: CarKinematicState[] = [
+      { x: 0, z: 0, heading: 0, speed: 1, t: 0 },
+      { x: 1, z: 0, heading: 0, speed: 1, t: 1 },
+      { x: 2, z: 0, heading: 0, speed: 1, t: 2 }, // cusp: forward ends here
+      { x: 1, z: 0.05, heading: Math.PI, speed: -1, t: 3 }, // reverse begins
+      { x: 0, z: 0.1, heading: Math.PI, speed: -1, t: 4 },
+      { x: -1, z: 0.15, heading: Math.PI, speed: -1, t: 5 },
+    ];
+    // Raw Menger curvature spikes at the cusp (this is the bug)…
+    const naive = curvaturePerSample(path);
+    expect(naive[2]!).toBeGreaterThan(1); // ~2 m⁻¹ phantom
+    // …but the gear-split reference-trajectory curvature is ~0 there.
+    const ref = toReferenceTrajectory(path);
+    expect(ref[2]!.kappa).toBeLessThan(0.05);
+  });
+
+  it('keeps a real reverse-park plan dynamically feasible', () => {
+    // Without the cusp split, the phantom κ trips the turn-radius check and the
+    // whole (perfectly drivable) parking plan is misdiagnosed as infeasible.
+    const park = reversePark();
+    // The plan really does reverse (a signed-speed sign flip exists).
+    expect(park.some((p) => p.speed < 0)).toBe(true);
+    expect(park.some((p) => p.speed > 0)).toBe(true);
+    const ref = toReferenceTrajectory(park);
+    const report = checkFeasibility(ref, {
+      frictionLimit: 4,
+      minTurnRadius: 4,
+      maxAccel: 6.5,
+      maxDecel: 8,
+    });
+    expect(report.feasible).toBe(true);
   });
 });
 

@@ -85,6 +85,69 @@ export function laneChange(opts: {
   return build(pts, opts.speed);
 }
 
+/** A reverse-park maneuver: drive forward on a left arc, stop at a CUSP, then
+ *  reverse on the opposite steer into the bay and stop. Built by integrating a
+ *  kinematic bicycle so `heading` is the car's true orientation — on the reverse
+ *  leg the car faces OPPOSITE its direction of travel, and `speed` is signed
+ *  (negative in reverse). This exercises the whole reverse pipeline the forward
+ *  shapes cannot: the gear-cusp curvature split, the reverse accel/decel
+ *  classification, and (as an isolation reference) the terminal pose/heading/
+ *  speed accuracy that catches stop-short and wrong-terminal-heading bugs.
+ *  Parameters are chosen so the maneuver is comfortably feasible (lat accel
+ *  V²/R, ramped longitudinal accel) for a typical parking budget. */
+export function reversePark(opts?: {
+  /** Cruise |speed| on each leg (m/s). */
+  speed?: number;
+  /** Turn radius on each leg (m). */
+  radius?: number;
+  /** Integration step (s). */
+  dt?: number;
+  /** Duration of each leg including ramps (s). */
+  legSeconds?: number;
+}): CarKinematicState[] {
+  const V = opts?.speed ?? 2;
+  // Default radius 6 m keeps curvature (≈1/6) comfortably inside a 4 m minimum
+  // turn radius even after the Menger discretization noise the low-speed ramp
+  // regions add — so the shape is a genuinely FEASIBLE known-good reference.
+  const R = opts?.radius ?? 6;
+  const dt = opts?.dt ?? 0.1;
+  const legT = opts?.legSeconds ?? 3;
+  const k = 1 / R;
+  const ramp = Math.min(0.6, legT / 2); // s to ramp |speed| up / down
+
+  const states: CarKinematicState[] = [];
+  let x = 0;
+  let z = 0;
+  let heading = 0;
+  let t = 0;
+  states.push({ x, z, heading, speed: 0, t });
+
+  // Trapezoidal signed-speed profile: ramp 0→dir·V, cruise, ramp back to 0.
+  const speedAt = (tau: number, dir: number): number => {
+    const up = Math.min(1, tau / ramp);
+    const down = Math.min(1, (legT - tau) / ramp);
+    return dir * V * Math.max(0, Math.min(up, down));
+  };
+  const integrateLeg = (dir: number, kk: number): void => {
+    let tau = 0;
+    while (tau < legT - 1e-9) {
+      const v = speedAt(Math.min(legT, tau + dt), dir);
+      heading += v * kk * dt;
+      x += v * Math.cos(heading) * dt;
+      z += v * Math.sin(heading) * dt;
+      t += dt;
+      tau += dt;
+      states.push({ x, z, heading, speed: v, t });
+    }
+    // Pin the leg's last sample to rest — the cusp (and final stop) are v = 0.
+    states[states.length - 1] = { ...states[states.length - 1]!, speed: 0 };
+  };
+
+  integrateLeg(+1, +k); // forward, steer left
+  integrateLeg(-1, -k); // reverse, opposite steer → curls into the bay, stops
+  return states;
+}
+
 /** A cone slalom: a sine weave of `amplitude` m with `cones` peaks spaced
  *  `spacing` m apart (the canonical fluidity / capability test). */
 export function slalom(opts: {

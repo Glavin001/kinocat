@@ -51,6 +51,30 @@ export interface ComfortReport {
   violations: string[];
 }
 
+/** Peak magnitude that must PERSIST for ≥`window` consecutive samples to count —
+ *  the max over the sliding `window`-sample minimum. This is a temporal deadband
+ *  for the second-order comfort metrics, which otherwise SATURATE on a stack
+ *  that issues stepwise (piecewise-constant) commands: a single held command
+ *  step, or any single-tick pose/speed impulse, produces a brief 2–3 sample
+ *  burst in a finite-differenced jerk / yaw-accel series, and a naive
+ *  single-sample max reads "uncomfortable" on every run. Requiring the excursion
+ *  to last the full window (~0.05·window s) rejects those transient artifacts
+ *  while genuine sustained thrash — many consecutive large samples, e.g. a
+ *  yaw-rate that flips every tick — still registers at ~its true magnitude. */
+const ROBUST_PEAK_WINDOW = 4;
+function robustPeak(series: ReadonlyArray<number>, window = ROBUST_PEAK_WINDOW): number {
+  const n = series.length;
+  if (n === 0) return 0;
+  if (n < window) return Math.max(0, ...series); // too short to debounce
+  let peak = 0;
+  for (let i = window - 1; i < n; i++) {
+    let sustained = Infinity;
+    for (let k = 0; k < window; k++) sustained = Math.min(sustained, series[i - k]!);
+    if (sustained > peak) peak = sustained;
+  }
+  return peak;
+}
+
 /** Compute comfort peaks and the single `comfortable` flag from an executed
  *  trajectory, by finite-differencing pose/speed at the fixed tick `dt`. */
 export function comfortFlags(
@@ -85,17 +109,28 @@ export function comfortFlags(
     yawRatePeak = Math.max(yawRatePeak, Math.abs(yawRate[i]!));
   }
 
-  let yawAccelPeak = 0;
-  let longJerkPeak = 0;
-  let jerkVecPeak = 0;
+  // Second-order (jerk / yaw-accel) series. These are the metrics that
+  // SATURATE on a stack that issues stepwise (piecewise-constant) commands: a
+  // single command step is one isolated large finite-difference spike, so a
+  // naive single-sample max reads "uncomfortable" on every run. `robustPeak`
+  // applies a temporal deadband — it only credits an excursion that persists for
+  // ≥2 consecutive ticks (max over the 2-sample sliding minimum) — so an
+  // isolated command-step artifact is ignored while genuine sustained thrash
+  // (many consecutive large samples) still trips the flag.
+  const yawAccelSeries: number[] = [];
+  const longJerkSeries: number[] = [];
+  const jerkVecSeries: number[] = [];
   for (let i = 1; i < longAccel.length; i++) {
     const yawAccel = (yawRate[i]! - yawRate[i - 1]!) / dt;
-    yawAccelPeak = Math.max(yawAccelPeak, Math.abs(yawAccel));
     const longJerk = (longAccel[i]! - longAccel[i - 1]!) / dt;
     const latJerk = (latAccel[i]! - latAccel[i - 1]!) / dt;
-    longJerkPeak = Math.max(longJerkPeak, Math.abs(longJerk));
-    jerkVecPeak = Math.max(jerkVecPeak, Math.hypot(longJerk, latJerk));
+    yawAccelSeries.push(Math.abs(yawAccel));
+    longJerkSeries.push(Math.abs(longJerk));
+    jerkVecSeries.push(Math.hypot(longJerk, latJerk));
   }
+  const yawAccelPeak = robustPeak(yawAccelSeries);
+  const longJerkPeak = robustPeak(longJerkSeries);
+  const jerkVecPeak = robustPeak(jerkVecSeries);
 
   const violations: string[] = [];
   if (longMin < bounds.longAccelMin) violations.push('longAccelMin');

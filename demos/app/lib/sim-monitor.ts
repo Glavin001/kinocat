@@ -25,6 +25,10 @@ import {
 } from '../../../core/src/internal/geom';
 
 export type { Pt } from '../../../core/src/internal/geom';
+import {
+  countSteerReversals,
+  DEFAULT_STEER_REVERSAL_DEADBAND,
+} from '../../../core/src/eval/tracking-metrics';
 
 // ---------------------------------------------------------------------------
 // Input shape. Structurally a subset of `RaceCarStatus` (race-scenario.ts), so
@@ -206,7 +210,6 @@ function planAimSign(
 export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
   const dt = cfg.dt;
   const success = cfg.success ?? DEFAULT_SUCCESS;
-  const deadband = cfg.steerRateDeadband ?? 0.05;
   const teleportDist = cfg.teleportDist ?? 2.0;
   const hasObstacles = cfg.obstacles.length > 0;
 
@@ -225,8 +228,8 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
   let movedAwayTicks = 0;
   let awayHeadingTicks = 0;
 
-  // jitter
-  let steerReversals = 0;
+  // jitter (steerReversals is computed in summary() from the recorded steer
+  // series via the stepwise-robust hysteresis counter, not accumulated online)
   let steerRateSumSq = 0;
   let lateralAccelSumSq = 0;
   let diffCount = 0; // ticks with a valid finite-difference (i ≥ 1)
@@ -240,7 +243,6 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
   // previous-tick state for finite differences
   let prev: MonitorSample | null = null;
   let prevAccel = NaN;
-  let prevSteerRateSign = 0;
   let prevPlanRef: MonitorSample['plan'] = null;
   let prevPlanSign = 0;
 
@@ -323,11 +325,6 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
 
       const steerRate = (s.metrics.liveControls.steer - prev.metrics.liveControls.steer) / sd;
       steerRateSumSq += steerRate * steerRate;
-      const sign = steerRate > deadband ? 1 : steerRate < -deadband ? -1 : 0;
-      if (sign !== 0) {
-        if (prevSteerRateSign !== 0 && sign !== prevSteerRateSign) steerReversals++;
-        prevSteerRateSign = sign;
-      }
 
       const yawRate = angleDiff(s.state.heading, prev.state.heading) / sd;
       const latAccel = s.state.speed * yawRate;
@@ -372,6 +369,13 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
     const durationSec = elapsed;
     const total = last?.diagnostics.totalReplans ?? 0;
     const ok = last?.diagnostics.successfulReplans ?? 0;
+    // Reversals from the full recorded steer series via the stepwise-robust
+    // hysteresis counter (rate-sign flips saturate on piecewise-constant
+    // commands — every held step reads as a reversal).
+    const steerReversals = countSteerReversals(
+      rows.map((r) => r.steer),
+      DEFAULT_STEER_REVERSAL_DEADBAND,
+    );
 
     let terminalPosError = NaN;
     let terminalHeadingError = NaN;

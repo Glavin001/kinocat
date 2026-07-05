@@ -112,9 +112,21 @@ export function checkFeasibility(
       void radius;
     }
 
-    // Longitudinal accel within the accel/decel envelope.
-    if (p.a >= 0) record(i, p.s, 'longitudinal-accel', p.a, limits.maxAccel);
-    else record(i, p.s, 'longitudinal-accel', -p.a, limits.maxDecel);
+    // Longitudinal accel within the accel/decel envelope. "Accelerating" means
+    // |speed| is INCREASING, which is sign(a) == sign(v) — NOT sign(a) > 0. In
+    // reverse (v < 0) a negative a speeds the car up (spend the accel budget)
+    // while a positive a is braking (decel budget); classifying by sign(a)
+    // alone silently swaps the two limits for every reverse-gear sample.
+    // sign(a·v) ≥ 0 ⇒ speeding up. At a standstill (v ≈ 0) treat it as accel
+    // (the car is departing), which is the correct budget off the line.
+    const speedingUp = p.a * p.v >= 0;
+    record(
+      i,
+      p.s,
+      'longitudinal-accel',
+      Math.abs(p.a),
+      speedingUp ? limits.maxAccel : limits.maxDecel,
+    );
 
     // Optional curvature-rate proxy for steering rate.
     if (limits.maxCurvatureRate !== undefined && i > 0) {

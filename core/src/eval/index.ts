@@ -18,6 +18,8 @@ export { projectOntoPath, type Projection } from './projection';
 export {
   trackingMetrics,
   runControllerIsolation,
+  countSteerReversals,
+  DEFAULT_STEER_REVERSAL_DEADBAND,
   type TrackingReport,
   type ErrorStats,
   type CrossTrackStats,
@@ -65,6 +67,7 @@ export {
   arcPath,
   laneChange,
   slalom,
+  reversePark,
 } from './reference-shapes';
 
 export {

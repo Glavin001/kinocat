@@ -28,6 +28,49 @@ export interface ReferencePoint {
 
 export type ReferenceTrajectory = ReferencePoint[];
 
+/** Per-sample curvature that is SPLIT at gear cusps (speed sign flips) before
+ *  the Menger formula runs. At a Reeds-Shepp cusp the car reverses direction, so
+ *  three consecutive samples straddle the reversal: the far side `c = |C − A|`
+ *  collapses while the triangle area stays finite, and `κ = 4·area/(a·b·c)`
+ *  explodes into a phantom spike (observed κ ≈ 13 m⁻¹ at a valid parking cusp),
+ *  which makes `checkFeasibility` misdiagnose every real parking plan as
+ *  planner-infeasible. Computing curvature within each maximal same-gear run
+ *  keeps every Menger triple on one side of the cusp; the reversal sample itself
+ *  (and the run endpoints) get κ = 0 — correct, since |v| → 0 there so the
+ *  lateral-accel demand v²·κ vanishes regardless. */
+function gearSegmentedCurvature(path: ReadonlyArray<CarKinematicState>): number[] {
+  const n = path.length;
+  const out = new Array<number>(n).fill(0);
+  if (n < 3) return out;
+  // Gear per sample: +1 forward, −1 reverse. Zero-speed samples inherit the
+  // previous gear so a momentary stop mid-run doesn't fragment it, but a true
+  // forward↔reverse sign change starts a new run.
+  const gear = new Array<number>(n).fill(0);
+  let cur = 0;
+  for (let i = 0; i < n; i++) {
+    const v = path[i]!.speed;
+    if (v > 0) cur = 1;
+    else if (v < 0) cur = -1;
+    gear[i] = cur;
+  }
+  // Back-fill any leading zeros with the first resolved gear.
+  const firstResolved = gear.find((g) => g !== 0) ?? 1;
+  for (let i = 0; i < n && gear[i] === 0; i++) gear[i] = firstResolved;
+  // Curvature within each maximal same-gear run only.
+  let start = 0;
+  for (let i = 1; i <= n; i++) {
+    if (i === n || gear[i] !== gear[start]) {
+      if (i - start >= 3) {
+        const seg = curvaturePerSample(path.slice(start, i));
+        for (let k = 0; k < seg.length; k++) out[start + k] = seg[k]!;
+      }
+      start = i;
+    }
+  }
+  return out;
+}
+
+
 /** Build a reference trajectory from a plan path. `s` accumulates arc-length,
  *  `kappa` reuses the Menger-formula `curvaturePerSample`, `a` is a central
  *  difference of `v` over the per-sample time `t` (falling back to dv/ds·v when
@@ -37,7 +80,7 @@ export function toReferenceTrajectory(
 ): ReferenceTrajectory {
   const n = path.length;
   if (n === 0) return [];
-  const kappa = curvaturePerSample(path);
+  const kappa = gearSegmentedCurvature(path);
 
   const s = new Array<number>(n).fill(0);
   for (let i = 1; i < n; i++) {

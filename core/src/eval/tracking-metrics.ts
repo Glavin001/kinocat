@@ -11,6 +11,7 @@ import type { ForwardSim } from '../primitives/types';
 import { angleDiff } from '../internal/math';
 import { toReferenceTrajectory, type ReferenceTrajectory } from './reference-trajectory';
 import { projectOntoPath } from './projection';
+import type { TerminalAccuracy } from './plan-quality';
 
 export interface ErrorStats {
   rmse: number;
@@ -41,6 +42,42 @@ function rms(sumSq: number, count: number): number {
   return count > 0 ? Math.sqrt(sumSq / count) : 0;
 }
 
+/** Count genuine steering reversals (left→right→left "chatter") in a steer
+ *  series, robust to stepwise commands. The old approach counted sign changes of
+ *  the per-tick steer RATE, which SATURATES on piecewise-constant commands: a
+ *  monotone staircase (steer ramping one way in held steps) flip-flops the rate
+ *  sign on every step and every step is miscounted as a reversal. This instead
+ *  tracks turning points of the steer VALUE with a magnitude deadband
+ *  (hysteresis): a reversal is credited only when the steer swings back from its
+ *  last extremum by more than `deadband` radians. A monotone staircase yields 0;
+ *  only true oscillations larger than the deadband count. */
+export function countSteerReversals(
+  steer: ReadonlyArray<number>,
+  deadband: number,
+): number {
+  if (steer.length < 2) return 0;
+  let count = 0;
+  let dir = 0; // 0 = not yet moving, +1 = rising, −1 = falling
+  let pivot = steer[0]!; // value at the last confirmed turning point
+  for (let i = 1; i < steer.length; i++) {
+    const s = steer[i]!;
+    if (dir === 0) {
+      if (s > pivot + deadband) { dir = 1; pivot = s; }
+      else if (s < pivot - deadband) { dir = -1; pivot = s; }
+    } else if (dir === 1) {
+      if (s > pivot) pivot = s; // extend the rising run
+      else if (s <= pivot - deadband) { count++; dir = -1; pivot = s; } // turned down
+    } else {
+      if (s < pivot) pivot = s; // extend the falling run
+      else if (s >= pivot + deadband) { count++; dir = 1; pivot = s; } // turned up
+    }
+  }
+  return count;
+}
+
+/** Default steer-swing deadband (rad ≈ 1.7°) for reversal counting. */
+export const DEFAULT_STEER_REVERSAL_DEADBAND = 0.03;
+
 function percentile(values: number[], p: number): number {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((x, y) => x - y);
@@ -54,8 +91,10 @@ export interface TrackingMetricsOptions {
   /** Commanded steering (curvature or angle) per executed sample, for
    *  smoothness. Omit to skip the steer-rate / reversal metrics. */
   steer?: ReadonlyArray<number>;
-  /** Deadband (rad/s) below which a steer-rate change is noise. Default 0.05. */
-  steerRateDeadband?: number;
+  /** Steer-swing deadband (rad) for reversal counting — a reversal counts only
+   *  when the steer swings back past its last extremum by more than this.
+   *  Default `DEFAULT_STEER_REVERSAL_DEADBAND` (0.03 rad). */
+  steerReversalDeadband?: number;
 }
 
 /** Score an executed trajectory against a reference trajectory. */
@@ -88,23 +127,22 @@ export function trackingMetrics(
     if (vel > velMax) velMax = vel;
   }
 
-  // Steering smoothness from the commanded-steer series.
+  // Steering smoothness from the commanded-steer series. steerRateRms is the
+  // RMS magnitude of the per-tick steer rate; reversals use the stepwise-robust
+  // hysteresis counter (not rate-sign flips, which saturate on held commands).
   let steerRateSumSq = 0;
   let steerReversals = 0;
   let diffCount = 0;
-  const deadband = opts.steerRateDeadband ?? 0.05;
   if (opts.steer && opts.steer.length >= 2) {
-    let prevSign = 0;
     for (let i = 1; i < opts.steer.length; i++) {
       const rate = (opts.steer[i]! - opts.steer[i - 1]!) / opts.dt;
       steerRateSumSq += rate * rate;
       diffCount++;
-      const sign = rate > deadband ? 1 : rate < -deadband ? -1 : 0;
-      if (sign !== 0) {
-        if (prevSign !== 0 && sign !== prevSign) steerReversals++;
-        prevSign = sign;
-      }
     }
+    steerReversals = countSteerReversals(
+      opts.steer,
+      opts.steerReversalDeadband ?? DEFAULT_STEER_REVERSAL_DEADBAND,
+    );
   }
 
   const n = executed.length;
@@ -131,6 +169,15 @@ export interface ControllerIsolationResult {
   steer: number[];
   report: TrackingReport;
   reachedGoal: boolean;
+  /** Terminal-state gap to the reference goal (final executed vs reference end).
+   *  Distinct from `report.crossTrack` (perpendicular gap ALONG the path): a
+   *  controller can hug the corridor yet stop short of the end (`posError`) or
+   *  settle at the right spot but the wrong heading (`headingError`, e.g. 16°),
+   *  and `speed` is the final |speed| — nonzero at a parking goal means it never
+   *  actually settled. These catch the stop-short / wrong-terminal-heading bug
+   *  classes cross-track cannot see. Reuses `plan-quality`'s `TerminalAccuracy`
+   *  rather than a parallel type. */
+  terminal: TerminalAccuracy;
 }
 
 /** Run ONLY the controller against a known-good reference (the planner is
@@ -161,5 +208,18 @@ export function runControllerIsolation(
   }
 
   const report = trackingMetrics(executed, ref, { dt, steer });
-  return { executed, steer, report, reachedGoal };
+  // Terminal accuracy: final executed pose/speed vs the reference's END state
+  // (its intended goal), NOT the projection foot point — so a controller that
+  // stops short still reports a large terminal posError even though its
+  // cross-track (perpendicular) error is tiny.
+  const goal = reference[reference.length - 1]!;
+  const finalState = executed[executed.length - 1]!;
+  const terminal: TerminalAccuracy = {
+    posError: Math.hypot(finalState.x - goal.x, finalState.z - goal.z),
+    headingError: Math.abs(angleDiff(finalState.heading, goal.heading)),
+    // Final |speed|. References here end at rest (parking cusp / stop), so this
+    // is the terminal speed error directly — a car still rolling never settled.
+    speed: Math.abs(finalState.speed),
+  };
+  return { executed, steer, report, reachedGoal, terminal };
 }

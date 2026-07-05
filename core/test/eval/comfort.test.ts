@@ -76,6 +76,43 @@ describe('comfortFlags', () => {
     expect(r.violations).toContain('yawRate');
   });
 
+  it('does not saturate on an ISOLATED single-tick command/pose spike', () => {
+    // Smooth straight cruise with one one-tick heading blip (the signature of a
+    // held stepwise command changing once). It produces a brief burst in the
+    // finite-differenced yaw-accel that a naive single-sample max would flag as
+    // uncomfortable on every run; the temporal-deadband peak rejects it.
+    const dt = 0.05;
+    const out: CarKinematicState[] = [];
+    let x = 0;
+    for (let i = 0; i < 40; i++) {
+      const heading = i === 20 ? 0.02 : 0; // isolated 1-tick blip
+      out.push({ x, z: 0, heading, speed: 6, t: i * dt });
+      x += 6 * dt;
+    }
+    const r = comfortFlags(out, dt);
+    expect(r.violations).not.toContain('yawAccel');
+    expect(r.comfortable).toBe(true);
+  });
+
+  it('still flags SUSTAINED yaw thrash (every-tick oscillation)', () => {
+    // Contrast to the isolated blip: a yaw rate that flips every tick is genuine
+    // discomfort and must survive the temporal deadband.
+    const dt = 0.05;
+    const out: CarKinematicState[] = [];
+    let heading = 0;
+    let x = 0;
+    let z = 0;
+    for (let i = 0; i < 40; i++) {
+      const yawRate = i % 2 === 0 ? 0.9 : -0.9;
+      out.push({ x, z, heading, speed: 7, t: i * dt });
+      heading += yawRate * dt;
+      x += 7 * Math.cos(heading) * dt;
+      z += 7 * Math.sin(heading) * dt;
+    }
+    const r = comfortFlags(out, dt);
+    expect(r.violations).toContain('yawAccel');
+  });
+
   it('respects custom (relaxed arcade) bounds', () => {
     const arcade = { ...DEFAULT_COMFORT_BOUNDS, latAccelAbs: 100 };
     const dt = 0.05;
