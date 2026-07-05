@@ -4,7 +4,7 @@ import type { VehicleAgent, CarKinematicState } from '../agent/types';
 import type { MotionPrimitiveLibrary } from '../primitives/library';
 import { makeNode } from '../planner/node';
 import { pack3 } from '../planner/resolution';
-import { placeFootprint } from '../internal/geom';
+import { placeFootprintInto } from '../internal/geom';
 import { angleDiff, dist, wrapAngle } from '../internal/math';
 import { reedsSheppShortestPath } from '../curves/reeds-shepp';
 import { sampleCurveWithGear } from '../curves/sample';
@@ -121,6 +121,10 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
   private hGoalH = NaN;
   private readonly cbEnabled: boolean;
   private readonly rCirc: number;
+  // Scratch buffer reused by every collision-check footprint placement to
+  // avoid allocating a fresh Pt[] on each call (thousands per plan). The
+  // length matches `agent.footprint`; values are overwritten each use.
+  private readonly fpScratch: Array<[number, number]>;
   private readonly ghEnabled: boolean;
   private readonly ghWeight: number;
   private ghGoalX = NaN;
@@ -162,6 +166,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
       if (r > rc) rc = r;
     }
     this.rCirc = rc;
+    this.fpScratch = this.agent.footprint.map(() => [0, 0]);
     this.cbEnabled =
       opts.clearanceBroadphase === true &&
       typeof this.world.clearanceAt === 'function';
@@ -262,7 +267,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
         if (cl !== null && cl >= this.rCirc) cleared = true;
       }
       if (!cleared) {
-        const fp = placeFootprint(this.agent.footprint, wx, wz, wh);
+        const fp = placeFootprintInto(this.agent.footprint, wx, wz, wh, this.fpScratch);
         this.rec.counters.collisionChecks++;
         if (!this.world.footprintClear(fp)) {
           this.rec.counters.collisionRejects++;
@@ -359,7 +364,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     let px = a.x;
     let pz = a.z;
     for (const p of poses) {
-      const fp = placeFootprint(this.agent.footprint, p.x, p.y, p.theta);
+      const fp = placeFootprintInto(this.agent.footprint, p.x, p.y, p.theta, this.fpScratch);
       this.rec.counters.collisionChecks++;
       if (!this.world.footprintClear(fp)) {
         this.rec.counters.collisionRejects++;
@@ -466,7 +471,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
   private poseClear(s: CarKinematicState): boolean {
     this.rec.counters.collisionChecks++;
     const ok = this.world.footprintClear(
-      placeFootprint(this.agent.footprint, s.x, s.z, s.heading),
+      placeFootprintInto(this.agent.footprint, s.x, s.z, s.heading, this.fpScratch),
     );
     if (!ok) this.rec.counters.collisionRejects++;
     return ok;

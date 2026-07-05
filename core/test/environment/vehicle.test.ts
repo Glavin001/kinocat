@@ -315,7 +315,7 @@ describe('VehicleEnvironment clearance broadphase', () => {
     }
   });
 
-  it('no-ops on a world without clearanceAt (InMemoryNavWorld)', () => {
+  it('plans correctly through InMemoryNavWorld with clearance broadphase enabled', () => {
     const world = new InMemoryNavWorld([rect(1, 0, -16, 40, 16)]);
     const r = plan(
       {
@@ -388,7 +388,7 @@ describe('VehicleEnvironment grid-Dijkstra dual heuristic', () => {
     expect(tiny.heuristic(from, to)).toBeCloseTo(base.heuristic(from, to), 9);
   });
 
-  it('no-ops on a world without buildGoalLowerBound (InMemoryNavWorld)', () => {
+  it('plans correctly through InMemoryNavWorld with gridHeuristic enabled', () => {
     const world = new InMemoryNavWorld([rect(1, 0, -16, 40, 16)]);
     const r = plan(
       {

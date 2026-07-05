@@ -82,6 +82,29 @@ export function placeFootprint(
   return local.map(([lx, lz]) => [ox + lx * c - lz * s, oz + lx * s + lz * c] as Pt);
 }
 
+/** Like `placeFootprint`, but writes into a caller-owned scratch buffer to
+ *  avoid per-call allocation on the hot collision-check path. The buffer
+ *  must have the same length as `local`; each row is a mutable 2-tuple that
+ *  this function overwrites in place. Returns the same buffer typed as a
+ *  readonly polygon ring. */
+export function placeFootprintInto(
+  local: ReadonlyArray<Pt>,
+  ox: number,
+  oz: number,
+  heading: number,
+  out: Array<[number, number]>,
+): ReadonlyArray<Pt> {
+  const c = Math.cos(heading);
+  const s = Math.sin(heading);
+  for (let i = 0; i < local.length; i++) {
+    const lx = local[i]![0];
+    const lz = local[i]![1];
+    out[i]![0] = ox + lx * c - lz * s;
+    out[i]![1] = oz + lx * s + lz * c;
+  }
+  return out as ReadonlyArray<Pt>;
+}
+
 /** Signed twice-area (standard shoelace). Positive for CCW winding in the XZ
  *  plane (x right, z up), negative for CW. Zero for degenerate polygons. */
 function signedArea2(poly: ReadonlyArray<Pt>): number {
