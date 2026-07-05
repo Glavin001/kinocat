@@ -361,6 +361,7 @@ export default function Parking() {
 
     // Animation loop
     let prev = performance.now();
+    let tickCarry = 0;
     function frame() {
       if (cancelled) return;
       const now = performance.now();
@@ -370,11 +371,15 @@ export default function Parking() {
       // responds even while paused).
       fpGroup.visible = showFootprintsRef.current;
       if (!pausedRef.current && raceScenario) {
-        // The shared runner uses a fixed-step physics tick (1/60s); accumulate
-        // wall-time deltas into discrete sim ticks, scaled by SIM_SPEED so the
-        // slow 2 m/s parking maneuver plays back at a watchable pace.
-        const baseSteps = Math.max(1, Math.round(dt / (1 / 60)));
-        const stepsThisFrame = Math.min(8 * SIM_SPEED, baseSteps * SIM_SPEED);
+        // Fixed-timestep ACCUMULATOR: convert wall time into whole 1/60 s sim
+        // ticks and carry the remainder. The old per-frame rounding
+        // (max(1, round(dt/step))) made playback speed display-refresh
+        // dependent — 4x realtime at 60 Hz but 8x at 120 Hz and 9.6x at
+        // 144 Hz. Sim RESULTS were unaffected (ticks are fixed-step), but a
+        // maneuver "felt" 2.4x faster on a gaming monitor.
+        tickCarry += dt * 60 * SIM_SPEED;
+        const stepsThisFrame = Math.min(8 * SIM_SPEED, Math.floor(tickCarry));
+        tickCarry -= stepsThisFrame;
         for (let i = 0; i < stepsThisFrame; i++) {
           raceScenario.tick();
         }

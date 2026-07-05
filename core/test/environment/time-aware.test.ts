@@ -52,7 +52,7 @@ describe('TimeAwareEnvironment: time as a dominance dimension', () => {
     // env one (far-away) predicted obstacle so the tagging machinery runs.
     const env = new TimeAwareEnvironment(base, {
       timeQuantum: 0.2,
-      obstacles: [{ predict: () => ({ x: 999, z: 999, radius: 0.5 }) }],
+      obstacles: [{ radius: 0.5, predict: () => ({ x: 999, z: 999, radius: 0.5 }) }],
     });
     const at = (t: number) =>
       env.createNode({ x: 1, z: 1, heading: 0, speed: 0, t }, null, null);

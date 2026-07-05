@@ -462,11 +462,14 @@ async function main(): Promise<void> {
     throw new Error(`Invalid --entry=${entryKind}. Use kinematic | parametric-only | v2-default.`);
   }
   const tuning: Partial<RaceTuning> = { tracker };
+  // Substring matching: `--filter=parking` selects all parking-* scenarios
+  // (the header's own usage example never matched anything under the old
+  // exact-name matching).
   const filter = values.filter
     ? new Set(values.filter.split(',').map((s) => s.trim()))
     : null;
   const scenarios = filter
-    ? ALL_SCENARIOS.filter((s) => filter.has(s.name))
+    ? ALL_SCENARIOS.filter((s) => [...filter].some((f) => s.name.includes(f)))
     : ALL_SCENARIOS;
 
   process.stdout.write(`controller bench · tracker=${tracker} · entry=${entryKind} · ${scenarios.length} scenarios\n\n`);

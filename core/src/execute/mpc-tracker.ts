@@ -32,6 +32,7 @@
 import type { CarKinematicState } from '../agent/types';
 import type { ForwardSim } from '../primitives/types';
 import type { PlanPath } from './types';
+import { lerpAngle } from '../internal/math';
 
 /** Native wheeled-vehicle control set the tracker emits each tick. */
 export interface MPCCommand {
@@ -198,7 +199,9 @@ function buildReference(
     ref.push({
       x: a.x + (b.x - a.x) * u,
       z: a.z + (b.z - a.z) * u,
-      heading: a.heading + (b.heading - a.heading) * u,
+      // Wrap-aware: a plan crossing the +-pi seam must not interpolate "the
+      // long way" (a reference heading near 0 would poison the wHeading cost).
+      heading: lerpAngle(a.heading, b.heading, u),
       // Reference speed = the advance speed, NOT the plan's stored per-sample
       // speed. The two must agree or the speed-tracking cost fights the
       // position-tracking cost: a plan that starts at rest (speed ≈ 0) but
