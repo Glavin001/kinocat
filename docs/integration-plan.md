@@ -1,5 +1,25 @@
 # kinocat integration plan — motion feasibility & execution layer
 
+## STATUS: all done-when gates met
+
+| Gate | Result | Proven by |
+|---|---|---|
+| replan-after-rebuild < 100 ms | **p95 ≈ 19 ms** | `demos/test/replan-after-rebuild.test.ts` (+ bench) |
+| ETA oracle < 2 ms/query | **median ≈ 1 µs** warm (build 0.2–6 ms/region, LRU-amortized) | `core/test/predict/eta-oracle.test.ts` + `core/bench/eta-oracle.bench.ts` |
+| 4 agents at 60 fps | **p95 tick ≈ 0.14 ms**, all agents replanning, zero stale | `demos/test/four-agents-frame-budget.test.ts` (real `worker_threads`) |
+| torture test | **recovery 45 ms**, auto-detected, no teleport/freeze, hole avoided | `core/test/adapters/tile-rebuild-torture.test.ts` |
+
+What landed (in order): region-scoped invalidation (`execute/invalidation.ts`,
+`markTileRebuilt` overload, revision-keyed NavcatWorld caches, `swapNavMesh`);
+worker `world-update` message + lazy heuristic-grid rebuild; region-seeded
+distance fields (`buildRegionLowerBound` on both worlds) + `createEtaOracle`;
+core `PlannerPool`/`ReplanScheduler`/`FrameBudget` (carchase migrated onto
+them); the torture test with real navmesh destruction. Also fixed a latent
+`InMemoryNavWorld` grid-Dijkstra float32/float64 mismatch that could either
+kill the wave at chokepoints or livelock it on equal-length route combos.
+
+The plan below is the original audit + phase breakdown, kept for reference.
+
 Status assessment against the integration charter (kinocat is feature-frozen;
 integration work only), plus the ordered work plan for what remains.
 
