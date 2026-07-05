@@ -28,6 +28,7 @@ checklist items that prove it:
 | P6 | Coasting: zero gas + zero brake (optionally while turning) must be available — braking is far more severe than gliding | v2 library (already has coast primitives, `race-primitives-scenarios.ts:464,487,517,521-522`); WS-1 adds an executor coast band | A1.2 |
 | P7 | Primitive segments may be too long / compose imprecisely (seams) | WS-2 (dynamic state through seams; root rollouts) | A2.1, A2.2, A2.5 |
 | P8 | The plan's rich control knowledge (exact steer/drive/brake per primitive) must actually drive the actuators, not be re-derived from geometry | WS-1½ (control feedforward) | A1½.1–A1½.5 |
+| P9 | 0.55 s chunks may be too coarse/noisy — maneuvers needing in-between switch times (e.g. a flick at t = 0.25 s into a chunk) aren't representable in-plan | §0c (architecture: chunked deliberation + continuous execution); WS-3 (50 ms control resolution); WS-2 optional interruptible primitives | A3.3, A3.6, A2.7 |
 
 **Definition of done for the phase** (the headline claims, all deterministic,
 all ratcheted):
@@ -59,6 +60,37 @@ all ratcheted):
 The model war is won (9× open-loop advantage, ratcheted); the *pipeline*
 war is not: an executor that never exceeds 0.44 of the friction circle and
 a planner that quantizes away dynamic state price model fidelity at zero.
+
+## 0c. Temporal resolution: where in-between timing comes from (P9)
+
+Within one committed plan, control switches happen only at primitive
+boundaries — multiples of 0.55 s from the replan instant (~15 m at top
+speed). Three layers make the *effective* resolution much finer, and this
+hierarchy (chunked deliberation + continuous execution) is the standard
+state-lattice architecture (Pivtoraiko/Kelly; Apollo/Autoware), not a
+shortcut:
+
+1. **Replans re-anchor the phase** every 300 ms + adaptive triggers
+   (`race-scenario.ts:89`) — chunk boundaries realign to the live state
+   roughly twice per chunk.
+2. **The executor actuates continuously**: steering/throttle recomputed at
+   60 Hz; brake-onset timing is answered by the braking-envelope math
+   every tick (`pure-pursuit.ts:172-235`) — the brake point is NOT
+   quantized to chunk boundaries. Chunks quantize the planner's *intent*
+   (line/maneuver topology), not when the pedals move.
+3. **MPPI (WS-3) owns fine timing by design**: 0.05 s control resolution
+   re-optimized every tick, with the chunked plan as a progress corridor.
+
+Counter-pressure against simply shrinking chunks (measured): at 4 m/s a
+0.55 s primitive's endpoint fan was already too small for the planner to
+distinguish choices (hull 0.19 m² < the 0.5 m² usability floor,
+`race-primitives-scenarios.ts:403-404`) — chunks must stay big enough that
+choices *differ*. The remaining genuine gap — maneuver topologies needing
+an in-plan switch mid-chunk — has a cheap fix: **interruptible
+primitives** (WS-2 optional item, A2.7). Each primitive already records 6
+substep samples ~0.09 s apart (`characterize.ts:63-66`); exposing early
+termination at substep boundaries (root node first, branching measured)
+gives ~0.09 s in-plan switch granularity at zero extra model-rollout cost.
 
 ---
 
@@ -308,6 +340,14 @@ state instead of caching"* (`characterize.ts:46-52`).
    sampling, `race-scenario.ts:447-453`). At 30 m/s and 300 ms cadence the
    car moves ~9 m per replan — planning from where the car *will be* is
    mandatory at speed.
+4. **Optional — interruptible primitives** (P9, see §0c): record
+   per-substep speed alongside the existing per-substep pose samples in
+   `characterize()`, and let the search terminate a primitive early at a
+   substep boundary (~0.09 s granularity). Scope to the **root node
+   first** (where dynamic rollouts are already generating fresh
+   trajectories) to bound the branching growth (×6 if applied
+   everywhere); expand deeper only if the measured benefit justifies the
+   node count.
 
 ### How to build it
 
@@ -347,6 +387,12 @@ state instead of caching"* (`characterize.ts:46-52`).
   replan CPU budget: expansion count per replan within 5% of before
   (root rollouts add ~114 model steps, no search-space change).
 - [ ] **A2.6** `pnpm verify` green; parking unaffected.
+- [ ] **A2.7** (optional, P9) Interruptible primitives at the root:
+  unit test that a plan can commit a partial first primitive ending at a
+  substep boundary (endpoint = the recorded substep state); benchmark
+  A/B with the feature on vs off — land it only if lap time or
+  failed-replan count improves with expansion count growth ≤ 2×; record
+  both outcomes in the PR either way.
 
 ---
 
