@@ -3,6 +3,12 @@ import { readdirSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { buildCrowd } from '../app/lib/crowd-scenario';
 import {
+  buildHovercraft,
+  planHovercraftLeg,
+  hovercraftWorldFrom,
+} from '../app/lib/hovercraft-scenario';
+import { HOVER_AGENT } from '../app/lib/hovercraft-domain';
+import {
   planPlayground,
   buildDynamic,
   world3dWorld,
@@ -689,6 +695,54 @@ describe('crowd demo: momentum humanoid through timed pedestrians', () => {
   });
 });
 
+describe('hovercraft demo: fifth motion body, defined outside kinocat', () => {
+  it('crosses the lagoon at speed, clear of every floe at its own time', () => {
+    const s = buildHovercraft();
+    expect(s.result.found).toBe(true);
+
+    const end = s.result.path[s.result.path.length - 1]!;
+    expect(Math.hypot(end.x - s.goal.x, end.z - s.goal.z)).toBeLessThanOrEqual(1.6 + 1e-9);
+
+    for (let i = 1; i < s.result.path.length; i++) {
+      expect(s.result.path[i]!.t).toBeGreaterThan(s.result.path[i - 1]!.t);
+    }
+
+    // Momentum body: it actually reaches cruising speed.
+    const maxSpeed = Math.max(
+      ...s.result.path.map((p) => Math.hypot(p.vx, p.vz)),
+    );
+    expect(maxSpeed).toBeGreaterThan(HOVER_AGENT.maxSpeed * 0.6);
+
+    // Space-time avoidance against the SAME predictors the demo animates.
+    const rr = 2.2 + HOVER_AGENT.radius;
+    for (const p of s.result.path) {
+      for (const f of s.floes) {
+        const q = f.predict(p.t);
+        if (!q) continue;
+        expect(Math.hypot(p.x - q.x, p.z - q.z)).toBeGreaterThan(rr - 1e-9);
+      }
+    }
+  });
+
+  it('retargets mid-drift: a replan from a moving state carries the momentum', () => {
+    const s = buildHovercraft();
+    // Take a mid-plan state (cruising) and retarget BEHIND it.
+    const mid = s.result.path[Math.floor(s.result.path.length / 2)]!;
+    expect(Math.hypot(mid.vx, mid.vz)).toBeGreaterThan(4);
+    const r = planHovercraftLeg(hovercraftWorldFrom(s.islands), s.floes, mid, {
+      x: 6,
+      z: 0,
+      heading: 0,
+      vx: 0,
+      vz: 0,
+      t: mid.t,
+    });
+    expect(r.found).toBe(true);
+    // Momentum carries it past the turn-around point before it can come back.
+    expect(Math.max(...r.path.map((p) => p.x))).toBeGreaterThan(mid.x + 1.5);
+  });
+});
+
 // Coverage manifest: every demo route under demos/app/<slug>/page.tsx MUST
 // have a headless scenario asserted above. This fails CI if a new demo ships
 // without a test (or if a tested demo is deleted), so "all demos are covered"
@@ -703,6 +757,7 @@ const TESTED_DEMOS = new Set([
   'dynamic', // 'dynamic demo scenarios' — buildDynamic (moving/coop/jump)
   'flagship', // 'flagship demo' — buildFlagship (large multi-agent navcat)
   'goals', // 'Goal Lab' — canonical scenario-goal authoring + visualization; presets exercised headlessly in goallab-presets.test.ts (compile + validate + plan) and scenario-goals.test.ts
+  'hovercraft', // 'hovercraft demo' — buildHovercraft (fifth body, defined outside kinocat)
   'humanoid', // 'humanoid demo' — buildHumanoid
   'jumplinks', // 'jumplinks demo' — buildJumpLinks
   'learnprimitives', // 'learnprimitives demo' — autonomous motion-primitive learner (Rapier)

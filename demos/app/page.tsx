@@ -218,6 +218,14 @@ const DEMOS: readonly Demo[] = [
 
   // ── 3D worlds & flight ────────────────────────────────────────────────
   {
+    href: '/hovercraft',
+    title: 'Hovercraft lagoon',
+    desc: 'A fifth motion body defined entirely outside kinocat: inertial, thrust-vectored, drifting. Tap to retarget mid-drift — momentum and the patrolling floes’ futures carry into every replan.',
+    tags: ['3D', 'Interactive', 'Time-aware'],
+    category: 'spatial',
+    level: 'flagship',
+  },
+  {
     href: '/world3d',
     title: '3D navmesh world',
     desc: 'A vehicle plans and tracks a 3D path with pure-pursuit and plan-switch hysteresis. Tap to retarget or drop obstacles.',
