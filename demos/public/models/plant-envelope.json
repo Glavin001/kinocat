@@ -1,0 +1,270 @@
+{
+  "vehicle": {
+    "chassisHalf": {
+      "x": 2.4,
+      "y": 0.5,
+      "z": 1
+    },
+    "chassisDensity": 60,
+    "wheelBase": 1.6,
+    "wheelTrack": 0.85,
+    "wheelRadius": 0.35,
+    "engineForce": 4000,
+    "brakeForce": 2000,
+    "maxSteerAngle": 0.6,
+    "driveTrain": "rwd"
+  },
+  "vMax": 97.014,
+  "launchCurve": [
+    {
+      "v": 0,
+      "a": 13.854
+    },
+    {
+      "v": 4,
+      "a": 13.468
+    },
+    {
+      "v": 8,
+      "a": 13.07
+    },
+    {
+      "v": 12,
+      "a": 12.663
+    },
+    {
+      "v": 16,
+      "a": 12.268
+    },
+    {
+      "v": 20,
+      "a": 11.866
+    },
+    {
+      "v": 24,
+      "a": 11.478
+    },
+    {
+      "v": 28,
+      "a": 11.065
+    }
+  ],
+  "brakeDecel": [
+    {
+      "entrySpeed": 8,
+      "decel": 15.715,
+      "brakeFrac": 0.25
+    },
+    {
+      "entrySpeed": 16,
+      "decel": 32.224,
+      "brakeFrac": 0.75
+    },
+    {
+      "entrySpeed": 24,
+      "decel": 46.536,
+      "brakeFrac": 1
+    },
+    {
+      "entrySpeed": 28,
+      "decel": 52.898,
+      "brakeFrac": 1
+    }
+  ],
+  "corneringBoundary": [
+    {
+      "steer": 0.15,
+      "entrySpeed": 8,
+      "sustainedSpeed": 16.131,
+      "yawRate": 0.725,
+      "radius": 22.254,
+      "latAccel": 11.692
+    },
+    {
+      "steer": 0.15,
+      "entrySpeed": 12,
+      "sustainedSpeed": 18.731,
+      "yawRate": 0.731,
+      "radius": 25.614,
+      "latAccel": 13.698
+    },
+    {
+      "steer": 0.15,
+      "entrySpeed": 16,
+      "sustainedSpeed": 21.229,
+      "yawRate": 0.645,
+      "radius": 32.929,
+      "latAccel": 13.686
+    },
+    {
+      "steer": 0.15,
+      "entrySpeed": 20,
+      "sustainedSpeed": 23.78,
+      "yawRate": 0.575,
+      "radius": 41.34,
+      "latAccel": 13.679
+    },
+    {
+      "steer": 0.15,
+      "entrySpeed": 24,
+      "sustainedSpeed": 26.46,
+      "yawRate": 0.517,
+      "radius": 51.16,
+      "latAccel": 13.685
+    },
+    {
+      "steer": 0.15,
+      "entrySpeed": 28,
+      "sustainedSpeed": 28.983,
+      "yawRate": 0.473,
+      "radius": 61.335,
+      "latAccel": 13.696
+    },
+    {
+      "steer": 0.3,
+      "entrySpeed": 8,
+      "sustainedSpeed": 14.528,
+      "yawRate": 0.915,
+      "radius": 15.883,
+      "latAccel": 13.289
+    },
+    {
+      "steer": 0.3,
+      "entrySpeed": 12,
+      "sustainedSpeed": 16.487,
+      "yawRate": 0.801,
+      "radius": 20.588,
+      "latAccel": 13.202
+    },
+    {
+      "steer": 0.3,
+      "entrySpeed": 16,
+      "sustainedSpeed": 18.685,
+      "yawRate": 0.705,
+      "radius": 26.498,
+      "latAccel": 13.176
+    },
+    {
+      "steer": 0.3,
+      "entrySpeed": 20,
+      "sustainedSpeed": 21.256,
+      "yawRate": 0.62,
+      "radius": 34.283,
+      "latAccel": 13.179
+    },
+    {
+      "steer": 0.3,
+      "entrySpeed": 24,
+      "sustainedSpeed": 23.94,
+      "yawRate": 0.551,
+      "radius": 43.426,
+      "latAccel": 13.197
+    },
+    {
+      "steer": 0.3,
+      "entrySpeed": 28,
+      "sustainedSpeed": 26.664,
+      "yawRate": 0.496,
+      "radius": 53.781,
+      "latAccel": 13.22
+    },
+    {
+      "steer": 0.45,
+      "entrySpeed": 8,
+      "sustainedSpeed": 12.639,
+      "yawRate": 0.986,
+      "radius": 12.817,
+      "latAccel": 12.464
+    },
+    {
+      "steer": 0.45,
+      "entrySpeed": 12,
+      "sustainedSpeed": 14.261,
+      "yawRate": 0.868,
+      "radius": 16.433,
+      "latAccel": 12.376
+    },
+    {
+      "steer": 0.45,
+      "entrySpeed": 16,
+      "sustainedSpeed": 16.461,
+      "yawRate": 0.751,
+      "radius": 21.923,
+      "latAccel": 12.359
+    },
+    {
+      "steer": 0.45,
+      "entrySpeed": 20,
+      "sustainedSpeed": 19.017,
+      "yawRate": 0.651,
+      "radius": 29.208,
+      "latAccel": 12.382
+    },
+    {
+      "steer": 0.45,
+      "entrySpeed": 24,
+      "sustainedSpeed": 21.744,
+      "yawRate": 0.571,
+      "radius": 38.074,
+      "latAccel": 12.418
+    },
+    {
+      "steer": 0.45,
+      "entrySpeed": 28,
+      "sustainedSpeed": 24.553,
+      "yawRate": 0.507,
+      "radius": 48.399,
+      "latAccel": 12.456
+    },
+    {
+      "steer": 0.6,
+      "entrySpeed": 8,
+      "sustainedSpeed": 10.689,
+      "yawRate": 1.059,
+      "radius": 10.089,
+      "latAccel": 11.324
+    },
+    {
+      "steer": 0.6,
+      "entrySpeed": 12,
+      "sustainedSpeed": 12.192,
+      "yawRate": 0.921,
+      "radius": 13.244,
+      "latAccel": 11.223
+    },
+    {
+      "steer": 0.6,
+      "entrySpeed": 16,
+      "sustainedSpeed": 14.339,
+      "yawRate": 0.783,
+      "radius": 18.317,
+      "latAccel": 11.225
+    },
+    {
+      "steer": 0.6,
+      "entrySpeed": 20,
+      "sustainedSpeed": 16.874,
+      "yawRate": 0.668,
+      "radius": 25.254,
+      "latAccel": 11.275
+    },
+    {
+      "steer": 0.6,
+      "entrySpeed": 24,
+      "sustainedSpeed": 19.63,
+      "yawRate": 0.577,
+      "radius": 33.992,
+      "latAccel": 11.335
+    },
+    {
+      "steer": 0.6,
+      "entrySpeed": 28,
+      "sustainedSpeed": 22.493,
+      "yawRate": 0.506,
+      "radius": 44.409,
+      "latAccel": 11.392
+    }
+  ],
+  "maxLateralAccel": 13.698,
+  "minTurnRadiusExecuted": 10.089
+}
