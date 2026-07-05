@@ -452,6 +452,45 @@ export const PARKING_SUCCESS: ParkingSuccess = {
   centeringTol: 0.6,
 };
 
+// ---------------------------------------------------------------------------
+// Closed-loop success semantics — the settle latch + per-scenario budgets.
+//
+// `evaluateParked` is an INSTANTANEOUS predicate; one true tick is not
+// success (the reverse-perp livelock was "parked" at t≈22 s and then shunted
+// for another 100 s). The latch (kinocat/execute `createSettleLatch`) demands
+// the predicate hold continuously, at rest, for `PARKING_SETTLE.holdSeconds`.
+// The budgets below are the CI quality bar: how fast the full closed loop
+// (planner + tracker + replan policy) must reach that settled state, and how
+// many replans it may spend. Bench + Vitest read the SAME table — the bar
+// cannot drift per-harness.
+
+export const PARKING_SETTLE = {
+  /** The parked predicate must hold continuously this long. */
+  holdSeconds: 2.0,
+  /** At-rest bound for the latch — 5 cm/s, not the display predicate's 0.3. */
+  speedTol: 0.05,
+  /** After latching, keep simulating this long; any creep-out is a failure. */
+  postHoldSeconds: 3.0,
+} as const;
+
+export interface ParkingBudget {
+  /** Max sim-time (s) until the settled hold BEGINS. */
+  maxTimeToSettledSec: number;
+  /** Max total replans spent over the whole run. */
+  maxReplans: number;
+}
+
+/** Closed-loop budgets per scenario. Baselines for context: the first
+ *  transient `parked` instant on 2026-07-05 main was 7.8 s / 20.1 s / 17.4 s
+ *  (pullin / reverse-perp / parallel) — but the runner then kept shuffling
+ *  indefinitely. The budgets demand the loop actually COMMIT to those
+ *  terminals: settle within ~1.5× the transient time and stop replanning. */
+export const PARKING_BUDGETS: Record<ParkingScenarioId, ParkingBudget> = {
+  'forward-pullin': { maxTimeToSettledSec: 15, maxReplans: 25 },
+  'reverse-perp': { maxTimeToSettledSec: 35, maxReplans: 55 },
+  parallel: { maxTimeToSettledSec: 35, maxReplans: 55 },
+};
+
 export interface ParkedEval {
   /** footprintInStall AND stopped AND centered — the headline result. */
   parked: boolean;

@@ -39,8 +39,11 @@ import {
   parkingScenarioOptions,
   buildParkingScenario,
   evaluateParked,
+  PARKING_SETTLE,
+  PARKING_BUDGETS,
   type ParkingScenarioId,
 } from '../app/lib/parking-scenarios';
+import { createSettleLatch } from 'kinocat/execute';
 import {
   createObstacleCourseScenario,
   PHYSICS_DT as PHYSICS_DT_OBS,
@@ -259,30 +262,52 @@ function makeParkingScenario(
       const scenario = await createRaceScenario(
         parkingScenarioOptions(id, [loadEntry(entryKind, 'parking')], tuning),
       );
-      // Stop once GENUINELY parked, or once the chassis has been stationary long
-      // enough that it's clearly done maneuvering (settled — captures the true
-      // terminal for scenarios that don't square up, without breaking mid-settle
-      // the way a loose `|v|<0.5` did, which mis-read reverse-perp as failing).
+      // Closed-loop success: the shared `evaluateParked` predicate must hold
+      // CONTINUOUSLY at rest (settle latch), then the sim keeps running a
+      // post-hold window so creep-out / replan shuffling AFTER "success" fails
+      // the bench. The old break-on-first-`parked` accepted a transient
+      // snapshot the runner destroyed ~300 ms later — the web page then showed
+      // 100+ s of livelock the bench never saw. Budgets (time-to-settled,
+      // replans) come from the SAME `PARKING_BUDGETS` table the Vitest
+      // invariants assert, so the bar cannot drift per-harness.
       const meter = makePlanFeasibilityMeter(BENCH_PLAN_LIMITS);
-      let settledTicks = 0;
+      const latch = createSettleLatch({
+        holdSeconds: PARKING_SETTLE.holdSeconds,
+        speedTol: PARKING_SETTLE.speedTol,
+      });
+      const budget = PARKING_BUDGETS[id];
+      const postTickBudget = Math.round(PARKING_SETTLE.postHoldSeconds * 60);
+      let postTicks = 0;
+      let replansAtSettle = 0;
       while (scenario.simTime() < maxSim) {
         scenario.tick();
         const status = scenario.status()[0]!;
         meter.observe(status.plan);
-        if (evaluateParked(status.state, parkScenario).parked) break;
-        settledTicks = Math.abs(status.state.speed) < 0.03 ? settledTicks + 1 : 0;
-        if (settledTicks >= 45) break;
+        const wasSettled = latch.state.settled;
+        latch.update(
+          { ok: evaluateParked(status.state, parkScenario).parked, speed: status.state.speed },
+          1 / 60,
+        );
+        if (latch.state.settled && !wasSettled) {
+          replansAtSettle = status.diagnostics.totalReplans;
+        }
+        if (latch.state.settled && ++postTicks >= postTickBudget) break;
       }
       const status = scenario.status()[0]!;
       const simTime = scenario.simTime();
       scenario.dispose();
       const feas = meter.result();
       const dist = Math.hypot(status.state.x - goal.x, status.state.z - goal.z);
-      // Shared "in-the-stall" predicate — the SAME `evaluateParked` the web page
-      // and the Vitest tests use, so the bench can't drift to a looser,
-      // position-only bar. A car that stops offset or angled FAILS honestly.
       const ev = evaluateParked(status.state, parkScenario);
-      const passed = ev.parked && simTime < maxSim;
+      const settle = latch.state;
+      const withinBudget =
+        settle.settled &&
+        settle.timeToSettled! < budget.maxTimeToSettledSec &&
+        replansAtSettle <= budget.maxReplans;
+      const passed = withinBudget && settle.violations === 0 && ev.parked;
+      const settleNote = settle.settled
+        ? `settled ${settle.timeToSettled!.toFixed(1)}s/${budget.maxTimeToSettledSec}s · replans ${replansAtSettle}/${budget.maxReplans}${settle.violations > 0 ? ` · ${settle.violations} POST-SETTLE VIOLATIONS` : ''}`
+        : `NEVER SETTLED (transient parked ≠ success)`;
       return {
         scenario: `parking-${id}`,
         passed,
@@ -293,9 +318,7 @@ function makeParkingScenario(
         offTrackEvents: status.offTrackEvents,
         totalReplans: status.diagnostics.totalReplans,
         ...feas,
-        note: passed
-          ? `parked (${(ev.coverage * 100).toFixed(0)}% in stall), plan ${(feas.planFeasibleFrac * 100).toFixed(0)}% feasible`
-          : `${(ev.coverage * 100).toFixed(0)}% in stall, ${((ev.headingError * 180) / Math.PI).toFixed(0)}° off, |v|=${status.state.speed.toFixed(2)}`,
+        note: `${passed ? `parked (${(ev.coverage * 100).toFixed(0)}% in stall)` : `${(ev.coverage * 100).toFixed(0)}% in stall, ${((ev.headingError * 180) / Math.PI).toFixed(0)}° off`} · ${settleNote}`,
       };
     },
   };
@@ -402,9 +425,9 @@ const rampScenario: BenchScenario = {
 
 const ALL_SCENARIOS: BenchScenario[] = [
   raceScenario,
-  makeParkingScenario('forward-pullin', 25, 'forward pull-in (easy)'),
-  makeParkingScenario('reverse-perp', 40, 'reverse perpendicular (medium)'),
-  makeParkingScenario('parallel', 40, 'parallel parking (hard)'),
+  makeParkingScenario('forward-pullin', 30, 'forward pull-in (easy)'),
+  makeParkingScenario('reverse-perp', 60, 'reverse perpendicular (medium)'),
+  makeParkingScenario('parallel', 60, 'parallel parking (hard)'),
   obstacleCourseScenario,
   rampScenario,
 ];
