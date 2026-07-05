@@ -1,4 +1,11 @@
-import type { Direction, ReferencePoint, Segment } from './types';
+import type { Direction, Segment } from './types';
+
+/** Minimal structural view segmentByGear needs — just the signed speed. Lets
+ *  callers pass a `ReferencePoint[]` OR any `{ vRef }[]` projection (e.g. a
+ *  `CarKinematicState[]` mapped `speed → vRef`) without a cast. */
+interface GearSample {
+  vRef: number;
+}
 
 /** Speed deadband (m/s) below which a sample is treated as "stopped" for
  *  gear purposes. */
@@ -19,7 +26,7 @@ const GEAR_EPS = 1e-3;
  *
  *  A plan with no cusps returns a single segment spanning the whole polyline.
  *  Inputs shorter than two points return `[]` (no traversable segment). */
-export function segmentByGear(points: ReadonlyArray<ReferencePoint>): Segment[] {
+export function segmentByGear(points: ReadonlyArray<GearSample>): Segment[] {
   const n = points.length;
   if (n < 2) return [];
 

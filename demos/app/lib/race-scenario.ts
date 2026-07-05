@@ -54,7 +54,7 @@ import {
   DEFAULT_LEARNABLE_CONFIG,
   type VehicleAgent,
 } from 'kinocat/agent';
-import { buildPlan, type Plan } from 'kinocat/plan';
+import { buildPlan, segmentByGear, type Plan } from 'kinocat/plan';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavWorld, AnalyticEdgeData } from 'kinocat/environment';
 import type { PlanResult } from 'kinocat/planner';
@@ -161,27 +161,22 @@ const PURE_PURSUIT_CONFIG = {
  * the cusp pose before the next-segment gear change. Plans with no
  * cusps return `[plan]` and downstream code is unchanged.
  *
- * Borrowed verbatim from the WIP parking branch
- * (claude/fervent-cori-KXMEy → `splitAtGearCusps` in Parking.tsx).
+ * Delegates to `segmentByGear` from `kinocat/plan` — the single source of
+ * truth for gear splitting, shared with the rich `Plan` builder. Unlike the
+ * previous local logic, it splits correctly across an exact rest sample
+ * (`speed ≈ 0`, the stop pose the chassis reverses from): the boundary lands
+ * ON that rest sample, so adjacent segments share it (the forward segment
+ * ends at the stop; the reverse segment starts there). Segments shorter than
+ * two samples are dropped, matching the prior contract.
  */
 export function splitAtGearCusps(plan: CarKinematicState[]): CarKinematicState[][] {
   if (plan.length < 2) return [plan.slice()];
+  const segs = segmentByGear(plan.map((p) => ({ vRef: p.speed })));
   const out: CarKinematicState[][] = [];
-  let cur: CarKinematicState[] = [plan[0]!];
-  for (let i = 1; i < plan.length; i++) {
-    const s = plan[i]!;
-    const prev = cur[cur.length - 1]!;
-    const flipped =
-      (prev.speed > 1e-3 && s.speed < -1e-3) ||
-      (prev.speed < -1e-3 && s.speed > 1e-3);
-    if (flipped) {
-      if (cur.length >= 2) out.push(cur);
-      cur = [s];
-    } else {
-      cur.push(s);
-    }
+  for (const seg of segs) {
+    const slice = plan.slice(seg.startIdx, seg.endIdx + 1);
+    if (slice.length >= 2) out.push(slice);
   }
-  if (cur.length >= 2) out.push(cur);
   return out.length > 0 ? out : [plan.slice()];
 }
 
