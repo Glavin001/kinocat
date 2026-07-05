@@ -9,6 +9,13 @@ export type {
 export { purePursuit } from './pure-pursuit';
 export { ReplanState, planPoseAt } from './replan';
 export {
+  planCrossesRegion,
+  markAffectedAgents,
+  footprintCircumradius,
+  type ChangedRegion,
+  type AffectedAgent,
+} from './invalidation';
+export {
   smoothSpeedProfile,
   curvaturePerSample,
   resampleScalarByArcLength,

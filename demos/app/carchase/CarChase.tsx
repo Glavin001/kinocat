@@ -12,6 +12,7 @@ import {
 import type { Predict, MovingObstacle } from 'kinocat/predict';
 import type { CarKinematicState } from 'kinocat/agent';
 import type { ObstacleDescriptor, WorkerPlanResponse } from 'kinocat/worker';
+import { ReplanScheduler, FrameBudget, type AgentPlanSource } from 'kinocat/worker';
 import {
   CARCHASE_AGENT,
   CARCHASE_BOUNDS,
@@ -579,10 +580,8 @@ export default function CarChase() {
     }
 
     // ---- planning helpers ----------------------------------------------
-    // Track in-flight worker requests so we don't double-dispatch.
-    const inflightReqIds = new Map<string, number>();
-    const inflightSendTimes = new Map<number, number>();
-    let nextReqId = 0;
+    // In-flight dedup, stale-result rejection, and request timing live in
+    // the core PlannerPool (behind CarChasePlannerHost) now.
 
     function applyPlanResult(
       npcId: string,
@@ -621,16 +620,11 @@ export default function CarChase() {
       }
     }
 
-    // Wire up async result handler when using worker.
+    // Wire up async result handler when using worker. The pool already
+    // dropped stale results and measured the round-trip.
     if (workerHost) {
-      workerHost.onResult((resp: WorkerPlanResponse) => {
-        const currentReqId = inflightReqIds.get(resp.npcId);
-        if (currentReqId !== resp.reqId) return; // stale
-        inflightReqIds.delete(resp.npcId);
-        const sendTime = inflightSendTimes.get(resp.reqId) ?? performance.now();
-        inflightSendTimes.delete(resp.reqId);
-        const budgetMs = performance.now() - sendTime;
-        applyPlanResult(resp.npcId, resp, budgetMs);
+      workerHost.onResult((resp: WorkerPlanResponse, elapsedMs: number) => {
+        applyPlanResult(resp.npcId, resp, elapsedMs);
       });
     }
 
@@ -704,89 +698,87 @@ export default function CarChase() {
     }
 
     // ---- replan scheduler ----------------------------------------------
-    // Round-robin across robber + cops. When a worker is available, dispatch
-    // is non-blocking; results arrive asynchronously via onResult. Otherwise
-    // fall back to synchronous main-thread planning.
-    let replanCursor = 0;
+    // Worker path: core ReplanScheduler — one dispatch per 25 ms tick,
+    // round-robin across robber + cops, per-agent plans running in parallel
+    // on the pool's workers, with the emergency slot-steal keeping the
+    // robber from ever coasting planless. Fallback path (no workers):
+    // synchronous main-thread planning under a FrameBudget so at most one
+    // over-budget plan lands per tick.
+    const agentSources: AgentPlanSource[] = [
+      {
+        id: 'robber',
+        prepare(now) {
+          const prep = prepareRobberReplan(now);
+          if (!prep) return null;
+          return { start: prep.start, goal: prep.goal, obstacles: prep.obstacles };
+        },
+        planRemainingSec(now) {
+          if (playerDrivingRef.current) return null;
+          if (!robber.plan || robber.plan.length === 0) return null;
+          const elapsed = (now - robber.planStartWall) / 1000;
+          return robber.plan[robber.plan.length - 1]!.t - elapsed;
+        },
+      },
+      ...cops.map((co, ci): AgentPlanSource => ({
+        id: co.id,
+        prepare(now) {
+          if (co.capturedAtWall + CAPTURE_COOLDOWN_MS > now) return null;
+          const prep = prepareCopReplan(co, ci, now);
+          return { start: prep.start, goal: prep.goal, obstacles: prep.obstacles };
+        },
+      })),
+    ];
+    const scheduler = workerHost
+      ? new ReplanScheduler(workerHost, agentSources, { priorityAgentId: 'robber' })
+      : null;
+
+    const rehydrate = (ds: ObstacleDescriptor[]): MovingObstacle[] =>
+      ds.map((d) =>
+        d.kind === 'plan'
+          ? (() => { const r = new PlanRegistry(); r.publish('_', d.path); return asObstacle(r.predictNPC('_'), d.radius); })()
+          : asObstacle(constantVelocity(d.state, d.horizon), d.radius),
+      );
+
+    const syncBudget = new FrameBudget(4);
+    let syncCursor = 0;
     const replanTimer = window.setInterval(() => {
       if (pausedRef.current) return;
       const now = performance.now();
 
-      // Emergency robber replan: if the active plan is nearly exhausted,
-      // steal this slot so the robber never runs out of plan mid-chase.
-      if (
-        !playerDrivingRef.current &&
-        workerHost &&
-        !inflightReqIds.has('robber') &&
-        robber.plan &&
-        robber.plan.length > 0
-      ) {
-        const elapsed = (now - robber.planStartWall) / 1000;
-        const planEnd = robber.plan[robber.plan.length - 1]!.t;
-        if (planEnd - elapsed < 0.6) {
-          const prep = prepareRobberReplan(now);
-          if (prep) {
-            const reqId = nextReqId++;
-            inflightReqIds.set('robber', reqId);
-            inflightSendTimes.set(reqId, performance.now());
-            workerHost.requestPlan({ type: 'plan', reqId, ...prep });
-            replanCursor += 1;
-            return;
-          }
-        }
+      if (scheduler) {
+        scheduler.tick(now);
+        return;
       }
 
-      const slot = replanCursor % (NUM_COPS + 1);
-
+      // Synchronous main-thread fallback.
+      syncBudget.startFrame();
+      const slot = syncCursor % (NUM_COPS + 1);
+      syncCursor += 1;
       if (slot === 0) {
         const prep = prepareRobberReplan(now);
-        if (!prep) { replanCursor += 1; return; }
-        if (workerHost) {
-          if (inflightReqIds.has('robber')) { replanCursor += 1; return; }
-          const reqId = nextReqId++;
-          inflightReqIds.set('robber', reqId);
-          inflightSendTimes.set(reqId, performance.now());
-          workerHost.requestPlan({ type: 'plan', reqId, ...prep });
-        } else {
-          // Synchronous fallback.
-          const obstacles: MovingObstacle[] = prep.obstacles.map((d) =>
-            d.kind === 'plan'
-              ? (() => { const r = new PlanRegistry(); r.publish('_', d.path); return asObstacle(r.predictNPC('_'), d.radius); })()
-              : asObstacle(constantVelocity(d.state, d.horizon), d.radius),
-          );
+        if (!prep) return;
+        syncBudget.run(() => {
           const t0 = performance.now();
           const res = planCarChaseAI({
             npcId: 'robber', state: prep.start, goal: prep.goal,
-            movingObstacles: obstacles, registry, course,
+            movingObstacles: rehydrate(prep.obstacles), registry, course,
           });
           applyPlanResult('robber', res, performance.now() - t0);
-        }
+        });
       } else {
         const ci = (slot - 1) % NUM_COPS;
         const co = cops[ci]!;
-        if (co.capturedAtWall + CAPTURE_COOLDOWN_MS > now) { replanCursor += 1; return; }
+        if (co.capturedAtWall + CAPTURE_COOLDOWN_MS > now) return;
         const prep = prepareCopReplan(co, ci, now);
-        if (workerHost) {
-          if (inflightReqIds.has(co.id)) { replanCursor += 1; return; }
-          const reqId = nextReqId++;
-          inflightReqIds.set(co.id, reqId);
-          inflightSendTimes.set(reqId, performance.now());
-          workerHost.requestPlan({ type: 'plan', reqId, ...prep });
-        } else {
-          const obstacles: MovingObstacle[] = prep.obstacles.map((d) =>
-            d.kind === 'plan'
-              ? (() => { const r = new PlanRegistry(); r.publish('_', d.path); return asObstacle(r.predictNPC('_'), d.radius); })()
-              : asObstacle(constantVelocity(d.state, d.horizon), d.radius),
-          );
+        syncBudget.run(() => {
           const t0 = performance.now();
           const res = planCarChaseAI({
             npcId: co.id, state: prep.start, goal: prep.goal,
-            movingObstacles: obstacles, registry, course,
+            movingObstacles: rehydrate(prep.obstacles), registry, course,
           });
           applyPlanResult(co.id, res, performance.now() - t0);
-        }
+        });
       }
-      replanCursor += 1;
     }, REPLAN_INTERVAL_MS);
 
     // ---- resize ---------------------------------------------------------

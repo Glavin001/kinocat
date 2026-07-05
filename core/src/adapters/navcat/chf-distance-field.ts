@@ -13,7 +13,7 @@
 
 import type { CompactHeightfield } from 'navcat';
 import { getCon } from 'navcat';
-import { type ChfGrid, makeChfGrid, worldCell } from './chf-grid';
+import { type ChfGrid, makeChfGrid, worldCell, isWalkable } from './chf-grid';
 import { BinaryHeap } from '../../internal/heap';
 
 const NOT_CONNECTED = 0x3f;
@@ -45,18 +45,56 @@ export class ChfGoalDistanceField {
   private readonly slack: number;
   readonly available: boolean;
 
-  constructor(chf: CompactHeightfield, gx: number, gz: number, gy?: number) {
+  /** Point-goal field. `regionSeeds` is internal — use `fromRegion`. */
+  constructor(
+    chf: CompactHeightfield,
+    gx: number,
+    gz: number,
+    gy?: number,
+    regionSeeds?: (g: ChfGrid) => number[],
+  ) {
     const g = makeChfGrid(chf);
     this.g = g;
     this.slack = Math.SQRT2 * g.cellSize;
     this.dist = new Float64Array(chf.spanCount).fill(Infinity);
-    const goal = this.spanInColumn(this.cellOf(gx, gz), gy, false);
-    if (goal < 0) {
+    const seeds = regionSeeds
+      ? regionSeeds(g)
+      : [this.spanInColumn(this.cellOf(gx, gz), gy, false)].filter((s) => s >= 0);
+    if (seeds.length === 0) {
       this.available = false;
       return;
     }
     this.available = true;
-    this.dijkstra(goal);
+    this.dijkstra(seeds);
+  }
+
+  /** Multi-source field seeded from EVERY walkable span whose column centre
+   *  lies inside the region — `lookup` then gives the obstacle-avoiding
+   *  distance to the NEAREST point of the region (a true region ETA bound).
+   *  Null when no column passes `containsXZ` (region off-mesh / degenerate;
+   *  callers fall back to their kinematic bound). */
+  static fromRegion(
+    chf: CompactHeightfield,
+    containsXZ: (x: number, z: number, cellHalfDiag?: number) => boolean,
+  ): ChfGoalDistanceField | null {
+    const field = new ChfGoalDistanceField(chf, NaN, NaN, undefined, (g) => {
+      const halfDiag = (g.cellSize * Math.SQRT2) / 2;
+      const seeds: number[] = [];
+      for (let cz = 0; cz < g.height; cz++) {
+        for (let cx = 0; cx < g.width; cx++) {
+          const wx = g.minX + (cx + 0.5) * g.cellSize;
+          const wz = g.minZ + (cz + 0.5) * g.cellSize;
+          if (!containsXZ(wx, wz, halfDiag)) continue;
+          const col = g.chf.cells[cx + cz * g.width];
+          if (!col) continue;
+          for (let s = col.index; s < col.index + col.count; s++) {
+            if (isWalkable(g, s)) seeds.push(s);
+          }
+        }
+      }
+      return seeds;
+    });
+    return field.available ? field : null;
   }
 
   private cellOf(x: number, z: number): number {
@@ -100,7 +138,7 @@ export class ChfGoalDistanceField {
     return pick;
   }
 
-  private dijkstra(goal: number): void {
+  private dijkstra(seeds: ReadonlyArray<number>): void {
     const g = this.g;
     const { width, height } = g;
     const cells = g.chf.cells;
@@ -119,8 +157,10 @@ export class ChfGoalDistanceField {
       }
     }
     const heap = new BinaryHeap<QItem>((a, b) => a.d - b.d);
-    dist[goal] = 0;
-    heap.push({ i: goal, d: 0 });
+    for (const s of seeds) {
+      dist[s] = 0;
+      heap.push({ i: s, d: 0 });
+    }
     while (!heap.isEmpty()) {
       const top = heap.pop()!;
       const si = top.i;
