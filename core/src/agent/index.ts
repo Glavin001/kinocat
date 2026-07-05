@@ -50,6 +50,7 @@ export type {
 } from './vehicle-model';
 export {
   DEFAULT_LEARNED_PARAMS_V2,
+  KINEMATIC_NATIVE_PARAMS,
   PARAMS_V2_LO,
   PARAMS_V2_HI,
   PARAMS_V2_ORDER,

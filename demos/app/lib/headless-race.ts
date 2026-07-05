@@ -25,7 +25,11 @@ import {
 } from './race-primitives-scenarios';
 import {
   buildParametricOnlyModel,
+  learnedForwardSimV2,
+  parametricForwardV2,
   DEFAULT_LEARNED_PARAMS_V2,
+  DEFAULT_LEARNABLE_CONFIG,
+  KINEMATIC_NATIVE_PARAMS,
   type LearnedVehicleModel,
 } from 'kinocat/agent';
 
@@ -137,19 +141,37 @@ export async function runHeadlessRace(
   });
 }
 
-/** Build a kinematic-baseline `RaceEntry`. */
+/** Build a kinematic-baseline `RaceEntry`. Under the MPPI (`tracker: 'mpc'`)
+ *  executor, this car tracks with the naive idealised-bicycle model
+ *  (`KINEMATIC_NATIVE_PARAMS`) — the native-controls analogue of the
+ *  kinematic library's worldview. Under pure-pursuit the `forwardModel` is
+ *  unused. */
 export function kinematicEntry(name = 'kinematic'): RaceEntry {
-  return { name, lib: buildKinematicLibrary() };
+  return {
+    name,
+    lib: buildKinematicLibrary(),
+    forwardModel: parametricForwardV2(KINEMATIC_NATIVE_PARAMS, DEFAULT_LEARNABLE_CONFIG),
+  };
 }
 
-/** Build a v2 `RaceEntry` from a `LearnedVehicleModel`. */
+/** Build a v2 `RaceEntry` from a `LearnedVehicleModel`. Under MPPI this car
+ *  tracks with its OWN learned model (parametric backbone + residual
+ *  ensemble), so its fidelity reaches the wheels. */
 export function v2Entry(name: string, model: LearnedVehicleModel): RaceEntry {
-  return { name, lib: buildLearnedRaceLibraryV2(model) };
+  return {
+    name,
+    lib: buildLearnedRaceLibraryV2(model),
+    forwardModel: learnedForwardSimV2(model),
+  };
 }
 
 /** Build a parametric-only baseline (no residual ensemble) from the
  *  default params + config. */
 export function parametricOnlyEntry(name = 'parametric-only'): RaceEntry {
   const m = buildParametricOnlyModel(DEFAULT_LEARNED_PARAMS_V2);
-  return { name, lib: buildLearnedRaceLibraryV2(m) };
+  return {
+    name,
+    lib: buildLearnedRaceLibraryV2(m),
+    forwardModel: learnedForwardSimV2(m),
+  };
 }

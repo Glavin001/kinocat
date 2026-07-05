@@ -131,6 +131,50 @@ export const DEFAULT_LEARNED_PARAMS_V2: LearnedVehicleParamsV2 = {
   rollingResistance: 0.05,
 };
 
+/**
+ * "Naive kinematic" native-control parameter set — the idealised bicycle
+ * worldview expressed through `parametricForwardV2`'s plumbing, for use as a
+ * MPPI forward model that represents the SIMPLE (kinematic) model in an
+ * honest head-to-head against the learned v2 model.
+ *
+ * The kinematic worldview believes the chassis is a perfect Ackermann
+ * bicycle: steering instantly produces the geometric yaw rate at any speed
+ * (no understeer), grip is unlimited (no friction circle), there is no
+ * sideslip, and force maps 1:1 to acceleration. A controller that trusts
+ * this model over-commands into corners — it thinks it can carry any speed
+ * through any radius — so against the real (grip-limited, understeering)
+ * Rapier plant it overshoots. That is the delusion the learned model
+ * corrects, and the mechanism by which the v2 car out-drives it once the
+ * model is actually in the control loop (MPPI).
+ *
+ * NOT a fitted artifact and NOT bounds-checked: it is a deliberately
+ * idealised reference, the native-controls analogue of `kinematicForwardSim`.
+ */
+export const KINEMATIC_NATIVE_PARAMS: LearnedVehicleParamsV2 = {
+  engineScale: 1.0,
+  reverseEffScale: 1.0,
+  brakeScale: 1.0,
+  accelTau: 0.1,
+  // Effectively unlimited grip: aMax = gripScale·frictionSlip·g·slack is so
+  // large the friction-circle clamp never fires → the model believes it can
+  // corner at any speed and any radius.
+  gripScale: 10,
+  frictionCircleSlack: 3,
+  steerRatio: 1.0,
+  // No understeer: geometric yaw rate is delivered in full at every speed.
+  understeerOffThrottle: 0,
+  understeerPowerOn: 0,
+  // Near-instant yaw response (no chassis-inertia lag).
+  yawRateTau: 0.02,
+  // No sideslip dynamics (pure kinematic bicycle: velocity is along heading).
+  lateralDamping: 20,
+  lateralFromSteer: 0,
+  slipDrag: 0,
+  loadTransferCoeff: 0,
+  driveDeadzone: 0,
+  rollingResistance: 0.02,
+};
+
 /** Bounds for parametric fit — PHYSICALLY plausible ranges. Looser
  *  bounds let the fit pin parameters to walls when the model lacks
  *  expressiveness for some trial (e.g. brakeScale=3.5 means the model

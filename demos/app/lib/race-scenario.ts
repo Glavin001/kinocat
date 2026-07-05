@@ -62,7 +62,7 @@ import { buildPlan, segmentByGear, type Plan } from 'kinocat/plan';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavWorld, AnalyticEdgeData } from 'kinocat/environment';
 import type { PlanResult } from 'kinocat/planner';
-import type { MotionPrimitiveLibrary } from 'kinocat/primitives';
+import type { MotionPrimitiveLibrary, ForwardSim } from 'kinocat/primitives';
 import {
   buildRaceCourse,
   planRaceMultiGoal,
@@ -500,6 +500,16 @@ export interface RaceEntry {
    *  Defaults to `RACE_AGENT` (race course). Parking entries set
    *  `PARKING_AGENT`. */
   agent?: VehicleAgent;
+  /** Forward dynamics model the MPPI (`tracker: 'mpc'`) tracker rolls for
+   *  this entry — the mechanism that turns model fidelity into control
+   *  quality. Each car's MPPI predicts the plant's response with ITS OWN
+   *  model: the v2 car uses the trained `learnedForwardSimV2`, the kinematic
+   *  car uses a naive idealised-bicycle model. A more accurate model
+   *  commands feasible corner speeds; a delusional one over-drives and
+   *  overshoots. Defaults to the shared v2-default parametric backbone (so
+   *  pure-pursuit-only entries and legacy callers are unaffected). Native
+   *  `[steer, driveForce, brakeForce]` controls. */
+  forwardModel?: ForwardSim<CarKinematicState>;
 }
 
 export interface RaceLap {
@@ -707,6 +717,8 @@ interface CarInternal {
   // Persistent MPC tracker state (warm-start sequence + RNG seed) when
   // the tracker is `'mpc'`. Lazily initialised on first MPC tick.
   mpcState: MPCTrackerState | null;
+  // Forward model this car's MPPI rolls (per-entry; the fidelity lever).
+  mpcForwardSim: ForwardSim<CarKinematicState>;
 }
 
 // ---------------------------------------------------------------------------
@@ -936,6 +948,7 @@ export async function createRaceScenario(
       lastInBounds: true,
       spawn,
       mpcState: null,
+      mpcForwardSim: entry.forwardModel ?? mpcForwardSim,
     };
   });
 
@@ -1410,7 +1423,7 @@ export async function createRaceScenario(
         if (tuning.tracker === 'mpc') {
           // Sampling MPC over the v2 parametric model.
           if (!c.mpcState) c.mpcState = createMPCTrackerState(MPC_HORIZON);
-          const cmdRaw = mpcTrack(stateBefore, live, mpcForwardSim, c.mpcState, MPC_CONFIG);
+          const cmdRaw = mpcTrack(stateBefore, live, c.mpcForwardSim, c.mpcState, MPC_CONFIG);
           const cmd: WheeledCarControls = {
             steer: cmdRaw.steer,
             driveForce: cmdRaw.driveForce,
@@ -1639,6 +1652,10 @@ export async function createRaceScenario(
       c.lastMoveSimTime = 0;
       c.lastPos = { x: c.spawn.x, z: c.spawn.z };
       c.lastInBounds = true;
+      // Reset the MPPI warm-start + RNG so reset() is bit-reproducible under
+      // the 'mpc' tracker (a stale warm-start sequence would make the second
+      // run diverge from a fresh one).
+      c.mpcState = null;
     }
   }
 
