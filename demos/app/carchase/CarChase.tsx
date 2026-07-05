@@ -232,6 +232,8 @@ export default function CarChase() {
     snapshot: ProgressSnapshot;
     label: string;
   } | null>(null);
+  // Which vehicle's goal the visualizer panel tracks. 'robber' | 'cop0' | …
+  const [vizAgent, setVizAgent] = useState('robber');
 
   const pausedRef = useRef(paused);
   const chaseRef = useRef(chase);
@@ -251,6 +253,8 @@ export default function CarChase() {
   showDebugRef.current = showDebug;
   showRapierDebugRef.current = showRapierDebug;
   playerDrivingRef.current = playerDriving;
+  const vizAgentRef = useRef(vizAgent);
+  vizAgentRef.current = vizAgent;
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -1113,22 +1117,50 @@ export default function CarChase() {
       if (now - lastHudWall > 100) {
         lastHudWall = now;
 
-        // Goal visualizer: compile the camera-followed robber's scenario goal
-        // and evaluate deterministic progress along its committed plan prefix —
+        // Goal visualizer: compile the SELECTED vehicle's scenario goal and
+        // evaluate deterministic progress along its committed plan prefix —
         // the planner's objective state, made visible (same evaluator + panel
-        // as the Goal Lab). Only meaningful while the AI drives the robber.
-        if (!playerDrivingRef.current && robber.goalRegion && robber.plan && robber.plan.length > 1) {
-          const automaton = compile(reach(robber.goalRegion));
-          const elapsed = (now - robber.planStartWall) / 1000;
-          const prefix = robber.plan.filter((s) => s.t <= elapsed);
-          const traj = prefix.length > 0 ? prefix : [robber.plan[0]!];
-          setGoalViz({
-            automaton,
-            snapshot: evaluateProgress(automaton, traj),
-            label: 'robber · reach(near escape)',
-          });
-        } else {
-          setGoalViz(null);
+        // as the Goal Lab). The switcher (vizAgent) picks robber or any cop.
+        {
+          const sel = vizAgentRef.current;
+          let region: Region | null = null;
+          let plan: CarKinematicState[] | null = null;
+          let planStartWall = now;
+          let state: CarKinematicState = robberStateAfter;
+          let label = '';
+          if (sel === 'robber') {
+            if (!playerDrivingRef.current) {
+              region = robber.goalRegion;
+              plan = robber.plan;
+              planStartWall = robber.planStartWall;
+              state = robberStateAfter;
+              label = `robber · reach(${region?.kind ?? '—'})`;
+            }
+          } else {
+            const ci = cops.findIndex((c) => c.id === sel);
+            if (ci >= 0) {
+              const co = cops[ci]!;
+              region = co.goalRegion;
+              plan = co.plan;
+              planStartWall = co.planStartWall;
+              state = copStatesAfter[ci]!;
+              label = `${co.id} · ${co.mode} · reach(${region?.kind ?? '—'})`;
+            }
+          }
+          if (region) {
+            const automaton = compile(reach(region));
+            let traj: CarKinematicState[];
+            if (plan && plan.length > 1) {
+              const elapsed = (now - planStartWall) / 1000;
+              const prefix = plan.filter((s) => s.t <= elapsed);
+              traj = prefix.length > 0 ? prefix : [plan[0]!];
+            } else {
+              traj = [{ ...state, t: 0 }];
+            }
+            setGoalViz({ automaton, snapshot: evaluateProgress(automaton, traj), label });
+          } else {
+            setGoalViz(null);
+          }
         }
 
         const v = Math.abs(robberStateAfter.speed).toFixed(1);
@@ -1229,7 +1261,7 @@ export default function CarChase() {
         <div style={{ opacity: 0.7, marginTop: 6 }}>
           busts: {score.busts} · round: {score.round}
         </div>
-        {showGoals && goalViz && (
+        {showGoals && (
           <div
             style={{
               marginTop: 8,
@@ -1237,12 +1269,41 @@ export default function CarChase() {
               borderTop: '1px solid #1f2735',
             }}
           >
-            <GoalProgressPanel
-              automaton={goalViz.automaton}
-              snapshot={goalViz.snapshot}
-              description={goalViz.label}
-              maxRows={4}
-            />
+            <div style={{ display: 'flex', gap: 4, marginBottom: 6, flexWrap: 'wrap' }}>
+              <span style={{ opacity: 0.6, alignSelf: 'center' }}>goal viz:</span>
+              {['robber', ...Array.from({ length: NUM_COPS }, (_, i) => `cop${i}`)].map((id) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setVizAgent(id)}
+                  style={{
+                    font: '11px ui-monospace, monospace',
+                    padding: '2px 6px',
+                    borderRadius: 6,
+                    border: `1px solid ${vizAgent === id ? '#7fd6ff' : '#1f2735'}`,
+                    background: vizAgent === id ? 'rgba(127,214,255,0.18)' : 'rgba(20,26,38,0.85)',
+                    color: vizAgent === id ? '#cdeaff' : '#8c95a4',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {id}
+                </button>
+              ))}
+            </div>
+            {goalViz ? (
+              <GoalProgressPanel
+                automaton={goalViz.automaton}
+                snapshot={goalViz.snapshot}
+                description={goalViz.label}
+                maxRows={4}
+              />
+            ) : (
+              <div style={{ opacity: 0.5 }}>
+                {vizAgent === 'robber' && playerDriving
+                  ? 'robber is player-driven (no AI goal)'
+                  : 'no active goal'}
+              </div>
+            )}
           </div>
         )}
         <div

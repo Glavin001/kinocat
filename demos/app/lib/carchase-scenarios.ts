@@ -642,6 +642,13 @@ export function tacticalGoal(
 //                   because it points toward both.
 //   3. MOMENTUM   — a mild bonus for not reversing direction every tick, so
 //                   the car commits to an escape lane instead of dithering.
+//   4. EDGE       — a repulsion from the arena boundary once the robber gets
+//                   near it. OPENNESS alone doesn't stop edge-hugging: a
+//                   heading straight at a wall stays "open" until the very
+//                   wall, and fleeing a cop that's *behind* means the outward
+//                   (wall-ward) heading also scores well on COP CLEAR — so the
+//                   evader used to run to the boundary and (past the padded
+//                   slab) off the map. This term makes it peel away first.
 //
 // The chosen heading is projected out to a far goal; the kinocat planner then
 // finds the feasible kinodynamic path there and still routes around the cops'
@@ -663,6 +670,11 @@ const ROBBER_RAYS = 24;
 const ROBBER_W_OPEN = 1.2;
 const ROBBER_W_COP = 1.3;
 const ROBBER_W_MOM = 0.35;
+// Start peeling away from a boundary once within this distance of it, and how
+// hard. Unlike the cop term this is NOT gated by openness, so it fires even
+// though there is technically open pavement up to the wall.
+const ROBBER_EDGE_BUFFER = 34; // m
+const ROBBER_W_EDGE = 2.2;
 
 /** Distance from `(x,z)` along unit direction `(dx,dz)` until the ray leaves
  *  the course bounds or enters an inflated building footprint. Capped at
@@ -780,16 +792,31 @@ export function robberGoal(
       copTerm += w * toward;
     }
 
+    // Edge term: how much this heading points toward a nearby arena wall,
+    // weighted by how close that wall is (0 when > ROBBER_EDGE_BUFFER away).
+    // Summed over the four walls so a corner repels on both axes.
+    const b = CARCHASE_BOUNDS;
+    let edgeTerm = 0;
+    const west = Math.max(0, 1 - (robber.x - b.x0) / ROBBER_EDGE_BUFFER);
+    const east = Math.max(0, 1 - (b.x1 - robber.x) / ROBBER_EDGE_BUFFER);
+    const south = Math.max(0, 1 - (robber.z - b.z0) / ROBBER_EDGE_BUFFER);
+    const north = Math.max(0, 1 - (b.z1 - robber.z) / ROBBER_EDGE_BUFFER);
+    edgeTerm += west * Math.max(0, -dx); // heading has a −x (west-ward) part
+    edgeTerm += east * Math.max(0, dx);
+    edgeTerm += south * Math.max(0, -dz);
+    edgeTerm += north * Math.max(0, dz);
+
     const momentum = Math.cos(ang - robber.heading);
-    // Openness gates the whole "is this a good escape" judgement: the value
-    // of running away from the cops down this heading is proportional to how
-    // far we can actually run. A wall-facing heading (open ≈ 0) therefore
-    // scores ≈ momentum only and can never win just because it points away
-    // from a nearby pursuer — which is what used to pin the robber in corners.
+    // Openness gates the cop-clearance judgement: the value of running away
+    // from the cops down this heading is proportional to how far we can
+    // actually run. A wall-facing heading (open ≈ 0) therefore scores ≈
+    // momentum only. The edge term is applied on top (ungated) so the evader
+    // turns away from the boundary *before* it gets pinned against it.
     const openFrac = open / ROBBER_LOOK;
     const score =
       openFrac * (ROBBER_W_OPEN - ROBBER_W_COP * copTerm) +
-      ROBBER_W_MOM * momentum;
+      ROBBER_W_MOM * momentum -
+      ROBBER_W_EDGE * edgeTerm;
 
     if (score > bestScore) {
       bestScore = score;
