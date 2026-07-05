@@ -11,6 +11,17 @@ export type {
 } from './protocol';
 export { rehydrateObstacle, rehydrateObstacles } from './rehydrate';
 export {
+  PlannerPool,
+  ReplanScheduler,
+  FrameBudget,
+  type WorkerLike,
+  type SpawnWorker,
+  type PlanRequestBody,
+  type PlanDispatcher,
+  type AgentPlanSource,
+  type ReplanSchedulerOptions,
+} from './pool';
+export {
   initWorkerContext,
   handlePlanMessage,
   handleWorldUpdateMessage,
