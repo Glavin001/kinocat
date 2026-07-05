@@ -22,6 +22,9 @@ const entry = {
   'adapters/rapier/index': 'src/adapters/rapier/index.ts',
   'adapters/three/index': 'src/adapters/three/index.ts',
   'worker/index': 'src/worker/index.ts',
+  // Dev-time conformance kit — deliberately NOT part of the size-gate entry
+  // set below (it never ships in a game bundle).
+  'testing/index': 'src/testing/index.ts',
 };
 
 export default defineConfig([
