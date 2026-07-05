@@ -549,16 +549,20 @@ export const RACE_TEST_MAX_EXPANSIONS = 60000;
 export const RACE_ARRIVE_RADIUS = 2.5;
 
 /** Radius (m) the multi-goal planner uses for its "gate reached" check.
- *  Comfortably less than RACE_ARRIVE_RADIUS (2.5 m) so EVERY valid plan
- *  brings the chassis close enough that pickNextWaypoint will advance —
- *  prevents the "plan says I clipped the gate, real chassis overshot by ε,
- *  loopIndex stays, U-turn back" failure mode. The generous 1.3 m margin
- *  below the arrive radius absorbs the pure-pursuit corner-cut: the tracker
- *  never reaches the plan's exact endpoint, so aiming for the gate CENTRE
- *  (small radius) keeps the executed pass inside the accept disk even when
- *  the line is cut — the chassis stops "just missing" a checkpoint and
- *  having to backtrack. */
-export const RACE_PLANNER_GATE_RADIUS = 1.2;
+ *  Strictly less than RACE_ARRIVE_RADIUS so EVERY valid plan brings the
+ *  chassis close enough that pickNextWaypoint will advance — prevents the
+ *  "plan says I clipped the gate, real chassis overshot by ε, loopIndex
+ *  stays, U-turn back" failure mode.
+ *
+ *  The TECHNICAL course tightens this to TECHNICAL_PLANNER_GATE_RADIUS via
+ *  its tuning defaults: near walls the pure-pursuit corner-cut can carry the
+ *  executed pass outside a 1.8 m aim ("just missed the checkpoint, backtrack")
+ *  — aiming at the gate centre keeps the cut inside the 2.5 m accept disk.
+ *  MEASURED: the tighter aim costs pace on the OPEN course (kin 33.0 →
+ *  46.8 s under the expansion cap — more expansions burnt per gate), so it
+ *  stays scoped to the walled variant where it buys smoothness. */
+export const RACE_PLANNER_GATE_RADIUS = 1.8;
+export const TECHNICAL_PLANNER_GATE_RADIUS = 1.2;
 
 export interface RacePlanRequest {
   state: CarKinematicState;

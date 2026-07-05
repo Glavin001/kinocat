@@ -120,6 +120,35 @@ async function main(): Promise<void> {
   }
   process.stdout.write('\n');
 
+  // Driving-quality report — the "how well is it driving" comparison
+  // beyond lap time: line efficiency (m driven per lap), tire utilization
+  // (g-g), smoothness (jerk), hesitation (stopped/reversing time), and
+  // stuck-recovery count.
+  const qWidths = [22, 10, 9, 9, 9, 9, 10, 9];
+  process.stdout.write(
+    tableLine(['model', 'dist/lap', 'meanSpd', 'ggMean', 'ggPeak', 'jerkRms', 'stopped', 'recov'], qWidths) + '\n',
+  );
+  for (const r of results) {
+    const q = r.quality;
+    const perLap = r.laps.length > 0 ? q.distanceTravelled / r.laps.length : NaN;
+    process.stdout.write(
+      tableLine(
+        [
+          r.name,
+          Number.isFinite(perLap) ? `${perLap.toFixed(0)}m` : '---',
+          `${q.meanSpeed.toFixed(1)}m/s`,
+          q.ggMeanUtil.toFixed(3),
+          q.ggPeakUtil.toFixed(2),
+          q.longJerkRms.toFixed(0),
+          `${q.timeStopped.toFixed(1)}s`,
+          q.recoveryCount,
+        ],
+        qWidths,
+      ) + '\n',
+    );
+  }
+  process.stdout.write('\n');
+
   // Comparison commentary.
   const v2 = results.find((r) => r.name.includes('v2') || modelPaths.some((p) => r.name === basename(p).replace(/\.json$/, '')));
   const kin = results.find((r) => r.name === 'kinematic');

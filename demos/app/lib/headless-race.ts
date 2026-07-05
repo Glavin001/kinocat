@@ -33,7 +33,8 @@ import {
   type LearnedVehicleModel,
 } from 'kinocat/agent';
 
-export type { RaceEntry, RaceLap, RaceTuning } from './race-scenario';
+export type { RaceEntry, RaceLap, RaceTuning, DrivingQuality } from './race-scenario';
+import type { DrivingQuality } from './race-scenario';
 export { DEFAULT_TUNING, LEGACY_TUNING } from './race-scenario';
 
 export interface RaceResult {
@@ -57,6 +58,10 @@ export interface RaceResult {
   /** RMS prediction error at primitive boundary (m). The honest
    *  "how accurate is the model the planner uses" metric. */
   predErrorRms: number;
+  /** Driving-quality report: line efficiency (distance/lap), g-g
+   *  utilization, smoothness, hesitation, recoveries. The qualitative
+   *  "how well is it driving" measurement beyond raw lap time. */
+  quality: DrivingQuality;
   /** Total successful + failed replans (planner-quality proxy). */
   totalReplans: number;
   successfulReplans: number;
@@ -135,6 +140,7 @@ export async function runHeadlessRace(
       offTrackEvents: c.offTrackEvents,
       wallStrikes: c.wallStrikes,
       predErrorRms: c.diagnostics.predErrorRms,
+      quality: c.quality,
       totalReplans: c.diagnostics.totalReplans,
       successfulReplans: c.diagnostics.successfulReplans,
     };

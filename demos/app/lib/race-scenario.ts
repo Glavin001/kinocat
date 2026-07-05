@@ -73,6 +73,7 @@ import {
   RACE_REPLAN_BUDGET_MS,
   RACE_ARRIVE_RADIUS,
   RACE_PLANNER_GATE_RADIUS,
+  TECHNICAL_PLANNER_GATE_RADIUS,
   RACE_MAX_EXPANSIONS,
   emptyMetrics,
   type RaceMetrics,
@@ -168,6 +169,11 @@ const PURE_PURSUIT_CONFIG = {
   // distribution).
   reverseCruiseSpeed: RACE_AGENT.maxReverseSpeed,
 };
+
+/** Friction-circle budget (µ·g, m/s²) used to normalise the g-g driving-
+ *  quality utilization. Same chassis for every entry → same budget. */
+const GG_FRICTION_LIMIT =
+  deriveVehicleCapabilities(DEFAULT_LEARNABLE_CONFIG).maxLateralAccel;
 
 // ---------------------------------------------------------------------------
 // Multi-cusp plan segmentation.
@@ -404,6 +410,10 @@ export interface RaceTuning {
   plannerBudgetMs?: number;
   /** Planner expansion cap. Race=30k; parking=80k. */
   plannerMaxExpansions?: number;
+  /** Multi-goal planner "gate reached" radius (m). Open course: 1.8
+   *  (RACE_PLANNER_GATE_RADIUS). Technical course tightens to 1.2 so the
+   *  pure-pursuit corner-cut still lands inside the 2.5 m accept disk. */
+  plannerGateRadius?: number;
   /**
    * Fixed replan cadence (ms). Defaults to `REPLAN_INTERVAL_MS` (300).
    * Racing wants a brisk cadence so the line stays fresh against the
@@ -534,6 +544,34 @@ export interface RaceCarDiagnostics {
   predErrorRms: number;
 }
 
+/** Per-car driving-quality accumulators — the "how well is it driving"
+ *  measurement beyond raw lap time. Accumulated every physics tick while the
+ *  car is racing (not holding / finished). All derived from executed chassis
+ *  state, so they compare LIBRARIES (planner intent) through the SAME
+ *  executor honestly. */
+export interface DrivingQuality {
+  /** Total distance the chassis actually travelled (m). Lower per lap =
+   *  tighter, more efficient line (less overshoot/backtracking). */
+  distanceTravelled: number;
+  /** Time-mean of |speed| (m/s). */
+  meanSpeed: number;
+  /** Seconds spent near-stationary (|v| < 0.5 m/s) while racing — hesitation,
+   *  wedges, replan stalls. */
+  timeStopped: number;
+  /** Seconds spent reversing (v < -0.5) — recovery shunts, not racing. */
+  timeReversing: number;
+  /** Mean friction-circle (g-g) utilization fraction: how much of the tire's
+   *  combined accel budget the car actually uses. Timid driving clusters near
+   *  0; at-the-limit driving approaches 1. */
+  ggMeanUtil: number;
+  /** Peak g-g utilization fraction. */
+  ggPeakUtil: number;
+  /** RMS longitudinal jerk (m/s³) — throttle/brake smoothness. */
+  longJerkRms: number;
+  /** Number of reverse-out recovery maneuvers triggered (stuck escapes). */
+  recoveryCount: number;
+}
+
 export interface RaceCarStatus {
   name: string;
   state: CarKinematicState;
@@ -546,6 +584,9 @@ export interface RaceCarStatus {
   /** Number of distinct times the chassis footprint touched a course wall
    *  (rising-edge counted, like `offTrackEvents`). 0 on the open course. */
   wallStrikes: number;
+  /** Driving-quality accumulators (line efficiency, g-g utilization,
+   *  smoothness, hesitation). */
+  quality: DrivingQuality;
   diagnostics: RaceCarDiagnostics;
   metrics: RaceMetrics;
   /** Latest plan (lifted to a sequence of state samples for visualization). */
@@ -724,6 +765,21 @@ interface CarInternal {
   recoveryEndSimTime: number;
   // Count of recovery maneuvers triggered (diagnostics).
   recoveryCount: number;
+  // Driving-quality accumulators (updated every tick while racing).
+  q: {
+    dist: number;
+    speedSum: number;
+    speedN: number;
+    stopped: number;
+    reversing: number;
+    ggSum: number;
+    ggN: number;
+    ggPeak: number;
+    jerkSumSq: number;
+    jerkN: number;
+    prevSpeed: number;
+    prevALong: number;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -801,7 +857,12 @@ export async function createRaceScenario(
   // default (measured faster there). Explicit `opts.tuning` still wins.
   const courseTuningDefaults: Partial<RaceTuning> =
     course.variant === 'technical'
-      ? { respectPathSpeed: true, curvatureFeedforward: true, enableSpeedProfile: true }
+      ? {
+          respectPathSpeed: true,
+          curvatureFeedforward: true,
+          enableSpeedProfile: true,
+          plannerGateRadius: TECHNICAL_PLANNER_GATE_RADIUS,
+        }
       : {};
   const tuning: RaceTuning = { ...DEFAULT_TUNING, ...courseTuningDefaults, ...(opts.tuning ?? {}) };
   // Tracker config derives from the tuning bundle so a single
@@ -980,6 +1041,11 @@ export async function createRaceScenario(
       recovering: false,
       recoveryEndSimTime: 0,
       recoveryCount: 0,
+      q: {
+        dist: 0, speedSum: 0, speedN: 0, stopped: 0, reversing: 0,
+        ggSum: 0, ggN: 0, ggPeak: 0, jerkSumSq: 0, jerkN: 0,
+        prevSpeed: 0, prevALong: 0,
+      },
     };
   });
 
@@ -1119,7 +1185,7 @@ export async function createRaceScenario(
           obstacles: course.obstacles,
           world: c.navWorld,
           deadlineMs: plannerBudget,
-          gateRadius: RACE_PLANNER_GATE_RADIUS,
+          gateRadius: tuning.plannerGateRadius ?? RACE_PLANNER_GATE_RADIUS,
           referencePath,
           referenceWeight: tuning.consistencyWeight,
           disableHeuristicTable: !tuning.enableHeuristicTable,
@@ -1415,7 +1481,13 @@ export async function createRaceScenario(
     // (wedged against a technical-course wall); leave it after
     // RECOVERY_DURATION_S of backing off, then clear the plan so the next
     // cadence replan starts from the freed pose.
-    if (!c.holdingForSync && !c.finished) {
+    //
+    // RACING ONLY (multi-waypoint courses): parking maneuvers STOP on
+    // purpose — cusp dwells and the goal-settle hold exceed the stuck
+    // timeout at rest, and a reverse-out there would wreck a correct
+    // maneuver (measured: all four parking invariants broke when this ran
+    // unscoped).
+    if (!c.holdingForSync && !c.finished && course.waypoints.length > 1) {
       if (c.recovering) {
         if (simTime >= c.recoveryEndSimTime) {
           c.recovering = false;
@@ -1591,6 +1663,37 @@ export async function createRaceScenario(
     }
     stepRaycastVehicle(c.world, [c.car], { dt, substeps: VEHICLE_SUBSTEPS });
     const after = c.car.readState(simTime + dt);
+    // Driving-quality accumulation (only while racing — sync holds and the
+    // post-finish brake hold would dilute the means).
+    if (!c.holdingForSync && !c.finished) {
+      const q = c.q;
+      q.dist += Math.hypot(after.x - stateBefore.x, after.z - stateBefore.z);
+      const sp = after.speed;
+      q.speedSum += Math.abs(sp);
+      q.speedN++;
+      if (Math.abs(sp) < 0.5) q.stopped += dt;
+      if (sp < -0.5) q.reversing += dt;
+      // g-g utilization from executed state: aLong from the speed delta,
+      // aLat = v·yawRate (centripetal). Budget = µ·g from the derived
+      // capability envelope (same for both cars — same chassis).
+      const aLong = (sp - q.prevSpeed) / dt;
+      const aLat = sp * (after.yawRate ?? 0);
+      const util = Math.hypot(aLong, aLat) / Math.max(1e-6, GG_FRICTION_LIMIT);
+      // Clamp outliers (contact spikes / recovery jolts would dominate the
+      // mean and misreport "aggression").
+      const utilClamped = Math.min(util, 1.5);
+      q.ggSum += utilClamped;
+      q.ggN++;
+      if (utilClamped > q.ggPeak) q.ggPeak = utilClamped;
+      const jerk = (aLong - q.prevALong) / dt;
+      // Same outlier guard for contact spikes.
+      if (Math.abs(jerk) < 2000) {
+        q.jerkSumSq += jerk * jerk;
+        q.jerkN++;
+      }
+      q.prevSpeed = sp;
+      q.prevALong = aLong;
+    }
     // TRUE goal completion (goal-settle courses): `finished` latches only
     // when the goal predicate has held continuously at rest — the same
     // settle semantics the bench/tests/HUD measure. Until then the goal
@@ -1684,6 +1787,16 @@ export async function createRaceScenario(
       holdingForSync: c.holdingForSync,
       offTrackEvents: c.offTrackEvents,
       wallStrikes: c.wallStrikes,
+      quality: {
+        distanceTravelled: c.q.dist,
+        meanSpeed: c.q.speedN > 0 ? c.q.speedSum / c.q.speedN : 0,
+        timeStopped: c.q.stopped,
+        timeReversing: c.q.reversing,
+        ggMeanUtil: c.q.ggN > 0 ? c.q.ggSum / c.q.ggN : 0,
+        ggPeakUtil: c.q.ggPeak,
+        longJerkRms: c.q.jerkN > 0 ? Math.sqrt(c.q.jerkSumSq / c.q.jerkN) : 0,
+        recoveryCount: c.recoveryCount,
+      },
       diagnostics: c.diagnostics,
       metrics: c.metrics,
       plan: c.plan,
@@ -1730,6 +1843,11 @@ export async function createRaceScenario(
       c.recovering = false;
       c.recoveryEndSimTime = 0;
       c.recoveryCount = 0;
+      c.q = {
+        dist: 0, speedSum: 0, speedN: 0, stopped: 0, reversing: 0,
+        ggSum: 0, ggN: 0, ggPeak: 0, jerkSumSq: 0, jerkN: 0,
+        prevSpeed: 0, prevALong: 0,
+      };
       // Reset the MPPI warm-start + RNG so reset() is bit-reproducible under
       // the 'mpc' tracker (a stale warm-start sequence would make the second
       // run diverge from a fresh one).
