@@ -88,10 +88,9 @@ export function buildPlan(
       vRef: st.speed,
       kappa,
       aRef,
-      // Tier 2: feedforward controls (approximated today).
+      // Tier 2: feedforward accel (approximated today; mirrors aRef).
       accelFf: aRef,
     };
-    if (L !== undefined) p.steerFf = Math.atan(L * kappa);
     // Tier 3: dynamic state, only when the source state carried it.
     if (st.yawRate !== undefined) p.rRef = st.yawRate;
     if (st.lateralVelocity !== undefined) {
@@ -100,7 +99,24 @@ export function buildPlan(
     points[i] = p;
   }
 
-  return { points, segments: segmentByGear(points) };
+  const segments = segmentByGear(points);
+
+  // Feedforward steer needs the enclosing SEGMENT's gear, not sign(vRef):
+  // `steerFf = atan(L·κ·dir)`. A car tracing a given geometric arc in reverse
+  // must steer the opposite way from tracing it forward (the demo's chassis
+  // conversion applies the same `-gear` flip), so ignoring direction reports
+  // the negated steer on every reverse segment — exactly wrong for parking.
+  // Deferred to a per-segment pass because a point's own vRef is ambiguous at
+  // the zero-speed cusp; the segment carries the authoritative gear.
+  if (L !== undefined) {
+    for (const seg of segments) {
+      for (let i = seg.startIdx; i <= seg.endIdx; i++) {
+        points[i]!.steerFf = Math.atan(L * points[i]!.kappa * seg.direction);
+      }
+    }
+  }
+
+  return { points, segments };
 }
 
 /** Round-trip a Plan back to the plain `CarKinematicState[]` the controllers

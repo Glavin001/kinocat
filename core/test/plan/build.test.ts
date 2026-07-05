@@ -48,6 +48,25 @@ describe('buildPlan', () => {
     for (const p of plan.points) expect(p.steerFf).toBeUndefined();
   });
 
+  it('flips steerFf sign on a reverse segment (same geometry, opposite gear)', () => {
+    const R = 5;
+    const L = 3;
+    // Same left-hand circle geometry, driven forward vs. in reverse.
+    const fwd = buildPlan(fullCircle(40, R, 6), { wheelBase: L });
+    const rev = buildPlan(fullCircle(40, R, -6), { wheelBase: L });
+    for (let i = 2; i < fwd.points.length - 2; i++) {
+      const kf = fwd.points[i]!.kappa;
+      const kr = rev.points[i]!.kappa;
+      // Geometry (hence curvature) is identical; only gear differs.
+      expect(kr).toBeCloseTo(kf, 6);
+      // Forward: steerFf = atan(L·κ); reverse: negated (the chassis must
+      // steer the opposite way to trace the same arc backward).
+      expect(fwd.points[i]!.steerFf).toBeCloseTo(Math.atan(L * kf), 6);
+      expect(rev.points[i]!.steerFf).toBeCloseTo(-Math.atan(L * kr), 6);
+      expect(rev.segments[0]!.direction).toBe(-1);
+    }
+  });
+
   it('has near-zero curvature and a single forward segment on a straight line', () => {
     const plan = buildPlan(straightLine(10, 1, 8));
     for (let i = 1; i < plan.points.length - 1; i++) {
@@ -86,17 +105,22 @@ describe('buildPlan', () => {
     }
   });
 
-  it('splits at a forward→reverse cusp into two single-gear segments', () => {
-    // Forward 0..5, then reverse 5..9 (speed sign flips at index 5).
+  it('splits at a forward→reverse cusp, boundary on the rest sample', () => {
+    // Forward 0..4 (speed 4), a rest sample at index 5 (speed 0 — the stop
+    // pose where the chassis reverses), then reverse 6..10 (speed -4).
     const path: CarKinematicState[] = [];
     for (let i = 0; i < 5; i++) path.push({ x: i, z: 0, heading: 0, speed: 4, t: i });
-    for (let i = 5; i < 10; i++) path.push({ x: 9 - i, z: 0, heading: 0, speed: -4, t: i });
+    path.push({ x: 4.5, z: 0, heading: 0, speed: 0, t: 5 }); // rest / cusp pose
+    for (let i = 6; i <= 10; i++) path.push({ x: 4.5 - (i - 5), z: 0, heading: 0, speed: -4, t: i });
     const plan = buildPlan(path);
     expect(plan.segments.length).toBe(2);
     expect(plan.segments[0]!.direction).toBe(1);
     expect(plan.segments[1]!.direction).toBe(-1);
-    // Contiguous: the first segment ends where the second begins (shared cusp).
-    expect(plan.segments[0]!.endIdx).toBe(plan.segments[1]!.startIdx);
+    // Shared boundary sits on the rest sample (index 5), NOT the first
+    // already-reversing sample — that's the stop target a controller brakes to.
+    expect(plan.segments[0]!.endIdx).toBe(5);
+    expect(plan.segments[1]!.startIdx).toBe(5);
+    expect(plan.points[5]!.vRef).toBe(0);
   });
 
   it('gates tier-3 fields on the source state carrying them', () => {
