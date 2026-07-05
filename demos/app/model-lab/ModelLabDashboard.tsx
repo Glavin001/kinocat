@@ -31,11 +31,17 @@ import { PerComponentRmsChart } from '../components/model-lab/PerComponentRmsCha
 import { ScenarioPlayground } from '../components/model-lab/ScenarioPlayground';
 import { PrimitiveFanPlot, type FanPlotGroundTruth, type FanPlotUncertainty } from '../components/PrimitiveFanPlot';
 import {
-  buildKinematicLibrary,
   buildLearnedRaceLibraryV2,
   RACE_START_SPEEDS,
 } from '../lib/race-primitives-scenarios';
-import { computeGroundTruthDots, computeUncertaintyHalos } from '../lib/fan-plot-ground-truth';
+import {
+  computeGroundTruthDots,
+  computeUncertaintyHalos,
+  computeActionComparison,
+  type ActionComparisonSummary,
+} from '../lib/fan-plot-ground-truth';
+import { ActionComparisonPanel } from '../components/model-lab/ActionComparisonPanel';
+import { buildParametricOnlyModel } from 'kinocat/agent';
 
 export default function ModelLabDashboard() {
   return (
@@ -101,8 +107,8 @@ function DashboardInner() {
         <RoundEvolutionTable rounds={roundHistory} />
       </Section>
 
-      <Section title="Action space at a speed bucket"
-        subtitle="The fan plot shows where the model thinks each control will end up after 0.55–1.5s. White dots are the Rapier ground-truth endpoints for the same controls; arrows = per-control error. Cyan halos = ensemble uncertainty (1σ).">
+      <Section title="How right is the model? — actions graded against the real car"
+        subtitle="Pick a speed, then “compare against real car”: every action the planner can take at that speed is rolled through Rapier, and the model's predicted endpoint is graded against where the chassis actually ends up. Each action gets a plain verdict — accurate, flagged-but-safe, or confidently wrong — so you can see at a glance which primitives the planner can trust and which carry hidden bias.">
         <FanPlotRow
           model={model}
           config={config}
@@ -169,14 +175,28 @@ function FanPlotRow({
 }) {
   const [groundTruth, setGroundTruth] = useState<FanPlotGroundTruth[]>([]);
   const [uncertainty, setUncertainty] = useState<FanPlotUncertainty[]>([]);
-  const [showGT, setShowGT] = useState(false);
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [computing, setComputing] = useState(false);
   const cacheRef = useRef<Map<string, { dx: number; dz: number }>>(new Map());
 
-  const kinematicLib = useMemo(() => buildKinematicLibrary(), []);
   const v2Lib = useMemo(() => (model ? buildLearnedRaceLibraryV2(model) : null), [model]);
-  const kinAtSpeed = useMemo(() => kinematicLib.lookup(selectedSpeed), [kinematicLib, selectedSpeed]);
+  // Parametric-only (residual MLP stripped) — the safety floor the residual is
+  // allowed to correct. Same control sets/order as the full v2 library.
+  const paraLib = useMemo(
+    () => (model ? buildLearnedRaceLibraryV2(buildParametricOnlyModel(model.params, model.config)) : null),
+    [model],
+  );
   const v2AtSpeed = useMemo(() => (v2Lib ? v2Lib.lookup(selectedSpeed) : null), [v2Lib, selectedSpeed]);
+  const paraAtSpeed = useMemo(() => (paraLib ? paraLib.lookup(selectedSpeed) : null), [paraLib, selectedSpeed]);
+
+  // Per-action comparison vs the Rapier ground truth (only once GT computed).
+  const summary: ActionComparisonSummary | null = useMemo(() => {
+    if (!model || !v2AtSpeed || !paraAtSpeed || groundTruth.length === 0) return null;
+    return computeActionComparison({
+      full: v2AtSpeed, parametric: paraAtSpeed, groundTruth, model,
+      startSpeed: selectedSpeed,
+    });
+  }, [model, v2AtSpeed, paraAtSpeed, groundTruth, selectedSpeed]);
 
   // Recompute uncertainty when the speed bucket or model changes. Cheap.
   useEffect(() => {
@@ -190,6 +210,7 @@ function FanPlotRow({
   }, [model, config, v2AtSpeed, selectedSpeed]);
 
   // Compute ground truth on demand.
+  const hasGT = groundTruth.length > 0;
   const computeGT = async () => {
     if (!v2AtSpeed) return;
     setComputing(true);
@@ -201,42 +222,29 @@ function FanPlotRow({
         harness: h, cache: cacheRef.current,
       });
       setGroundTruth(gt);
-      setShowGT(true);
     } finally {
       setComputing(false);
     }
   };
 
-  // Reset GT when speed changes (it's bucket-specific).
+  // Reset GT + selection when speed changes (it's bucket-specific).
   useEffect(() => {
     setGroundTruth([]);
-    setShowGT(false);
+    setSelectedIndex(null);
   }, [selectedSpeed]);
 
+  // Extent for the pre-GT "action-space shape" preview (v2 sweeps only).
   const extent = useMemo(() => {
-    let xMin = -1, xMax = 1, zMin = -1, zMax = 1;
-    const consume = (prims: ReadonlyArray<MotionPrimitive>) => {
-      for (const p of prims) for (const s of p.sweep) {
-        if (s.x < xMin) xMin = s.x;
-        if (s.x > xMax) xMax = s.x;
-        if (s.z < zMin) zMin = s.z;
-        if (s.z > zMax) zMax = s.z;
-      }
-    };
-    consume(kinAtSpeed);
-    if (v2AtSpeed) consume(v2AtSpeed);
-    // Also widen for GT dots so arrows stay visible.
-    if (showGT) {
-      for (const g of groundTruth) {
-        if (g.dx < xMin) xMin = g.dx;
-        if (g.dx > xMax) xMax = g.dx;
-        if (g.dz < zMin) zMin = g.dz;
-        if (g.dz > zMax) zMax = g.dz;
-      }
+    let xMin = -2, xMax = 2, zMin = -2, zMax = 2;
+    if (v2AtSpeed) for (const p of v2AtSpeed) for (const s of p.sweep) {
+      if (s.x < xMin) xMin = s.x;
+      if (s.x > xMax) xMax = s.x;
+      if (s.z < zMin) zMin = s.z;
+      if (s.z > zMax) zMax = s.z;
     }
     const pad = 1.5;
     return { xMin: xMin - pad, xMax: xMax + pad, zMin: zMin - pad, zMax: zMax + pad };
-  }, [kinAtSpeed, v2AtSpeed, groundTruth, showGT]);
+  }, [v2AtSpeed]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -264,55 +272,62 @@ function FanPlotRow({
           onClick={computeGT}
           disabled={!v2AtSpeed || computing}
           style={{
-            padding: '4px 10px', borderRadius: 4, cursor: 'pointer',
-            background: showGT ? '#1a2030' : '#0d1119',
-            border: '1px solid #1f2735', color: '#cdd3de',
+            padding: '4px 12px', borderRadius: 4, cursor: v2AtSpeed ? 'pointer' : 'default',
+            background: hasGT ? '#0d1119' : '#13233a',
+            border: `1px solid ${hasGT ? '#1f2735' : '#2a4a6e'}`,
+            color: hasGT ? '#9aa6b2' : '#7fd6ff',
             font: '11px ui-monospace, monospace',
           }}
         >
-          {computing ? 'running Rapier…' : showGT ? 'refresh ground truth' : 'overlay Rapier ground truth'}
+          {computing ? 'running Rapier…' : hasGT ? 'recompute vs Rapier' : '▶ compare against real car (Rapier)'}
         </button>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, opacity: 0.7 }}>
-          <input
-            type="checkbox"
-            checked={showGT}
-            onChange={(e) => setShowGT(e.target.checked)}
-            disabled={groundTruth.length === 0}
-          />
-          show GT
-        </label>
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)', gap: 12 }}>
-        <PrimitiveFanPlot
-          primitives={kinAtSpeed}
-          forwardColor="#ff8aa0"
-          title={`KINEMATIC · ${selectedSpeed} m/s`}
-          subtitle={`${kinAtSpeed.length} primitives`}
-          fixedExtent={extent}
+
+      {summary ? (
+        <ActionComparisonPanel
+          summary={summary}
+          speed={selectedSpeed}
+          selectedIndex={selectedIndex}
+          onSelectIndex={setSelectedIndex}
         />
-        {v2AtSpeed ? (
+      ) : v2AtSpeed ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
           <PrimitiveFanPlot
             primitives={v2AtSpeed}
             forwardColor="#55dcff"
-            title={`V2 LEARNED · ${selectedSpeed} m/s`}
-            subtitle={`${v2AtSpeed.length} primitives${uncertainty.length > 0 ? ' · uncertainty halos' : ''}`}
+            title={`Action space · ${selectedSpeed} m/s`}
+            subtitle={`${v2AtSpeed.length} primitives the planner can pick from${uncertainty.length > 0 ? ' · σ halos' : ''}`}
             fixedExtent={extent}
-            groundTruth={showGT ? groundTruth : undefined}
             uncertainty={uncertainty}
+            highlightIndex={selectedIndex ?? undefined}
+            onHover={setSelectedIndex}
           />
-        ) : (
-          <div style={{
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            border: '1px dashed #1f2735', borderRadius: 6, padding: 24,
-            opacity: 0.6, fontSize: 12, textAlign: 'center', minHeight: 200,
-          }}>
-            No v2 model — train one above to see its action space.
-          </div>
-        )}
-      </div>
+          <p style={{ margin: 0, fontSize: 11, opacity: 0.6, lineHeight: 1.5 }}>
+            Each curve is one control held for the full primitive; the dot is where the
+            model predicts the chassis ends up. Click{' '}
+            <strong style={{ color: '#7fd6ff' }}>“compare against real car”</strong>{' '}
+            to roll every action through Rapier and grade how right or wrong the model is.
+          </p>
+        </div>
+      ) : (
+        <NoModelPanel />
+      )}
     </div>
   );
 }
+
+function NoModelPanel() {
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      border: '1px dashed #1f2735', borderRadius: 6, padding: 24,
+      opacity: 0.6, fontSize: 12, textAlign: 'center', minHeight: 200,
+    }}>
+      No v2 model — train one above to see its action space.
+    </div>
+  );
+}
+
 
 function Section({ title, subtitle, children }: { title?: string; subtitle?: string; children: React.ReactNode }) {
   return (

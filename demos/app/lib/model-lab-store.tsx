@@ -41,6 +41,7 @@ import {
 } from './training-driver';
 import {
   loadV2Model,
+  loadV2ModelWithFallback,
   saveV2Model,
   clearV2Model,
   type PersistedV2Model,
@@ -158,14 +159,27 @@ export function ModelLabProvider({ children }: { children: ReactNode }) {
   // a frozen "initializing" state — the harness builder finishes
   // almost instantly once `ensureRapier()` is cached.
   useEffect(() => {
+    let cancelled = false;
+    // Synchronous localStorage hit paints immediately; otherwise fall back to
+    // the shipped overnight-trained artifact (`/models/v2-default.json`) so a
+    // fresh visitor still sees the parametric-vs-learned-vs-Rapier comparison
+    // without having to train a model first.
     const cached = loadV2Model();
     if (cached) {
       setModel(cached.model);
       setMeta(cached.meta);
       setConfig(cached.model.config);
+    } else {
+      void loadV2ModelWithFallback().then((loaded) => {
+        if (cancelled || !loaded) return;
+        setModel(loaded.model);
+        setMeta(loaded.meta);
+        setConfig(loaded.model.config);
+      }).catch(() => { /* no shipped model — train path still works */ });
     }
     void ensureRapier().catch(() => { /* surface lazily on first train */ });
     return () => {
+      cancelled = true;
       try { harness?.dispose(); } catch { /* noop */ }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

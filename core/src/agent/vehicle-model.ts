@@ -349,6 +349,32 @@ export interface LearnedVehicleModel {
    * easily). Tune via per-regime eval after training.
    */
   oodStdThreshold?: number[];
+  /**
+   * Coverage gate (the primary OOD trigger). `oodStdThreshold` keys off
+   * ensemble *disagreement*, which fails silently when the whole ensemble
+   * shares a blind spot (all members extrapolate the same wrong way → low
+   * variance, high error = "confident bias"). `inputSupport` instead keys off
+   * *distance to the training input distribution*: a query far from anything
+   * the residual was fit on falls back to the parametric backbone regardless
+   * of whether the ensemble agrees. Populated at train time; absent on legacy
+   * models (which keep the variance-only behaviour). See `computeInputSupport`.
+   */
+  inputSupport?: InputSupport;
+}
+
+/** Per-dimension statistics of the MLP inputs the residual was trained on,
+ *  plus a calibrated coverage threshold. Used to detect out-of-support queries
+ *  (the regimes where "confident bias" lives). */
+export interface InputSupport {
+  /** Per-dim mean of training MLP inputs (length MLP_INPUT_DIM). */
+  mean: number[];
+  /** Per-dim std of training MLP inputs. Dims with ~0 spread (e.g. the
+   *  config one-hot in a single-config model) are ignored at query time. */
+  std: number[];
+  /** Coverage threshold on the normalised RMS z-distance: queries beyond it
+   *  are out-of-support → fall back to parametric. Calibrated as a high
+   *  quantile (e.g. p99.5) of the training inputs' own distances. */
+  threshold: number;
 }
 
 /** Default OOD thresholds (per output dim: x, z, heading, speed,
@@ -362,6 +388,13 @@ export interface PredictionWithUncertainty {
   /** Standard deviation across the ensemble per output dimension
    *  (x, z, heading, speed, yawRate, lateralVelocity). Length 6. */
   std: number[];
+  /** Normalised distance of this query to the training input support
+   *  (`inputSupportDistance`). 0 when the model carries no `inputSupport`. */
+  supportDistance?: number;
+  /** True when the gate would fall back to parametric for this query —
+   *  either out-of-support (coverage) or ensemble disagreement exceeded
+   *  its threshold. The runtime monitor / risk-aware MPPI can read this. */
+  ood?: boolean;
 }
 
 /** Build a parametric-only model (no residual MLP). Most useful for unit
@@ -402,9 +435,18 @@ export function learnedForwardSimV2(model: LearnedVehicleModel): ForwardSim<CarK
   // emit the residual unconditionally with a note in the diagnostics
   // (a 1-MLP model trades the OOD safety for compute simplicity).
   const ensembleSize = model.residualEnsemble.length;
+  const support = model.inputSupport;
   return (s: CarKinematicState, controls: number[], dt: number): CarKinematicState => {
     const base = paraSim(s, controls, dt);
     const input = buildMLPInput(s, controls, model.config);
+    // Coverage gate (primary): a query outside the training input support
+    // falls back to the parametric floor — even when the ensemble agrees.
+    // This is the fix for "confident bias": the dangerous regimes are
+    // exactly the ones the residual never saw, where ensemble variance is
+    // an unreliable signal. Applies regardless of ensemble size.
+    if (support && inputSupportDistance(support, input) > support.threshold) {
+      return base;
+    }
     if (ensembleSize === 1) {
       const residualMean = ensembleMean(model.residualEnsemble, input);
       const scale = dt / model.residualReferenceDt;
@@ -444,9 +486,19 @@ export function predictWithUncertainty(
   const paraSim = parametricForwardV2(model.params, model.config);
   const base = paraSim(s, controls, dt);
   if (model.residualEnsemble.length === 0) {
-    return { next: base, std: [0, 0, 0, 0, 0, 0] };
+    return { next: base, std: [0, 0, 0, 0, 0, 0], supportDistance: 0, ood: false };
   }
   const input = buildMLPInput(s, controls, model.config);
+  const supportDistance = model.inputSupport
+    ? inputSupportDistance(model.inputSupport, input)
+    : 0;
+  const outOfSupport = model.inputSupport
+    ? supportDistance > model.inputSupport.threshold
+    : false;
+  if (outOfSupport) {
+    // Coverage gate fired → the runtime uses the parametric prediction.
+    return { next: base, std: [0, 0, 0, 0, 0, 0], supportDistance, ood: true };
+  }
   const outputs = model.residualEnsemble.map((mlp) => mlpForward(mlp, input).output);
   const mean = new Float64Array(outputs[0]!.length);
   for (const o of outputs) for (let i = 0; i < o.length; i++) mean[i]! += o[i]! / outputs.length;
@@ -458,8 +510,15 @@ export function predictWithUncertainty(
     }
   }
   for (let i = 0; i < std.length; i++) std[i] = Math.sqrt(std[i]);
+  const thresh = model.oodStdThreshold ?? DEFAULT_OOD_STD_THRESHOLD;
+  const varianceOod = std.some((sd, i) => sd > (thresh[i] ?? Infinity));
   const scale = dt / model.residualReferenceDt;
-  return { next: applyResidual(base, mean, scale), std };
+  return {
+    next: varianceOod ? base : applyResidual(base, mean, scale),
+    std,
+    supportDistance,
+    ood: varianceOod,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +586,51 @@ export function buildMLPInput(
     inputs.push(cfgVec[i]! / scale);
   }
   return inputs;
+}
+
+/** Normalised RMS z-distance of an MLP input from the training support.
+ *  Dimensions whose training spread is ~0 (config one-hot for a single-config
+ *  model) are skipped so the distance reflects the varying regime axes
+ *  (speed, yaw rate, lateral velocity, controls). */
+export function inputSupportDistance(
+  support: InputSupport,
+  input: ReadonlyArray<number>,
+): number {
+  let acc = 0;
+  let n = 0;
+  for (let i = 0; i < support.mean.length; i++) {
+    const sd = support.std[i] ?? 0;
+    if (sd <= 1e-6) continue;
+    const z = ((input[i] ?? 0) - (support.mean[i] ?? 0)) / sd;
+    acc += z * z;
+    n++;
+  }
+  return n > 0 ? Math.sqrt(acc / n) : 0;
+}
+
+/** Build an `InputSupport` from the MLP inputs the residual was trained on.
+ *  `quantile` sets the coverage threshold as that fraction of in-sample
+ *  distances (default p99.5 — in-distribution queries almost never trip the
+ *  gate, anything well outside the training cloud does). Returns null for an
+ *  empty input set. */
+export function computeInputSupport(
+  inputs: ReadonlyArray<ReadonlyArray<number>>,
+  quantile = 0.995,
+): InputSupport | null {
+  if (inputs.length === 0) return null;
+  const dim = inputs[0]!.length;
+  const mean = new Array(dim).fill(0);
+  for (const v of inputs) for (let i = 0; i < dim; i++) mean[i]! += (v[i] ?? 0) / inputs.length;
+  const std = new Array(dim).fill(0);
+  for (const v of inputs) for (let i = 0; i < dim; i++) {
+    const d = (v[i] ?? 0) - mean[i]!;
+    std[i]! += (d * d) / inputs.length;
+  }
+  for (let i = 0; i < dim; i++) std[i] = Math.sqrt(std[i]!);
+  const stats: InputSupport = { mean, std, threshold: Infinity };
+  const dists = inputs.map((v) => inputSupportDistance(stats, v)).sort((a, b) => a - b);
+  const idx = Math.min(dists.length - 1, Math.max(0, Math.floor(quantile * dists.length)));
+  return { mean, std, threshold: dists[idx]! };
 }
 
 function ensembleMean(ensemble: MLP[], input: ReadonlyArray<number>): Float64Array {
