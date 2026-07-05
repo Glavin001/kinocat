@@ -8,3 +8,17 @@ export type {
 } from './types';
 export { purePursuit } from './pure-pursuit';
 export { ReplanState, planPoseAt } from './replan';
+export {
+  smoothSpeedProfile,
+  curvaturePerSample,
+  resampleScalarByArcLength,
+  type SpeedProfileOptions,
+} from './speed-profile';
+export { smoothTrajectory, type TrajectorySmoothOptions } from './trajectory-smoother';
+export {
+  mpcTrack,
+  createMPCTrackerState,
+  type MPCTrackerConfig,
+  type MPCTrackerState,
+  type MPCCommand,
+} from './mpc-tracker';

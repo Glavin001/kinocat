@@ -1,4 +1,4 @@
-import type { VehicleAgent, VehicleState } from './types';
+import type { VehicleAgent, CarKinematicState } from './types';
 import type { ForwardSim } from '../primitives/types';
 import { clamp, wrapAngle } from '../internal/math';
 
@@ -29,9 +29,9 @@ export function defaultVehicleAgent(overrides: Partial<VehicleAgent> = {}): Vehi
  * Used by the characterization harness and tests; real games supply a
  * physics-backed ForwardSim instead.
  */
-export function kinematicForwardSim(agent: VehicleAgent): ForwardSim<VehicleState> {
+export function kinematicForwardSim(agent: VehicleAgent): ForwardSim<CarKinematicState> {
   const kMax = 1 / agent.minTurnRadius;
-  return (s: VehicleState, controls: number[], dt: number): VehicleState => {
+  return (s: CarKinematicState, controls: number[], dt: number): CarKinematicState => {
     const curvature = clamp(controls[0] ?? 0, -kMax, kMax);
     const target = clamp(controls[1] ?? 0, -agent.maxReverseSpeed, agent.maxSpeed);
     // first-order speed tracking toward target
@@ -77,7 +77,7 @@ export const DEFAULT_LEARNED_PARAMS: LearnedVehicleParams = {
 };
 
 /**
- * Same `ForwardSim<VehicleState>` shape as `kinematicForwardSim`, but with a
+ * Same `ForwardSim<CarKinematicState>` shape as `kinematicForwardSim`, but with a
  * dynamics model rich enough to reproduce a Rapier raycast vehicle inside
  * ~0.3m over 0.55s once `params` have been fit. Drop-in for
  * `characterizeVehicle()` → no other planner change needed.
@@ -85,9 +85,9 @@ export const DEFAULT_LEARNED_PARAMS: LearnedVehicleParams = {
 export function learnedForwardSim(
   params: LearnedVehicleParams,
   agent: VehicleAgent,
-): ForwardSim<VehicleState> {
+): ForwardSim<CarKinematicState> {
   const kMax = 1 / agent.minTurnRadius;
-  return (s: VehicleState, controls: number[], dt: number): VehicleState => {
+  return (s: CarKinematicState, controls: number[], dt: number): CarKinematicState => {
     const curvature = clamp(controls[0] ?? 0, -kMax, kMax);
     const target = clamp(controls[1] ?? 0, -agent.maxReverseSpeed, agent.maxSpeed);
     const tau = Math.max(params.accelTau, 1e-3);

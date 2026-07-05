@@ -6,7 +6,7 @@ import { InMemoryNavWorld, type NavPolygon } from '../../src/environment/nav-wor
 import { characterizeVehicle } from '../../src/primitives/characterize';
 import { defaultVehicleAgent, kinematicForwardSim } from '../../src/agent/vehicle';
 import { linearObstacle } from '../../src/predict/factories';
-import type { VehicleAgent, VehicleState } from '../../src/agent/types';
+import type { VehicleAgent, CarKinematicState } from '../../src/agent/types';
 
 function rect(id: number, x0: number, z0: number, x1: number, z1: number): NavPolygon {
   return { id, y: 0, ring: [[x0, z0], [x1, z0], [x1, z1], [x0, z1]] };
@@ -84,8 +84,8 @@ describe('TimeAwareEnvironment: time as a dominance dimension', () => {
 
 describe('TimeAwareEnvironment: predicted-obstacle avoidance', () => {
   const world = new InMemoryNavWorld([rect(1, 0, -14, 32, 14)]);
-  const start: VehicleState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
-  const goal: VehicleState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
+  const start: CarKinematicState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
+  const goal: CarKinematicState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
 
   it('detours around a (predicted) stationary obstacle on the straight line', () => {
     const base = new VehicleEnvironment(world, agent, lib, {
@@ -140,8 +140,8 @@ describe('TimeAwareEnvironment: predicted-obstacle avoidance', () => {
 
 describe('TimeAwareEnvironment: moving-obstacle broadphase is a pure accelerator', () => {
   const world = new InMemoryNavWorld([rect(1, 0, -14, 32, 14)]);
-  const start: VehicleState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
-  const goal: VehicleState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
+  const start: CarKinematicState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
+  const goal: CarKinematicState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
   const obstacles = [
     linearObstacle(15, -12, 0, 4, 2.5, 0, 60),
     linearObstacle(20, 12, 0, -3, 2.0, 0, 60),

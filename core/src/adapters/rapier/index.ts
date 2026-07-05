@@ -5,7 +5,7 @@
 // characterization.
 
 import type { ForwardSim } from '../../primitives/types';
-import type { VehicleState } from '../../agent/types';
+import type { CarKinematicState } from '../../agent/types';
 import { wrapAngle } from '../../internal/math';
 import type { RapierBodyLike, RapierQuatLike, RapierWorldLike } from './types';
 
@@ -17,6 +17,7 @@ export type { RapierBodyLike, RapierWorldLike, RapierVec3Like, RapierQuatLike } 
 export {
   ensureRapier,
   createRaycastVehicle,
+  deriveLearnableConfig,
   planToAckermannControls,
   createBoxCollider,
   createGroundCollider,
@@ -32,7 +33,21 @@ export type {
   GroundColliderOptions,
   HeightfieldColliderOptions,
   HeightSampler,
+  WheelTelemetry,
 } from './raycast-vehicle';
+
+export { stepRaycastVehicle } from './step';
+export type { StepRaycastVehicleOptions } from './step';
+export { RapierCarBody } from './car-body';
+export type { RapierCarBodyOptions } from './car-body';
+
+export { createHeadlessTrialHarness } from './headless-trial';
+export type {
+  HeadlessTrialHarness,
+  HeadlessTrialOptions,
+  TrialSpec,
+  TrialOutcome,
+} from './headless-trial';
 
 export interface RapierForwardSimOptions {
   world: RapierWorldLike;
@@ -59,10 +74,10 @@ function yawFromQuat(q: RapierQuatLike): number {
  */
 export function rapierForwardSim(
   opts: RapierForwardSimOptions,
-): ForwardSim<VehicleState> {
+): ForwardSim<CarKinematicState> {
   const y = opts.groundY ?? 0;
   const { world, body } = opts;
-  return (s: VehicleState, controls: number[], dt: number): VehicleState => {
+  return (s: CarKinematicState, controls: number[], dt: number): CarKinematicState => {
     const curvature = controls[0] ?? 0;
     const speed = controls[1] ?? 0;
     body.setTranslation({ x: s.x, y, z: s.z }, true);

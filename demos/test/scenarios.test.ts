@@ -49,7 +49,7 @@ import {
 // (`demos/test/carchase-scenarios.test.ts`) so they run in a parallel
 // vitest worker — adding them here pushed total wall time past the 60 s
 // birpc RPC timeout in CI.
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 
 // These assert the *exact* configuration the demos ship with always finds a
 // plan within its expansion budget — so a "no plan" regression fails CI.
@@ -138,8 +138,8 @@ describe('navmesh demo runs over a real navcat navmesh', () => {
     expect(world.polygonAt(36, 12)).not.toBeNull(); // platform
     const r = planNavmesh(
       world,
-      { x: 4, z: 12, heading: 0, speed: 0, t: 0 } as VehicleState,
-      { x: 36, z: 12, heading: 0, speed: 0, t: 0 } as VehicleState,
+      { x: 4, z: 12, heading: 0, speed: 0, t: 0 } as CarKinematicState,
+      { x: 36, z: 12, heading: 0, speed: 0, t: 0 } as CarKinematicState,
     );
     expect(r.found).toBe(true);
     expect(r.stats.expansions).toBeLessThan(DEMO_MAX_EXPANSIONS);
@@ -657,6 +657,7 @@ const TESTED_DEMOS = new Set([
   'dogfight', // 'dogfight demo' — buildDogfightSnapshot (heightfield + multi-AI)
   'dynamic', // 'dynamic demo scenarios' — buildDynamic (moving/coop/jump)
   'flagship', // 'flagship demo' — buildFlagship (large multi-agent navcat)
+  'goals', // 'Goal Lab' — canonical scenario-goal authoring + visualization; presets exercised headlessly in goallab-presets.test.ts (compile + validate + plan) and scenario-goals.test.ts
   'humanoid', // 'humanoid demo' — buildHumanoid
   'jumplinks', // 'jumplinks demo' — buildJumpLinks
   'learnprimitives', // 'learnprimitives demo' — autonomous motion-primitive learner (Rapier)
@@ -665,8 +666,12 @@ const TESTED_DEMOS = new Set([
   'plane', // 'aircraft demo' — waypoint/canyon/restricted/gauntlet/knife-edge
   'playground', // 'playground demo' — planPlayground
   'raceprimitives', // 'raceprimitives demo' — side-by-side kinematic vs learned library race
+  'parking', // 'parking demo' — three tight-parking scenarios; the same parking scenarios are exercised headlessly by the controller-bench harness (`pnpm run controller-bench`) which is the canonical coverage path for the unified planner+tracker stack
   'ramp', // 'ramp + affordance demo' — drivable heightfield ramp + planner-only BallisticJump
   'primitives', // 'primitives demo' — buildPrimitiveFan
+  'primitive-explorer', // 'primitive-explorer demo' — kinematic-vs-v2 action-space diagnostics (tested in primitive-diagnostics.test.ts)
+  'model-lab', // 'model-lab demo' — v2 training + diagnostics dashboard (helpers tested in fan-plot-ground-truth.test.ts; training pipeline in training-driver.test.ts)
+  'sim-to-real', // 'sim-to-real demo' — 3D scope overlaying model prediction on Rapier reality (pure helpers tested in sim-to-real-scene.test.ts; wheel telemetry in core/test/adapters/raycast-vehicle.test.ts)
   'reverse', // 'reverse demo' — planReverse
   'swarm', // 'swarm demo' — buildSwarm
   'world3d', // 'world3d demo' — planWorld3d

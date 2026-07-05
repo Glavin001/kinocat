@@ -67,4 +67,13 @@ export interface Environment<State> {
    *  contribute counters can omit this method. Composing wrappers (e.g.
    *  TimeAwareEnvironment) must forward to their base environment. */
   attachRecorder?(rec: PerfRecorder): void;
+
+  /** Optional BEST-PROGRESS score (higher = closer to the objective). When the
+   *  goal region is never reached (e.g. an unbounded `repeat`, or an
+   *  infeasible course), the planner keeps the highest-progress node it saw and
+   *  returns it as an "anytime" incumbent (`PlanResult.partial = true`).
+   *  Environments that omit this behave exactly as before — the planner only
+   *  pays for the hook when the method is present. Composing wrappers must
+   *  forward to (or augment) the base environment's score. */
+  progress?(node: Node<State>): number;
 }

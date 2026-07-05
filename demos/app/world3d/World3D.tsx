@@ -5,7 +5,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { purePursuit, ReplanState } from 'kinocat/execute';
 import { kinematicForwardSim } from 'kinocat/agent';
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import {
   world3dWorldFrom,
   planWorld3d,
@@ -38,7 +38,7 @@ export default function World3D() {
   const obstaclesRef = useRef<BoxObstacle[]>(
     WORLD3D_DEFAULT_OBSTACLES.map((o) => ({ ...o })),
   );
-  const goalRef = useRef<VehicleState>({ x: 36, z: 0, heading: 0, speed: 0, t: 0 });
+  const goalRef = useRef<CarKinematicState>({ x: 36, z: 0, heading: 0, speed: 0, t: 0 });
   const apiRef = useRef<{ clear: () => void } | null>(null);
 
   useEffect(() => {
@@ -123,7 +123,7 @@ export default function World3D() {
     rebuildObstacleMeshes();
 
     let world = world3dWorldFrom(obstaclesRef.current);
-    let state: VehicleState = { x: 4, z: 0, heading: 0, speed: 0, t: 0 };
+    let state: CarKinematicState = { x: 4, z: 0, heading: 0, speed: 0, t: 0 };
     const replan = new ReplanState({
       divergenceThresholdMeters: 2.5,
       refreshIntervalMs: 1500,
@@ -132,7 +132,7 @@ export default function World3D() {
     });
 
     let pathLine: THREE.Line | null = null;
-    const drawPath = (path: VehicleState[]) => {
+    const drawPath = (path: CarKinematicState[]) => {
       if (pathLine) {
         scene.remove(pathLine);
         pathLine.geometry.dispose();

@@ -16,7 +16,13 @@
     "test:coverage": "vitest run --coverage",
     "bench": "vitest bench --run",
     "size": "pnpm --filter kinocat size",
-    "verify": "pnpm typecheck && pnpm test && pnpm --filter kinocat build && pnpm size"
+    "verify": "pnpm typecheck && pnpm test && pnpm --filter kinocat build && pnpm size",
+    "train": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos train",
+    "train:quick": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos train:quick",
+    "train:sweep": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos train:sweep",
+    "race": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos race",
+    "race:quick": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos race:quick",
+    "controller-bench": "pnpm --filter kinocat build && pnpm --filter @kinocat/demos controller-bench"
   },
   "devDependencies": {
     "@vitest/coverage-v8": "^3.0.0",

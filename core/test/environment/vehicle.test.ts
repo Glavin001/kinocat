@@ -4,7 +4,7 @@ import { VehicleEnvironment } from '../../src/environment/vehicle-environment';
 import { InMemoryNavWorld, type NavPolygon } from '../../src/environment/nav-world';
 import { characterizeVehicle } from '../../src/primitives/characterize';
 import { defaultVehicleAgent, kinematicForwardSim } from '../../src/agent/vehicle';
-import type { VehicleAgent, VehicleState } from '../../src/agent/types';
+import type { VehicleAgent, CarKinematicState } from '../../src/agent/types';
 import { placeFootprint } from '../../src/internal/geom';
 
 function rect(id: number, x0: number, z0: number, x1: number, z1: number): NavPolygon {
@@ -44,7 +44,7 @@ const agent = defaultVehicleAgent({
 });
 const lib = buildLib(agent);
 
-function footprintsClear(world: InMemoryNavWorld, path: VehicleState[]): boolean {
+function footprintsClear(world: InMemoryNavWorld, path: CarKinematicState[]): boolean {
   return path.every((s) =>
     world.footprintClear(placeFootprint(agent.footprint, s.x, s.z, s.heading)),
   );
@@ -57,8 +57,8 @@ describe('VehicleEnvironment', () => {
       goalRadius: 1.5,
       goalHeadingTol: Infinity,
     });
-    const start: VehicleState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
-    const goal: VehicleState = { x: 24, z: 6, heading: 0, speed: 0, t: 0 };
+    const start: CarKinematicState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
+    const goal: CarKinematicState = { x: 24, z: 6, heading: 0, speed: 0, t: 0 };
     const r = plan(
       { start, goal, environment: env, options: { maxExpansions: 200000 } },
       Infinity,
@@ -81,8 +81,8 @@ describe('VehicleEnvironment', () => {
       goalRadius: 1.5,
       goalHeadingTol: Infinity,
     });
-    const start: VehicleState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
-    const goal: VehicleState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
+    const start: CarKinematicState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
+    const goal: CarKinematicState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
     // straight line is blocked, so a detour is mandatory
     expect(world.segmentClear(start.x, start.z, goal.x, goal.z)).toBe(false);
     const r = plan(
@@ -100,8 +100,8 @@ describe('VehicleEnvironment', () => {
       goalRadius: 1.5,
       goalHeadingTol: Infinity,
     });
-    const start: VehicleState = { x: 20, z: 0, heading: 0, speed: 0, t: 0 };
-    const goal: VehicleState = { x: 5, z: 0, heading: 0, speed: 0, t: 0 };
+    const start: CarKinematicState = { x: 20, z: 0, heading: 0, speed: 0, t: 0 };
+    const goal: CarKinematicState = { x: 5, z: 0, heading: 0, speed: 0, t: 0 };
     const r = plan(
       { start, goal, environment: env, options: { maxExpansions: 200000 } },
       Infinity,
@@ -127,8 +127,8 @@ describe('VehicleEnvironment Reeds-Shepp analytic expansion', () => {
       goalHeadingTol: Infinity,
       analyticExpansion: {},
     });
-    const start: VehicleState = { x: 5, z: 0, heading: 0, speed: 0, t: 0 };
-    const goal: VehicleState = { x: 280, z: 0, heading: 0, speed: 0, t: 0 };
+    const start: CarKinematicState = { x: 5, z: 0, heading: 0, speed: 0, t: 0 };
+    const goal: CarKinematicState = { x: 280, z: 0, heading: 0, speed: 0, t: 0 };
     const r = plan(
       { start, goal, environment: env, options: { maxExpansions: 100000 } },
       Infinity,
@@ -153,8 +153,8 @@ describe('VehicleEnvironment Reeds-Shepp analytic expansion', () => {
       goalHeadingTol: Infinity,
       analyticExpansion: {},
     });
-    const start: VehicleState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
-    const goal: VehicleState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
+    const start: CarKinematicState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
+    const goal: CarKinematicState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
     const r = plan(
       { start, goal, environment: env, options: { maxExpansions: 400000 } },
       Infinity,
@@ -256,8 +256,8 @@ class StubWorld implements NavWorld {
 }
 
 describe('VehicleEnvironment clearance broadphase', () => {
-  const start: VehicleState = { x: 3, z: 0, heading: 0, speed: 0, t: 0 };
-  const goal: VehicleState = { x: 37, z: 0, heading: 0, speed: 0, t: 0 };
+  const start: CarKinematicState = { x: 3, z: 0, heading: 0, speed: 0, t: 0 };
+  const goal: CarKinematicState = { x: 37, z: 0, heading: 0, speed: 0, t: 0 };
   const WORLD: Rect = { x0: 0, z0: -16, x1: 40, z1: 16 };
   const envOpts = {
     goalRadius: 1.5,
@@ -358,8 +358,8 @@ class LBWorld implements NavWorld {
 }
 
 describe('VehicleEnvironment grid-Dijkstra dual heuristic', () => {
-  const to: VehicleState = { x: 30, z: 0, heading: 0, speed: 0, t: 0 };
-  const from: VehicleState = { x: 4, z: 6, heading: 0.3, speed: 0, t: 0 };
+  const to: CarKinematicState = { x: 30, z: 0, heading: 0, speed: 0, t: 0 };
+  const from: CarKinematicState = { x: 4, z: 6, heading: 0.3, speed: 0, t: 0 };
   const mkEnv = (world: NavWorld, gridHeuristic: false | Record<string, never>) =>
     new VehicleEnvironment(world, agent, lib, { gridHeuristic });
 

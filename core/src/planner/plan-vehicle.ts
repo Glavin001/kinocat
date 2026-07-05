@@ -10,7 +10,7 @@
 // `envOptions` if a specific game needs tighter resolution or more aggressive
 // analytic shots.
 
-import type { VehicleAgent, VehicleState } from '../agent/types';
+import type { VehicleAgent, CarKinematicState } from '../agent/types';
 import type { MotionPrimitiveLibrary } from '../primitives/library';
 import type { MovingObstacle } from '../predict/types';
 import type { AffordanceRegistry } from '../predict/affordance-registry';
@@ -27,8 +27,8 @@ import { plan } from './ighastar';
 import type { PlanResult, PlannerOptions } from './types';
 
 export interface PlanVehicleRequest {
-  start: VehicleState;
-  goal: VehicleState;
+  start: CarKinematicState;
+  goal: CarKinematicState;
   world: NavWorld;
   agent: VehicleAgent;
   lib: MotionPrimitiveLibrary;
@@ -81,7 +81,7 @@ const DEFAULT_MAX_EXPANSIONS = 25000;
  *  Same algorithm as building `VehicleEnvironment` + `TimeAwareEnvironment` +
  *  calling `plan()` manually — this is just the boilerplate consolidator
  *  every interactive AI needs. */
-export function planVehicleOnce(req: PlanVehicleRequest): PlanResult<VehicleState> {
+export function planVehicleOnce(req: PlanVehicleRequest): PlanResult<CarKinematicState> {
   const envOpts = { ...DEFAULT_ENV_OPTIONS, ...(req.envOptions ?? {}) };
   const baseEnv = new VehicleEnvironment(req.world, req.agent, req.lib, envOpts);
 

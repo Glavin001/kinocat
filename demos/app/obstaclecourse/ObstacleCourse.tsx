@@ -12,22 +12,7 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import RAPIER from '@dimforge/rapier3d-compat';
-import {
-  InMemoryNavWorld,
-  rampHeightSampler,
-  combineHeightSamplers,
-} from 'kinocat/environment';
-import type { HeightSampler } from 'kinocat/environment';
-import type { VehicleState } from 'kinocat/agent';
-import {
-  ensureRapier,
-  createRaycastVehicle,
-  createGroundCollider,
-  createBoxCollider,
-  createHeightfieldCollider,
-  planToAckermannControls,
-} from 'kinocat/adapters/rapier';
+import { ensureRapier } from 'kinocat/adapters/rapier';
 import {
   createGroundPlaneHelper,
   createBuildingHelper,
@@ -44,30 +29,24 @@ import {
   createRampChevronsHelper,
   createJumpArcHelper,
   createRapierDebugRenderer,
+  updateChaseCamera,
 } from 'kinocat/adapters/three';
+import { wheeledFromNormalized } from 'kinocat/vehicle/car';
+import type { CarKinematicState } from 'kinocat/agent';
 import {
   OBS_AGENT,
   OBS_BOUNDS,
   OBS_PALETTE as C,
   OBS_BLOCKS_ALL,
-  buildObstacleCourse,
   type ObstacleCourse as Course,
-  obsPickWaypoint,
-  obsSpawn,
-  planObstacleCourse,
   type ObsBlocks,
 } from '../lib/obstaclecourse-scenarios';
-
-const PHYSICS_DT = 1 / 60;
-const VEHICLE_SUBSTEPS = 4;
-const REPLAN_INTERVAL_MS = 120;
-const WHEEL_BASE = 1.6; // matches default in createRaycastVehicle
-
-// Gentle terrain so a flat-ground vehicle still copes. Bumps + bowls let us
-// see suspension behaviour without making the planner-vs-physics gap obvious.
-function terrainSampler(x: number, z: number): number {
-  return 0.6 * Math.sin(x / 18) + 0.6 * Math.cos(z / 14);
-}
+import {
+  createObstacleCourseScenario,
+  OBSTACLE_FORCE_TUNING,
+  PHYSICS_DT,
+  type ObstacleCourseScenario,
+} from '../lib/obstaclecourse-scenario';
 
 export default function ObstacleCourse() {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -107,7 +86,12 @@ export default function ObstacleCourse() {
     (async () => {
       await ensureRapier();
       if (disposed) return;
-      cleanup = setupScene(mount);
+      const scenario = await createObstacleCourseScenario({ blocks: blocksRef.current });
+      if (disposed) {
+        scenario.dispose();
+        return;
+      }
+      cleanup = setupScene(mount, scenario);
       setReady(true);
     })();
     return () => {
@@ -122,7 +106,7 @@ export default function ObstacleCourse() {
     rebuildRef.current?.();
   }, [blocks]);
 
-  function setupScene(mount: HTMLDivElement): () => void {
+  function setupScene(mount: HTMLDivElement, scenario: ObstacleCourseScenario): () => void {
     const W0 = window.innerWidth;
     const H0 = window.innerHeight;
 
@@ -148,19 +132,18 @@ export default function ObstacleCourse() {
     sun.position.set(60, 140, 40);
     scene.add(sun);
 
-    // ---- physics + course state, rebuilt on toggle changes ----
-    const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+    // ---- course state lives in the headless scenario ----
+    // The scenario owns the Rapier world, car, colliders, planner and control
+    // loop (identical to the headless tests). This component only renders the
+    // visuals for `scenario.course` and uses `scenario.heightSampler` so the
+    // terrain mesh matches the physics surface exactly.
+    const world = scenario.getWorld();
+    let course: Course = scenario.course;
 
-    let course: Course = buildObstacleCourse(blocksRef.current);
-    let navWorld = new InMemoryNavWorld(course.polygons, course.obstacles);
-
-    // Visual groups we tear down on rebuild. Path / goal / footprint persist
-    // across rebuilds (they belong to the car, not the course).
-    let coursePhysics: RAPIER.Collider[] = [];
     let courseVisuals = new THREE.Group();
     scene.add(courseVisuals);
 
-    function buildCourseVisualsAndPhysics() {
+    function buildCourseVisuals() {
       // Wipe previous visuals.
       scene.remove(courseVisuals);
       courseVisuals.traverse((o) => {
@@ -173,24 +156,10 @@ export default function ObstacleCourse() {
       courseVisuals = new THREE.Group();
       scene.add(courseVisuals);
 
-      // Wipe previous physics colliders.
-      for (const col of coursePhysics) {
-        const body = col.parent();
-        world.removeCollider(col, true);
-        if (body) world.removeRigidBody(body);
-      }
-      coursePhysics = [];
-
-      // Heightfield surface = (optional) bumpy terrain max-blended with the
-      // drivable ramps. When neither block is on, fall back to a flat ground
-      // slab. Using a single heightfield for both means the car physically
-      // climbs the ramp via the same drivable surface as the /ramp demo —
-      // no cuboid colliders for ramps.
-      const samplers: HeightSampler[] = [];
-      if (blocksRef.current.heightfield) samplers.push(terrainSampler);
-      if (course.ramps.length > 0) samplers.push(rampHeightSampler(course.ramps));
-      if (samplers.length > 0) {
-        const sampler = combineHeightSamplers(...samplers);
+      // Heightfield surface — uses the SAME sampler the scenario's physics
+      // collider was built from (terrain ⊕ ramps), or a flat ground slab.
+      const sampler = scenario.heightSampler;
+      if (sampler) {
         courseVisuals.add(
           createHeightfieldMeshHelper({
             bounds: OBS_BOUNDS,
@@ -198,25 +167,13 @@ export default function ObstacleCourse() {
             segmentsX: 60,
             segmentsZ: 40,
             groundColor: C.ground,
-            // Vertex-colour the ramp body brown above 0.2 m so the drivable
-            // ramp visually pops out of the bumpy terrain.
             vertexColorAbove: course.ramps.length > 0 ? 0.2 : undefined,
             aboveColor: C.ramp,
-          }),
-        );
-        coursePhysics.push(
-          createHeightfieldCollider(world, {
-            sampler,
-            bounds: OBS_BOUNDS,
-            cellSize: 2,
           }),
         );
       } else {
         courseVisuals.add(
           createGroundPlaneHelper({ bounds: OBS_BOUNDS, color: 0x1a2233 }),
-        );
-        coursePhysics.push(
-          createGroundCollider(world, { bounds: OBS_BOUNDS, pad: 20 }),
         );
       }
 
@@ -224,21 +181,8 @@ export default function ObstacleCourse() {
         courseVisuals.add(
           createBuildingHelper(b, { color: 0x3a4458, edgeColor: 0x6c7a94 }),
         );
-        coursePhysics.push(
-          createBoxCollider(world, {
-            x: b.x,
-            y: b.height / 2,
-            z: b.z,
-            hx: b.hx,
-            hy: b.height / 2,
-            hz: b.hz,
-          }),
-        );
       }
 
-      // Drivable ramps: directional chevrons on the surface + the jump
-      // affordance arc overlay. No cuboid collider — physics is the
-      // heightfield above.
       for (const r of course.ramps) {
         courseVisuals.add(createRampChevronsHelper(r));
       }
@@ -263,9 +207,9 @@ export default function ObstacleCourse() {
     }
 
     function rebuildCourse() {
-      course = buildObstacleCourse(blocksRef.current);
-      navWorld = new InMemoryNavWorld(course.polygons, course.obstacles);
-      buildCourseVisualsAndPhysics();
+      scenario.rebuild(blocksRef.current);
+      course = scenario.course;
+      buildCourseVisuals();
       // Refresh inflated overlay too.
       debugGroup.clear();
       for (const b of course.buildings) {
@@ -273,8 +217,6 @@ export default function ObstacleCourse() {
       }
       debugGroup.add(createNavBoundsHelper(OBS_BOUNDS));
       debugGroup.add(carFootprint);
-      // Wake the AI.
-      ai.plan = null;
     }
     rebuildRef.current = rebuildCourse;
 
@@ -291,29 +233,16 @@ export default function ObstacleCourse() {
     rapierDebug.mesh.visible = false;
     scene.add(rapierDebug.mesh);
 
-    // ---- car ----
-    const car = createRaycastVehicle(world, {
-      id: 'obs-car',
-      position: { x: obsSpawn().x, z: obsSpawn().z },
-      heading: obsSpawn().heading,
-    });
+    // ---- car (owned by the scenario) ----
+    const car = scenario.getCar();
     const carMesh = createCarMeshHelper({ color: C.car });
     scene.add(carMesh.group);
-
-    const ai = {
-      plan: null as VehicleState[] | null,
-      planStartWall: performance.now(),
-      loopIndex: 0,
-      goal: null as VehicleState | null,
-      lastExpansions: 0,
-      lastBudgetMs: 0,
-    };
 
     const goalMarker = createGoalMarkerHelper({ color: C.goal });
     scene.add(goalMarker);
 
     let pathLine: THREE.Line | null = null;
-    function replacePathLine(path: VehicleState[]): void {
+    function replacePathLine(path: CarKinematicState[]): void {
       if (pathLine) {
         scene.remove(pathLine);
         pathLine.geometry.dispose();
@@ -332,7 +261,7 @@ export default function ObstacleCourse() {
     }
 
     // First build.
-    buildCourseVisualsAndPhysics();
+    buildCourseVisuals();
     for (const b of course.buildings) {
       debugGroup.add(createInflatedObstacleHelper(b, 0.5));
     }
@@ -350,42 +279,13 @@ export default function ObstacleCourse() {
       if (k === 'd') setShowDebug((v) => !v);
       if (k === '2') setShowRapierDebug((v) => !v);
       if (k === 't') setPlayerDriving((v) => !v);
-      if (k === 'r') {
-        car.teleport({ x: obsSpawn().x, z: obsSpawn().z, heading: obsSpawn().heading });
-        ai.plan = null;
-        ai.loopIndex = 0;
-      }
+      if (k === 'r') scenario.reset();
     };
     const onKeyUp = (e: KeyboardEvent) => keys.delete(e.key.toLowerCase());
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
-
-    // ---- replan ----
-    function replan() {
-      const now = performance.now();
-      const state = car.readState(now);
-      const pick = obsPickWaypoint(state, course, ai.loopIndex, navWorld);
-      ai.loopIndex = pick.nextIndex;
-      ai.goal = pick.goal;
-      const t0 = performance.now();
-      const res = planObstacleCourse({
-        state: { ...state, t: 0 },
-        goal: { ...pick.goal, t: 0 },
-        course,
-        world: navWorld,
-      });
-      ai.lastBudgetMs = performance.now() - t0;
-      ai.lastExpansions = res.stats.expansions;
-      if (res.found && res.path.length > 1) {
-        ai.plan = res.path;
-        ai.planStartWall = now;
-        if (showPathRef.current) replacePathLine(res.path);
-      }
-    }
-    const replanTimer = window.setInterval(() => {
-      if (pausedRef.current || playerDrivingRef.current) return;
-      replan();
-    }, REPLAN_INTERVAL_MS);
+    // NOTE: replanning is driven inside scenario.tick() on a SIM-time cadence —
+    // no wall-clock setInterval (that was a source of headed↔headless drift).
 
     // ---- resize ----
     const onResize = () => {
@@ -400,6 +300,8 @@ export default function ObstacleCourse() {
     // ---- main loop ----
     let stopped = false;
     let lastHudWall = 0;
+    let lastPlanRef: CarKinematicState[] | null = null;
+    let prevWall = performance.now();
     function tick() {
       if (stopped) return;
       requestAnimationFrame(tick);
@@ -408,58 +310,41 @@ export default function ObstacleCourse() {
         return;
       }
       const now = performance.now();
-      const state = car.readState(now);
 
-      // Drive — player or AI.
-      if (playerDrivingRef.current) {
-        const accel =
-          (keys.has('w') || keys.has('arrowup') ? 1 : 0) -
-          (keys.has('s') || keys.has('arrowdown') ? 1 : 0);
-        const steerIn =
-          (keys.has('a') || keys.has('arrowleft') ? 1 : 0) -
-          (keys.has('d') || keys.has('arrowright') ? 1 : 0);
-        const brake = keys.has(' ') ? 1 : 0;
-        car.applyControls({ steer: steerIn * 0.55, throttle: accel, brake });
-      } else if (ai.plan && ai.plan.length > 1) {
-        const elapsed = (now - ai.planStartWall) / 1000;
-        const live = trimPlan(ai.plan, elapsed);
-        if (live.length >= 2) {
-          car.applyControls(
-            planToAckermannControls(state, live, {
-              wheelBase: 2 * WHEEL_BASE,
-              lookaheadMin: 3,
-              lookaheadGain: 0.45,
-              lookaheadMax: 14,
-              maxLateralAccel: 8,
-              maxAccel: 6,
-              maxDecel: 8,
-              cruiseSpeed: OBS_AGENT.maxSpeed,
-              goalTolerance: 2,
-              minTurnRadius: OBS_AGENT.minTurnRadius,
-            }),
-          );
-        } else {
-          car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
-        }
-      } else {
-        // No plan yet — coast in neutral. Idling forward into the first plan
-        // sounds harmless until a heightfield slope flips the car into a
-        // wall; see bug-audit notes.
-        car.applyControls({ steer: 0, throttle: 0, brake: 0 });
+      // Accumulate wall-time into whole fixed sim ticks (capped), then advance
+      // the headless scenario — the SAME engine the tests drive. The component
+      // never touches physics or the planner directly.
+      const dt = Math.min((now - prevWall) / 1000, 1 / 30);
+      prevWall = now;
+      const steps = Math.max(1, Math.min(8, Math.round(dt / PHYSICS_DT)));
+      for (let i = 0; i < steps; i++) {
+        const playerControls = playerDrivingRef.current
+          ? wheeledFromNormalized(
+              {
+                steer:
+                  ((keys.has('a') || keys.has('arrowleft') ? 1 : 0) -
+                    (keys.has('d') || keys.has('arrowright') ? 1 : 0)) *
+                  0.55,
+                throttle:
+                  (keys.has('w') || keys.has('arrowup') ? 1 : 0) -
+                  (keys.has('s') || keys.has('arrowdown') ? 1 : 0),
+                brake: keys.has(' ') ? 1 : 0,
+              },
+              OBSTACLE_FORCE_TUNING,
+            )
+          : null;
+        scenario.tick(playerControls);
       }
 
-      // Physics: vehicle update before world step, sub-stepped (Rapier
-      // raycast-vehicle is twitchy at 60 Hz on its own).
-      const subDt = PHYSICS_DT / VEHICLE_SUBSTEPS;
-      world.timestep = subDt;
-      const wheelFilter = RAPIER.QueryFilterFlags.EXCLUDE_DYNAMIC;
-      for (let s = 0; s < VEHICLE_SUBSTEPS; s++) {
-        car.vehicle.updateVehicle(subDt, wheelFilter);
-        world.step();
-      }
-
-      const after = car.readState(now);
+      const st = scenario.status();
+      const after = st.state;
       syncCarMesh(carMesh.group, after);
+
+      // Refresh the path line only when the plan actually changed.
+      if (st.plan !== lastPlanRef) {
+        lastPlanRef = st.plan;
+        if (st.plan && st.plan.length > 1) replacePathLine(st.plan);
+      }
       if (pathLine) pathLine.visible = showPathRef.current;
 
       debugGroup.visible = showDebugRef.current;
@@ -470,20 +355,11 @@ export default function ObstacleCourse() {
         carFootprint.rotation.y = -after.heading;
       }
 
-      goalMarker.visible = !!ai.goal;
-      if (ai.goal) goalMarker.position.set(ai.goal.x, 2, ai.goal.z);
+      goalMarker.visible = !!st.goal;
+      if (st.goal) goalMarker.position.set(st.goal.x, 2, st.goal.z);
 
       if (chaseRef.current) {
-        const c = Math.cos(after.heading);
-        const s = Math.sin(after.heading);
-        const cam = new THREE.Vector3(
-          after.x - 14 * c,
-          7,
-          after.z - 14 * s,
-        );
-        camera.position.lerp(cam, 0.12);
-        orbit.target.set(after.x, 1.5, after.z);
-        orbit.update();
+        updateChaseCamera(camera, { x: after.x, z: after.z, heading: after.heading }, { orbit });
       }
 
       if (now - lastHudWall > 100) {
@@ -494,7 +370,7 @@ export default function ObstacleCourse() {
           `${playerDrivingRef.current ? 'YOU' : 'AI'} · v=${v} m/s · hdg=${hdg}°`,
         );
         setStatus(
-          `plan=${ai.plan?.length ?? 0} exp=${ai.lastExpansions} budget=${ai.lastBudgetMs.toFixed(0)}ms wp=${ai.loopIndex}/${course.waypoints.length}`,
+          `plan=${st.plan?.length ?? 0} exp=${st.diagnostics.lastExpansions} replans=${st.diagnostics.successfulReplans}/${st.diagnostics.totalReplans} wp=${st.loopIndex}/${course.waypoints.length}`,
         );
       }
 
@@ -504,15 +380,13 @@ export default function ObstacleCourse() {
 
     return () => {
       stopped = true;
-      window.clearInterval(replanTimer);
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('resize', onResize);
-      car.dispose();
+      scenario.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === mount)
         mount.removeChild(renderer.domElement);
-      world.free();
     };
   }
 
@@ -610,12 +484,6 @@ export default function ObstacleCourse() {
       </div>
     </div>
   );
-}
-
-function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
-  let i = 0;
-  while (i < plan.length - 1 && plan[i + 1]!.t <= elapsed) i++;
-  return plan.slice(i);
 }
 
 function ToggleButton({

@@ -1,12 +1,12 @@
-import type { VehicleState, VehicleAgent } from '../agent/types';
+import type { CarKinematicState, VehicleAgent } from '../agent/types';
 import type { NavPolygon } from '../environment/nav-world';
 import type { PlanStats } from '../planner/types';
 
 /** Serializable descriptor for a MovingObstacle. The worker reconstructs
  *  the predict closure from this data. */
 export type ObstacleDescriptor =
-  | { kind: 'plan'; path: VehicleState[]; radius: number }
-  | { kind: 'cv'; state: VehicleState; horizon: number; radius: number };
+  | { kind: 'plan'; path: CarKinematicState[]; radius: number }
+  | { kind: 'cv'; state: CarKinematicState; horizon: number; radius: number };
 
 export interface WorkerInitMsg {
   type: 'init';
@@ -26,8 +26,8 @@ export interface WorkerPlanRequest {
   type: 'plan';
   reqId: number;
   npcId: string;
-  start: VehicleState;
-  goal: VehicleState;
+  start: CarKinematicState;
+  goal: CarKinematicState;
   obstacles: ObstacleDescriptor[];
   deadlineMs?: number;
   maxExpansions?: number;
@@ -39,7 +39,7 @@ export interface WorkerPlanResponse {
   npcId: string;
   found: boolean;
   cost: number;
-  path: VehicleState[];
+  path: CarKinematicState[];
   stats: PlanStats;
 }
 

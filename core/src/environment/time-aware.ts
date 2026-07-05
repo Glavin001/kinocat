@@ -9,7 +9,7 @@
 import type { Environment, EdgeRef, Node } from './types';
 import type { MovingObstacle } from '../predict/types';
 import type { AffordanceRegistry } from '../predict/affordance-registry';
-import type { VehicleState } from '../agent/types';
+import type { CarKinematicState } from '../agent/types';
 import { NULL_RECORDER, type PerfRecorder } from '../planner/perf';
 
 export interface TimeAwareOptions {
@@ -251,7 +251,7 @@ export class TimeAwareEnvironment<State extends HasXZT>
     if (!reg) return;
     const st = node.state;
     if (!('speed' in st)) return; // affordances are vehicle-typed for now
-    const vs = st as unknown as VehicleState;
+    const vs = st as unknown as CarKinematicState;
     for (const aff of reg.queryNearby(st.x, st.z, st.t, this.affordanceRadius)) {
       const r = aff.tryUse(vs, st.t);
       if (!r) continue;

@@ -24,6 +24,23 @@ export type {
 } from './heightfield-airspace';
 export { TimeAwareEnvironment } from './time-aware';
 export type { TimeAwareOptions } from './time-aware';
+// Multi-goal Environment wrapper — single A* over an ordered SEQUENCE of
+// intermediate goals. Domain-agnostic; usable with any base Environment.
+export {
+  MultiGoalEnvironment,
+  multiGoalStart,
+  multiGoalTerminal,
+} from './multi-goal';
+export type { MultiGoalState, MultiGoalOptions } from './multi-goal';
+// Scenario Environment wrapper — generalizes MultiGoal: drives the search from
+// a compiled goal automaton (reach/seq/all/any/repeat) + invariant pruning +
+// cost terms. The canonical planner bridge for `kinocat/scenario`.
+export {
+  ScenarioEnvironment,
+  scenarioStart,
+  scenarioTerminal,
+} from './scenario-environment';
+export type { ScenarioAugState, ScenarioEnvOptions } from './scenario-environment';
 export { nudgeGoalClear } from './nudge-goal';
 export type { NudgeGoalOptions } from './nudge-goal';
 export {

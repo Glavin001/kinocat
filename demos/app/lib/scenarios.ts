@@ -42,7 +42,7 @@ import {
 import type { CurvePath } from 'kinocat/curves';
 import type {
   VehicleAgent,
-  VehicleState,
+  CarKinematicState,
   HumanoidState,
 } from 'kinocat/agent';
 
@@ -134,8 +134,8 @@ function box(x: number, z: number, hx: number, hz: number): [number, number][] {
 // Playground
 
 export interface PlaygroundInput {
-  start: VehicleState;
-  goal: VehicleState;
+  start: CarKinematicState;
+  goal: CarKinematicState;
   obstacles: { x: number; z: number }[];
   obstacleHalf?: number;
   reverseCost?: number;
@@ -143,7 +143,7 @@ export interface PlaygroundInput {
   bounds?: { x0: number; z0: number; x1: number; z1: number };
 }
 
-export function planPlayground(inp: PlaygroundInput): PlanResult<VehicleState> {
+export function planPlayground(inp: PlaygroundInput): PlanResult<CarKinematicState> {
   const b = inp.bounds ?? { x0: 0, z0: -11, x1: 44, z1: 11 };
   const oh = inp.obstacleHalf ?? 2.4;
   const world = new InMemoryNavWorld(
@@ -182,12 +182,12 @@ export interface DynamicScene {
   scenario: Scenario;
   bounds: { x0: number; z0: number; x1: number; z1: number };
   islands: [number, number, number, number][];
-  result: PlanResult<VehicleState>;
+  result: PlanResult<CarKinematicState>;
   duration: number;
-  start: VehicleState;
-  goal: VehicleState;
+  start: CarKinematicState;
+  goal: CarKinematicState;
   ghostAt?: (t: number) => { x: number; z: number } | null;
-  affordanceHop?: [VehicleState, VehicleState] | null;
+  affordanceHop?: [CarKinematicState, CarKinematicState] | null;
   info: string;
 }
 
@@ -249,11 +249,11 @@ function dynEnv(world: InMemoryNavWorld) {
 }
 
 export function buildDynamic(scn: Scenario): DynamicScene {
-  const start: VehicleState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
+  const start: CarKinematicState = { x: 2, z: 0, heading: 0, speed: 0, t: 0 };
   const opts = { maxExpansions: DEMO_DYNAMIC_MAX_EXPANSIONS };
 
   if (scn === 'moving') {
-    const goal: VehicleState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
+    const goal: CarKinematicState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
     const world = new InMemoryNavWorld([rectPoly(1, 0, -14, 32, 14)]);
     const obstacle = linearObstacle(15, -12, 0, 4, 2.5, 0, 60);
     const env = new TimeAwareEnvironment(dynEnv(world), {
@@ -278,7 +278,7 @@ export function buildDynamic(scn: Scenario): DynamicScene {
   }
 
   if (scn === 'coop') {
-    const goal: VehicleState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
+    const goal: CarKinematicState = { x: 28, z: 0, heading: 0, speed: 0, t: 0 };
     const world = new InMemoryNavWorld([rectPoly(1, 0, -14, 32, 14)]);
     const reg = new PlanRegistry();
     // NPC A holds the centre of the corridor; NPC B must route around it.
@@ -311,7 +311,7 @@ export function buildDynamic(scn: Scenario): DynamicScene {
   }
 
   // jump
-  const goal: VehicleState = { x: 34, z: 0, heading: 0, speed: 0, t: 0 };
+  const goal: CarKinematicState = { x: 34, z: 0, heading: 0, speed: 0, t: 0 };
   const world = new InMemoryNavWorld(
     [rectPoly(1, 0, -6, 14, 6), rectPoly(2, 22, -6, 40, 6)],
     [],
@@ -333,7 +333,7 @@ export function buildDynamic(scn: Scenario): DynamicScene {
   });
   const r = plan({ start, goal, environment: env, options: opts }, Infinity);
   const dur = r.found ? r.path[r.path.length - 1]!.t : 0;
-  let hop: [VehicleState, VehicleState] | null = null;
+  let hop: [CarKinematicState, CarKinematicState] | null = null;
   const hi = r.nodes.findIndex((n) => n.edge?.kind === 'affordance');
   if (hi > 0) hop = [r.path[hi - 1]!, r.path[hi]!];
   return {
@@ -385,9 +385,9 @@ export function world3dWorld(): InMemoryNavWorld {
 
 export function planWorld3d(
   world: InMemoryNavWorld,
-  start: VehicleState,
-  goal: VehicleState,
-): PlanResult<VehicleState> {
+  start: CarKinematicState,
+  goal: CarKinematicState,
+): PlanResult<CarKinematicState> {
   return plan(
     {
       start: { ...start, t: 0 },
@@ -435,9 +435,9 @@ export function buildNavmesh() {
 
 export function planNavmesh(
   world: ReturnType<typeof buildNavmesh>['world'],
-  start: VehicleState,
-  goal: VehicleState,
-): PlanResult<VehicleState> {
+  start: CarKinematicState,
+  goal: CarKinematicState,
+): PlanResult<CarKinematicState> {
   const env = new VehicleEnvironment(world, AGENT, LIB, {
     posCell: 1,
     headingBuckets: 12,
@@ -513,14 +513,14 @@ export interface AnytimeStep {
   found: boolean;
   cost: number;
   expansions: number;
-  path: VehicleState[];
+  path: CarKinematicState[];
 }
 
 export interface AnytimeResult {
   bounds: { x0: number; z0: number; x1: number; z1: number };
   obstacles: { x: number; z: number; hx: number; hz: number }[];
-  start: VehicleState;
-  goal: VehicleState;
+  start: CarKinematicState;
+  goal: CarKinematicState;
   /** Best plan at each anytime budget, smallest → largest. */
   steps: AnytimeStep[];
 }
@@ -539,8 +539,8 @@ export function buildAnytime(): AnytimeResult {
     [bounds.x1, bounds.z1],
     [bounds.x0, bounds.z1],
   ];
-  const start: VehicleState = { x: 3, z: 0, heading: 0, speed: 0, t: 0 };
-  const goal: VehicleState = { x: 41, z: 0, heading: 0, speed: 0, t: 0 };
+  const start: CarKinematicState = { x: 3, z: 0, heading: 0, speed: 0, t: 0 };
+  const goal: CarKinematicState = { x: 41, z: 0, heading: 0, speed: 0, t: 0 };
   const budgets = [250, 700, 2000, 7000, 25000];
   const steps: AnytimeStep[] = budgets.map((budget) => {
     const world = new InMemoryNavWorld(
@@ -582,16 +582,16 @@ export interface ReverseInput {
 }
 
 export interface ReverseSegment {
-  from: VehicleState;
-  to: VehicleState;
+  from: CarKinematicState;
+  to: CarKinematicState;
   reverse: boolean;
 }
 
 export interface ReverseResult {
   bounds: { x0: number; z0: number; x1: number; z1: number };
-  start: VehicleState;
-  goal: VehicleState;
-  path: VehicleState[];
+  start: CarKinematicState;
+  goal: CarKinematicState;
+  path: CarKinematicState[];
   segments: ReverseSegment[];
   found: boolean;
   cost: number;
@@ -638,8 +638,8 @@ export function planReverse(inp: ReverseInput = {}): ReverseResult {
     analyticExpansion: false,
     heuristicTable: {},
   });
-  const start: VehicleState = { x: 30, z: 0, heading: 0, speed: 0, t: 0 };
-  const goal: VehicleState = { x: 8, z: 0, heading: 0, speed: 0, t: 0 };
+  const start: CarKinematicState = { x: 30, z: 0, heading: 0, speed: 0, t: 0 };
+  const goal: CarKinematicState = { x: 8, z: 0, heading: 0, speed: 0, t: 0 };
   const r = plan(
     {
       start,
@@ -742,9 +742,9 @@ export interface SwarmInput {
 
 export interface SwarmAgent {
   id: string;
-  start: VehicleState;
-  goal: VehicleState;
-  path: VehicleState[];
+  start: CarKinematicState;
+  goal: CarKinematicState;
+  path: CarKinematicState[];
   found: boolean;
 }
 
@@ -784,14 +784,14 @@ export function buildSwarm(inp: SwarmInput): SwarmResult {
     const a = (i / n) * 2 * Math.PI;
     const sx = R * Math.cos(a);
     const sz = R * Math.sin(a);
-    const start: VehicleState = {
+    const start: CarKinematicState = {
       x: sx,
       z: sz,
       heading: Math.atan2(-sz, -sx),
       speed: 0,
       t: 0,
     };
-    const goal: VehicleState = {
+    const goal: CarKinematicState = {
       x: -sx,
       z: -sz,
       heading: 0,
@@ -860,7 +860,7 @@ export interface HumanoidResult {
   start: { x: number; z: number };
   goal: { x: number; z: number };
   humanoid: { found: boolean; path: HumanoidState[] };
-  vehicle: { found: boolean; path: VehicleState[] };
+  vehicle: { found: boolean; path: CarKinematicState[] };
 }
 
 /** A tight L-corridor. The omnidirectional humanoid threads it; the same
@@ -1108,9 +1108,9 @@ export interface FlagshipInput {
 
 export interface FlagshipAgent {
   id: string;
-  start: VehicleState;
-  goal: VehicleState;
-  path: VehicleState[];
+  start: CarKinematicState;
+  goal: CarKinematicState;
+  path: CarKinematicState[];
   found: boolean;
   usedShortcut: boolean;
   usedMisdirect: boolean;
@@ -1254,9 +1254,9 @@ export function buildFlagshipWorld(rich = false): FlagshipWorld {
 function flagshipAgentPairs(
   n: number,
   crossTraffic: boolean,
-): { id: string; start: VehicleState; goal: VehicleState }[] {
+): { id: string; start: CarKinematicState; goal: CarKinematicState }[] {
   const span = FLAGSHIP_D - 12;
-  const pairs: { id: string; start: VehicleState; goal: VehicleState }[] = [];
+  const pairs: { id: string; start: CarKinematicState; goal: CarKinematicState }[] = [];
   for (let i = 0; i < n; i++) {
     const z = 6 + (i / (n - 1)) * span;
     if (!crossTraffic) {
@@ -1308,7 +1308,7 @@ export function solveFlagship(
   const agents: FlagshipAgent[] = flagshipAgentPairs(n, crossTraffic).map(
     (p) => {
       const ov = overrides[p.id];
-      const goal: VehicleState = ov
+      const goal: CarKinematicState = ov
         ? { x: ov.x, z: ov.z, heading: 0, speed: 0, t: 0 }
         : p.goal;
       return {
@@ -1356,7 +1356,7 @@ export function solveFlagship(
       },
     );
 
-  const cur: VehicleState[] = agents.map((a) => ({ ...a.start }));
+  const cur: CarKinematicState[] = agents.map((a) => ({ ...a.start }));
   const arrived: boolean[] = agents.map(() => false);
   for (let r = 0; r < rounds; r++) {
     for (let i = 0; i < agents.length; i++) {
@@ -1654,8 +1654,8 @@ export function buildCatAndMouseWorld(): CatMouseWorld {
 
 export interface CatMouseAgent {
   id: string;
-  state: VehicleState;
-  plan: VehicleState[];
+  state: CarKinematicState;
+  plan: CarKinematicState[];
   replan: ReplanState;
   usedBoost: boolean;
   usedJump: boolean;
@@ -1714,7 +1714,7 @@ export function initCatAndMouseState(
   for (let i = 0; i < catCount; i++) {
     const startX = 46 + (i % 2 === 0 ? -2 : 2);
     const startZ = 6 + i * 3;
-    const state: VehicleState = {
+    const state: CarKinematicState = {
       x: startX,
       z: startZ,
       heading: Math.PI,
@@ -1915,7 +1915,7 @@ export function stepCatAndMouse(
     const flankDx = flankR * Math.cos(flankAngle);
     const flankDz = flankR * Math.sin(flankAngle);
 
-    let goal: VehicleState;
+    let goal: CarKinematicState;
     if (predictionEnabled) {
       const dToMouse = Math.hypot(
         cat.state.x - m.state.x,

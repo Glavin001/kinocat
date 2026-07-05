@@ -58,6 +58,11 @@ export interface PlanStats {
 
 export interface PlanResult<State> {
   found: boolean;
+  /** True when `found` is satisfied by a BEST-PROGRESS fallback (the env's
+   *  `progress` hook) rather than by reaching an accepting/goal region — i.e.
+   *  the objective was NOT formally satisfied but this is the furthest the
+   *  search advanced. Always absent/false for ordinary goal-reaching plans. */
+  partial?: boolean;
   cost: number;
   /** State sequence start → goal (JSON-serializable). */
   path: State[];

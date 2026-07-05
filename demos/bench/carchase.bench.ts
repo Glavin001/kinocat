@@ -28,7 +28,7 @@ import type { VehicleEnvOptions } from 'kinocat/environment';
 import { asObstacle, constantVelocity } from 'kinocat/predict';
 import type { MovingObstacle } from 'kinocat/predict';
 import { InMemoryNavWorld } from 'kinocat/environment';
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import {
   buildCarChaseCourse,
   CARCHASE_AGENT,
@@ -43,7 +43,7 @@ const { robber: ROBBER, cops: COPS } = spawnPoses();
 
 // Robber's first goal — first waypoint of its loop. Bypass the full
 // `robberGoal` helper so the bench scene is deterministic across runs.
-const ROBBER_GOAL: VehicleState = {
+const ROBBER_GOAL: CarKinematicState = {
   x: COURSE.robberLoop[0]!.x,
   z: COURSE.robberLoop[0]!.z,
   heading: COURSE.robberLoop[0]!.heading,
@@ -54,7 +54,7 @@ const ROBBER_GOAL: VehicleState = {
 // Cop intercept goal — aim straight at the robber's current pose. Real
 // `tacticalGoal` adds lead-time / lateral offset, but for the bench what
 // matters is the planner stress, not the tactical layer.
-const COP_GOAL: VehicleState = { ...ROBBER, speed: CARCHASE_AGENT.maxSpeed };
+const COP_GOAL: CarKinematicState = { ...ROBBER, speed: CARCHASE_AGENT.maxSpeed };
 
 function robberObstacles(): MovingObstacle[] {
   return COPS.map((c) => asObstacle(constantVelocity(c, 4), 2.6));
@@ -83,8 +83,8 @@ const ALL: VehicleEnvOptions = {
 
 interface Scenario {
   name: string;
-  start: VehicleState;
-  goal: VehicleState;
+  start: CarKinematicState;
+  goal: CarKinematicState;
   obstacles: MovingObstacle[];
 }
 

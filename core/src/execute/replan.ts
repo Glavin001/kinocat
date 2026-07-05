@@ -2,12 +2,12 @@
 // divergence from the planned pose, periodic refresh, or an event-driven
 // dirty mark (tile rebuild, new affordance, prediction change).
 
-import type { VehicleState } from '../agent/types';
+import type { CarKinematicState } from '../agent/types';
 import type { PlanPath, ReplanReason, ReplanTrigger } from './types';
 import { dist, lerp, lerpAngle } from '../internal/math';
 
 /** Interpolate the planned pose at absolute time `t` (clamped to the ends). */
-export function planPoseAt(path: PlanPath, t: number): VehicleState | null {
+export function planPoseAt(path: PlanPath, t: number): CarKinematicState | null {
   if (path.length === 0) return null;
   const first = path[0]!;
   const last = path[path.length - 1]!;
@@ -58,14 +58,14 @@ export class ReplanState {
   }
 
   /** Divergence between actual state and the plan at the actual state's time. */
-  divergence(current: VehicleState): number {
+  divergence(current: CarKinematicState): number {
     if (!this.plan) return Infinity;
     const expected = planPoseAt(this.plan, current.t);
     if (!expected) return Infinity;
     return dist(current.x, current.z, expected.x, expected.z);
   }
 
-  shouldReplan(current: VehicleState, nowMs: number): boolean {
+  shouldReplan(current: CarKinematicState, nowMs: number): boolean {
     if (!this.plan) {
       this.lastReason = 'no-plan';
       return true;

@@ -33,6 +33,10 @@
       "types": "./dist/environment/index.d.ts",
       "default": "./dist/environment/index.js"
     },
+    "./scenario": {
+      "types": "./dist/scenario/index.d.ts",
+      "default": "./dist/scenario/index.js"
+    },
     "./predict": {
       "types": "./dist/predict/index.d.ts",
       "default": "./dist/predict/index.js"
@@ -40,6 +44,30 @@
     "./execute": {
       "types": "./dist/execute/index.d.ts",
       "default": "./dist/execute/index.js"
+    },
+    "./learning": {
+      "types": "./dist/learning/index.d.ts",
+      "default": "./dist/learning/index.js"
+    },
+    "./scene": {
+      "types": "./dist/scene/index.d.ts",
+      "default": "./dist/scene/index.js"
+    },
+    "./diagnostics": {
+      "types": "./dist/diagnostics/index.d.ts",
+      "default": "./dist/diagnostics/index.js"
+    },
+    "./training": {
+      "types": "./dist/training/index.d.ts",
+      "default": "./dist/training/index.js"
+    },
+    "./vehicle/car": {
+      "types": "./dist/vehicle/car/index.d.ts",
+      "default": "./dist/vehicle/car/index.js"
+    },
+    "./vehicle/airplane": {
+      "types": "./dist/vehicle/airplane/index.d.ts",
+      "default": "./dist/vehicle/airplane/index.js"
     },
     "./adapters/navcat": {
       "types": "./dist/adapters/navcat/index.d.ts",

@@ -14,7 +14,12 @@
 // fully overridable via `RaycastVehicleOptions`.
 
 import RAPIER from '@dimforge/rapier3d-compat';
-import type { VehicleState } from '../../agent/types';
+import type { CarKinematicState } from '../../agent/types';
+import type { WheeledCarControls } from '../../agent/controls';
+import type {
+  LearnableVehicleConfig,
+  DrivenWheels,
+} from '../../agent/vehicle-config';
 import type { PurePursuitConfig } from '../../execute/types';
 import { purePursuit } from '../../execute/pure-pursuit';
 import { wrapAngle } from '../../internal/math';
@@ -37,10 +42,29 @@ export interface CarHandle {
   chassis: RAPIER.RigidBody;
   vehicle: RAPIER.DynamicRayCastVehicleController;
   /** Read the chassis pose/speed back as a planner-shaped state. */
-  readState(now: number): VehicleState;
-  /** Drive the raycast vehicle for the upcoming physics tick. Caller is
-   *  responsible for calling `vehicle.updateVehicle(dt)` then `world.step()`. */
+  readState(now: number): CarKinematicState;
+  /**
+   * Drive the raycast vehicle for the upcoming physics tick. Caller is
+   * responsible for calling `vehicle.updateVehicle(dt)` then `world.step()`.
+   *
+   * @deprecated Prefer {@link applyWheeledControls} so every control source
+   * (user keyboard, plan-follower, model rollout, headless trial) emits the
+   * same `WheeledCarControls` shape the v2 model is trained on.
+   * `applyControls` accepts normalized `{throttle, brake}` and skips the
+   * planner→Rapier steer-sign-flip, which leaks Rapier's frame convention
+   * into call sites. Migration is mechanical:
+   *   `applyControls({steer, throttle, brake})` ⇒
+   *   `applyWheeledControls({ steer: -steer, driveForce: throttle * engineForceN, brakeForce: brake * brakeForceN })`
+   * The `-steer` pre-negation preserves the exact chassis behavior across
+   * the API switch.
+   */
   applyControls(c: { steer: number; throttle: number; brake: number }): void;
+  /** Drive the vehicle with NATIVE Rapier-form controls: actual steer angle
+   *  (radians, will be clamped to maxSteerAngle), signed engine force (N),
+   *  brake force (N). Used by the v2 learned model + IGHA* planner whose
+   *  action space is `[steer, driveForce, brakeForce]` — no pure-pursuit /
+   *  speed-PID layer in between. */
+  applyWheeledControls(c: WheeledCarControls): void;
   /** Hard reset to a pose (e.g. on /R). */
   teleport(pose: { x: number; z: number; heading: number }): void;
   /** Like {@link teleport} but with a forward speed (m/s) imparted along the
@@ -50,7 +74,49 @@ export interface CarHandle {
     pose: { x: number; z: number; heading: number },
     speed: number,
   ): void;
+  /** Teleport to a pose AND seed the full kinematic state (forward velocity
+   *  along chassis-forward, lateral velocity along chassis-right, yaw rate
+   *  about world +Y). Used by the offline-exploration trial harness to start
+   *  trials at non-trivial initial conditions (mid-drift, mid-turn) that
+   *  steady-state racing would never naturally visit. */
+  teleportFull(
+    pose: { x: number; z: number; heading: number },
+    kin: { forwardSpeed: number; lateralVelocity?: number; yawRate?: number },
+  ): void;
+  /** Read per-wheel telemetry for the LAST `vehicle.updateVehicle(dt)` call.
+   *  Used by sim-to-real diagnostics to render friction-circle widgets and
+   *  detect tire saturation / airborne wheels. Values are zero-filled when
+   *  Rapier returns null (typically when a wheel is not in contact). */
+  readWheelTelemetry(): WheelTelemetry[];
   dispose(): void;
+}
+
+/** Snapshot of a single wheel's last-tick state for diagnostics.
+ *
+ *  `forwardImpulse` / `sideImpulse` are the impulses (N·s) applied over the
+ *  most recent `updateVehicle(dt)` step. They are NOT steady-state forces —
+ *  callers comparing across tick sizes should divide by `dt`. Both signs are
+ *  in the Rapier wheel-local frame (forward+ along the wheel's roll direction,
+ *  side+ along the wheel's axle).
+ *
+ *  `suspensionForce` is the vertical reaction from the suspension spring (N).
+ *  Multiplied by `frictionSlip` it bounds the tire's friction-circle radius —
+ *  the visualization uses that product as the "available grip" denominator. */
+export interface WheelTelemetry {
+  /** Wheel raycast made ground contact this tick. When false, the other
+   *  fields may be stale / zero. */
+  inContact: boolean;
+  /** World-space ground-contact point under the wheel; null when airborne. */
+  contactPoint: { x: number; y: number; z: number } | null;
+  /** Impulse applied along the wheel's forward axis last tick (N·s). */
+  forwardImpulse: number;
+  /** Impulse applied along the wheel's side axis last tick (N·s). */
+  sideImpulse: number;
+  /** Suspension reaction force this tick (N). */
+  suspensionForce: number;
+  /** Friction-slip multiplier configured on this wheel (used as the radius
+   *  factor of the friction circle). */
+  frictionSlip: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,15 +275,26 @@ export function createRaycastVehicle(
     vehicle.setWheelSideFrictionStiffness(i, D.sideFrictionStiffness);
   }
 
-  function readState(now: number): VehicleState {
+  function readState(now: number): CarKinematicState {
     const t = chassis.translation();
     const q = chassis.rotation();
     const lin = chassis.linvel();
+    const ang = chassis.angvel();
     const heading = yawFromQuat(q);
     // Signed forward speed: project linear velocity onto the chassis forward.
-    const fwd = { x: Math.cos(heading), z: Math.sin(heading) };
-    const speed = lin.x * fwd.x + lin.z * fwd.z;
-    return { x: t.x, z: t.z, heading, speed, t: now };
+    const cosH = Math.cos(heading);
+    const sinH = Math.sin(heading);
+    const speed = lin.x * cosH + lin.z * sinH;
+    // Lateral velocity: project linvel onto chassis-right. Under the kinocat
+    // sign convention (heading rotates +X toward +Z), the right axis is
+    // (sin h, -cos h). (Equivalently, +90° clockwise rotation of forward in
+    // the kinocat heading sense.)
+    const lateralVelocity = lin.x * sinH - lin.z * cosH;
+    // Yaw rate: Rapier's angvel.y is the rotation about world +Y under its
+    // right-hand convention; the kinocat heading sign is flipped (see
+    // yawFromQuat). So planning-frame yaw rate is -angvel.y.
+    const yawRate = -ang.y;
+    return { x: t.x, z: t.z, heading, speed, yawRate, lateralVelocity, t: now };
   }
 
   // Which wheel indices take engine torque, per drive-train choice.
@@ -238,6 +315,22 @@ export function createRaycastVehicle(
     for (let i = 0; i < 4; i++) vehicle.setWheelBrake(i, brakeForce);
   }
 
+  function applyWheeledControls(c: WheeledCarControls) {
+    // Same sign-flip convention as `planToAckermannControls`: kinocat
+    // +curvature rotates +X toward +Z; Rapier yaw rotates +X toward -Z.
+    // The `steer` field here is in the kinocat planning-frame sense;
+    // negate at the Rapier boundary.
+    const steer = clamp(-c.steer, -D.maxSteerAngle, D.maxSteerAngle);
+    const driveForce = clamp(c.driveForce, -D.engineForce, D.engineForce);
+    const brakeForce = clamp(c.brakeForce, 0, D.brakeForce);
+    vehicle.setWheelSteering(0, steer);
+    vehicle.setWheelSteering(1, steer);
+    for (let i = 0; i < 4; i++) {
+      vehicle.setWheelEngineForce(i, driveIdx.includes(i) ? driveForce : 0);
+    }
+    for (let i = 0; i < 4; i++) vehicle.setWheelBrake(i, brakeForce);
+  }
+
   function teleport(pose: { x: number; z: number; heading: number }) {
     chassis.setTranslation({ x: pose.x, y: cy, z: pose.z }, true);
     chassis.setRotation(yawQuat(pose.heading), true);
@@ -249,13 +342,42 @@ export function createRaycastVehicle(
     pose: { x: number; z: number; heading: number },
     speed: number,
   ) {
+    teleportFull(pose, { forwardSpeed: speed });
+  }
+
+  function teleportFull(
+    pose: { x: number; z: number; heading: number },
+    kin: { forwardSpeed: number; lateralVelocity?: number; yawRate?: number },
+  ) {
     chassis.setTranslation({ x: pose.x, y: cy, z: pose.z }, true);
     chassis.setRotation(yawQuat(pose.heading), true);
-    chassis.setLinvel(
-      { x: speed * Math.cos(pose.heading), y: 0, z: speed * Math.sin(pose.heading) },
-      true,
-    );
-    chassis.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    const cosH = Math.cos(pose.heading);
+    const sinH = Math.sin(pose.heading);
+    const vy = kin.lateralVelocity ?? 0;
+    // world.x = forward * cosH + right.x * vy; right = (sin h, -cos h).
+    const vx = kin.forwardSpeed * cosH + vy * sinH;
+    const vz = kin.forwardSpeed * sinH - vy * cosH;
+    chassis.setLinvel({ x: vx, y: 0, z: vz }, true);
+    // Planning-frame yaw rate → Rapier angvel.y with sign flip.
+    const yr = kin.yawRate ?? 0;
+    chassis.setAngvel({ x: 0, y: -yr, z: 0 }, true);
+  }
+
+  function readWheelTelemetry(): WheelTelemetry[] {
+    const out: WheelTelemetry[] = [];
+    for (let i = 0; i < 4; i++) {
+      const inContact = vehicle.wheelIsInContact(i);
+      const cp = vehicle.wheelContactPoint(i);
+      out.push({
+        inContact,
+        contactPoint: cp ? { x: cp.x, y: cp.y, z: cp.z } : null,
+        forwardImpulse: vehicle.wheelForwardImpulse(i) ?? 0,
+        sideImpulse: vehicle.wheelSideImpulse(i) ?? 0,
+        suspensionForce: vehicle.wheelSuspensionForce(i) ?? 0,
+        frictionSlip: vehicle.wheelFrictionSlip(i) ?? 0,
+      });
+    }
+    return out;
   }
 
   function dispose() {
@@ -269,9 +391,39 @@ export function createRaycastVehicle(
     vehicle,
     readState,
     applyControls,
+    applyWheeledControls,
     teleport,
     teleportWithSpeed,
+    teleportFull,
+    readWheelTelemetry,
     dispose,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// LearnableVehicleConfig derivation — pure function from the user-facing
+// `RaycastVehicleOptions` to the domain-agnostic `LearnableVehicleConfig`
+// the v2 learned model consumes. Estimates chassis mass from the cuboid
+// half-extents and density.
+
+export function deriveLearnableConfig(
+  opts: RaycastVehicleOptions,
+): LearnableVehicleConfig {
+  const D = withDefaults(opts);
+  const volume = 8 * D.chassisHalf.x * D.chassisHalf.y * D.chassisHalf.z;
+  const chassisMass = volume * D.chassisDensity;
+  return {
+    chassisMass,
+    wheelBase: D.wheelBase,
+    wheelTrack: D.wheelTrack,
+    wheelRadius: D.wheelRadius,
+    suspensionStiffness: D.suspensionStiffness,
+    frictionSlip: D.frictionSlip,
+    sideFrictionStiffness: D.sideFrictionStiffness,
+    maxDriveForce: D.engineForce,
+    maxBrakeForce: D.brakeForce,
+    maxSteerAngle: D.maxSteerAngle,
+    drivenWheels: D.driveTrain as DrivenWheels,
   };
 }
 
@@ -295,8 +447,8 @@ export interface AckermannCommand {
 /** Convert a kinocat plan tail to (steer, throttle, brake) for Rapier.
  *  `state` is the current chassis state read back from physics. */
 export function planToAckermannControls(
-  state: VehicleState,
-  path: VehicleState[],
+  state: CarKinematicState,
+  path: CarKinematicState[],
   cfg: AckermannConfig,
 ): AckermannCommand {
   const cmd = purePursuit(state, path, cfg);

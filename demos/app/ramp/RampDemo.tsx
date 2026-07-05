@@ -9,16 +9,8 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import RAPIER from '@dimforge/rapier3d-compat';
-import { InMemoryNavWorld } from 'kinocat/environment';
-import type { VehicleState } from 'kinocat/agent';
-import {
-  ensureRapier,
-  createRaycastVehicle,
-  createHeightfieldCollider,
-  planToAckermannControls,
-  type RaycastVehicleOptions,
-} from 'kinocat/adapters/rapier';
+import { ensureRapier } from 'kinocat/adapters/rapier';
+import type { CarKinematicState } from 'kinocat/agent';
 import {
   createCarMeshHelper,
   syncCarMesh,
@@ -30,37 +22,21 @@ import {
   createHeightfieldMeshHelper,
   createRampChevronsHelper,
   createRapierDebugRenderer,
+  updateChaseCamera,
 } from 'kinocat/adapters/three';
+import { wheeledFromNormalized } from 'kinocat/vehicle/car';
 import {
   RAMP_AGENT,
   RAMP_BOUNDS,
   RAMP_PALETTE as C,
-  buildRampCourse,
-  planRampDemo,
   rampHeightSampler,
-  type RampCourse,
 } from '../lib/ramp-scenarios';
-
-const PHYSICS_DT = 1 / 60;
-const VEHICLE_SUBSTEPS = 4;
-const REPLAN_INTERVAL_MS = 120;
-const WHEEL_BASE = 1.6;
-
-// Slightly more suspension travel than the obstacle-course tuning — the
-// ramp lip + landing benefit from a softer chassis.
-const RAMP_VEHICLE_TUNING: Omit<RaycastVehicleOptions, 'id' | 'position' | 'heading'> = {
-  chassisHalf: { x: 2.4, y: 0.5, z: 1.0 },
-  chassisDensity: 60,
-  wheelBase: WHEEL_BASE,
-  wheelTrack: 0.85,
-  wheelRadius: 0.35,
-  suspensionRestLength: 0.4,
-  suspensionMaxTravel: 0.3,
-  engineForce: 4500,
-  brakeForce: 2000,
-  maxSteerAngle: 0.6,
-  driveTrain: 'rwd',
-};
+import {
+  createRampScenario,
+  RAMP_FORCE_TUNING,
+  PHYSICS_DT,
+  type RampScenario,
+} from '../lib/ramp-scenario';
 
 export default function RampDemo() {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -83,7 +59,7 @@ export default function RampDemo() {
   const showRapierDebugRef = useRef(showRapierDebug);
   const playerDrivingRef = useRef(playerDriving);
   const affordanceOnRef = useRef(affordanceOn);
-  const replanNowRef = useRef<(() => void) | null>(null);
+  const affordanceToggleRef = useRef<((on: boolean) => void) | null>(null);
   pausedRef.current = paused;
   chaseRef.current = chase;
   showPathRef.current = showPath;
@@ -100,7 +76,12 @@ export default function RampDemo() {
     (async () => {
       await ensureRapier();
       if (disposed) return;
-      cleanup = setupScene(mount);
+      const scenario = await createRampScenario({ affordance: affordanceOnRef.current });
+      if (disposed) {
+        scenario.dispose();
+        return;
+      }
+      cleanup = setupScene(mount, scenario);
       setReady(true);
     })();
     return () => {
@@ -110,13 +91,13 @@ export default function RampDemo() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Replan whenever the affordance toggle changes so the user sees the
-  // path swap immediately.
+  // Swap the affordance on the scenario when the toggle changes so the user
+  // sees the path flip immediately.
   useEffect(() => {
-    replanNowRef.current?.();
+    affordanceToggleRef.current?.(affordanceOn);
   }, [affordanceOn]);
 
-  function setupScene(mount: HTMLDivElement): () => void {
+  function setupScene(mount: HTMLDivElement, scenario: RampScenario): () => void {
     const W0 = window.innerWidth;
     const H0 = window.innerHeight;
 
@@ -141,24 +122,11 @@ export default function RampDemo() {
     sun.position.set(60, 140, 40);
     scene.add(sun);
 
-    const course: RampCourse = buildRampCourse();
-    const navWorld = new InMemoryNavWorld(course.polygons, course.obstacles);
+    // Course + physics + planner live in the headless scenario (the same one
+    // the tests drive). This component only renders.
+    const course = scenario.course;
+    const world = scenario.getWorld();
     const sampler = rampHeightSampler(course.ramps);
-
-    // ---- physics: heightfield (flat ground + ramp lip) ----
-    const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
-    // Finer cellSize than ObstacleCourse — we need a sharp lip at the crest
-    // for a clean launch instead of a smooth roll-off.
-    createHeightfieldCollider(world, {
-      sampler,
-      bounds: RAMP_BOUNDS,
-      // Matches the obstacle-course demo. Finer resolution (cellSize=1)
-      // produced denser triangulation at the ramp's sharp crest "lip"
-      // that occasionally WASM-trapped the vehicle controller's wheel
-      // raycasts under load.
-      cellSize: 2,
-      friction: 1.5,
-    });
 
     // ---- visuals: heightfield mesh + arc + gap + waypoints ----
     const courseVisuals = new THREE.Group();
@@ -240,27 +208,13 @@ export default function RampDemo() {
     rapierDebug.mesh.visible = false;
     scene.add(rapierDebug.mesh);
 
-    // ---- car ----
-    const car = createRaycastVehicle(world, {
-      id: 'ramp-car',
-      position: { x: course.spawn.x, z: course.spawn.z },
-      heading: course.spawn.heading,
-      ...RAMP_VEHICLE_TUNING,
-    });
+    // ---- car (owned by the scenario) ----
+    const car = scenario.getCar();
     const carMesh = createCarMeshHelper({ color: C.car });
     scene.add(carMesh.group);
 
-    const ai = {
-      plan: null as VehicleState[] | null,
-      planStartWall: performance.now(),
-      goal: course.goal,
-      lastExpansions: 0,
-      lastBudgetMs: 0,
-      lastUsedAffordance: false,
-    };
-
     let pathLine: THREE.Line | null = null;
-    function replacePathLine(path: VehicleState[]): void {
+    function replacePathLine(path: CarKinematicState[]): void {
       if (pathLine) {
         scene.remove(pathLine);
         pathLine.geometry.dispose();
@@ -290,56 +244,20 @@ export default function RampDemo() {
       if (k === '2') setShowRapierDebug((v) => !v);
       if (k === 't') setPlayerDriving((v) => !v);
       if (k === 'j') setAffordanceOn((v) => !v);
-      if (k === 'r') {
-        car.teleport({
-          x: course.spawn.x,
-          z: course.spawn.z,
-          heading: course.spawn.heading,
-        });
-        ai.plan = null;
-      }
+      if (k === 'r') scenario.reset();
     };
     const onKeyUp = (e: KeyboardEvent) => keys.delete(e.key.toLowerCase());
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
 
-    // ---- replan ----
-    function replan() {
-      const now = performance.now();
-      const state = car.readState(now);
-      const t0 = performance.now();
-      const res = planRampDemo({
-        state: { ...state, t: 0 },
-        goal: { ...course.goal, t: 0 },
-        course,
-        world: navWorld,
-        withoutAffordances: !affordanceOnRef.current,
-      });
-      ai.lastBudgetMs = performance.now() - t0;
-      ai.lastExpansions = res.stats.expansions;
-      if (res.found && res.path.length > 1) {
-        ai.plan = res.path;
-        ai.planStartWall = now;
-        ai.lastUsedAffordance = res.path.some(
-          (_, i) =>
-            i > 0 &&
-            // Heuristic: an affordance step jumps the planner state by more
-            // than any primitive could in a single tick.
-            Math.hypot(
-              res.path[i]!.x - res.path[i - 1]!.x,
-              res.path[i]!.z - res.path[i - 1]!.z,
-            ) > 10,
-        );
-        if (showPathRef.current) replacePathLine(res.path);
-      }
-      for (const arc of arcGroups) arc.visible = affordanceOnRef.current;
-    }
-    replanNowRef.current = replan;
-
-    const replanTimer = window.setInterval(() => {
-      if (pausedRef.current || playerDrivingRef.current) return;
-      replan();
-    }, REPLAN_INTERVAL_MS);
+    // Affordance toggle: hand it to the scenario (forces a replan so the path
+    // flips) and update the arc overlays. Replanning itself runs inside
+    // scenario.tick() on a SIM-time cadence — no wall-clock setInterval.
+    affordanceToggleRef.current = (on: boolean) => {
+      scenario.setAffordance(on);
+      for (const arc of arcGroups) arc.visible = on;
+    };
+    for (const arc of arcGroups) arc.visible = affordanceOnRef.current;
 
     // ---- resize ----
     const onResize = () => {
@@ -354,6 +272,8 @@ export default function RampDemo() {
     // ---- main loop ----
     let stopped = false;
     let lastHudWall = 0;
+    let lastPlanRef: CarKinematicState[] | null = null;
+    let prevWall = performance.now();
     function tick() {
       if (stopped) return;
       requestAnimationFrame(tick);
@@ -362,61 +282,46 @@ export default function RampDemo() {
         return;
       }
       const now = performance.now();
-      const state = car.readState(now);
 
-      if (playerDrivingRef.current) {
-        const accel =
-          (keys.has('w') || keys.has('arrowup') ? 1 : 0) -
-          (keys.has('s') || keys.has('arrowdown') ? 1 : 0);
-        const steerIn =
-          (keys.has('a') || keys.has('arrowleft') ? 1 : 0) -
-          (keys.has('d') || keys.has('arrowright') ? 1 : 0);
-        const brake = keys.has(' ') ? 1 : 0;
-        car.applyControls({ steer: steerIn * 0.55, throttle: accel, brake });
-      } else if (ai.plan && ai.plan.length > 1) {
-        const elapsed = (now - ai.planStartWall) / 1000;
-        const live = trimPlan(ai.plan, elapsed);
-        if (live.length >= 2) {
-          car.applyControls(
-            planToAckermannControls(state, live, {
-              wheelBase: 2 * WHEEL_BASE,
-              lookaheadMin: 3,
-              lookaheadGain: 0.45,
-              lookaheadMax: 14,
-              maxLateralAccel: 8,
-              maxAccel: 6,
-              maxDecel: 8,
-              cruiseSpeed: RAMP_AGENT.maxSpeed,
-              goalTolerance: 2,
-              minTurnRadius: RAMP_AGENT.minTurnRadius,
-            }),
-          );
-        } else {
-          car.applyControls({ steer: 0, throttle: 0.2, brake: 0 });
-        }
-      } else {
-        car.applyControls({ steer: 0, throttle: 0, brake: 0 });
+      // Accumulate wall-time into whole fixed sim ticks, then advance the
+      // headless scenario — the SAME engine the tests drive.
+      const dt = Math.min((now - prevWall) / 1000, 1 / 30);
+      prevWall = now;
+      const steps = Math.max(1, Math.min(8, Math.round(dt / PHYSICS_DT)));
+      for (let i = 0; i < steps; i++) {
+        const playerControls = playerDrivingRef.current
+          ? wheeledFromNormalized(
+              {
+                steer:
+                  ((keys.has('a') || keys.has('arrowleft') ? 1 : 0) -
+                    (keys.has('d') || keys.has('arrowright') ? 1 : 0)) *
+                  0.55,
+                throttle:
+                  (keys.has('w') || keys.has('arrowup') ? 1 : 0) -
+                  (keys.has('s') || keys.has('arrowdown') ? 1 : 0),
+                brake: keys.has(' ') ? 1 : 0,
+              },
+              RAMP_FORCE_TUNING,
+            )
+          : null;
+        scenario.tick(playerControls);
       }
 
-      const subDt = PHYSICS_DT / VEHICLE_SUBSTEPS;
-      world.timestep = subDt;
-      const wheelFilter = RAPIER.QueryFilterFlags.EXCLUDE_DYNAMIC;
-      for (let s = 0; s < VEHICLE_SUBSTEPS; s++) {
-        car.vehicle.updateVehicle(subDt, wheelFilter);
-        world.step();
-      }
-
-      const after = car.readState(now);
+      const st = scenario.status();
+      const after = st.state;
       // syncCarMesh only updates X, Z, yaw. For the ramp demo we MUST also
       // sync world-Y and full chassis attitude (pitch/roll) — the car
-      // physically climbs the ramp and flies through the air, and without
-      // this the mesh stays glued to y=0 and looks "stuck behind the ramp"
-      // even when physics is doing the right thing.
+      // physically climbs the ramp and flies through the air.
       syncCarMesh(carMesh.group, after);
       const tr = car.chassis.translation();
       const qr = car.chassis.rotation();
       carMesh.group.position.y = tr.y;
       carMesh.group.quaternion.set(qr.x, qr.y, qr.z, qr.w);
+
+      if (st.plan !== lastPlanRef) {
+        lastPlanRef = st.plan;
+        if (st.plan && st.plan.length > 1) replacePathLine(st.plan);
+      }
       if (pathLine) pathLine.visible = showPathRef.current;
 
       rapierDebug.mesh.visible = showRapierDebugRef.current;
@@ -429,16 +334,7 @@ export default function RampDemo() {
       }
 
       if (chaseRef.current) {
-        const cc = Math.cos(after.heading);
-        const ss = Math.sin(after.heading);
-        const cam = new THREE.Vector3(
-          after.x - 14 * cc,
-          7,
-          after.z - 14 * ss,
-        );
-        camera.position.lerp(cam, 0.12);
-        orbit.target.set(after.x, 1.5, after.z);
-        orbit.update();
+        updateChaseCamera(camera, { x: after.x, z: after.z, heading: after.heading }, { orbit });
       }
 
       if (now - lastHudWall > 100) {
@@ -450,7 +346,7 @@ export default function RampDemo() {
           `${playerDrivingRef.current ? 'YOU' : 'AI'} · v=${v} m/s · hdg=${hdg}° · y=${y.toFixed(2)}m`,
         );
         setStatus(
-          `plan=${ai.plan?.length ?? 0} exp=${ai.lastExpansions} budget=${ai.lastBudgetMs.toFixed(0)}ms aff=${ai.lastUsedAffordance ? 'used' : '—'}`,
+          `plan=${st.plan?.length ?? 0} exp=${st.diagnostics.lastExpansions} replans=${st.diagnostics.successfulReplans}/${st.diagnostics.totalReplans} aff=${st.diagnostics.usedAffordance ? 'used' : '—'}`,
         );
       }
 
@@ -460,15 +356,13 @@ export default function RampDemo() {
 
     return () => {
       stopped = true;
-      window.clearInterval(replanTimer);
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('resize', onResize);
-      car.dispose();
+      scenario.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === mount)
         mount.removeChild(renderer.domElement);
-      world.free();
     };
   }
 
@@ -564,12 +458,6 @@ export default function RampDemo() {
       </div>
     </div>
   );
-}
-
-function trimPlan(plan: VehicleState[], elapsed: number): VehicleState[] {
-  let i = 0;
-  while (i < plan.length - 1 && plan[i + 1]!.t <= elapsed) i++;
-  return plan.slice(i);
 }
 
 function ToggleButton({

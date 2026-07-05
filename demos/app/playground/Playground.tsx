@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { VehicleState } from 'kinocat/agent';
+import type { CarKinematicState } from 'kinocat/agent';
 import { planPlayground, PALETTE, DEMO_MAX_EXPANSIONS } from '../lib/scenarios';
 
 const BW = 44;
@@ -28,8 +28,8 @@ function toPx(x: number, z: number): [number, number] {
 
 export default function Playground() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [start, setStart] = useState<VehicleState>({ x: 4, z: 0, heading: 0, speed: 0, t: 0 });
-  const [goal, setGoal] = useState<VehicleState>({ x: 40, z: 0, heading: 0, speed: 0, t: 0 });
+  const [start, setStart] = useState<CarKinematicState>({ x: 4, z: 0, heading: 0, speed: 0, t: 0 });
+  const [goal, setGoal] = useState<CarKinematicState>({ x: 40, z: 0, heading: 0, speed: 0, t: 0 });
   const [obstacles, setObstacles] = useState<Obstacle[]>([{ x: 22, z: 0 }]);
   const [budget, setBudget] = useState(DEMO_MAX_EXPANSIONS);
   const [reverseCost, setReverseCost] = useState(2);
