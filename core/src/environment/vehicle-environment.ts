@@ -139,6 +139,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
   private readonly ghWeight: number;
   private ghGoalX = NaN;
   private ghGoalZ = NaN;
+  private ghRev = -1;
   private ghLB: ((x: number, z: number, y?: number) => number | null) | null = null;
   private rec: PerfRecorder = NULL_RECORDER;
   private readonly refPath: ReadonlyArray<{ x: number; z: number }>;
@@ -472,9 +473,16 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
       tRS = Math.max(rs, euclid) / this.agent.maxSpeed;
     }
     if (this.ghEnabled) {
-      if (to.x !== this.ghGoalX || to.z !== this.ghGoalZ) {
+      // Revision guard: a tile rebuild under a long-lived env must not keep
+      // serving a lower bound computed against the old geometry.
+      if (
+        to.x !== this.ghGoalX ||
+        to.z !== this.ghGoalZ ||
+        this.world.revision !== this.ghRev
+      ) {
         this.ghGoalX = to.x;
         this.ghGoalZ = to.z;
+        this.ghRev = this.world.revision;
         this.ghLB = this.world.buildGoalLowerBound!(to.x, to.z);
       }
       if (this.ghLB) {

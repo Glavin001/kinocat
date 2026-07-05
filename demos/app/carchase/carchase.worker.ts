@@ -1,7 +1,11 @@
 /// <reference lib="webworker" />
 
 import type { MainToWorker } from 'kinocat/worker';
-import { initWorkerContext, handlePlanMessage } from 'kinocat/worker';
+import {
+  initWorkerContext,
+  handlePlanMessage,
+  handleWorldUpdateMessage,
+} from 'kinocat/worker';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import { MotionPrimitiveLibrary } from 'kinocat/primitives';
 import { carChaseAffordances, type CarChaseCourse } from '../lib/carchase-scenarios';
@@ -24,5 +28,10 @@ self.onmessage = (e: MessageEvent<MainToWorker>) => {
 
   if (msg.type === 'plan') {
     handlePlanMessage(msg, (resp) => self.postMessage(resp));
+    return;
+  }
+
+  if (msg.type === 'world-update') {
+    handleWorldUpdateMessage(msg, (resp) => self.postMessage(resp));
   }
 };

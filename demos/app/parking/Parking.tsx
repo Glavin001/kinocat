@@ -21,7 +21,10 @@
 // `planRace`), the multi-cusp segment executor, and the pure-pursuit
 // tracker — all configured through the same `RaceTuning` overrides the
 // CLI bench uses. Press [r] to reset, [p] to pause, [l] to toggle path
-// rendering, [d] to toggle the parked-car clearance overlay.
+// rendering, [d] to toggle the rich-plan debug view — the 3-D overlay
+// (speed-colored path, cusp/stop markers, sparse feedforward-steer wheel
+// glyphs) AND a 2-D profile strip (speed / steer / accel vs. arc length) —
+// and [f] to toggle the footprint overlay.
 
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
@@ -33,10 +36,13 @@ import {
   createGoalMarkerHelper,
   createRegionHelper,
   REGION_COLORS,
+  createPlanDebugHelper,
 } from 'kinocat/adapters/three';
 import { goalRegions, maintainRegions, compile, stepAutomaton } from 'kinocat/scenario';
 import type { CompiledAutomaton, ProgressSnapshot } from 'kinocat/scenario';
 import { GoalProgressPanel } from '../components/GoalProgressPanel';
+import { PlanProfilePlot } from '../components/PlanProfilePlot';
+import type { Plan } from 'kinocat/plan';
 import {
   PARKING_BOUNDS,
   PARKING_PALETTE as C,
@@ -89,6 +95,7 @@ export default function Parking() {
   const [scenarioId, setScenarioId] = useState<ParkingScenarioId>('forward-pullin');
   const [paused, setPaused] = useState(false);
   const [showPath, setShowPath] = useState(true);
+  const [showPlanDebug, setShowPlanDebug] = useState(false);
   const [showFootprints, setShowFootprints] = useState(false);
   // Direction-switch cost (the planner's `directionChangePenalty`, in seconds):
   // how much an A* edge is penalised for flipping forward↔reverse. Higher =>
@@ -99,6 +106,10 @@ export default function Parking() {
   const [switchCost, setSwitchCost] = useState(PARKING_AGENT.directionChangePenalty);
   const [hud, setHud] = useState('');
   const [status, setStatus] = useState('initialising...');
+  // Rich plan for the 2-D profile strip. Updated only when the committed plan
+  // changes (on replan), NOT every frame — the plot is a scalar-vs-arc-length
+  // readout, not an animation.
+  const [profilePlan, setProfilePlan] = useState<Plan | null>(null);
   const [goalViz, setGoalViz] = useState<{
     automaton: CompiledAutomaton;
     snapshot: ProgressSnapshot;
@@ -107,11 +118,13 @@ export default function Parking() {
   const scenarioIdRef = useRef(scenarioId);
   const pausedRef = useRef(paused);
   const showPathRef = useRef(showPath);
+  const showPlanDebugRef = useRef(showPlanDebug);
   const showFootprintsRef = useRef(showFootprints);
   const switchCostRef = useRef(switchCost);
   scenarioIdRef.current = scenarioId;
   pausedRef.current = paused;
   showPathRef.current = showPath;
+  showPlanDebugRef.current = showPlanDebug;
   showFootprintsRef.current = showFootprints;
   switchCostRef.current = switchCost;
 
@@ -144,6 +157,7 @@ export default function Parking() {
     // Per-scenario meshes
     const scenarioMeshes: THREE.Object3D[] = [];
     let pathLine: THREE.Line | null = null;
+    let planDebug: THREE.Group | null = null;
     let carMesh: ReturnType<typeof createCarMeshHelper> | null = null;
     let goalMesh: THREE.Mesh | null = null;
     let raceScenario: RaceScenario | null = null;
@@ -153,6 +167,9 @@ export default function Parking() {
     let goalAutomaton: CompiledAutomaton | null = null;
     let goalQ = 0;
     let prevGoalPose: { x: number; z: number; heading: number; speed: number; t: number } | null = null;
+    // Last committed rich plan pushed to the profile strip (by reference — the
+    // runner mints a new object on each replan), so we setState only on change.
+    let lastRichPlan: Plan | null = null;
     let lastGoalHudMs = 0;
     // Current scenario geometry — held so the frame loop can read `targetStall`
     // for the shared `evaluateParked` "in-the-stall" check that drives the HUD.
@@ -359,6 +376,25 @@ export default function Parking() {
       scene.add(pathLine);
     }
 
+    // Rich-plan debug overlay: speed-colored path, reverse-segment hue, cusp
+    // markers, and feedforward-steer ticks. Disposed/rebuilt each tick like
+    // `pathLine`. Parking plans show this off best — reverse cusps and slow
+    // single-gear segments are exactly what the bare path line can't convey.
+    function refreshPlanDebug(plan: Parameters<typeof createPlanDebugHelper>[0] | null) {
+      if (planDebug) {
+        scene.remove(planDebug);
+        planDebug.traverse((o) => {
+          const m = o as THREE.Mesh;
+          m.geometry?.dispose?.();
+          (m.material as THREE.Material | undefined)?.dispose?.();
+        });
+        planDebug = null;
+      }
+      if (!plan || !showPlanDebugRef.current) return;
+      planDebug = createPlanDebugHelper(plan, { maxSpeed: PARKING_AGENT.maxSpeed, y: 0.37 });
+      scene.add(planDebug);
+    }
+
     // Animation loop
     let prev = performance.now();
     let tickCarry = 0;
@@ -413,6 +449,11 @@ export default function Parking() {
             );
           }
           refreshPathLine(s.plan);
+          refreshPlanDebug(s.richPlan);
+          if (s.richPlan !== lastRichPlan) {
+            lastRichPlan = s.richPlan;
+            setProfilePlan(s.richPlan ?? null);
+          }
           const goalDist = (() => {
             const c = parkingCourse(scenarioIdRef.current);
             const wp = c?.waypoints[0];
@@ -465,6 +506,7 @@ export default function Parking() {
       else if (e.key === 'r' || e.key === 'R') rebuildRef.current?.(scenarioIdRef.current);
       else if (e.key === 'p' || e.key === 'P') setPaused((p) => !p);
       else if (e.key === 'l' || e.key === 'L') setShowPath((s) => !s);
+      else if (e.key === 'd' || e.key === 'D') setShowPlanDebug((s) => !s);
       else if (e.key === 'f' || e.key === 'F') setShowFootprints((s) => !s);
     }
     window.addEventListener('keydown', onKey);
@@ -629,9 +671,35 @@ export default function Parking() {
         <div style={{ marginTop: 8, display: 'flex', gap: 6, flexWrap: 'wrap', fontSize: 11 }}>
           <button onClick={() => setPaused((p) => !p)}>{`[p] ${paused ? 'paused' : 'running'}`}</button>
           <button onClick={() => setShowPath((s) => !s)}>{`[l] path ${showPath ? 'on' : 'off'}`}</button>
+          <button onClick={() => setShowPlanDebug((s) => !s)}>{`[d] plan-debug ${showPlanDebug ? 'on' : 'off'}`}</button>
           <button onClick={() => setShowFootprints((s) => !s)}>{`[f] footprints ${showFootprints ? 'on' : 'off'}`}</button>
           <button onClick={() => rebuildRef.current?.(scenarioId)}>[r] reset</button>
         </div>
+        {showPlanDebug && (
+          <div
+            style={{
+              marginTop: 10,
+              padding: '8px',
+              background: '#0e1622',
+              border: '1px solid #1c2840',
+              borderRadius: 4,
+            }}
+          >
+            <div style={{ fontSize: 11, marginBottom: 6, opacity: 0.8 }}>
+              plan reference profiles
+            </div>
+            <PlanProfilePlot plan={profilePlan} />
+            <div style={{ marginTop: 6, opacity: 0.55, fontSize: 10, lineHeight: 1.4 }}>
+              the scalar reference the planner hands the controller, vs. distance
+              along the plan. dashed{' '}
+              <span style={{ color: '#ffd24a' }}>yellow</span> = forward↔reverse
+              cusp. in the 3-D view: path shaded by speed,{' '}
+              <span style={{ color: '#3366ff' }}>blue</span> = reverse,{' '}
+              <span style={{ color: '#ffff00' }}>yellow dot</span> = stop/cusp,{' '}
+              <span style={{ color: '#ffaa33' }}>orange</span> = feedforward steer.
+            </div>
+          </div>
+        )}
         <div style={{ marginTop: 6, opacity: 0.5, fontSize: 10 }}>
           [1] [2] [3] scenarios · [r] reset · [p] pause · [l] path · [f] footprints
         </div>

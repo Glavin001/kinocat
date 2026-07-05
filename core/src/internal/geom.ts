@@ -105,6 +105,44 @@ export function placeFootprintInto(
   return out as ReadonlyArray<Pt>;
 }
 
+/** Segment vs axis-aligned box (slab test). Endpoint-inside short-circuits;
+ *  degenerate (zero-extent) boxes and segments behave as points. */
+export function segmentIntersectsAABB(
+  x0: number, z0: number, x1: number, z1: number,
+  minX: number, minZ: number, maxX: number, maxZ: number,
+): boolean {
+  // Endpoint inside — the common case for a path segment ending in the box.
+  if (x0 >= minX && x0 <= maxX && z0 >= minZ && z0 <= maxZ) return true;
+  if (x1 >= minX && x1 <= maxX && z1 >= minZ && z1 <= maxZ) return true;
+  const dx = x1 - x0;
+  const dz = z1 - z0;
+  let tMin = 0;
+  let tMax = 1;
+  // X slab.
+  if (Math.abs(dx) < 1e-12) {
+    if (x0 < minX || x0 > maxX) return false;
+  } else {
+    let tA = (minX - x0) / dx;
+    let tB = (maxX - x0) / dx;
+    if (tA > tB) { const t = tA; tA = tB; tB = t; }
+    tMin = Math.max(tMin, tA);
+    tMax = Math.min(tMax, tB);
+    if (tMin > tMax) return false;
+  }
+  // Z slab.
+  if (Math.abs(dz) < 1e-12) {
+    if (z0 < minZ || z0 > maxZ) return false;
+  } else {
+    let tA = (minZ - z0) / dz;
+    let tB = (maxZ - z0) / dz;
+    if (tA > tB) { const t = tA; tA = tB; tB = t; }
+    tMin = Math.max(tMin, tA);
+    tMax = Math.min(tMax, tB);
+    if (tMin > tMax) return false;
+  }
+  return true;
+}
+
 /** Signed twice-area (standard shoelace). Positive for CCW winding in the XZ
  *  plane (x right, z up), negative for CW. Zero for degenerate polygons. */
 function signedArea2(poly: ReadonlyArray<Pt>): number {

@@ -1,31 +1,34 @@
-import type {
-  WorkerPlanRequest,
-  WorkerPlanResponse,
-  MainToWorker,
-  WorkerToMain,
+import {
+  PlannerPool,
+  type PlanRequestBody,
+  type WorkerLike,
+  type WorkerInitMsg,
+  type WorkerPlanResponse,
+  type WorkerWorldUpdateMsg,
 } from 'kinocat/worker';
 import type { VehicleAgent } from 'kinocat/agent';
 import type { MotionPrimitiveLibrary } from 'kinocat/primitives';
 import type { CarChaseCourse } from '../lib/carchase-scenarios';
 
-/** Pool of planner workers, one per agent id. With N agents sharing a single
- *  worker the round-robin replan scheduler can only land one plan per slot —
- *  net per-agent cadence ≈ N × slot interval. A pool keyed by `npcId` lets all
- *  N plans of a round run in parallel, so each agent's replan rate matches the
- *  raw slot interval. The per-agent in-flight gate in the scheduler stays the
- *  authority on backpressure; the pool just removes the worker-side
- *  serialization. */
+/** Thin browser binding of the core `PlannerPool` (one worker per agent —
+ *  see the pool's docs for the scheduling/backpressure contract). All this
+ *  file owns is what core cannot: constructing the bundler-resolved Worker
+ *  and packing the carchase init message. */
 export class CarChasePlannerHost {
-  private workers = new Map<string, Worker>();
-  private resultCb: ((r: WorkerPlanResponse) => void) | null = null;
+  private readonly pool = new PlannerPool(
+    () =>
+      new Worker(new URL('./carchase.worker.ts', import.meta.url), {
+        type: 'module',
+      }) as unknown as WorkerLike,
+  );
 
-  async init(
+  init(
     course: CarChaseCourse,
     agent: VehicleAgent,
     lib: MotionPrimitiveLibrary,
     npcIds: ReadonlyArray<string>,
   ): Promise<void> {
-    const initMsg: MainToWorker = {
+    const initMsg: WorkerInitMsg = {
       type: 'init',
       polygons: course.polygons,
       obstacles: course.obstacles,
@@ -33,44 +36,27 @@ export class CarChasePlannerHost {
       libJSON: lib.toJSON(),
       courseJSON: JSON.stringify(course),
     };
-
-    const promises = npcIds.map(
-      (id) =>
-        new Promise<void>((resolve, reject) => {
-          const w = new Worker(
-            new URL('./carchase.worker.ts', import.meta.url),
-            { type: 'module' },
-          );
-          this.workers.set(id, w);
-          w.onerror = (err) => reject(err);
-          w.onmessage = (e: MessageEvent<WorkerToMain>) => {
-            if (e.data.type === 'init-ack') {
-              w.onerror = null;
-              w.onmessage = (ev: MessageEvent<WorkerToMain>) => {
-                if (ev.data.type === 'plan-result') {
-                  this.resultCb?.(ev.data);
-                }
-              };
-              resolve();
-            }
-          };
-          w.postMessage(initMsg);
-        }),
-    );
-
-    await Promise.all(promises);
+    return this.pool.init(initMsg, npcIds);
   }
 
-  onResult(cb: (r: WorkerPlanResponse) => void): void {
-    this.resultCb = cb;
+  onResult(cb: (r: WorkerPlanResponse, elapsedMs: number) => void): void {
+    this.pool.onResult(cb);
   }
 
-  requestPlan(req: WorkerPlanRequest): void {
-    this.workers.get(req.npcId)?.postMessage(req);
+  requestPlan(agentId: string, body: PlanRequestBody): boolean {
+    return this.pool.requestPlan(agentId, body);
+  }
+
+  hasInflight(agentId: string): boolean {
+    return this.pool.hasInflight(agentId);
+  }
+
+  /** Push a live world change to every planner worker (no re-init). */
+  broadcast(update: Omit<WorkerWorldUpdateMsg, 'type' | 'seq'>): Promise<void> {
+    return this.pool.broadcast(update);
   }
 
   dispose(): void {
-    for (const w of this.workers.values()) w.terminate();
-    this.workers.clear();
+    this.pool.dispose();
   }
 }

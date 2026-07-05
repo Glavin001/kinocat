@@ -156,6 +156,52 @@ pulls zero planner/environment code. Peers (`navcat`, `@dimforge/rapier3d-compat
 A headless test (`demos/test/scenarios.test.ts`) asserts the exact shipped demo
 configs always find a plan within budget, so a "no plan" regression fails CI.
 
+### Preview the rich plan (visual debugging)
+
+The planner→controller reference is captured as a rich `Plan`
+(`kinocat/plan`): per-point arc length, signed curvature, target speed /
+accel, feedforward steer, reserved dynamic-state / free-space slots, and the
+single-gear segment / cusp structure. The **Parking demo** renders it as a
+visual-debug overlay:
+
+```sh
+pnpm dev            # builds core, starts Next.js on http://localhost:3000
+```
+
+Open **http://localhost:3000/parking**, then press **`d`** (or the
+`[d] plan-debug` button). The reverse-perp and parallel scenarios (`[2]` /
+`[3]`) show it best, since they have forward↔reverse cusps. It has two halves,
+each in the medium that fits the data:
+
+**3-D overlay — the spatial story (where/how it drives):**
+
+- **Speed-colored path** — the reference line shaded by `|vRef|` (slow → fast
+  = red → green), so you can *see* where the profile slows for the stall.
+- **Reverse spans in blue** — segments the plan drives in reverse gear.
+- **Cusp/stop markers** (yellow) — where the chassis stops and flips gear.
+- **Feedforward-steer wheel glyphs** (orange) — sparse, fixed-length marks
+  rotated to the wheel direction (`heading + steerFf`); they show *which way*
+  the wheel points, not a magnitude.
+
+**2-D profile strip — the quantitative story (the reference signals):**
+`vRef`, `steerFf`, and `aRef` plotted against **arc length** (a 1-D signal is
+legible as a curve, unreadable as 3-D glyphs), with cusps as vertical dashed
+lines. This is where you read the reference precisely — and the natural place
+to later overlay planned-vs-executed for MPC/LQR tuning.
+
+Both are built from the live committed plan (`buildPlan(smoothed, …)` in
+`demos/app/lib/race-scenario.ts`), so they update on every replan. It is
+*produce-but-don't-consume*: the controller still tracks the plain path today;
+a follow-up feeds `Plan.kappa` / `steerFf` into the tracker.
+
+**Test it.** The builder is unit-tested (curvature/arc-length/accel,
+feedforward sign in reverse, cusp-boundary placement, round-trip):
+
+```sh
+pnpm test plan/build                            # core/test/plan/build.test.ts
+pnpm test parking-invariants parking-success    # flagship parking still tracks
+```
+
 ## Develop
 
 ```sh

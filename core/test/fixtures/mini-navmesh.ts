@@ -39,3 +39,20 @@ export function singlePlaneMesh(): TriMesh {
   addQuad(mesh, 0, 0, 30, 0 + 20, 0);
   return mesh;
 }
+
+/** The 30×20 plane with a rectangular hole punched out — "the ground was
+ *  destroyed under you". Four quads frame the hole so everything else stays
+ *  walkable. */
+export function planeWithHoleMesh(hole: {
+  x0: number;
+  z0: number;
+  x1: number;
+  z1: number;
+}): TriMesh {
+  const mesh: TriMesh = { positions: [], indices: [] };
+  if (hole.x0 > 0) addQuad(mesh, 0, 0, hole.x0, 20, 0); // west
+  if (hole.x1 < 30) addQuad(mesh, hole.x1, 0, 30, 20, 0); // east
+  if (hole.z0 > 0) addQuad(mesh, hole.x0, 0, hole.x1, hole.z0, 0); // south strip
+  if (hole.z1 < 20) addQuad(mesh, hole.x0, hole.z1, hole.x1, 20, 0); // north strip
+  return mesh;
+}

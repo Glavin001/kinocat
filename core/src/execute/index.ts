@@ -16,6 +16,13 @@ export {
   type SettleLatch,
 } from './settle';
 export {
+  planCrossesRegion,
+  markAffectedAgents,
+  footprintCircumradius,
+  type ChangedRegion,
+  type AffectedAgent,
+} from './invalidation';
+export {
   smoothSpeedProfile,
   curvaturePerSample,
   resampleScalarByArcLength,
