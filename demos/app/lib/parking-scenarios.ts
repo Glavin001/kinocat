@@ -17,7 +17,7 @@ import { planVehicleOnce } from 'kinocat/planner';
 import type { PlanResult } from 'kinocat/planner';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavPolygon, NavWorld } from 'kinocat/environment';
-import { reach, at, stayInside } from 'kinocat/scenario';
+import { reach, at, stayInside, stopped } from 'kinocat/scenario';
 import type { Goal, Invariant } from 'kinocat/scenario';
 import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
 import type { VehicleAgent, CarKinematicState } from 'kinocat/agent';
@@ -140,7 +140,13 @@ function pose(x: number, z: number, heading: number): CarKinematicState {
 // sub-meter-clearance stall.
 
 export const PARKING_AGENT: VehicleAgent = defaultVehicleAgent({
-  minTurnRadius: 3.5,
+  // MUST be >= what the chassis can physically TRACK. The parking chassis
+  // steers to 0.75 rad with true Ackermann per-wheel angles (see the rapier
+  // adapter) -> kinematic R = 3.2/tan(0.75) ~ 3.44 m; planning at 4.0 leaves
+  // the tracker ~15% curvature authority to converge onto max-radius arcs.
+  // (Without Ackermann, parallel-steered fronts scrub past ~0.6 rad and the
+  // chassis plows wide -- do not raise the envelope without it.)
+  minTurnRadius: 4.0,
   // Cap at 2 m/s. Pure-pursuit drift on a Rapier raycast vehicle scales
   // roughly with speed; at 3-4 m/s the chassis cuts the inside of a
   // tight Reeds-Shepp arc by 20-30 cm and clips a parked car, even
@@ -166,6 +172,24 @@ export const PARKING_AGENT: VehicleAgent = defaultVehicleAgent({
   reverseCostMultiplier: 1.05,
   directionChangePenalty: 0.15,
 });
+
+/** Planning-time clearance margin (m) reserved for closed-loop tracking
+ *  error. The PLANNER collision-checks an inflated footprint so every plan
+ *  keeps at least this much air between the real chassis and the obstacles;
+ *  the monitor / `evaluateParked` keep judging the TRUE footprint. Without
+ *  it, a collision-free plan can pass within ~0 cm of a block corner and the
+ *  ~5-10 cm the tracker actually drifts mid-swing becomes a touch. */
+export const PARKING_PLAN_MARGIN = 0.32;
+
+function inflateFootprint(
+  fp: ReadonlyArray<readonly [number, number]>,
+  m: number,
+): Array<[number, number]> {
+  return fp.map(([x, z]) => [
+    x + Math.sign(x) * m,
+    z + Math.sign(z) * m,
+  ]) as Array<[number, number]>;
+}
 
 export function buildParkingPrimitives(
   agent: VehicleAgent = PARKING_AGENT,
@@ -429,33 +453,83 @@ export interface ParkingSuccess {
   headingTol: number;
   /** Max |speed| to count as stopped (m/s). */
   speedTol: number;
+  /** Max offset ALONG the stall's long axis from its centre (m). Coverage alone
+   *  can't catch this in a long slot (a parallel-park bay is ~7 m of stall for a
+   *  4.8 m car), so a chassis parked square but 1.4 m off-centre still overlaps
+   *  ~85% and would read "parked" without this bound. */
+  centeringTol: number;
 }
 
-/** The tight bar, calibrated against the real (deterministic) Rapier sim so it
- *  separates a cleanly-parked car from one that stops offset/angled:
- *    forward-pullin → coverage 0.90, heading 0°  ⇒ PARKED
- *    reverse-perp   → coverage 0.75              ⇒ not parked (footprint pokes out)
- *    parallel       → heading 16°                ⇒ not parked (not squared up)
- *  `headingTol` ≈ 8°. The two failing scenarios are the deliberate signal that
- *  pure-pursuit still lacks terminal-heading control (see the `it.fails` tests
- *  in `parking-invariants.test.ts`). */
+/** The tight bar, calibrated against the real (deterministic) Rapier sim: a
+ *  cleanly-parked chassis clears coverage ≥ 0.85, heading ≤ ~8°, |v| ≤ 0.3, and
+ *  centre-offset ≤ 0.6 m, while a chassis that stops offset / angled / off-centre
+ *  does not. All three scenarios now clear it (forward-pullin ~0.97 coverage,
+ *  reverse-perp ~0.92, parallel ~0.96 @ ~3°) — the terminal-brake and
+ *  terminal-heading fixes closed the gaps the demo showed. */
 export const PARKING_SUCCESS: ParkingSuccess = {
   coverageMin: 0.85,
   headingTol: 0.14,
   speedTol: 0.3,
+  // Matches the "reaches slot cleanly" invariant's 0.6 m position bound. Cleanly
+  // parked chassis sit ~0.15–0.22 m off-centre, so this has wide margin while
+  // rejecting the ~1.4 m mid-maneuver cusp pauses in the long parallel slot.
+  centeringTol: 0.6,
+};
+
+// ---------------------------------------------------------------------------
+// Closed-loop success semantics — the settle latch + per-scenario budgets.
+//
+// `evaluateParked` is an INSTANTANEOUS predicate; one true tick is not
+// success (the reverse-perp livelock was "parked" at t≈22 s and then shunted
+// for another 100 s). The latch (kinocat/execute `createSettleLatch`) demands
+// the predicate hold continuously, at rest, for `PARKING_SETTLE.holdSeconds`.
+// The budgets below are the CI quality bar: how fast the full closed loop
+// (planner + tracker + replan policy) must reach that settled state, and how
+// many replans it may spend. Bench + Vitest read the SAME table — the bar
+// cannot drift per-harness.
+
+export const PARKING_SETTLE = {
+  /** The parked predicate must hold continuously this long. */
+  holdSeconds: 2.0,
+  /** At-rest bound for the latch — 5 cm/s, not the display predicate's 0.3. */
+  speedTol: 0.05,
+  /** After latching, keep simulating this long; any creep-out is a failure. */
+  postHoldSeconds: 3.0,
+} as const;
+
+export interface ParkingBudget {
+  /** Max sim-time (s) until the settled hold BEGINS. */
+  maxTimeToSettledSec: number;
+  /** Max total replans spent over the whole run. */
+  maxReplans: number;
+}
+
+/** Closed-loop budgets per scenario. Baselines for context: the first
+ *  transient `parked` instant on 2026-07-05 main was 7.8 s / 20.1 s / 17.4 s
+ *  (pullin / reverse-perp / parallel) — but the runner then kept shuffling
+ *  indefinitely. The budgets demand the loop actually COMMIT to those
+ *  terminals: settle within ~1.5× the transient time and stop replanning. */
+export const PARKING_BUDGETS: Record<ParkingScenarioId, ParkingBudget> = {
+  'forward-pullin': { maxTimeToSettledSec: 15, maxReplans: 25 },
+  'reverse-perp': { maxTimeToSettledSec: 35, maxReplans: 55 },
+  parallel: { maxTimeToSettledSec: 35, maxReplans: 55 },
 };
 
 export interface ParkedEval {
-  /** footprintInStall AND stopped — the headline result. */
+  /** footprintInStall AND stopped AND centered — the headline result. */
   parked: boolean;
   /** coverage ≥ coverageMin AND headingError ≤ headingTol. */
   footprintInStall: boolean;
   /** |speed| ≤ speedTol. */
   stopped: boolean;
+  /** |offset along the stall long axis| ≤ centeringTol. */
+  centered: boolean;
   /** Fraction of the car footprint area overlapping the stall box (0..1). */
   coverage: number;
   /** Euclidean distance from the chassis to the goal/stall centre (m). */
   posError: number;
+  /** Offset along the stall's long axis from its centre (m). */
+  centerOffset: number;
   /** |heading − stall.heading|, wrapped to [0, π] (rad). */
   headingError: number;
 }
@@ -502,15 +576,24 @@ export function evaluateParked(
   const coverage = carArea > 0 ? Math.min(1, inter / carArea) : 0;
   const headingError = Math.abs(wrapPi(state.heading - stall.heading));
   const posError = Math.hypot(state.x - stall.x, state.z - stall.z);
+  // Offset along the stall's long axis (heading direction) — the drift coverage
+  // can't see in a long slot.
+  const centerOffset = Math.abs(
+    (state.x - stall.x) * Math.cos(stall.heading) +
+      (state.z - stall.z) * Math.sin(stall.heading),
+  );
   const stopped = Math.abs(state.speed) <= success.speedTol;
+  const centered = centerOffset <= success.centeringTol;
   const footprintInStall =
     coverage >= success.coverageMin && headingError <= success.headingTol;
   return {
-    parked: footprintInStall && stopped,
+    parked: footprintInStall && stopped && centered,
     footprintInStall,
     stopped,
+    centered,
     coverage,
     posError,
+    centerOffset,
     headingError,
   };
 }
@@ -621,15 +704,57 @@ export const PARKING_RACE_TUNING: Partial<RaceTuning> = {
   // onto the goal: forward-pullin → 0.97 coverage, reverse-perp → 0.89 (it now
   // PARKS). `arriveRadius` is kept well above `goalTolerance` (0.25 vs 0.08) so
   // the cusp-advance logic still triggers through each forward↔reverse gear
-  // change — they're decoupled knobs. (This is a position fix only; parallel's
-  // residual is a ~16° HEADING error that pure-pursuit structurally can't null —
-  // tracked by the `it.fails` in parking-invariants.test.ts.)
+  // change — they're decoupled knobs. (Position fix; reverse-perp's residual was
+  // position, parallel's was heading — see `terminalHeadingGain` below.)
   goalTolerance: 0.08,
   arriveRadius: 0.25,
+  // Stanley-style terminal heading alignment. Pure-pursuit chases a lookahead
+  // POINT and ignores the plan's heading, so on a parking final approach — where
+  // the lookahead overshoots the short (~1 m, curvature-limited) terminal
+  // straightening curve — it cuts the corner and rests at its approach angle
+  // (parallel-park came to rest ~16° off the curb). This adds a curvature term
+  // proportional to the heading error vs the local path tangent so the chassis
+  // rotates onto the planned heading. The RUNNER gates it on distance to the
+  // TRUE goal (`terminalHeadingRadius`, 2 m), not the per-segment path end, so it
+  // engages only on the terminal approach and never near a forward↔reverse cusp
+  // (whose local tangent isn't the goal heading). Effect: parallel 16° → ~3° (now
+  // PARKS, centred); forward/reverse unaffected (straight-in / reverse arrive
+  // aligned and the term is forward-gear only). Gain sits on a stable plateau.
+  terminalHeadingGain: 4.0,
+  terminalHeadingRadius: 2.0,
   plannerPosCell: 0.3,
   plannerHeadingBuckets: 36,
-  plannerGoalRadius: 0.35,
-  plannerGoalHeadingTol: 0.2,
+  plannerGoalRadius: 0.2,
+  // Terminal heading tolerance MUST be tighter than the success predicate's
+  // headingTol (0.14): the planner stops improving at its own tolerance edge,
+  // so a 0.2 bound let plans terminate ~11.5° off and fail the 8° success bar.
+  // (Surfaced when the direction-change penalty was fixed: a correctly-priced
+  // final straightening shunt is only planned if the goal test demands it.)
+  plannerGoalHeadingTol: 0.06,
+  // Parking-scale tracking. The race lookahead floor (3 m) exceeds most
+  // parking segments (0.5-3 m), collapsing pure-pursuit to "aim at the
+  // endpoint" — it could never remove lateral error (the frozen ~0.3 m
+  // offset). Speed-scaled lookahead 0.8-3 m tracks the planner's actual
+  // curve geometry. `minApproachSpeed` replaces the historic lookaheadMin
+  // unit-bug floor so the brake-to-goal ramp engages below cruise: the
+  // terminal approach decelerates smoothly instead of braking open-loop from
+  // 2 m/s at the 0.08 m tolerance ring (the 0.1-0.5 m skid scatter).
+  lookaheadMin: 0.5,
+  lookaheadGain: 0.35,
+  lookaheadMax: 2.5,
+  minApproachSpeed: 0.35,
+  // Match the plant/library reverse envelope (maxReverseSpeed 1.5): without
+  // this cap pure-pursuit reversed at forward cruise (~1.9 m/s), over-sped
+  // the planned reverse arcs, saturated curvature authority and drifted
+  // ~0.45 m wide into the neighboring stall block.
+  reverseCruiseSpeed: 1.0,
+  lateralErrorReplanM: 0.35,
+  // Steer with the plan's curvature (feedback corrects only disturbances):
+  // kills the 0.1-0.3 m steady-state drift on max-curvature swings that used
+  // to eat the plan's clearance margin at the neighbor-block corner.
+  curvatureFeedforward: true,
+  trackerMinTurnRadius: 3.44,
+  maxSteerAngle: 0.75,
   plannerBudgetMs: 500,
   plannerMaxExpansions: 80_000,
   mpcWTerminalPosition: 50,
@@ -669,15 +794,17 @@ export function parkingPlannerGoal(s: ParkingScenario): {
     [s.bounds.x0, s.bounds.z1],
   ];
   return {
-    // Disk (radius 0.35) + heading (0.2) matches the legacy planner's goal test
-    // (goalRadius / goalHeadingTol), plus a terminal STOP so the reached node is
-    // at rest and the lifted plan ends at speed 0 (the tracker brakes to a halt
-    // in the stall — reverse-perp needs this to settle). No `prefer` cost terms:
-    // VehicleEnvironment's edge cost is already time-based, so the bridge's
-    // search stays equivalent to legacy planRace.
+    // Disk (radius 0.35) + heading matches the legacy planner's goal test
+    // (goalRadius / plannerGoalHeadingTol), plus a terminal STOP so the reached
+    // node is at rest and the lifted plan ends at speed 0 (the tracker brakes
+    // to a halt in the stall — reverse-perp needs this to settle). The heading
+    // band must stay TIGHTER than the success predicate's 0.14: the planner
+    // stops improving at its own tolerance edge, and the tracker adds ~2-3° on
+    // top. No `prefer` cost terms: VehicleEnvironment's edge cost is already
+    // time-based, so the bridge's search stays equivalent to legacy planRace.
     goal: reach(
-      at({ x: s.goal.x, z: s.goal.z, heading: s.goal.heading }, { radius: 0.35, dheading: 0.2 }),
-      { speed: { max: 0 } },
+      at({ x: s.goal.x, z: s.goal.z, heading: s.goal.heading }, { radius: 0.2, dheading: 0.1 }),
+      stopped(),
     ),
     invariants: [stayInside(lot)],
   };
@@ -733,10 +860,36 @@ export function parkingScenarioOptions(
   // `minTurnRadius`/`maxSpeed`, not on the cost weights, so it stays valid).
   agentOverride?: Partial<VehicleAgent>,
 ): RaceScenarioOptions {
+  const planningAgent: VehicleAgent = {
+    ...PARKING_AGENT,
+    footprint: inflateFootprint(PARKING_AGENT.footprint, PARKING_PLAN_MARGIN),
+  };
   const agent: VehicleAgent = agentOverride
-    ? { ...PARKING_AGENT, ...agentOverride }
-    : PARKING_AGENT;
+    ? { ...planningAgent, ...agentOverride }
+    : planningAgent;
+  const parkScenario = buildParkingScenario(id);
+  // Per-scenario shunt economics. `parallel` corrects itself by RE-PARKING
+  // (pull out, re-enter) when the first attempt lands crooked; with a cheap
+  // flip penalty the planner instead grinds out dozens of in-slot
+  // micro-shunts (117 replans / 33 gear flips observed) that take ~50 s and
+  // shave the neighbors. A 0.8 s penalty makes the decisive maneuver the
+  // cheap one: it re-parks square in ~2 attempts. The open-aisle scenarios
+  // keep the 0.15 base — their proven swing plans use mid-course flips that
+  // a heavy penalty would distort.
+  const scenarioAgent: VehicleAgent =
+    id === 'parallel' ? { ...agent, directionChangePenalty: 0.8 } : agent;
   return {
+    // TRUE completion: the course is finished only when the shared parked
+    // predicate has HELD at rest (settle latch) — the same oracle the HUD,
+    // bench, and tests measure. Waypoint arrival (a position-only disk) no
+    // longer terminates the goal loop, so a car that arrives crooked keeps
+    // replanning — shunting, or pulling out and re-entering — until it is
+    // genuinely parked.
+    goalSettle: {
+      predicate: (state) => evaluateParked(state, parkScenario).parked,
+      holdSeconds: PARKING_SETTLE.holdSeconds,
+      speedTol: PARKING_SETTLE.speedTol,
+    },
     // Pin every parking entry to PARKING_AGENT so the planner's heuristic +
     // footprint + turn radius match the parking primitive library. Without
     // this the runner planned parking with RACE_AGENT (30 m/s, 4.5 m turn
@@ -745,7 +898,7 @@ export function parkingScenarioOptions(
     // that A* degenerated into near-breadth-first search — the reverse-perp /
     // parallel replan-failure storm. Callers don't need to know the agent;
     // they just pass `{ name, lib: parkingLibrary() }`.
-    entries: entries.map((e) => ({ ...e, agent })),
+    entries: entries.map((e) => ({ ...e, agent: scenarioAgent })),
     targetLaps: 1,
     syncHold: false,
     offTrackRecovery: 'none',

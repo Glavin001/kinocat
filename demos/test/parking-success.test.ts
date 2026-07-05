@@ -76,6 +76,23 @@ describe('evaluateParked', () => {
     expect(ev.parked).toBe(false);
   });
 
+  it('parallel: squared up but drifted along the long slot is NOT parked (centering)', () => {
+    // The parallel bay is ~7 m of stall for a 4.8 m car, so a chassis parked
+    // square but 1.4 m off-centre still overlaps ~85%. Coverage + heading alone
+    // would call that parked; the centering bound rejects it. (This is exactly
+    // the mid-maneuver cusp pose that used to false-trigger the sim's done gate.)
+    const s = buildParkingScenario('parallel');
+    const ev = evaluateParked(
+      { x: s.goal.x + 1.4, z: s.goal.z, heading: s.goal.heading, ...stopped },
+      s,
+    );
+    expect(ev.coverage).toBeGreaterThan(PARKING_SUCCESS.coverageMin); // still overlaps
+    expect(ev.headingError).toBeLessThan(PARKING_SUCCESS.headingTol); // still square
+    expect(ev.centerOffset).toBeGreaterThan(PARKING_SUCCESS.centeringTol);
+    expect(ev.centered).toBe(false);
+    expect(ev.parked).toBe(false);
+  });
+
   it('uses the agent footprint by default and accepts an override', () => {
     const s = buildParkingScenario('forward-pullin');
     const onGoal = { x: s.goal.x, z: s.goal.z, heading: s.goal.heading, ...stopped };

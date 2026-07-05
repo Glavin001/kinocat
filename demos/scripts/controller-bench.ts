@@ -39,8 +39,11 @@ import {
   parkingScenarioOptions,
   buildParkingScenario,
   evaluateParked,
+  PARKING_SETTLE,
+  PARKING_BUDGETS,
   type ParkingScenarioId,
 } from '../app/lib/parking-scenarios';
+import { createSettleLatch } from 'kinocat/execute';
 import {
   createObstacleCourseScenario,
   PHYSICS_DT as PHYSICS_DT_OBS,
@@ -51,8 +54,65 @@ import { RAMP_AGENT } from '../app/lib/ramp-scenarios';
 import { createSimMonitor } from '../app/lib/sim-monitor';
 import { modelFromJson } from '../app/lib/v2-model-file';
 import type { PersistedV2Model } from '../app/lib/v2-model-persistence';
+import {
+  checkFeasibility,
+  toReferenceTrajectory,
+  referenceLength,
+  limitsFromAgent,
+  type DynamicLimits,
+} from 'kinocat/eval';
+import { smoothTrajectory } from 'kinocat/execute';
+import type { CarKinematicState } from 'kinocat/agent';
+import { TRACKER_MAX_LATERAL_ACCEL } from '../app/lib/race-scenario';
+import { RACE_AGENT } from '../app/lib/race-primitives-scenarios';
 
 type EntryKind = 'kinematic' | 'parametric-only' | 'v2-default';
+
+// Plan-feasibility limits for the RACE_AGENT-planned bench scenarios (race +
+// parking both plan with RACE_AGENT). Lets the bench measure the PLANNER half of
+// the decomposition — whether the committed plan was dynamically executable —
+// via the same kinocat/eval check the harness and tests use, instead of only
+// measuring terminal outcome + safety.
+const BENCH_PLAN_LIMITS: DynamicLimits = limitsFromAgent(RACE_AGENT, {
+  frictionLimit: TRACKER_MAX_LATERAL_ACCEL,
+  maxAccel: 6,
+  maxDecel: 8,
+});
+
+/** Accumulate plan feasibility over a run by scoring each newly-committed plan
+ *  with kinocat/eval. Guards short / near-degenerate stubs exactly like
+ *  eval-harness (≥10 samples, smoothed ≥6, arc-length ≥5 m) so their meaningless
+ *  curvature can't skew the fraction. */
+function makePlanFeasibilityMeter(limits: DynamicLimits) {
+  let lastRef: readonly CarKinematicState[] | null = null;
+  let scored = 0;
+  let feasible = 0;
+  let worst = 0;
+  return {
+    observe(plan: readonly CarKinematicState[] | null): void {
+      if (!plan || plan === lastRef || plan.length < 10) return;
+      lastRef = plan;
+      const tracked = smoothTrajectory(plan as CarKinematicState[], {
+        sampleSpacing: 0.5,
+        iterations: 8,
+      });
+      if (tracked.length < 6) return;
+      const ref = toReferenceTrajectory(tracked);
+      if (referenceLength(ref) < 5) return;
+      const rep = checkFeasibility(ref, limits);
+      scored++;
+      if (rep.feasible) feasible++;
+      if (rep.worstRatio > worst) worst = rep.worstRatio;
+    },
+    result() {
+      return {
+        plansScored: scored,
+        planFeasibleFrac: scored > 0 ? feasible / scored : 1,
+        planWorstRatio: worst,
+      };
+    },
+  };
+}
 
 function loadEntry(kind: EntryKind, forScenario: 'race' | 'parking'): RaceEntry {
   if (forScenario === 'parking') {
@@ -124,6 +184,14 @@ interface BenchResult {
   maxJerk?: number;
   /** Teleports observed — must be 0 (we removed all teleportation). */
   teleports?: number;
+  /** Fraction of committed plans that were dynamically feasible (kinocat/eval).
+   *  < 1 attributes trouble to the PLANNER (an inexecutable plan), independent
+   *  of how well the controller tracked it. */
+  planFeasibleFrac?: number;
+  /** How many committed plans were scored for `planFeasibleFrac`. */
+  plansScored?: number;
+  /** Worst demand/limit ratio across all scored plans (≤ 1 ⇒ all feasible). */
+  planWorstRatio?: number;
   /** Scenario-specific notes. */
   note: string;
 }
@@ -142,13 +210,16 @@ const raceScenario: BenchScenario = {
       offTrackRecovery: 'spawn',
       tuning,
     });
+    const meter = makePlanFeasibilityMeter(BENCH_PLAN_LIMITS);
     while (scenario.simTime() < MAX_SIM) {
       const r = scenario.tick();
+      meter.observe(scenario.status()[0]!.plan);
       if (r.allFinished) break;
     }
     const status = scenario.status()[0]!;
     const simTime = scenario.simTime();
     scenario.dispose();
+    const feas = meter.result();
     const completed = status.laps.length >= 1;
     const passed = completed && simTime <= 90 && status.offTrackEvents === 0;
     return {
@@ -160,7 +231,10 @@ const raceScenario: BenchScenario = {
       terminalSpeed: Math.abs(status.state.speed),
       offTrackEvents: status.offTrackEvents,
       totalReplans: status.diagnostics.totalReplans,
-      note: completed ? `${status.laps[0]!.duration.toFixed(1)}s lap` : 'DNF',
+      ...feas,
+      note: completed
+        ? `${status.laps[0]!.duration.toFixed(1)}s lap · plan ${(feas.planFeasibleFrac * 100).toFixed(0)}% feasible`
+        : 'DNF',
     };
   },
 };
@@ -188,27 +262,52 @@ function makeParkingScenario(
       const scenario = await createRaceScenario(
         parkingScenarioOptions(id, [loadEntry(entryKind, 'parking')], tuning),
       );
-      // Stop once GENUINELY parked, or once the chassis has been stationary long
-      // enough that it's clearly done maneuvering (settled — captures the true
-      // terminal for scenarios that don't square up, without breaking mid-settle
-      // the way a loose `|v|<0.5` did, which mis-read reverse-perp as failing).
-      let settledTicks = 0;
+      // Closed-loop success: the shared `evaluateParked` predicate must hold
+      // CONTINUOUSLY at rest (settle latch), then the sim keeps running a
+      // post-hold window so creep-out / replan shuffling AFTER "success" fails
+      // the bench. The old break-on-first-`parked` accepted a transient
+      // snapshot the runner destroyed ~300 ms later — the web page then showed
+      // 100+ s of livelock the bench never saw. Budgets (time-to-settled,
+      // replans) come from the SAME `PARKING_BUDGETS` table the Vitest
+      // invariants assert, so the bar cannot drift per-harness.
+      const meter = makePlanFeasibilityMeter(BENCH_PLAN_LIMITS);
+      const latch = createSettleLatch({
+        holdSeconds: PARKING_SETTLE.holdSeconds,
+        speedTol: PARKING_SETTLE.speedTol,
+      });
+      const budget = PARKING_BUDGETS[id];
+      const postTickBudget = Math.round(PARKING_SETTLE.postHoldSeconds * 60);
+      let postTicks = 0;
+      let replansAtSettle = 0;
       while (scenario.simTime() < maxSim) {
         scenario.tick();
         const status = scenario.status()[0]!;
-        if (evaluateParked(status.state, parkScenario).parked) break;
-        settledTicks = Math.abs(status.state.speed) < 0.03 ? settledTicks + 1 : 0;
-        if (settledTicks >= 45) break;
+        meter.observe(status.plan);
+        const wasSettled = latch.state.settled;
+        latch.update(
+          { ok: evaluateParked(status.state, parkScenario).parked, speed: status.state.speed },
+          1 / 60,
+        );
+        if (latch.state.settled && !wasSettled) {
+          replansAtSettle = status.diagnostics.totalReplans;
+        }
+        if (latch.state.settled && ++postTicks >= postTickBudget) break;
       }
       const status = scenario.status()[0]!;
       const simTime = scenario.simTime();
       scenario.dispose();
+      const feas = meter.result();
       const dist = Math.hypot(status.state.x - goal.x, status.state.z - goal.z);
-      // Shared "in-the-stall" predicate — the SAME `evaluateParked` the web page
-      // and the Vitest tests use, so the bench can't drift to a looser,
-      // position-only bar. A car that stops offset or angled FAILS honestly.
       const ev = evaluateParked(status.state, parkScenario);
-      const passed = ev.parked && simTime < maxSim;
+      const settle = latch.state;
+      const withinBudget =
+        settle.settled &&
+        settle.timeToSettled! < budget.maxTimeToSettledSec &&
+        replansAtSettle <= budget.maxReplans;
+      const passed = withinBudget && settle.violations === 0 && ev.parked;
+      const settleNote = settle.settled
+        ? `settled ${settle.timeToSettled!.toFixed(1)}s/${budget.maxTimeToSettledSec}s · replans ${replansAtSettle}/${budget.maxReplans}${settle.violations > 0 ? ` · ${settle.violations} POST-SETTLE VIOLATIONS` : ''}`
+        : `NEVER SETTLED (transient parked ≠ success)`;
       return {
         scenario: `parking-${id}`,
         passed,
@@ -218,9 +317,8 @@ function makeParkingScenario(
         terminalSpeed: Math.abs(status.state.speed),
         offTrackEvents: status.offTrackEvents,
         totalReplans: status.diagnostics.totalReplans,
-        note: passed
-          ? `parked (${(ev.coverage * 100).toFixed(0)}% in stall)`
-          : `${(ev.coverage * 100).toFixed(0)}% in stall, ${((ev.headingError * 180) / Math.PI).toFixed(0)}° off, |v|=${status.state.speed.toFixed(2)}`,
+        ...feas,
+        note: `${passed ? `parked (${(ev.coverage * 100).toFixed(0)}% in stall)` : `${(ev.coverage * 100).toFixed(0)}% in stall, ${((ev.headingError * 180) / Math.PI).toFixed(0)}° off`} · ${settleNote}`,
       };
     },
   };
@@ -327,9 +425,9 @@ const rampScenario: BenchScenario = {
 
 const ALL_SCENARIOS: BenchScenario[] = [
   raceScenario,
-  makeParkingScenario('forward-pullin', 25, 'forward pull-in (easy)'),
-  makeParkingScenario('reverse-perp', 40, 'reverse perpendicular (medium)'),
-  makeParkingScenario('parallel', 40, 'parallel parking (hard)'),
+  makeParkingScenario('forward-pullin', 30, 'forward pull-in (easy)'),
+  makeParkingScenario('reverse-perp', 60, 'reverse perpendicular (medium)'),
+  makeParkingScenario('parallel', 60, 'parallel parking (hard)'),
   obstacleCourseScenario,
   rampScenario,
 ];
@@ -364,11 +462,14 @@ async function main(): Promise<void> {
     throw new Error(`Invalid --entry=${entryKind}. Use kinematic | parametric-only | v2-default.`);
   }
   const tuning: Partial<RaceTuning> = { tracker };
+  // Substring matching: `--filter=parking` selects all parking-* scenarios
+  // (the header's own usage example never matched anything under the old
+  // exact-name matching).
   const filter = values.filter
     ? new Set(values.filter.split(',').map((s) => s.trim()))
     : null;
   const scenarios = filter
-    ? ALL_SCENARIOS.filter((s) => filter.has(s.name))
+    ? ALL_SCENARIOS.filter((s) => [...filter].some((f) => s.name.includes(f)))
     : ALL_SCENARIOS;
 
   process.stdout.write(`controller bench · tracker=${tracker} · entry=${entryKind} · ${scenarios.length} scenarios\n\n`);

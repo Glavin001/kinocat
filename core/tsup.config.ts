@@ -12,6 +12,8 @@ const entry = {
   'scenario/index': 'src/scenario/index.ts',
   'predict/index': 'src/predict/index.ts',
   'execute/index': 'src/execute/index.ts',
+  'eval/index': 'src/eval/index.ts',
+  'plan/index': 'src/plan/index.ts',
   'learning/index': 'src/learning/index.ts',
   'scene/index': 'src/scene/index.ts',
   'diagnostics/index': 'src/diagnostics/index.ts',

@@ -45,6 +45,14 @@
       "types": "./dist/execute/index.d.ts",
       "default": "./dist/execute/index.js"
     },
+    "./eval": {
+      "types": "./dist/eval/index.d.ts",
+      "default": "./dist/eval/index.js"
+    },
+    "./plan": {
+      "types": "./dist/plan/index.d.ts",
+      "default": "./dist/plan/index.js"
+    },
     "./learning": {
       "types": "./dist/learning/index.d.ts",
       "default": "./dist/learning/index.js"

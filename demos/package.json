@@ -19,7 +19,9 @@
     "ablation": "tsx scripts/ablation.ts",
     "ablation:quick": "tsx scripts/ablation.ts --laps=3 --max-sim=180",
     "controller-bench": "tsx scripts/controller-bench.ts",
-    "controller-bench:json": "tsx scripts/controller-bench.ts --json=docs/controller-bench/latest.json"
+    "controller-bench:json": "tsx scripts/controller-bench.ts --json=docs/controller-bench/latest.json",
+    "eval": "tsx scripts/eval-harness.ts",
+    "eval:json": "tsx scripts/eval-harness.ts --json=docs/eval-results/latest.json"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.14.0",

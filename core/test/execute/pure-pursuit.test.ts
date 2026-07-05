@@ -85,10 +85,14 @@ describe('purePursuit', () => {
     expect(purePursuit(cur, path, cfg)).toEqual(purePursuit(cur, path, cfg));
   });
 
-  it('respects path speed when respectPathSpeed is enabled', () => {
-    // Straight path with a slow zone in the forward window. Without the
-    // option, the controller targets cruise; with it, the target should
-    // drop to the slow zone's planned speed.
+  it('caps speed via the braking envelope of upcoming plan speeds', () => {
+    // Straight path with a slow zone ahead. Plan speeds constrain
+    // through the braking envelope sqrt(v² + 2·maxDecel·d): a slow zone
+    // binds exactly when the chassis is inside braking distance of it,
+    // not from arbitrarily far away (the old raw window-min meant any
+    // coast-to-stop sample in the window pinned the target to ~0 —
+    // measured closed-loop: race cars crawled to 0 laps in 100 s with
+    // the toggle on).
     const path: PlanPath = [
       { x: 0, z: 0, heading: 0, speed: 6, t: 0 },
       { x: 2, z: 0, heading: 0, speed: 6, t: 0.3 },
@@ -96,12 +100,20 @@ describe('purePursuit', () => {
       { x: 6, z: 0, heading: 0, speed: 2, t: 1.5 },
       { x: 8, z: 0, heading: 0, speed: 6, t: 2.0 },
     ];
-    const cur: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 6, t: 0 };
-    const without = purePursuit(cur, path, { ...cfg, respectPathSpeed: false });
-    const withCap = purePursuit(cur, path, { ...cfg, respectPathSpeed: true });
+    // Just before the slow zone: inside braking distance, so the cap
+    // binds at the envelope value sqrt(2² + 2·maxDecel·d).
+    const near: CarKinematicState = { x: 3.5, z: 0, heading: 0, speed: 6, t: 0 };
+    const without = purePursuit(near, path, { ...cfg, respectPathSpeed: false });
+    const withCap = purePursuit(near, path, { ...cfg, respectPathSpeed: true });
     expect(Math.abs(without.targetSpeed)).toBeGreaterThan(Math.abs(withCap.targetSpeed));
-    // The cap should be the slow-zone speed (2 m/s).
-    expect(Math.abs(withCap.targetSpeed)).toBeCloseTo(2, 5);
+    const envelope = Math.sqrt(2 * 2 + 2 * cfg.maxDecel * 0.5); // d = 0.5 m to the slow sample
+    expect(Math.abs(withCap.targetSpeed)).toBeCloseTo(envelope, 5);
+
+    // A stopped chassis on the plan's first sample (the rest echo) must
+    // still launch: the d≈0 echo is excluded from the constraint.
+    const resting: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
+    const launch = purePursuit(resting, path, { ...cfg, respectPathSpeed: true });
+    expect(Math.abs(launch.targetSpeed)).toBeGreaterThan(1);
   });
 
   it('brakes at the goal', () => {
@@ -114,5 +126,69 @@ describe('purePursuit', () => {
     expect(cmd.atGoal).toBe(true);
     expect(cmd.brake).toBe(1);
     expect(cmd.targetSpeed).toBe(0);
+  });
+
+  describe('terminal heading term (headingGain)', () => {
+    // A path whose tangent points along +x (heading 0) but the chassis sits on
+    // it pointed 0.3 rad off. Pure-pursuit's lookahead point is straight ahead
+    // (no cross-track), so WITHOUT a heading term it commands ~0 curvature and
+    // never corrects the orientation; WITH the term it commands curvature toward
+    // the path heading.
+    const straight: PlanPath = [
+      { x: 0, z: 0, heading: 0, speed: 1, t: 0 },
+      { x: 1, z: 0, heading: 0, speed: 1, t: 1 },
+      { x: 2, z: 0, heading: 0, speed: 1, t: 2 },
+    ];
+    const offHeading: CarKinematicState = { x: 0, z: 0, heading: 0.3, speed: 1, t: 0 };
+
+    it('adds curvature toward the path tangent when the chassis is mis-aligned', () => {
+      // Unclamped config so the exact delta is observable (the curvature limit
+      // is exercised by its own test below).
+      const noClamp: PurePursuitConfig = { ...cfg, minTurnRadius: undefined };
+      const base = purePursuit(offHeading, straight, noClamp).steering;
+      const withTerm = purePursuit(offHeading, straight, { ...noClamp, headingGain: 1.0 }).steering;
+      // Chassis heading (+0.3) exceeds the path tangent (0) ⇒ correction is a
+      // negative-curvature (turn back toward the path heading) delta of exactly
+      // headingGain · (tangent − heading) = 1.0 · (0 − 0.3).
+      expect(withTerm).toBeLessThan(base);
+      expect(withTerm - base).toBeCloseTo(-0.3, 6);
+    });
+
+    it('is gated off beyond headingRadius', () => {
+      // distToGoal from (0,0) to (2,0) is 2; a 1.5 m radius gates the term off.
+      const gated = purePursuit(offHeading, straight, { ...cfg, headingGain: 1.0, headingRadius: 1.5 });
+      const base = purePursuit(offHeading, straight, cfg);
+      expect(gated.steering).toBeCloseTo(base.steering, 9);
+    });
+
+    it('respects the minimum turn radius after adding the term', () => {
+      const kMax = 1 / cfg.minTurnRadius!;
+      const cmd = purePursuit(
+        { x: 0, z: 0, heading: 1.2, speed: 1, t: 0 },
+        straight,
+        { ...cfg, headingGain: 5.0 },
+      );
+      expect(Math.abs(cmd.steering)).toBeLessThanOrEqual(kMax + 1e-9);
+    });
+
+    it('applies in reverse gear with the same formula (travel-frame law)', () => {
+      // The pursuit runs in the travel frame (body frame flipped by pi when
+      // reversing), where d(heading)/dt = |v| * kappa holds for both gears and
+      // the pose-heading error equals the travel-frame error. So the heading
+      // term is gain * wrapAngle(tangent - heading) in reverse too. (It used
+      // to be gated forward-only on the assumption that reverse maneuvers
+      // arrive pre-aligned — false once the direction-change penalty fix made
+      // plans legitimately terminate on a reverse leg.)
+      const revPath: PlanPath = [
+        { x: 0, z: 0, heading: 0, speed: -1, t: 0 },
+        { x: -1, z: 0, heading: 0, speed: -1, t: 1 },
+        { x: -2, z: 0, heading: 0, speed: -1, t: 2 },
+      ];
+      const noClamp: PurePursuitConfig = { ...cfg, minTurnRadius: undefined };
+      const base = purePursuit(offHeading, revPath, noClamp).steering;
+      const withTerm = purePursuit(offHeading, revPath, { ...noClamp, headingGain: 1.0 }).steering;
+      // offHeading has heading +0.3 vs path tangent 0 -> term adds 1.0 * (0 - 0.3).
+      expect(withTerm - base).toBeCloseTo(-0.3, 6);
+    });
   });
 });

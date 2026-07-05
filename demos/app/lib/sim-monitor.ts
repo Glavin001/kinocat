@@ -25,6 +25,10 @@ import {
 } from '../../../core/src/internal/geom';
 
 export type { Pt } from '../../../core/src/internal/geom';
+import {
+  countSteerReversals,
+  DEFAULT_STEER_REVERSAL_DEADBAND,
+} from '../../../core/src/eval/tracking-metrics';
 
 // ---------------------------------------------------------------------------
 // Input shape. Structurally a subset of `RaceCarStatus` (race-scenario.ts), so
@@ -157,8 +161,12 @@ export interface RunReport {
 }
 
 export interface SimMonitor {
-  /** Call once per tick AFTER scenario.tick(), with that car's status. */
-  sample(s: MonitorSample): void;
+  /** Call once per tick AFTER scenario.tick(), with that car's status.
+   *  `dtSample` overrides the construction `dt` for THIS tick's finite
+   *  differences + elapsed-time accounting — pass the real per-frame dt when
+   *  driving the monitor from a variable-rate rAF loop (the browser HUD); omit
+   *  it for fixed-step harness/test runs. */
+  sample(s: MonitorSample, dtSample?: number): void;
   /** Finalize and read the scalar report (uses the last sample for terminals). */
   summary(): RunReport;
   /** The full recorded telemetry stream. */
@@ -202,7 +210,6 @@ function planAimSign(
 export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
   const dt = cfg.dt;
   const success = cfg.success ?? DEFAULT_SUCCESS;
-  const deadband = cfg.steerRateDeadband ?? 0.05;
   const teleportDist = cfg.teleportDist ?? 2.0;
   const hasObstacles = cfg.obstacles.length > 0;
 
@@ -221,8 +228,8 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
   let movedAwayTicks = 0;
   let awayHeadingTicks = 0;
 
-  // jitter
-  let steerReversals = 0;
+  // jitter (steerReversals is computed in summary() from the recorded steer
+  // series via the stepwise-robust hysteresis counter, not accumulated online)
   let steerRateSumSq = 0;
   let lateralAccelSumSq = 0;
   let diffCount = 0; // ticks with a valid finite-difference (i ≥ 1)
@@ -236,15 +243,16 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
   // previous-tick state for finite differences
   let prev: MonitorSample | null = null;
   let prevAccel = NaN;
-  let prevSteerRateSign = 0;
   let prevPlanRef: MonitorSample['plan'] = null;
   let prevPlanSign = 0;
 
   let last: MonitorSample | null = null;
   let ticks = 0;
+  let elapsed = 0; // accumulated sim-time (sums per-sample dt; exact under variable dt)
 
-  function sample(s: MonitorSample): void {
-    const t = ticks * dt;
+  function sample(s: MonitorSample, dtSample?: number): void {
+    const sd = dtSample !== undefined && dtSample > 0 ? dtSample : dt;
+    const t = elapsed;
     const sp = Math.abs(s.state.speed);
     peakSpeed = Math.max(peakSpeed, sp);
 
@@ -304,26 +312,21 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
       // Discontinuity: drop the cross-teleport differences entirely.
       prevAccel = NaN;
     } else if (prev) {
-      const accel = (s.state.speed - prev.state.speed) / dt;
+      const accel = (s.state.speed - prev.state.speed) / sd;
       // Skip the first finite-difference (settle/teleport from spawn).
       if (diffCount >= 1) {
         if (Math.abs(accel) > maxAccel) maxAccel = Math.abs(accel);
         if (Number.isFinite(prevAccel)) {
-          const jerk = (accel - prevAccel) / dt;
+          const jerk = (accel - prevAccel) / sd;
           if (Math.abs(jerk) > maxJerk) maxJerk = Math.abs(jerk);
         }
       }
       prevAccel = accel;
 
-      const steerRate = (s.metrics.liveControls.steer - prev.metrics.liveControls.steer) / dt;
+      const steerRate = (s.metrics.liveControls.steer - prev.metrics.liveControls.steer) / sd;
       steerRateSumSq += steerRate * steerRate;
-      const sign = steerRate > deadband ? 1 : steerRate < -deadband ? -1 : 0;
-      if (sign !== 0) {
-        if (prevSteerRateSign !== 0 && sign !== prevSteerRateSign) steerReversals++;
-        prevSteerRateSign = sign;
-      }
 
-      const yawRate = angleDiff(s.state.heading, prev.state.heading) / dt;
+      const yawRate = angleDiff(s.state.heading, prev.state.heading) / sd;
       const latAccel = s.state.speed * yawRate;
       lateralAccelSumSq += latAccel * latAccel;
 
@@ -359,12 +362,20 @@ export function createSimMonitor(cfg: MonitorConfig): SimMonitor {
     prev = s;
     last = s;
     ticks++;
+    elapsed += sd;
   }
 
   function summary(): RunReport {
-    const durationSec = ticks * dt;
+    const durationSec = elapsed;
     const total = last?.diagnostics.totalReplans ?? 0;
     const ok = last?.diagnostics.successfulReplans ?? 0;
+    // Reversals from the full recorded steer series via the stepwise-robust
+    // hysteresis counter (rate-sign flips saturate on piecewise-constant
+    // commands — every held step reads as a reversal).
+    const steerReversals = countSteerReversals(
+      rows.map((r) => r.steer),
+      DEFAULT_STEER_REVERSAL_DEADBAND,
+    );
 
     let terminalPosError = NaN;
     let terminalHeadingError = NaN;

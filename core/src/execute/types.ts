@@ -7,6 +7,33 @@ export interface PurePursuitConfig {
   lookaheadGain: number;
   /** Maximum lookahead distance. */
   lookaheadMax: number;
+  /**
+   * Floor for the commanded approach speed toward a stop terminal (m/s).
+   * Keeps the brake-to-goal ramp from asymptoting to zero far from the goal.
+   * When unset, falls back to `lookaheadMin` — a historic unit bug (a DISTANCE
+   * used as a speed) that races happened to tune around; parking must set a
+   * real value (~0.3-0.5 m/s) or the ramp never engages below cruise and the
+   * terminal approach is bang-bang with a 0.1-0.5 m brake skid.
+   */
+  minApproachSpeed?: number;
+  /**
+   * Cruise cap while in REVERSE gear (m/s). Without it `cruiseSpeed` applies
+   * to both gears, so a chassis whose reverse envelope is lower (agents
+   * typically back up at 60-75% of forward speed) is commanded to reverse at
+   * forward cruise — it over-speeds the planned reverse arcs, saturates its
+   * curvature authority, and drifts wide. Defaults to `cruiseSpeed`.
+   */
+  reverseCruiseSpeed?: number;
+  /**
+   * Feed the reference path's local curvature forward into the steering
+   * command (kappa = kappa_ff + pursuit feedback). Without it, pure pursuit
+   * must ACCUMULATE cross-track error to generate the curvature of an arc —
+   * on max-curvature parking swings that steady-state error is 0.1-0.3 m,
+   * exactly the clearance margin the plan reserved. With feedforward the
+   * feedback term only corrects disturbances. Off by default (race tuning
+   * predates it); parking enables it.
+   */
+  curvatureFeedforward?: boolean;
   /** Curvature-aware speed cap: v = sqrt(maxLateralAccel / |κ|). */
   maxLateralAccel: number;
   maxAccel: number;
@@ -26,6 +53,35 @@ export interface PurePursuitConfig {
    * the smoothed profile is ignored. Default false (legacy behaviour).
    */
   respectPathSpeed?: boolean;
+  /**
+   * When true, the tracker caps target speed by UPCOMING path curvature
+   * through the braking envelope: for each sample at arc distance d with
+   * local (Menger) curvature κ, allowed = sqrt(maxLateralAccel/|κ| +
+   * 2·maxDecel·d). Without this, `vCurve` sees only the instantaneous
+   * chord to the lookahead point, so a plan that runs straight into a
+   * tight corner (e.g. a dynamics-honest brake-then-turn plan) is
+   * entered at full speed and overshot. Pure geometry — no trust in the
+   * plan's per-sample speeds required. Default false (legacy behaviour).
+   */
+  previewCurvature?: boolean;
+  /** Lateral-accel budget used by the curvature preview's corner-speed
+   *  term (m/s²). Defaults to `maxLateralAccel`. Set this to the plant's
+   *  physical grip ceiling (μ·g, see deriveVehicleCapabilities) when
+   *  `maxLateralAccel` is a comfort cap — braking preview should trigger
+   *  at the physical limit, not the comfort limit, or clean laps slow
+   *  down across the board. */
+  previewLateralAccel?: number;
+  /** Optional Stanley-style heading-alignment gain. When > 0, a curvature term
+   *  proportional to the heading error against the local path tangent is added
+   *  (forward gear only), so the tracker drives the chassis onto the planned
+   *  heading rather than only chasing the lookahead point. Default 0 (off) —
+   *  used by parking for terminal-pose precision; racing leaves it off. */
+  headingGain?: number;
+  /** Only apply `headingGain` within this distance of the goal (m). Confines the
+   *  heading correction to the clear terminal zone so it doesn't perturb the
+   *  chassis off a tight, clearance-critical earlier part of the path. Default
+   *  Infinity (apply whenever headingGain > 0). */
+  headingRadius?: number;
 }
 
 export interface TrackingCommand {

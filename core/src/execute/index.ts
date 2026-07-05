@@ -9,6 +9,20 @@ export type {
 export { purePursuit } from './pure-pursuit';
 export { ReplanState, planPoseAt } from './replan';
 export {
+  createSettleLatch,
+  type SettleConfig,
+  type SettleSample,
+  type SettleState,
+  type SettleLatch,
+} from './settle';
+export {
+  planCrossesRegion,
+  markAffectedAgents,
+  footprintCircumradius,
+  type ChangedRegion,
+  type AffectedAgent,
+} from './invalidation';
+export {
   smoothSpeedProfile,
   curvaturePerSample,
   resampleScalarByArcLength,

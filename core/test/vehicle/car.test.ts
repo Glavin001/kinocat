@@ -172,6 +172,58 @@ describe('PlanFollowerCarDriver', () => {
     const c = d.sample({ x: 0, z: 0, heading: 0, speed: 0, t: 0 }, 0, 1 / 60);
     expect(c).toEqual({ steer: 0, driveForce: 0, brakeForce: 0 });
   });
+
+  const mkDriver = () =>
+    new PlanFollowerCarDriver({
+      config: {
+        lookaheadMin: 1,
+        lookaheadGain: 0.5,
+        lookaheadMax: 10,
+        maxLateralAccel: 6,
+        maxAccel: 5,
+        maxDecel: 5,
+        cruiseSpeed: 5,
+        goalTolerance: 0.5,
+      },
+      wheelBase: 3.2,
+      engineForceN: 4000,
+      brakeForceN: 4000,
+      maxSteerAngle: 0.6,
+    });
+
+  it('steering sign: forward left-curving plan -> NEGATIVE Rapier steer', () => {
+    // The car sits left of a straight +x path, so the tracker commands a
+    // right-turning (negative planning-frame) curvature... use the clearer
+    // case: car BELOW the path (z = -1) -> lookahead is up-left -> positive
+    // lateral offset in body frame -> positive planning curvature kappa.
+    // Net applied Rapier steer must be -atan(kappa * L) (frame flip), i.e.
+    // NEGATIVE. A double negation here once inverted this and every forward
+    // follower veered away from its plan on the first tick.
+    const d = mkDriver();
+    const path = Array.from({ length: 11 }, (_, i) => ({
+      x: i * 2, z: 0, heading: 0, speed: 3, t: i * 2 / 3,
+    }));
+    d.setPlan(path, 0);
+    const cmd = d.sample({ x: 0, z: -1, heading: 0, speed: 3, t: 0 }, 0, 1 / 60);
+    expect(cmd.driveForce).toBeGreaterThan(0); // forward gear
+    expect(cmd.steer).toBeLessThan(0); // frame-flipped left turn
+  });
+
+  it('steering sign: reverse plan flips both drive force and steer', () => {
+    const d = mkDriver();
+    // Straight reverse along -x; car sits at z = -1 (same lateral offset).
+    const path = Array.from({ length: 11 }, (_, i) => ({
+      x: -i * 2, z: 0, heading: 0, speed: -3, t: i * 2 / 3,
+    }));
+    d.setPlan(path, 0);
+    const cmd = d.sample({ x: 0, z: -1, heading: 0, speed: -3, t: 0 }, 0, 1 / 60);
+    expect(cmd.driveForce).toBeLessThan(0); // reverse gear now possible at all
+    // Derivation (matches the demo runner's proven -gear*atan(kappa*L)):
+    // reversed body frame he = pi; lookahead at (-Ld, 0) from (0,-1) gives
+    // lateral offset yV = -1 -> kappa < 0 (travel frame). gear = -1, so
+    // applied steer = -gear*atan(kappa*L) = atan(kappa*L) < 0.
+    expect(cmd.steer).toBeLessThan(0);
+  });
 });
 
 describe('wheeledFromNormalized', () => {

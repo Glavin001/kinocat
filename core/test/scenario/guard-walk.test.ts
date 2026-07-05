@@ -16,6 +16,7 @@ import {
   avoid,
   maintain,
   stayInside,
+  stopped,
   speed,
   distanceFrom,
   closingSpeed,
@@ -40,6 +41,17 @@ describe('checkAcceptance', () => {
     expect(checkAcceptance({ speed: { max: 0 } }, S(0, 0, 0, 1))).toBe(false);
     expect(checkAcceptance({ speed: { min: 8 } }, S(0, 0, 0, 9))).toBe(true);
     expect(checkAcceptance({ speed: { min: 8 } }, S(0, 0, 0, 5))).toBe(false);
+  });
+  it('stopped() is a symmetric band: reverse motion is NOT stopped', () => {
+    // The footgun this replaces: {max: 0} bounds SIGNED speed, so a car
+    // reversing through the goal at -1.5 m/s "satisfied" the stop condition
+    // (the /parking DONE-while-reversing bug). stopped() rejects it.
+    expect(checkAcceptance({ speed: { max: 0 } }, S(0, 0, 0, -1.5))).toBe(true); // the footgun, documented
+    expect(checkAcceptance(stopped(), S(0, 0, 0, -1.5))).toBe(false);
+    expect(checkAcceptance(stopped(), S(0, 0, 0, 1.5))).toBe(false);
+    expect(checkAcceptance(stopped(), S(0, 0, 0, 0))).toBe(true);
+    expect(checkAcceptance(stopped(), S(0, 0, 0, -0.04))).toBe(true);
+    expect(checkAcceptance(stopped(0.2), S(0, 0, 0, -0.15))).toBe(true);
   });
   it('heading band (wrap-aware arc + one-sided)', () => {
     expect(checkAcceptance({ heading: { min: -deg(10), max: deg(10) } }, S(0, 0, deg(5)))).toBe(true);

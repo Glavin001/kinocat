@@ -93,7 +93,10 @@ describe('pure-pursuit stop — BUG A fixed: respectPathSpeed drives a stop-term
   });
 
   it('respects an in-window slow zone (the feature still works)', () => {
-    // A slow zone in the forward window must still cap the target speed.
+    // A slow zone must cap the target speed once the chassis is within
+    // braking distance of it, at the envelope value sqrt(v² + 2·a·d).
+    // (Semantics updated from raw window-min: a distant slow sample no
+    // longer pins the target from outside braking range.)
     const slow: PlanPath = [
       { x: 0, z: 0, heading: 0, speed: 6, t: 0 },
       { x: 2, z: 0, heading: 0, speed: 6, t: 0 },
@@ -101,9 +104,14 @@ describe('pure-pursuit stop — BUG A fixed: respectPathSpeed drives a stop-term
       { x: 6, z: 0, heading: 0, speed: 2, t: 0 },
       { x: 8, z: 0, heading: 0, speed: 6, t: 0 },
     ];
-    const cur: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 6, t: 0 };
-    const cmd = purePursuit(cur, slow, { ...BASE_CFG, respectPathSpeed: true });
-    expect(Math.abs(cmd.targetSpeed)).toBeCloseTo(2, 5);
+    const near: CarKinematicState = { x: 3.5, z: 0, heading: 0, speed: 6, t: 0 };
+    const cmd = purePursuit(near, slow, { ...BASE_CFG, respectPathSpeed: true });
+    const envelope = Math.sqrt(2 * 2 + 2 * BASE_CFG.maxDecel * 0.5); // d = 0.5 m
+    expect(Math.abs(cmd.targetSpeed)).toBeCloseTo(envelope, 5);
+    // Outside braking range of the zone the cap must NOT bind to 2.
+    const far: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 6, t: 0 };
+    const cmdFar = purePursuit(far, slow, { ...BASE_CFG, respectPathSpeed: true });
+    expect(Math.abs(cmdFar.targetSpeed)).toBeGreaterThan(3);
   });
 });
 

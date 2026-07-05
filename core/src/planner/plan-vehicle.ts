@@ -82,8 +82,29 @@ const DEFAULT_MAX_EXPANSIONS = 25000;
  *  calling `plan()` manually — this is just the boilerplate consolidator
  *  every interactive AI needs. */
 export function planVehicleOnce(req: PlanVehicleRequest): PlanResult<CarKinematicState> {
-  const envOpts = { ...DEFAULT_ENV_OPTIONS, ...(req.envOptions ?? {}) };
-  const baseEnv = new VehicleEnvironment(req.world, req.agent, req.lib, envOpts);
+  // An obstacle-routing grid-Dijkstra lower bound is INADMISSIBLE once
+  // affordances can bypass obstacles. The goal-distance field routes AROUND a
+  // planner-only obstacle (e.g. the ramp demo's "gap") that an affordance jumps
+  // straight over, so it overestimates cost-to-go near the launch — and
+  // branch-and-bound then prunes the (cheaper) affordance branch the moment a
+  // detour incumbent is found, so the jump is never taken. Default the grid
+  // heuristic OFF whenever affordances are present (the caller can still force
+  // it back on through `envOptions.gridHeuristic`). Moving obstacles do NOT
+  // trigger this: they only ADD constraints, so a static lower bound stays
+  // admissible.
+  const affordanceAware = req.affordances !== undefined;
+  const envOpts = {
+    ...DEFAULT_ENV_OPTIONS,
+    ...(affordanceAware ? { gridHeuristic: false as const } : {}),
+    ...(req.envOptions ?? {}),
+  };
+  // Time participates in the dedup hash only when something is actually
+  // time-varying; in static worlds it inflates the search ~3.8x for nothing.
+  const hasDynamics = (req.movingObstacles?.length ?? 0) > 0 || affordanceAware;
+  const baseEnv = new VehicleEnvironment(req.world, req.agent, req.lib, {
+    timeInHash: hasDynamics,
+    ...envOpts,
+  });
 
   // Agent circumscribed radius (Euclidean from origin to the farthest
   // footprint vertex) — used to inflate moving-obstacle radii so the
