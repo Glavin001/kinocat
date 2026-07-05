@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { readdirSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { buildCrowd } from '../app/lib/crowd-scenario';
 import {
   planPlayground,
   buildDynamic,
@@ -645,6 +646,42 @@ describe('dogfight demo: interactive 3D pursuit', () => {
   });
 });
 
+describe('crowd demo: momentum humanoid through timed pedestrians', () => {
+  it('sprints, weaves, and never meets a pedestrian at its own time', () => {
+    const s = buildCrowd();
+    expect(s.result.found).toBe(true);
+
+    // Reaches the goal region.
+    const end = s.result.path[s.result.path.length - 1]!;
+    expect(Math.hypot(end.x - s.goal.x, end.z - s.goal.z)).toBeLessThanOrEqual(
+      s.goalRadius + 1e-9,
+    );
+
+    // Monotone time (kinodynamic contract).
+    for (let i = 1; i < s.result.path.length; i++) {
+      expect(s.result.path[i]!.t).toBeGreaterThan(s.result.path[i - 1]!.t);
+    }
+
+    // Momentum is real: the runner actually reaches sprint (beyond the
+    // strafe cap) somewhere along the crossing.
+    const maxSpeed = Math.max(
+      ...s.result.path.map((p) => Math.hypot(p.vx, p.vz)),
+    );
+    expect(maxSpeed).toBeGreaterThan(s.agent.strafeSpeed);
+
+    // Space-time avoidance: at every committed state's own time, every
+    // pedestrian is clear by the combined radii.
+    const rr = 0.45 + s.agent.radius;
+    for (const p of s.result.path) {
+      for (const ped of s.pedestrians) {
+        const q = ped.predict(p.t);
+        if (!q) continue;
+        expect(Math.hypot(p.x - q.x, p.z - q.z)).toBeGreaterThan(rr - 1e-9);
+      }
+    }
+  });
+});
+
 // Coverage manifest: every demo route under demos/app/<slug>/page.tsx MUST
 // have a headless scenario asserted above. This fails CI if a new demo ships
 // without a test (or if a tested demo is deleted), so "all demos are covered"
@@ -653,6 +690,7 @@ const TESTED_DEMOS = new Set([
   'anytime', // 'anytime demo' — buildAnytime
   'carchase', // 'carchase demo' — buildCarChaseSnapshot (Rapier + multi-AI ground pursuit)
   'catmouse', // 'catmouse demo' — buildCatAndMouseScenario (predict + intercept)
+  'crowd', // 'crowd demo' — buildCrowd (momentum humanoid + TimeAware pedestrians)
   'curves', // 'curves demo' — compareCurves
   'dogfight', // 'dogfight demo' — buildDogfightSnapshot (heightfield + multi-AI)
   'dynamic', // 'dynamic demo scenarios' — buildDynamic (moving/coop/jump)

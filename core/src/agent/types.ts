@@ -30,6 +30,22 @@ export interface HumanoidState {
   t: number;
 }
 
+/** Momentum humanoid search state. Velocity is a world-frame vector kept
+ *  SEPARATE from facing (`heading`): people strafe and backpedal at low
+ *  speed but must face their motion to run, and a sprinter cannot turn a
+ *  corner the way a walker can. This is the "realistic person through space
+ *  and time" state — inertial, kinodynamic, planned by the same IGHA* core. */
+export interface MomentumHumanoidState {
+  x: number;
+  z: number;
+  /** Facing (rad). Distinct from the motion direction. */
+  heading: number;
+  /** World-frame velocity (m/s). */
+  vx: number;
+  vz: number;
+  t: number;
+}
+
 /** Aircraft search state. Unlike CarKinematicState, altitude `y` is part of the
  *  searched state — a genuinely 3D plan, not an XZ plan with derived height.
  *  `heading` is the XZ-plane bearing (yaw), `pitch` the flight-path angle
@@ -47,7 +63,11 @@ export interface AircraftState {
   t: number;
 }
 
-export type AgentState = CarKinematicState | HumanoidState | AircraftState;
+export type AgentState =
+  | CarKinematicState
+  | HumanoidState
+  | MomentumHumanoidState
+  | AircraftState;
 
 export interface VehicleAgent {
   kind: 'vehicle';
@@ -71,6 +91,22 @@ export interface HumanoidAgent {
   maxSpeed: number;
 }
 
+export interface MomentumHumanoidAgent {
+  kind: 'momentum-humanoid';
+  /** Body radius (round footprint). */
+  radius: number;
+  /** Sprint speed (m/s) — reachable only when facing the motion. */
+  maxSpeed: number;
+  /** Max speed of NON-facing motion (strafe / backpedal), m/s. */
+  strafeSpeed: number;
+  /** Max launch acceleration (m/s²). */
+  maxAccel: number;
+  /** Max braking deceleration (m/s²) — humans brake harder than they launch. */
+  maxDecel: number;
+  /** Turn rate at rest (rad/s); the effective rate shrinks with speed. */
+  maxTurnRate: number;
+}
+
 export interface AircraftAgent {
   kind: 'aircraft';
   /** Minimum turning radius in the horizontal plane (world units). */
@@ -90,4 +126,8 @@ export interface AircraftAgent {
   halfHeight: number;
 }
 
-export type AgentModel = VehicleAgent | HumanoidAgent | AircraftAgent;
+export type AgentModel =
+  | VehicleAgent
+  | HumanoidAgent
+  | MomentumHumanoidAgent
+  | AircraftAgent;

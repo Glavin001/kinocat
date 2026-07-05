@@ -104,6 +104,12 @@ const GROUPS: readonly DemoGroup[] = [
         tags: ['2D'],
       },
       {
+        href: '/crowd',
+        title: 'Momentum runner',
+        desc: 'An inertial person — sprint, strafe cap, brake limits — weaves through pedestrians timed to cut its line. Space-time planning, fourth agent domain.',
+        tags: ['2D', 'Time-aware'],
+      },
+      {
         href: '/playground',
         title: 'Sandbox',
         desc: 'Drag the start, goal, and obstacles. Tune the anytime deadline and reverse cost — the planner reruns instantly.',
