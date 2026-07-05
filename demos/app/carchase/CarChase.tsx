@@ -23,12 +23,25 @@ import {
   planCarChaseAI,
   predictRobberFromState,
   robberGoal,
+  copGoalRegion,
   selectTacticalMode,
   tacticalGoal,
   spawnPoses,
+  ROBBER_SEE_COP_R,
+  COP_SEE_ROBBER_R,
+  COP_COP_R,
   type CarChaseCourse,
   type CopTacticalMode,
 } from '../lib/carchase-scenarios';
+import {
+  compile,
+  evaluateProgress,
+  reach,
+  type Region,
+  type CompiledAutomaton,
+  type ProgressSnapshot,
+} from 'kinocat/scenario';
+import { GoalProgressPanel } from '../components/GoalProgressPanel';
 import { CarChasePlannerHost } from './plannerWorkerHost';
 import {
   CARCHASE_BRAKE_FORCE_N,
@@ -64,8 +77,8 @@ import {
   createDriftGateHelper,
   createCarMeshHelper,
   syncCarMesh as syncCarMeshCore,
-  createWaypointLoopHelper,
   createGoalMarkerHelper,
+  createRegionHelper,
   createInflatedObstacleHelper,
   createNavBoundsHelper,
   createAgentFootprintHelper,
@@ -83,6 +96,9 @@ interface CopAI {
   planStartWall: number;
   mode: CopTacticalMode;
   goal: CarKinematicState | null;
+  // Canonical `kinocat/scenario` goal region this cop is planning toward
+  // (within/ahead/beside the robber). Drawn as an overlay when goals are on.
+  goalRegion: Region | null;
   lastReplanWall: number;
   lastExpansions: number;
   lastBudgetMs: number;
@@ -114,6 +130,7 @@ interface RobberAI {
   planStartWall: number;
   loopIndex: number;
   goal: CarKinematicState | null;
+  goalRegion: Region | null;
   lastReplanWall: number;
   lastExpansions: number;
   lastBudgetMs: number;
@@ -143,7 +160,7 @@ interface Banner {
   untilWall: number;
 }
 
-const NUM_COPS = 3;
+const NUM_COPS = 4;
 const CAPTURE_DISTANCE = 4.5;
 // Maximum vertical separation (world Y) for a capture to count. Without this
 // a cop sitting directly under a robber mid-air over the jump ramp registers
@@ -188,7 +205,9 @@ const RESET_FLIP_UP_Y = 0.5;
 const RESET_FALL_Y = -10;
 const RESET_COOLDOWN_MS = 5000;
 
-const COP_COLORS = [0xff5566, 0xffaa44, 0xff66dd];
+// One color per persona: Hunter (red), Blocker (amber), Shepherd (pink),
+// Ambusher (violet). Index order matches COP_PERSONAS in carchase-scenarios.
+const COP_COLORS = [0xff5566, 0xffaa44, 0xff66dd, 0xaa77ff];
 
 export default function CarChase() {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -207,6 +226,16 @@ export default function CarChase() {
   const [robberStatus, setRobberStatus] = useState('');
   const [score, setScore] = useState<Score>({ busts: 0, round: 1 });
   const [banner, setBanner] = useState<Banner | null>(null);
+  // Live goal-visualizer state for the camera-followed robber: its compiled
+  // scenario-goal automaton + deterministic progress along the committed plan
+  // (the same `GoalProgressPanel` the Goal Lab uses).
+  const [goalViz, setGoalViz] = useState<{
+    automaton: CompiledAutomaton;
+    snapshot: ProgressSnapshot;
+    label: string;
+  } | null>(null);
+  // Which vehicle's goal the visualizer panel tracks. 'robber' | 'cop0' | …
+  const [vizAgent, setVizAgent] = useState('robber');
 
   const pausedRef = useRef(paused);
   const chaseRef = useRef(chase);
@@ -226,6 +255,8 @@ export default function CarChase() {
   showDebugRef.current = showDebug;
   showRapierDebugRef.current = showRapierDebug;
   playerDrivingRef.current = playerDriving;
+  const vizAgentRef = useRef(vizAgent);
+  vizAgentRef.current = vizAgent;
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -370,7 +401,8 @@ export default function CarChase() {
     for (const g of course.driftGates) {
       affordanceGroup.add(createDriftGateHelper({ x: g.x, z: g.z, heading: g.heading }));
     }
-    affordanceGroup.add(createWaypointLoopHelper(course.robberLoop));
+    // The robber is now a free evader (no fixed waypoint loop), so the loop
+    // overlay is intentionally not drawn.
 
     // ---- rapier debug wireframe ----
     const rapierDebug = createRapierDebugRenderer();
@@ -390,6 +422,7 @@ export default function CarChase() {
       planStartWall: performance.now(),
       loopIndex: 0,
       goal: null,
+      goalRegion: null,
       lastReplanWall: -Infinity,
       lastExpansions: 0,
       lastBudgetMs: 0,
@@ -417,6 +450,7 @@ export default function CarChase() {
         planStartWall: performance.now(),
         mode: 'PURSUE',
         goal: null,
+        goalRegion: null,
         lastReplanWall: -Infinity,
         lastExpansions: 0,
         lastBudgetMs: 0,
@@ -479,6 +513,38 @@ export default function CarChase() {
       debugGroup.add(fp);
       return fp;
     });
+
+    // Goal-region overlay: draws each agent's canonical `kinocat/scenario`
+    // goal region (the cop's within/ahead/beside ball, the robber's escape
+    // disc) straight from the region object — the same introspection the Goal
+    // Lab uses. Meshes are rebuilt only when the underlying region changes
+    // (each replan) to avoid per-frame geometry churn.
+    const regionGroup = new THREE.Group();
+    scene.add(regionGroup);
+    function disposeGroup(g: THREE.Group) {
+      g.traverse((o) => {
+        const m = o as THREE.Mesh | THREE.Line;
+        if ((m as THREE.Mesh).geometry) (m as THREE.Mesh).geometry.dispose();
+        const mat = (m as THREE.Mesh).material as THREE.Material | undefined;
+        if (mat) mat.dispose();
+      });
+    }
+    interface RegionHolder {
+      mesh: THREE.Group | null;
+      shown: Region | null;
+    }
+    const robberRegionHolder: RegionHolder = { mesh: null, shown: null };
+    const copRegionHolders: RegionHolder[] = cops.map(() => ({ mesh: null, shown: null }));
+    function updateRegionMesh(holder: RegionHolder, region: Region | null, color: number) {
+      if (region === holder.shown) return;
+      if (holder.mesh) {
+        regionGroup.remove(holder.mesh);
+        disposeGroup(holder.mesh);
+      }
+      holder.mesh = region ? createRegionHelper(region, { color, y: 0.35 }) : null;
+      holder.shown = region;
+      if (holder.mesh) regionGroup.add(holder.mesh);
+    }
 
     // ---- shared planning state -----------------------------------------
     const registry = new PlanRegistry();
@@ -652,8 +718,9 @@ export default function CarChase() {
       );
       robber.loopIndex = pick.nextIndex;
       robber.goal = pick.goal;
+      robber.goalRegion = pick.region;
       const obstacles: ObstacleDescriptor[] = cops.map((co) =>
-        dehydrateObstacle(co.id, registry, co.car.readState(now), 2.6, 4),
+        dehydrateObstacle(co.id, registry, co.car.readState(now), ROBBER_SEE_COP_R, 4),
       );
       return {
         npcId: 'robber',
@@ -671,22 +738,25 @@ export default function CarChase() {
     } {
       const robberState = robber.car.readState(now);
       const copState = co.car.readState(now);
-      const mode = selectTacticalMode(robberState, copState, copIndex);
+      const copStates = cops.map((c) => c.car.readState(now));
+      const mode = selectTacticalMode(robberState, copStates, copIndex);
       const robberPredict: Predict<CarKinematicState> = (t) => {
         const p = registry.predictNPC('robber')(t) as CarKinematicState | null;
         return p ?? predictRobberFromState(robberState, 8)(t);
       };
-      const goal = tacticalGoal(robberState, robberPredict, copState, mode, course.buildings, course);
+      const copCtx = { cops: copStates, buildings: course.buildings, course };
+      const goal = tacticalGoal(robberState, robberPredict, copState, mode, copCtx);
       co.mode = mode;
       co.goal = goal;
+      co.goalRegion = copGoalRegion(robberState, robberPredict, copState, mode, copCtx);
       const siblingIds = cops
         .filter((o) => o.id !== co.id)
         .map((o) => o.id);
       const obstacles: ObstacleDescriptor[] = [
-        dehydrateObstacle('robber', registry, robberState, 2.6, 8),
+        dehydrateObstacle('robber', registry, robberState, COP_SEE_ROBBER_R, 8),
         ...siblingIds.map((sid) => {
           const sibCop = cops.find((c) => c.id === sid)!;
-          return dehydrateObstacle(sid, registry, sibCop.car.readState(now), 2.6, 4);
+          return dehydrateObstacle(sid, registry, sibCop.car.readState(now), COP_COP_R, 4);
         }),
       ];
       return {
@@ -1028,6 +1098,15 @@ export default function CarChase() {
         if (co.goal) copGoalMarks[i]!.position.set(co.goal.x, 2, co.goal.z);
       }
 
+      // Goal-region overlay (rebuilt only when a region changes).
+      regionGroup.visible = showGoalsRef.current;
+      if (showGoalsRef.current) {
+        updateRegionMesh(robberRegionHolder, robber.goalRegion, C.robber);
+        for (let i = 0; i < cops.length; i++) {
+          updateRegionMesh(copRegionHolders[i]!, cops[i]!.goalRegion, cops[i]!.color);
+        }
+      }
+
       // Chase camera tracks the robber from behind.
       if (chaseRef.current) {
         updateChaseCamera(
@@ -1040,6 +1119,53 @@ export default function CarChase() {
       // HUD throttle (~10 Hz to avoid React thrash).
       if (now - lastHudWall > 100) {
         lastHudWall = now;
+
+        // Goal visualizer: compile the SELECTED vehicle's scenario goal and
+        // evaluate deterministic progress along its committed plan prefix —
+        // the planner's objective state, made visible (same evaluator + panel
+        // as the Goal Lab). The switcher (vizAgent) picks robber or any cop.
+        {
+          const sel = vizAgentRef.current;
+          let region: Region | null = null;
+          let plan: CarKinematicState[] | null = null;
+          let planStartWall = now;
+          let state: CarKinematicState = robberStateAfter;
+          let label = '';
+          if (sel === 'robber') {
+            if (!playerDrivingRef.current) {
+              region = robber.goalRegion;
+              plan = robber.plan;
+              planStartWall = robber.planStartWall;
+              state = robberStateAfter;
+              label = `robber · reach(${region?.kind ?? '—'})`;
+            }
+          } else {
+            const ci = cops.findIndex((c) => c.id === sel);
+            if (ci >= 0) {
+              const co = cops[ci]!;
+              region = co.goalRegion;
+              plan = co.plan;
+              planStartWall = co.planStartWall;
+              state = copStatesAfter[ci]!;
+              label = `${co.id} · ${co.mode} · reach(${region?.kind ?? '—'})`;
+            }
+          }
+          if (region) {
+            const automaton = compile(reach(region));
+            let traj: CarKinematicState[];
+            if (plan && plan.length > 1) {
+              const elapsed = (now - planStartWall) / 1000;
+              const prefix = plan.filter((s) => s.t <= elapsed);
+              traj = prefix.length > 0 ? prefix : [plan[0]!];
+            } else {
+              traj = [{ ...state, t: 0 }];
+            }
+            setGoalViz({ automaton, snapshot: evaluateProgress(automaton, traj), label });
+          } else {
+            setGoalViz(null);
+          }
+        }
+
         const v = Math.abs(robberStateAfter.speed).toFixed(1);
         const hdg = ((robberStateAfter.heading * 180) / Math.PI).toFixed(0);
         setHud(
@@ -1138,6 +1264,51 @@ export default function CarChase() {
         <div style={{ opacity: 0.7, marginTop: 6 }}>
           busts: {score.busts} · round: {score.round}
         </div>
+        {showGoals && (
+          <div
+            style={{
+              marginTop: 8,
+              paddingTop: 8,
+              borderTop: '1px solid #1f2735',
+            }}
+          >
+            <div style={{ display: 'flex', gap: 4, marginBottom: 6, flexWrap: 'wrap' }}>
+              <span style={{ opacity: 0.6, alignSelf: 'center' }}>goal viz:</span>
+              {['robber', ...Array.from({ length: NUM_COPS }, (_, i) => `cop${i}`)].map((id) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setVizAgent(id)}
+                  style={{
+                    font: '11px ui-monospace, monospace',
+                    padding: '2px 6px',
+                    borderRadius: 6,
+                    border: `1px solid ${vizAgent === id ? '#7fd6ff' : '#1f2735'}`,
+                    background: vizAgent === id ? 'rgba(127,214,255,0.18)' : 'rgba(20,26,38,0.85)',
+                    color: vizAgent === id ? '#cdeaff' : '#8c95a4',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {id}
+                </button>
+              ))}
+            </div>
+            {goalViz ? (
+              <GoalProgressPanel
+                automaton={goalViz.automaton}
+                snapshot={goalViz.snapshot}
+                description={goalViz.label}
+                maxRows={4}
+              />
+            ) : (
+              <div style={{ opacity: 0.5 }}>
+                {vizAgent === 'robber' && playerDriving
+                  ? 'robber is player-driven (no AI goal)'
+                  : 'no active goal'}
+              </div>
+            )}
+          </div>
+        )}
         <div
           style={{
             display: 'flex',
