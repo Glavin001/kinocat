@@ -32,6 +32,7 @@ import {
   createCarMeshHelper,
   syncCarMesh,
   createGroundPlaneHelper,
+  createBuildingHelper,
 } from 'kinocat/adapters/three';
 import {
   buildKinematicLibrary,
@@ -805,7 +806,16 @@ async function setupScene(
   mount.appendChild(renderer.domElement);
 
   // ---- Shared course ----
-  const course = buildRaceCourse();
+  // Course variant is selectable via `?course=technical` — the walled /
+  // chicane / thread-the-gate layout that turns corner overshoot into a
+  // physical wall strike (see race-primitives-scenarios.ts). Defaults to the
+  // open flat pad.
+  const courseVariant: 'open' | 'technical' =
+    (typeof window !== 'undefined' &&
+      new URLSearchParams(window.location.search).get('course') === 'technical')
+      ? 'technical'
+      : 'open';
+  const course = buildRaceCourse(courseVariant);
   const navWorld = new InMemoryNavWorld(course.polygons, course.obstacles);
   const kinematicLib = buildKinematicLibrary();
   const initialLearnerParams = params ?? DEFAULT_LEARNED_PARAMS;
@@ -837,6 +847,7 @@ async function setupScene(
     ],
     syncHold: true,
     offTrackRecovery: 'waypoint',
+    course,
   });
 
   // ---- Per-car setup ----
@@ -856,6 +867,17 @@ async function setupScene(
     sun.position.set(40, 100, 20);
     scene.add(sun);
     scene.add(createGroundPlaneHelper({ bounds: RACE_BOUNDS, color: 0x141a26 }));
+    // Technical-course walls (empty on the open course). Rendered as slate
+    // blocks with edge wireframes; these are the same boxes the planner sees
+    // (inflated) as obstacles and the physics world has as colliders.
+    for (const w of course.walls ?? []) {
+      scene.add(
+        createBuildingHelper(
+          { x: w.x, z: w.z, hx: w.hx, hz: w.hz, height: w.height },
+          { color: 0x3a4458, edgeColor: 0x8fa2c0 },
+        ),
+      );
+    }
     // Waypoint cones — shared geometry per car scene.
     for (let i = 0; i < course.waypoints.length; i++) {
       const wp = course.waypoints[i]!;
