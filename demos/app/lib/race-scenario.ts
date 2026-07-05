@@ -348,6 +348,12 @@ export interface RaceTuning {
   maxSteerAngle?: number;
   /** Reverse-gear cruise cap (m/s) — see PurePursuitConfig.reverseCruiseSpeed. */
   reverseCruiseSpeed?: number;
+  /** Adaptive-replan lateral threshold (m). Race default 2.0; precision
+   *  maneuvers should correct early (~0.35) — mid-swing drift toward an
+   *  obstacle corner consumes the plan's clearance margin. */
+  lateralErrorReplanM?: number;
+  /** Curvature feedforward in pure-pursuit — see PurePursuitConfig. */
+  curvatureFeedforward?: boolean;
   /**
    * Stanley-style heading-alignment gain for the pure-pursuit tracker (forward
    * gear only). 0/undefined ⇒ classic position-only pursuit (racing). Parking
@@ -709,6 +715,7 @@ export async function createRaceScenario(
     minApproachSpeed: tuning.minApproachSpeed,
     reverseCruiseSpeed: tuning.reverseCruiseSpeed,
     minTurnRadius: tuning.trackerMinTurnRadius ?? PURE_PURSUIT_CONFIG.minTurnRadius,
+    curvatureFeedforward: tuning.curvatureFeedforward ?? false,
     respectPathSpeed: tuning.respectPathSpeed,
     headingGain: tuning.terminalHeadingGain ?? 0,
     // The runner gates the heading term on distance to the TRUE goal (see the
@@ -1107,10 +1114,17 @@ export async function createRaceScenario(
    *  chassis has drifted from the reference too far for the controller
    *  alone to recover comfortably. */
   function lateralFromPlan(c: CarInternal, x: number, z: number): number {
-    if (!c.plan || c.plan.length < 2) return Infinity;
-    const elapsed = Math.max(0, simTime - c.planStartSimTime);
-    const tail = trimPlan(c.plan, elapsed);
-    if (tail.length < 2) return Infinity;
+    // GEOMETRIC divergence, measured against the ACTIVE SEGMENT — the exact
+    // polyline the tracker is following. Two prior designs both misfired:
+    //  - time-trimmed tails read plan-time lag as "divergence" (segments now
+    //    genuinely DWELL at cusp rest samples, so the chassis is always
+    //    behind plan-time near a cusp — that is not an error);
+    //  - whole-plan minimum distance under-reports on multi-cusp plans whose
+    //    legs pass near each other (the pose matches a PAST leg).
+    // Plan exhaustion is a separate, progress-based condition in the cadence
+    // gate — pretending it is infinite lateral error caused replan storms.
+    const tail = c.segments[c.activeSegIdx] ?? c.plan;
+    if (!tail || tail.length < 2) return Infinity;
     let best = Infinity;
     for (let i = 0; i < tail.length - 1; i++) {
       const ax = tail[i]!.x;
@@ -1147,7 +1161,7 @@ export async function createRaceScenario(
     if (sinceLastMs < MIN_TIME_BETWEEN_REPLANS_MS) return false;
     // Trigger: large lateral error from the plan.
     const dLat = lateralFromPlan(c, state.x, state.z);
-    if (dLat > LATERAL_ERROR_REPLAN_M) return true;
+    if (dLat > (tuning.lateralErrorReplanM ?? LATERAL_ERROR_REPLAN_M)) return true;
     // Trigger: consecutive failures — keep trying. Cadence already
     // does this every 300ms but events let us retry earlier.
     if (c.diagnostics.consecutiveFailedReplans >= 2) return true;
@@ -1187,9 +1201,26 @@ export async function createRaceScenario(
     if (c.goalLatch?.state.holding) cadenceUseful = false;
     if (cadenceUseful && cadenceDue && c.plan && c.plan.length > 1) {
       const dLat = lateralFromPlan(c, stateBefore.x, stateBefore.z);
-      const elapsed = simTime - c.planStartSimTime;
-      const planDur = c.plan[c.plan.length - 1]!.t - c.plan[0]!.t;
-      const nearExhaustion = elapsed > planDur * 0.7;
+      // Exhaustion by PROGRESS, not by clock: cusp dwells and decel ramps put
+      // the chassis behind the plan's timeline by design, so elapsed-time
+      // exhaustion re-planned mid-maneuver on every cusp (the post-merge
+      // 102-replan churn). The plan is spent when the chassis is tracking
+      // its FINAL segment and has consumed most of it.
+      let nearExhaustion = false;
+      const seg = c.segments[c.activeSegIdx];
+      if (!seg || c.activeSegIdx >= c.segments.length - 1) {
+        const tail = seg ?? c.plan;
+        let ni = 0;
+        let bd = Infinity;
+        for (let i = 0; i < tail.length; i++) {
+          const d = Math.hypot(stateBefore.x - tail[i]!.x, stateBefore.z - tail[i]!.z);
+          if (d < bd) {
+            bd = d;
+            ni = i;
+          }
+        }
+        nearExhaustion = ni >= (tail.length - 1) * 0.8;
+      }
       const failing = c.diagnostics.consecutiveFailedReplans > 0;
       cadenceUseful = dLat > 0.25 || nearExhaustion || failing;
     }
@@ -1197,8 +1228,13 @@ export async function createRaceScenario(
       replanCar(c);
     }
     // Waypoint advance + lap detection (60Hz so lap times aren't quantized
-    // to the replan cadence).
-    if (!c.holdingForSync) {
+    // to the replan cadence). Single-waypoint goal-settle courses (parking)
+    // skip this entirely: the lone waypoint can only wrap onto itself, so
+    // every crossing of the arrive disk read as an "advance" — firing the
+    // waypoint-advance replan trigger every rate-limit window (5+/s) while
+    // the car shunted near the goal, and stamping phantom laps. Completion
+    // is the settle latch's job there.
+    if (!c.holdingForSync && !(opts.goalSettle && course.waypoints.length === 1)) {
       const pick = pickNextWaypoint(
         { ...stateBefore, t: 0 },
         course.waypoints,

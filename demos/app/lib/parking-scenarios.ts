@@ -179,7 +179,7 @@ export const PARKING_AGENT: VehicleAgent = defaultVehicleAgent({
  *  the monitor / `evaluateParked` keep judging the TRUE footprint. Without
  *  it, a collision-free plan can pass within ~0 cm of a block corner and the
  *  ~5-10 cm the tracker actually drifts mid-swing becomes a touch. */
-export const PARKING_PLAN_MARGIN = 0.25;
+export const PARKING_PLAN_MARGIN = 0.32;
 
 function inflateFootprint(
   fp: ReadonlyArray<readonly [number, number]>,
@@ -747,7 +747,12 @@ export const PARKING_RACE_TUNING: Partial<RaceTuning> = {
   // this cap pure-pursuit reversed at forward cruise (~1.9 m/s), over-sped
   // the planned reverse arcs, saturated curvature authority and drifted
   // ~0.45 m wide into the neighboring stall block.
-  reverseCruiseSpeed: 1.2,
+  reverseCruiseSpeed: 1.0,
+  lateralErrorReplanM: 0.35,
+  // Steer with the plan's curvature (feedback corrects only disturbances):
+  // kills the 0.1-0.3 m steady-state drift on max-curvature swings that used
+  // to eat the plan's clearance margin at the neighbor-block corner.
+  curvatureFeedforward: true,
   trackerMinTurnRadius: 3.44,
   maxSteerAngle: 0.75,
   plannerBudgetMs: 500,

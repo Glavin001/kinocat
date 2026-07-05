@@ -24,6 +24,16 @@ export interface PurePursuitConfig {
    * curvature authority, and drifts wide. Defaults to `cruiseSpeed`.
    */
   reverseCruiseSpeed?: number;
+  /**
+   * Feed the reference path's local curvature forward into the steering
+   * command (kappa = kappa_ff + pursuit feedback). Without it, pure pursuit
+   * must ACCUMULATE cross-track error to generate the curvature of an arc —
+   * on max-curvature parking swings that steady-state error is 0.1-0.3 m,
+   * exactly the clearance margin the plan reserved. With feedforward the
+   * feedback term only corrects disturbances. Off by default (race tuning
+   * predates it); parking enables it.
+   */
+  curvatureFeedforward?: boolean;
   /** Curvature-aware speed cap: v = sqrt(maxLateralAccel / |κ|). */
   maxLateralAccel: number;
   maxAccel: number;

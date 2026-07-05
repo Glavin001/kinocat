@@ -90,6 +90,27 @@ export function purePursuit(
   const dz = lp.z - current.z;
   const yV = -dx * s + dz * c; // lateral offset
   let kappa = (2 * yV) / (Ld * Ld);
+  // Curvature feedforward: signed Menger curvature of the reference polyline
+  // at the nearest sample (sample = execution order), mapped into the
+  // command convention. The vehicle law is dTheta_pose/dt = v * kappa_cmd,
+  // so kappa_cmd = (dTheta_pose/ds) * sign(v) = gear * kappa_menger — the
+  // gear factor matters: a reverse arc's polyline curvature is the NEGATION
+  // of the steering curvature that produces it. With feedforward, the
+  // pursuit term above acts as pure feedback and no longer needs
+  // steady-state cross-track error to hold an arc.
+  if (config.curvatureFeedforward && path.length >= 3) {
+    const i1 = Math.min(Math.max(ni, 1), path.length - 2);
+    const a = path[i1 - 1]!;
+    const b = path[i1]!;
+    const cc = path[i1 + 1]!;
+    const l1 = dist(a.x, a.z, b.x, b.z);
+    const l2 = dist(b.x, b.z, cc.x, cc.z);
+    const l3 = dist(a.x, a.z, cc.x, cc.z);
+    if (l1 > 1e-6 && l2 > 1e-6 && l3 > 1e-6) {
+      const cross = (b.x - a.x) * (cc.z - a.z) - (b.z - a.z) * (cc.x - a.x);
+      kappa += (gear * 2 * cross) / (l1 * l2 * l3);
+    }
+  }
   if (config.minTurnRadius) {
     const kMax = 1 / config.minTurnRadius;
     kappa = clamp(kappa, -kMax, kMax);
