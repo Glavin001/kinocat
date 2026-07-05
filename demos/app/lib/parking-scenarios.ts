@@ -19,7 +19,12 @@ import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavPolygon, NavWorld } from 'kinocat/environment';
 import { reach, at, stayInside } from 'kinocat/scenario';
 import type { Goal, Invariant } from 'kinocat/scenario';
-import { defaultVehicleAgent, kinematicForwardSim } from 'kinocat/agent';
+import {
+  defaultVehicleAgent,
+  kinematicForwardSim,
+  DEFAULT_LEARNABLE_CONFIG,
+  plannerVehicleCapabilities,
+} from 'kinocat/agent';
 import type { VehicleAgent, CarKinematicState } from 'kinocat/agent';
 import {
   characterizeVehicle,
@@ -140,6 +145,16 @@ function pose(x: number, z: number, heading: number): CarKinematicState {
 // sub-meter-clearance stall.
 
 export const PARKING_AGENT: VehicleAgent = defaultVehicleAgent({
+  // DELIBERATELY 25% inside the plant's kinematic minimum
+  // (L/tan(steerMax) ≈ 4.68 m). The scenario stall/aisle geometry was
+  // authored around 3.5 m maneuvers, and the tight intent acts as
+  // over-command the tracker's feedback exploits (the plant saturates
+  // at its own minimum). MEASURED: deriving this from
+  // plannerVehicleCapabilities (≈ 4.91 m) broke the reverse-perp
+  // invariant outright — feasible-radius plans need either wider
+  // scenario geometry or executor feedforward to compensate the wide
+  // tracking they're meant to fix. Revisit when curvature feedforward
+  // lands.
   minTurnRadius: 3.5,
   // Cap at 2 m/s. Pure-pursuit drift on a Rapier raycast vehicle scales
   // roughly with speed; at 3-4 m/s the chassis cuts the inside of a

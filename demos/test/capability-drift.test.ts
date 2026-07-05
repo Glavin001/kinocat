@@ -20,16 +20,20 @@ import { PARKING_AGENT } from '../app/lib/parking-scenarios';
 const plant = deriveVehicleCapabilities(DEFAULT_LEARNABLE_CONFIG);
 
 describe('agent capability drift vs derived plant envelope', () => {
-  // KNOWN INVERSION (production-readiness review E2): RACE_AGENT hand-codes
-  // 4.5 m but the chassis's kinematic minimum is L/tan(0.6) ≈ 4.68 m.
-  // Owned by the production-readiness fix branch; flip to `it` when the
-  // agents consume `plannerVehicleCapabilities`.
+  // MEASURED INVERSION, kept deliberately (see the agents' comments):
+  // planning slightly tighter than the plant can execute is intentional
+  // over-command that closed-loop feedback exploits. Enforcing strict
+  // containment (radius ≈ 4.91 m from plannerVehicleCapabilities)
+  // REGRESSED reality: kinematic lap 32.6 → 49.7 s, v2 DNF, parking
+  // reverse-perp invariant broken (stall geometry authored for 3.5 m).
+  // These stay `it.fails` as an honest record of the gap between the
+  // containment ideal and today's feedback-only executor; flip to `it`
+  // when curvature feedforward makes feasible-radius plans the faster
+  // ones — verify via closed-loop-race-benchmark + parking invariants.
   it.fails('race agent plans at a turn radius the plant can execute', () => {
     expect(RACE_AGENT.minTurnRadius).toBeGreaterThanOrEqual(plant.minTurnRadius);
   });
 
-  // KNOWN INVERSION (E2, worst case): parking plans 3.5 m arcs — 25%+
-  // beyond the chassis's capability.
   it.fails('parking agent plans at a turn radius the plant can execute', () => {
     expect(PARKING_AGENT.minTurnRadius).toBeGreaterThanOrEqual(plant.minTurnRadius);
   });

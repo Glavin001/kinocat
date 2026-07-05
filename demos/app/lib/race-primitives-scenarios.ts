@@ -21,7 +21,13 @@ import type { PlanResult } from 'kinocat/planner';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavPolygon, NavWorld } from 'kinocat/environment';
 import type { Goal, Invariant, CostTerm } from 'kinocat/scenario';
-import { defaultVehicleAgent, kinematicForwardSim, learnedForwardSimV2 } from 'kinocat/agent';
+import {
+  defaultVehicleAgent,
+  kinematicForwardSim,
+  learnedForwardSimV2,
+  DEFAULT_LEARNABLE_CONFIG,
+  plannerVehicleCapabilities,
+} from 'kinocat/agent';
 import type {
   LearnedVehicleParams,
   VehicleAgent,
@@ -138,6 +144,16 @@ export function buildRaceCourse(): RaceCourse {
 // test is the library.
 
 export const RACE_AGENT: VehicleAgent = defaultVehicleAgent({
+  // DELIBERATELY 4% inside the plant's kinematic minimum
+  // (L/tan(steerMax) ≈ 4.68 m — see deriveVehicleCapabilities). This is
+  // intentional over-command, not drift: planning slightly tighter than
+  // the chassis can execute makes the plant saturate at ITS OWN minimum
+  // radius on full-lock arcs, which pure-pursuit feedback exploits.
+  // MEASURED (closed-loop-race-benchmark): raising this to the "feasible"
+  // 4.91 m (5% planner margin) regressed the kinematic lap 32.6 → 49.7 s
+  // and DNF'd the v2 car — strict containment without executor
+  // feedforward compensation is a net loss on this stack. Revisit when
+  // curvature feedforward lands.
   minTurnRadius: 4.5,
   // 30 m/s = the Rapier chassis's physical ceiling on flat ground with the
   // race tuning (~4kN engine on ~580kg, no air drag in Rapier). The planner's
