@@ -47,8 +47,11 @@ export interface LearnedVehicleParamsV2 {
   reverseEffScale: number;
   /** Brake effectiveness scaling: longitudinal decel = brakeScale * (brakeForce / mass). */
   brakeScale: number;
-  /** Speed-tracking time constant (s). Sets the proportional-control gain
-   *  on residual accel near zero speedError. */
+  /** @deprecated No longer part of the model. Rapier applies wheel engine
+   *  force instantly, so the plant has no longitudinal command lag to fit;
+   *  the previous implementation was also algebraically inert
+   *  (`a·(1−e^−dt/τ) + a·e^−dt/τ ≡ a`). Kept in the interface so persisted
+   *  payloads round-trip; excluded from `PARAMS_V2_ORDER` (not fit). */
   accelTau: number;
   /** Tire grip multiplier on top of `frictionSlip`. Effective µ = grip * frictionSlip. */
   gripScale: number;
@@ -80,9 +83,11 @@ export interface LearnedVehicleParamsV2 {
    *  parameterized by lateral velocity instead of curvature, so it
    *  captures slip-induced drag honestly). */
   slipDrag: number;
-  /** Pitch-induced grip change (placeholder for load-transfer effects):
-   *  long accel reduces front-axle grip; rear-only-drivetrains have
-   *  asymmetric load. Bounded small. */
+  /** @deprecated Never referenced by `parametricForwardV2` — fitting it
+   *  was a free degree of freedom (fit degeneracy). Kept in the interface
+   *  so persisted payloads round-trip; excluded from `PARAMS_V2_ORDER`
+   *  (not fit). Re-introduce only together with an actual load-transfer
+   *  term in the integration body. */
   loadTransferCoeff: number;
   /** Throttle deadzone (N): below this drive force, no accel. Captures
    *  rolling resistance / clutch effects. */
@@ -173,16 +178,30 @@ export const PARAMS_V2_HI: LearnedVehicleParamsV2 = {
   rollingResistance: 0.2,
 };
 
+/** Parameters the fitter optimizes. `accelTau` and `loadTransferCoeff`
+ *  are deliberately absent: both were inert in the integration body, so
+ *  fitting them burned Nelder-Mead dimensions on coefficients with zero
+ *  gradient (see their @deprecated docs). */
 export const PARAMS_V2_ORDER: (keyof LearnedVehicleParamsV2)[] = [
-  'engineScale', 'reverseEffScale', 'brakeScale', 'accelTau',
+  'engineScale', 'reverseEffScale', 'brakeScale',
   'gripScale', 'frictionCircleSlack', 'steerRatio',
   'understeerOffThrottle', 'understeerPowerOn', 'yawRateTau',
   'lateralDamping', 'lateralFromSteer', 'slipDrag',
-  'loadTransferCoeff', 'driveDeadzone', 'rollingResistance',
+  'driveDeadzone', 'rollingResistance',
 ];
 
 export function paramsV2ToVec(p: LearnedVehicleParamsV2): number[] {
   return PARAMS_V2_ORDER.map((k) => p[k]);
+}
+
+/** Names of fitted params lying outside [PARAMS_V2_LO, PARAMS_V2_HI].
+ *  Loaders should surface these (a persisted artifact trained under
+ *  older, looser bounds carries values the current physical-plausibility
+ *  rationale rejects — the honest remedy is a re-fit, not a silent clamp,
+ *  since any residual ensemble was trained around the unclamped
+ *  backbone). Deprecated non-fit params are not checked. */
+export function paramsV2OutOfBounds(p: LearnedVehicleParamsV2): (keyof LearnedVehicleParamsV2)[] {
+  return PARAMS_V2_ORDER.filter((k) => p[k] < PARAMS_V2_LO[k] || p[k] > PARAMS_V2_HI[k]);
 }
 
 export function paramsV2FromVec(v: ReadonlyArray<number>): LearnedVehicleParamsV2 {
@@ -261,17 +280,14 @@ export function parametricForwardV2(
     aLong *= scale;
     const yawRateAllowed = yawRateCmd * scale;
 
-    // --- Speed dynamics with first-order accel tracking ------------------
-    // Smooth saturating accel: tanh-mix between long-accel cap and rolling.
-    // accelTau primarily affects how fast the chassis "wakes up" to a step
-    // command; clamps using params.accelTau when the residual is small.
-    const tau = Math.max(0.02, params.accelTau);
-    const aEff = aLong * (1 - Math.exp(-dt / tau)) + aLong * Math.exp(-dt / tau);
-    // (Equivalent to `aLong` for steady-state but keeps the form available
-    // for fitting.)
+    // --- Speed dynamics ---------------------------------------------------
+    // No first-order lag on aLong: the Rapier plant sets wheel engine force
+    // instantly (`setWheelEngineForce` per tick), so longitudinal response
+    // is mass-limited only. (`accelTau` used to appear here in an
+    // algebraically-inert expression — see its @deprecated doc.)
     // Slip-induced drag: lateral velocity costs forward speed.
     const slipLoss = -params.slipDrag * Math.abs(vy) * Math.sign(v) * dt;
-    let speed = v + aEff * dt + slipLoss;
+    let speed = v + aLong * dt + slipLoss;
     // Don't let brake-driven sign flip past zero in a single step.
     if (Math.sign(speed) !== Math.sign(v) && c.brakeForce > 0 && Math.abs(v) > 0) {
       speed = 0;
@@ -477,7 +493,6 @@ export const MLP_OUTPUT_DIM = 6;
 // Heading is sin/cos (already bounded ±1). Speed, yawRate, lateralVel
 // are normalised by typical chassis magnitudes.
 const STATE_SCALES = [1, 1, 20, 4, 6]; // (sinH, cosH, speed, yawRate, lateralVelocity)
-const CONTROL_SCALES = [1, 4000, 2000];
 
 export function buildMLPInput(
   s: CarKinematicState,
@@ -494,10 +509,19 @@ export function buildMLPInput(
     s.lateralVelocity ?? 0,
   ];
   const ctrlVec = [controls[0] ?? 0, controls[1] ?? 0, controls[2] ?? 0];
+  // Normalise drive/brake by the config's own force limits (identical to
+  // the historical hardcoded [1, 4000, 2000] for the reference chassis,
+  // but stays correct when a different chassis is trained). Training and
+  // inference both come through here, so the encoding cannot drift.
+  const controlScales = [
+    1,
+    Math.max(1, config.maxDriveForce),
+    Math.max(1, config.maxBrakeForce),
+  ];
   const cfgVec = encodeConfigOneHot(config);
   const inputs: number[] = [];
   for (let i = 0; i < stateVec.length; i++) inputs.push(stateVec[i]! / STATE_SCALES[i]!);
-  for (let i = 0; i < ctrlVec.length; i++) inputs.push(ctrlVec[i]! / CONTROL_SCALES[i]!);
+  for (let i = 0; i < ctrlVec.length; i++) inputs.push(ctrlVec[i]! / controlScales[i]!);
   for (let i = 0; i < cfgVec.length; i++) {
     const scale = CONFIG_SCALES_ORDINAL[Math.min(i, CONFIG_SCALES_ORDINAL.length - 1)] || 1;
     inputs.push(cfgVec[i]! / scale);

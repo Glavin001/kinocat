@@ -19,6 +19,7 @@ import {
   DEFAULT_LEARNED_PARAMS_V2,
   DEFAULT_LEARNABLE_CONFIG,
   buildParametricOnlyModel,
+  paramsV2OutOfBounds,
   type LearnedVehicleParamsV2,
   type LearnableVehicleConfig,
   type LearnedVehicleModel,
@@ -107,8 +108,21 @@ function rebuildModel(payload: PersistedV2Model): LearnedVehicleModel {
   const { deserializeMLP } = require('kinocat/agent') as {
     deserializeMLP?: (s: string) => unknown;
   };
+  const params = payload.params ?? DEFAULT_LEARNED_PARAMS_V2;
+  // Surface (don't clamp) params outside the current physical-plausibility
+  // bounds: an artifact fit under older, looser bounds behaves as trained
+  // only with its original values — silently clamping would degrade it,
+  // because any residual ensemble was trained around the unclamped
+  // backbone. The honest remedy is a re-fit; warn so it's visible.
+  const outOfBounds = paramsV2OutOfBounds(params);
+  if (outOfBounds.length > 0) {
+    console.warn(
+      `[kinocat] v2 model params outside current fit bounds (${outOfBounds.join(', ')}); ` +
+        'artifact was likely trained under older bounds — retrain to reconcile.',
+    );
+  }
   const base = buildParametricOnlyModel(
-    payload.params ?? DEFAULT_LEARNED_PARAMS_V2,
+    params,
     payload.config ?? DEFAULT_LEARNABLE_CONFIG,
   );
   if (deserializeMLP && payload.residualEnsembleJson?.length) {

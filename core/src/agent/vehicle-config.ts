@@ -37,9 +37,13 @@ export interface LearnableVehicleConfig {
 }
 
 /** Sensible defaults — match the kinocat sport-car reference chassis (the
- *  raycast-vehicle adapter's `DEFAULTS`, derived for the same vehicle). */
+ *  raycast-vehicle adapter's `DEFAULTS`, derived for the same vehicle).
+ *  chassisMass is the exact cuboid derivation (8·2.4·0.5·1.0 halfExtents
+ *  volume × density 60 = 576 kg), matching `deriveLearnableConfig` — a
+ *  hand-rounded 580 lived here for a while and drifted from every
+ *  Rapier-derived config, including the shipped model artifact. */
 export const DEFAULT_LEARNABLE_CONFIG: LearnableVehicleConfig = {
-  chassisMass: 580,
+  chassisMass: 576,
   wheelBase: 1.6,
   wheelTrack: 0.85,
   wheelRadius: 0.35,

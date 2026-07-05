@@ -53,6 +53,24 @@ export interface PurePursuitConfig {
    * the smoothed profile is ignored. Default false (legacy behaviour).
    */
   respectPathSpeed?: boolean;
+  /**
+   * When true, the tracker caps target speed by UPCOMING path curvature
+   * through the braking envelope: for each sample at arc distance d with
+   * local (Menger) curvature κ, allowed = sqrt(maxLateralAccel/|κ| +
+   * 2·maxDecel·d). Without this, `vCurve` sees only the instantaneous
+   * chord to the lookahead point, so a plan that runs straight into a
+   * tight corner (e.g. a dynamics-honest brake-then-turn plan) is
+   * entered at full speed and overshot. Pure geometry — no trust in the
+   * plan's per-sample speeds required. Default false (legacy behaviour).
+   */
+  previewCurvature?: boolean;
+  /** Lateral-accel budget used by the curvature preview's corner-speed
+   *  term (m/s²). Defaults to `maxLateralAccel`. Set this to the plant's
+   *  physical grip ceiling (μ·g, see deriveVehicleCapabilities) when
+   *  `maxLateralAccel` is a comfort cap — braking preview should trigger
+   *  at the physical limit, not the comfort limit, or clean laps slow
+   *  down across the board. */
+  previewLateralAccel?: number;
   /** Optional Stanley-style heading-alignment gain. When > 0, a curvature term
    *  proportional to the heading error against the local path tangent is added
    *  (forward gear only), so the tracker drives the chassis onto the planned

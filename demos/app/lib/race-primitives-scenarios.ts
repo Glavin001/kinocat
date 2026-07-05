@@ -21,7 +21,13 @@ import type { PlanResult } from 'kinocat/planner';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavPolygon, NavWorld } from 'kinocat/environment';
 import type { Goal, Invariant, CostTerm } from 'kinocat/scenario';
-import { defaultVehicleAgent, kinematicForwardSim, learnedForwardSimV2 } from 'kinocat/agent';
+import {
+  defaultVehicleAgent,
+  kinematicForwardSim,
+  learnedForwardSimV2,
+  DEFAULT_LEARNABLE_CONFIG,
+  plannerVehicleCapabilities,
+} from 'kinocat/agent';
 import type {
   LearnedVehicleParams,
   VehicleAgent,
@@ -138,6 +144,16 @@ export function buildRaceCourse(): RaceCourse {
 // test is the library.
 
 export const RACE_AGENT: VehicleAgent = defaultVehicleAgent({
+  // DELIBERATELY 4% inside the plant's kinematic minimum
+  // (L/tan(steerMax) ≈ 4.68 m — see deriveVehicleCapabilities). This is
+  // intentional over-command, not drift: planning slightly tighter than
+  // the chassis can execute makes the plant saturate at ITS OWN minimum
+  // radius on full-lock arcs, which pure-pursuit feedback exploits.
+  // MEASURED (closed-loop-race-benchmark): raising this to the "feasible"
+  // 4.91 m (5% planner margin) regressed the kinematic lap 32.6 → 49.7 s
+  // and DNF'd the v2 car — strict containment without executor
+  // feedforward compensation is a net loss on this stack. Revisit when
+  // curvature feedforward lands.
   minTurnRadius: 4.5,
   // 30 m/s = the Rapier chassis's physical ceiling on flat ground with the
   // race tuning (~4kN engine on ~580kg, no air drag in Rapier). The planner's
@@ -155,8 +171,15 @@ export const RACE_AGENT: VehicleAgent = defaultVehicleAgent({
     [-2.4, -1.0],
     [2.4, -1.0],
   ],
-  reverseCostMultiplier: 1.4,
-  directionChangePenalty: 0.4,
+  // Reverse is a recovery gear in racing, never a racing line. With the
+  // tracker's reverse cruise now correctly capped at maxReverseSpeed
+  // (6 m/s), a planned 100 m reverse leg costs ~17 s of real time — the
+  // cost prior must reflect that so the planner U-turns instead.
+  // (Measured before this: BOTH libraries planned multi-10 m reverse
+  // legs after corner overshoots, previously masked by the tracker
+  // executing reverse at forward cruise speed.)
+  reverseCostMultiplier: 3.0,
+  directionChangePenalty: 1.0,
 });
 
 /** Race-tuned control set spanning the full speed envelope to chassis
@@ -202,8 +225,15 @@ export function raceControlSets(agent: VehicleAgent = RACE_AGENT): number[][] {
 
 /** Start-speed buckets covering the full envelope from rest to top speed.
  *  The planner picks the bucket nearest the car's current speed when
- *  expanding a node. */
-export const RACE_START_SPEEDS = [0, 10, 20, 28];
+ *  expanding a node — so the bucket spacing IS the model's sampling
+ *  density. The old [0, 10, 20, 28] grid quantized away most of what a
+ *  speed-dependent model knows (understeer ∝ v², friction circle): a
+ *  node at 15 m/s expanded with arcs baked at 10 or 20 m/s, an endpoint
+ *  error that dwarfs the v2 model's sub-meter 1 s accuracy. 4 m/s
+ *  spacing keeps nearest-bucket error ≤ 2 m/s — matching the training
+ *  grid ([0,4,…,28] in training-driver) — at zero search cost (lookup
+ *  stays nearest-bucket; branching per node is unchanged). */
+export const RACE_START_SPEEDS = [0, 4, 8, 12, 16, 20, 24, 28];
 
 export function buildKinematicLibrary(): MotionPrimitiveLibrary {
   return characterizeVehicle({
@@ -256,23 +286,43 @@ export function buildLearnedRaceLibraryV2(
 ): MotionPrimitiveLibrary {
   const inner = learnedForwardSimV2(model);
   const cfg = model.config;
+  // Duration tuned per-regime: enough time for control differences to
+  // produce DISTINGUISHABLE endpoints (so the planner has real choices)
+  // but not so long that the planner can't react to nearby gates.
+  // At v=0 the chassis needs ~1.5 s to accelerate to a speed where turn
+  // dynamics differentiate. At speed, brake-into-corner trajectories need
+  // ~0.8 s to develop (5.5 m/s² brake decel × 0.8 s = 4.4 m/s of speed
+  // change, enough to discriminate plans). The regime → control-set
+  // mapping follows the same physics rationale as the original 4-bucket
+  // layout; the denser RACE_START_SPEEDS grid just samples each regime
+  // at more start speeds so nearest-bucket quantization stays ≤ 2 m/s.
+  // Duration parity with the kinematic library (0.55 s) once the chassis
+  // is moving: the planner's decision cadence is part of the "identical
+  // system" contract, and longer v2 primitives measurably cost agility
+  // in the slalom (fewer direction changes per second available to the
+  // search). Only the launch bucket keeps a longer window — from rest,
+  // 0.55 s of full throttle covers < 1 m and endpoints barely
+  // differentiate.
+  const regimeFor = (v: number): { duration: number; controls: number[][] } => {
+    // Launch bucket keeps 1.5 s: from rest the acceleration phase
+    // dominates and a shorter window collapses the endpoint fan below
+    // the planner-usability floor (primitive-diagnostics asserts
+    // hull ≥ 0.5 m²; 1.0 s measured 0.26 m²).
+    if (v < 2) return { duration: 1.5, controls: lowSpeedV2Controls(cfg) };
+    // 4 m/s bucket needs 0.8 s for a non-degenerate endpoint fan
+    // (0.55 s measured hull 0.19 m² < the 0.5 m² usability floor).
+    // (Launch-style controls here were measured WORSE: 21 failed
+    // replans on the flying lap — the coast/brake options matter.)
+    if (v < 6) return { duration: 0.8, controls: midSpeedV2Controls(cfg) };
+    if (v < 14) return { duration: 0.55, controls: midSpeedV2Controls(cfg) };
+    if (v < 23) return { duration: 0.55, controls: highSpeedV2Controls(cfg) };
+    return { duration: 0.55, controls: topSpeedV2Controls(cfg) };
+  };
   const buckets: Array<{
     startSpeed: number;
     duration: number;
     controls: number[][];
-  }> = [
-    // Duration tuned per-bucket: enough time for control differences to
-    // produce DISTINGUISHABLE endpoints (so the planner has real choices)
-    // but not so long that the planner can't react to nearby gates.
-    // At v=0 the chassis needs ~1.5 s to accelerate to a speed where turn
-    // dynamics differentiate. At v=28 brake-into-corner trajectories need
-    // ~0.8 s to develop (5.5 m/s² brake decel × 0.8 s = 4.4 m/s of speed
-    // change, enough to discriminate plans).
-    { startSpeed: 0,  duration: 1.5,  controls: lowSpeedV2Controls(cfg) },
-    { startSpeed: 10, duration: 0.8,  controls: midSpeedV2Controls(cfg) },
-    { startSpeed: 20, duration: 0.8,  controls: highSpeedV2Controls(cfg) },
-    { startSpeed: 28, duration: 0.8,  controls: topSpeedV2Controls(cfg) },
-  ];
+  }> = RACE_START_SPEEDS.map((v) => ({ startSpeed: v, ...regimeFor(v) }));
   const all: import('kinocat/primitives').MotionPrimitive[] = [];
   let id = 0;
   for (const b of buckets) {
@@ -368,6 +418,10 @@ function topSpeedV2Controls(cfg: CfgLike): number[][] {
   const brk = cfg.maxBrakeForce;
   const st = cfg.maxSteerAngle;
   return [
+    [0, drv, 0],                  // full throttle straight — without this the
+                                  // planner cannot plan sustained acceleration
+                                  // above ~23 m/s (the top-speed regime had no
+                                  // full-power action at all)
     [0, 0.4 * drv, 0],            // accelerate-cruise (small accel)
     [0, 0, 0],                    // coast straight
     [0, 0, 0.3 * brk],            // light brake straight

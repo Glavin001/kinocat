@@ -151,39 +151,103 @@ export function purePursuit(
     2 * config.maxDecel * Math.max(distToGoal - config.goalTolerance, 0),
   );
 
-  // Optional path-speed cap: when the upstream planner attached a
-  // speed-profile-smoothed plan, the per-sample `speed` already encodes
-  // curvature- and brake-distance-aware targets. Take the min of the
-  // planned speeds in a forward window so the controller actually
-  // consumes that information (without this, the smoother has no effect).
+  // Optional path-speed cap: consume the plan's per-sample speed intent
+  // through the BRAKING ENVELOPE, not a raw window-min. A future planned
+  // speed v_i at arc distance d_i constrains the speed HERE only to
+  // sqrt(v_i² + 2·maxDecel·d_i) — the fastest we can go now and still
+  // brake down to v_i by the time we get there. The previous raw
+  // window-min meant any near-zero sample (a coast-to-stop primitive, a
+  // cusp, a plan terminal) inside the 14 m window pinned the target to
+  // ~0 from far away — measured closed-loop: BOTH race cars crawled to
+  // 0 laps in 100 s with the toggle on, which is why it was disabled.
+  // With the envelope, distant slow-downs bind exactly when physics says
+  // they should, so the planner's honest entry speeds become executable.
+  // Anticipatory curvature braking: cap speed by UPCOMING path curvature
+  // through the braking envelope. `vCurve` above only sees the chord to
+  // the lookahead point, so a plan whose geometry runs straight into a
+  // tight corner is entered at full speed and overshot (measured on the
+  // race track: the v2 car's honest brake-then-turn plan blew through
+  // the 90° corner ~10 m wide and triggered a 3 s failed-replan U-turn).
+  // Pure geometry — works identically for any library.
+  let vPreview = Infinity;
+  if (config.previewCurvature && path.length >= 3) {
+    // Look as far ahead as braking from the CURRENT speed requires —
+    // previewing from cruise speed capped mild curves 50+ m out and
+    // slowed clean laps by ~50% (measured).
+    const v0 = Math.abs(current.speed);
+    const previewHorizon = Math.max(
+      config.lookaheadMax,
+      (v0 * v0) / (2 * config.maxDecel),
+    );
+    let acc = 0;
+    for (let i = Math.max(ni, 1); i < path.length - 1 && acc <= previewHorizon; i++) {
+      acc += dist(path[i - 1]!.x, path[i - 1]!.z, path[i]!.x, path[i]!.z);
+      // Menger curvature through samples i-1, i, i+1.
+      const ax = path[i - 1]!.x, az = path[i - 1]!.z;
+      const bx = path[i]!.x, bz = path[i]!.z;
+      const cx = path[i + 1]!.x, cz = path[i + 1]!.z;
+      const area2 = Math.abs((bx - ax) * (cz - az) - (bz - az) * (cx - ax));
+      const ab = Math.hypot(bx - ax, bz - az);
+      const bc = Math.hypot(cx - bx, cz - bz);
+      const ca = Math.hypot(cx - ax, cz - az);
+      const denom = ab * bc * ca;
+      if (denom < 1e-9) continue;
+      const kappaAt = (2 * area2) / denom;
+      // Only GENUINE corners bind (R ≤ 12.5 m). Replanned chord paths
+      // carry curvature noise on straights; previewing every wiggle
+      // capped both cars well below their clean pace (measured).
+      if (kappaAt < 0.08) continue;
+      const aLatPreview = config.previewLateralAccel ?? config.maxLateralAccel;
+      const vAtCorner2 = aLatPreview / kappaAt;
+      const allowed = Math.sqrt(vAtCorner2 + 2 * config.maxDecel * acc);
+      if (allowed < vPreview) vPreview = allowed;
+    }
+  }
+
   let vPath = Infinity;
   if (config.respectPathSpeed) {
-    let acc = 0;
     const window = config.lookaheadMax;
-    let i = ni;
-    for (; i < path.length - 1 && acc <= window; i++) {
-      const s2 = Math.abs(path[i]!.speed);
-      if (s2 < vPath) vPath = s2;
-      acc += dist(path[i]!.x, path[i]!.z, path[i + 1]!.x, path[i + 1]!.z);
+    // The nearest sample constrains at its true distance — but ONLY when
+    // it lies AHEAD along the direction of travel. At d≈0 it is the
+    // plan's echo of the current state (folding it in pins a stopped car
+    // to 0 — never launches); when BEHIND, it caps the car to a speed it
+    // already passed (race plans have metres between samples, so the
+    // rest-speed spawn node kept the whole field crawling). Samples past
+    // the nearest constrain through their braking envelope regardless.
+    const dxs = path[ni]!.x - current.x;
+    const dzs = path[ni]!.z - current.z;
+    const aheadSigned =
+      (dxs * Math.cos(current.heading) + dzs * Math.sin(current.heading)) * gear;
+    const d0 = dist(current.x, current.z, path[ni]!.x, path[ni]!.z);
+    if (aheadSigned > 0.05) {
+      const s0 = Math.abs(path[ni]!.speed);
+      const allowed0 = Math.sqrt(s0 * s0 + 2 * config.maxDecel * d0);
+      if (allowed0 < vPath) vPath = allowed0;
     }
-    // Only fold in the terminal (goal) speed once the goal itself is within the
-    // lookahead window (the loop consumed the whole path). Doing it
-    // unconditionally pins the target to the terminal stop speed (~0) from
-    // arbitrarily far away, so a plan that ends in a stop never starts moving.
-    if (i >= path.length - 1) {
-      const last = Math.abs(path[path.length - 1]!.speed);
-      if (last < vPath) vPath = last;
+    let acc = aheadSigned > 0 ? d0 : 0;
+    for (let i = ni; i < path.length - 1 && acc <= window; i++) {
+      acc += dist(path[i]!.x, path[i]!.z, path[i + 1]!.x, path[i + 1]!.z);
+      const s2 = Math.abs(path[i + 1]!.speed);
+      const allowed = Math.sqrt(s2 * s2 + 2 * config.maxDecel * acc);
+      if (allowed < vPath) vPath = allowed;
     }
     if (!Number.isFinite(vPath)) vPath = Infinity;
   }
 
+  // Reverse cruise is capped by BOTH limits: the chassis's reverse
+  // envelope AND the scenario cruise (a parking scenario cruising at
+  // 2 m/s must not back in at the 6 m/s chassis reverse limit —
+  // measured: 5.4 m/s reverse approaches parked 12° crooked).
   const cruise =
-    gear < 0 ? (config.reverseCruiseSpeed ?? config.cruiseSpeed) : config.cruiseSpeed;
+    gear < 0
+      ? Math.min(config.cruiseSpeed, config.reverseCruiseSpeed ?? config.cruiseSpeed)
+      : config.cruiseSpeed;
   const speedMag = atGoal
     ? 0
     : Math.min(
         cruise,
         vCurve,
+        vPreview,
         vPath,
         Math.max(vGoal, config.minApproachSpeed ?? config.lookaheadMin),
       );

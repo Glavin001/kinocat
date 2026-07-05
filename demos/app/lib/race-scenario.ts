@@ -54,6 +54,7 @@ import {
   parametricForwardV2,
   DEFAULT_LEARNED_PARAMS_V2,
   DEFAULT_LEARNABLE_CONFIG,
+  deriveVehicleCapabilities,
   type VehicleAgent,
 } from 'kinocat/agent';
 import { buildPlan, segmentByGear, type Plan } from 'kinocat/plan';
@@ -150,6 +151,21 @@ const PURE_PURSUIT_CONFIG = {
   // this the smoother has no effect and the controller would still
   // arrive hot at corner entries. (Tuning override below toggles this.)
   respectPathSpeed: true,
+  // Anticipatory curvature braking: brake for UPCOMING plan-geometry
+  // corners via the braking envelope, not just the instantaneous chord.
+  // Measured on the feedforward executor (deterministic 2-lap
+  // benchmark): costs both cars ~4 s of pace but eliminates the v2
+  // car's corner-overshoot replan storms (11 → 0 failed replans) and
+  // improves BOTH cars' closed-loop prediction error (kin 0.93 → 0.82,
+  // v2 0.99 → 0.92 m). Reliability + predictability over peak pace.
+  previewCurvature: true,
+  previewLateralAccel:
+    0.8 * deriveVehicleCapabilities(DEFAULT_LEARNABLE_CONFIG).maxLateralAccel,
+  // Reverse gear executes at the chassis's reverse limit, NOT forward
+  // cruise (measured without this: −24 m/s reverse down a 100 m
+  // straight — outside the chassis envelope AND the model's training
+  // distribution).
+  reverseCruiseSpeed: RACE_AGENT.maxReverseSpeed,
 };
 
 // ---------------------------------------------------------------------------
@@ -280,6 +296,9 @@ export interface RaceTuning {
   /** Pure-pursuit folds the smoothed plan's per-sample speeds into the
    *  target-speed clamp (the smoother has no effect without this). */
   respectPathSpeed: boolean;
+  /** Override for the curvature preview's lateral-accel budget (m/s²).
+   *  Undefined → PURE_PURSUIT_CONFIG default (plant grip ceiling). */
+  previewLateralAccel?: number;
   /** Event-driven replan triggers in addition to the fixed cadence. */
   enableAdaptiveReplan: boolean;
   /** Trigger an extra replan on waypoint advance (subset of adaptive). */
@@ -717,6 +736,8 @@ export async function createRaceScenario(
     minTurnRadius: tuning.trackerMinTurnRadius ?? PURE_PURSUIT_CONFIG.minTurnRadius,
     curvatureFeedforward: tuning.curvatureFeedforward ?? false,
     respectPathSpeed: tuning.respectPathSpeed,
+    previewLateralAccel:
+      tuning.previewLateralAccel ?? PURE_PURSUIT_CONFIG.previewLateralAccel,
     headingGain: tuning.terminalHeadingGain ?? 0,
     // The runner gates the heading term on distance to the TRUE goal (see the
     // controller loop), so pure-pursuit's own per-path-end radius stays open.
