@@ -7,9 +7,21 @@ workstream follows the same shape — **What to build → How to build it →
 Acceptance checklist** — so each one is unambiguous about the deliverable
 and mechanically verifiable when done.*
 
-*Status: PLAN. Every file:line reference verified against this branch
-(post-PR #50: grip-saturating brake model, technical course, per-car MPPI
-model wiring, driving-quality metrics).*
+*Status: PLAN + PARTIAL IMPLEMENTATION. Every file:line reference verified
+against this branch (post-PR #50: grip-saturating brake model, technical
+course, per-car MPPI model wiring, driving-quality metrics).*
+
+## Implementation status (this branch)
+
+| WS | Status | Result |
+|---|---|---|
+| WS-0 plant envelope | ✅ landed | `plant-envelope.ts` + `plant-envelope.test.ts`. Finding: plant has NO intrinsic top speed (accel ~11 m/s² @28 m/s; ~97 m/s in a 12 s launch); brake 15–50 m/s²; cornering ~13.7 m/s². `RACE_AGENT.maxSpeed=30` is policy, not physics. |
+| WS-1 faithful speed execution | ✅ landed | No phantom horizon braking, bang-bang throttle + split coast bands, envelope-raised caps. Open ratio **1.28→1.02** (both clean), g-g **0.44→0.65**; **technical course v2 now BEATS kinematic 35.9 s vs 44.4 s (ratio 0.81)** — the delusion strikes walls. Ratchets tightened (open 1.10, technical 0.90). |
+| WS-2 dynamic rollouts | ⚠️ capability landed, OFF by default | `characterizeVehicleFromState` + `VehicleEnvironment.rootRollout` + unit tests (A2.1/A2.2). Enabling root-only regressed the closed loop (slip-aware first primitive chained with zero-slip successors = inconsistent seam); needs carry-slip-through-successors + a yaw-frame audit to complete. |
+| WS-1½ control feedforward | ⬜ not started | Queued. |
+| WS-3 racing MPPI | ⬜ not started | Per-car model wiring exists (pre-PR #50); the cost redesign (progress reward + corridor + substepping) that stops it DNF'ing is not done. Highest-risk item; deferred to keep the WS-1 wins clean. |
+| WS-4 circuit course | ⬜ attempted, reverted | An untuned outer-wall circuit punished v2's honest (wider) line instead of the kinematic delusion; reverted. The technical course already separates the models (v2 wins, kinematic strikes walls). A properly-calibrated circuit remains future work. |
+| WS-5 gates | ✅ | Full suite 859 pass / 2 skip; typecheck + build + size green; non-forcing audit holds (bang-bang floors toward the planner's target, caps only reduce speed, no spawn-at-speed). |
 
 ---
 
