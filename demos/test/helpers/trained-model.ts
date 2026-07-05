@@ -6,10 +6,20 @@
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { deserializeMLP, type LearnedVehicleModel, type MLP } from 'kinocat/agent';
+import {
+  deserializeMLP,
+  v3FromJson,
+  type LearnedVehicleModel,
+  type LearnedVehicleModelV3,
+  type MLP,
+} from 'kinocat/agent';
 
 export const TRAINED_V2_ARTIFACT_PATH = join(
   __dirname, '..', '..', 'public', 'models', 'v2-default.json',
+);
+
+export const TRAINED_V3_ARTIFACT_PATH = join(
+  __dirname, '..', '..', 'public', 'models', 'v3-default.json',
 );
 
 export function loadTrainedV2FromDisk(
@@ -26,4 +36,11 @@ export function loadTrainedV2FromDisk(
     residualReferenceDt: payload.residualReferenceDt ?? 0.1,
     oodStdThreshold: payload.oodStdThreshold,
   };
+}
+
+/** The shipped purely-learned v3 artifact (`demos/scripts/train-v3.ts`). */
+export function loadTrainedV3FromDisk(
+  path: string = TRAINED_V3_ARTIFACT_PATH,
+): LearnedVehicleModelV3 {
+  return v3FromJson(JSON.parse(readFileSync(path, 'utf8')));
 }

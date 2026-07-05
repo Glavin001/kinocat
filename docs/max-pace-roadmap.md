@@ -11,6 +11,19 @@ and mechanically verifiable when done.*
 against this branch (post-PR #50: grip-saturating brake model, technical
 course, per-car MPPI model wiring, driving-quality metrics).*
 
+## Follow-up: the v3 purely-learned model
+
+The post-WS-1 review traced "v2 never hits its top speed" to a hand-coded
+bound inside the v2 parametric backbone (`engineScale ≤ 1.05` — false: the
+plant applies engine force per driven wheel, so real launch accel is
+13.9 m/s², double what the clamped backbone can express). The residual MLP
+silently absorbed the error; the OOD fallback re-introduced it. The fix is
+architectural, not a retune: **v3**, a purely data-driven neural transition
+model with no parametric backbone and no hand-set constants. See
+`docs/v3-purely-learned-model.md` for design, implementation map, and
+measured results (0.8 s endpoint fidelity: v3 0.63 m vs v2 1.07 m vs
+kinematic 4.16 m mean).
+
 ## Implementation status (this branch)
 
 | WS | Status | Result |

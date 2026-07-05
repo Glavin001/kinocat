@@ -73,6 +73,27 @@ export {
   MLP_OUTPUT_DIM,
 } from './vehicle-model';
 
+// V3 learned dynamics: PURELY data-driven neural transition model — no
+// parametric backbone, no hand-set parameter bounds. Body-frame by
+// construction (the plant's own translation/rotation symmetry); all
+// normalization constants are statistics of the training data.
+export type {
+  LearnedVehicleModelV3,
+  V3Normalization,
+  V3PredictionWithUncertainty,
+  PersistedV3Model,
+} from './vehicle-model-v3';
+export {
+  V3_INPUT_DIM,
+  V3_OUTPUT_DIM,
+  buildV3Input,
+  forwardSimV3,
+  predictWithUncertaintyV3,
+  v3ToJson,
+  v3FromJson,
+  isV3Payload,
+} from './vehicle-model-v3';
+
 // Physical capability envelope derived from the vehicle config — the
 // single source of truth for planner/tracker limits (mass, wheelbase,
 // min turn radius, accel/decel/lateral ceilings).
