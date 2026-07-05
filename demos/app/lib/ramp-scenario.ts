@@ -33,6 +33,7 @@ import {
   RAMP_MAX_EXPANSIONS,
   buildRampCourse,
   planRampDemo,
+  planTakesJump,
   rampHeightSampler,
   type RampCourse,
 } from './ramp-scenarios';
@@ -150,13 +151,7 @@ export async function createRampScenario(
       planStartSimTime = simTime;
       successfulReplans++;
       consecutiveFailedReplans = 0;
-      // An affordance step jumps the planner state by more than any primitive
-      // could in a single tick (same heuristic the page used).
-      usedAffordance = res.path.some(
-        (_, i) =>
-          i > 0 &&
-          Math.hypot(res.path[i]!.x - res.path[i - 1]!.x, res.path[i]!.z - res.path[i - 1]!.z) > 10,
-      );
+      usedAffordance = planTakesJump(res.path, course);
     } else {
       consecutiveFailedReplans++;
     }

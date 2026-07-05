@@ -237,6 +237,39 @@ export function rampAffordances(course: RampCourse): AffordanceRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// Affordance detection. A plan "takes the jump" when a consecutive pair of
+// path states steps from near a registered jump's launch to near its land in
+// one edge — the off-mesh ballistic shortcut, not a ground primitive. This is
+// far more robust than the old "any hop > 10 m" heuristic, which false-
+// positived on the detour plan (whose final coarse segment to the far goal is
+// itself a long straight hop) and so reported "affordance used" even while the
+// car physically drove around the gap.
+export function planTakesJump(
+  path: CarKinematicState[],
+  course: RampCourse,
+  radius = 4,
+): boolean {
+  for (let i = 1; i < path.length; i++) {
+    const a = path[i - 1]!;
+    const b = path[i]!;
+    for (const j of course.jumps) {
+      const nearLaunch = Math.hypot(a.x - j.launch.x, a.z - j.launch.z) <= radius;
+      const nearLand = Math.hypot(b.x - j.land.x, b.z - j.land.z) <= radius;
+      if (nearLaunch && nearLand) return true;
+    }
+  }
+  return false;
+}
+
+/** Peak lateral excursion of a plan — how far off the z=0 centreline it swings.
+ *  The jump plan hugs z≈0; the detour swings out past the gap half-width. */
+export function planLateralExcursion(path: CarKinematicState[]): number {
+  let m = 0;
+  for (const p of path) m = Math.max(m, Math.abs(p.z));
+  return m;
+}
+
+// ---------------------------------------------------------------------------
 // Planning helper.
 
 export const RAMP_REPLAN_BUDGET_MS = 100;
