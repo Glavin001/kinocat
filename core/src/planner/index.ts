@@ -4,7 +4,7 @@ export { planVehicleOnce } from './plan-vehicle';
 export type { PlanVehicleRequest } from './plan-vehicle';
 export { planVehicleMultiGoal } from './plan-vehicle-multi';
 export type { PlanVehicleMultiGoalRequest } from './plan-vehicle-multi';
-export { planVehicleScenario } from './plan-vehicle-scenario';
+export { planVehicleScenario, planVehicleScenarioCar } from './plan-vehicle-scenario';
 export type {
   PlanVehicleScenarioRequest,
   ScenarioPlanResult,

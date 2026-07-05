@@ -62,6 +62,7 @@ import {
   buildRaceCourse,
   planRaceMultiGoal,
   planRace,
+  planRaceScenario,
   pickNextWaypoint,
   RACE_AGENT,
   RACE_REPLAN_BUDGET_MS,
@@ -856,28 +857,40 @@ export async function createRaceScenario(
     const isParking = course.waypoints.length === 1;
     const plannerBudget = tuning.plannerBudgetMs ?? RACE_REPLAN_BUDGET_MS;
     const plannerMaxExp = tuning.plannerMaxExpansions ?? RACE_MAX_EXPANSIONS;
+    // Shared single-goal planner params (parking tuning).
+    const singleGoalParams = {
+      state: startState,
+      lib: c.entry.lib,
+      agent: c.entry.agent,
+      polygons: course.polygons,
+      obstacles: course.obstacles,
+      world: c.navWorld,
+      deadlineMs: plannerBudget,
+      maxExpansions: plannerMaxExp,
+      posCell: tuning.plannerPosCell,
+      headingBuckets: tuning.plannerHeadingBuckets,
+      goalRadius: tuning.plannerGoalRadius,
+      goalHeadingTol: tuning.plannerGoalHeadingTol,
+      enableHeuristicTable: tuning.enableHeuristicTable,
+      // Soft hysteresis toward the last committed plan so the multi-cusp
+      // parking maneuver stays stable across replans instead of flipping
+      // between near-equal-cost back-in alternatives every 300 ms.
+      referencePath,
+      referenceWeight: tuning.consistencyWeight,
+    };
     const res = isParking
-      ? planRace({
-          state: startState,
-          goal: gates[0]!,
-          lib: c.entry.lib,
-          agent: c.entry.agent,
-          polygons: course.polygons,
-          obstacles: course.obstacles,
-          world: c.navWorld,
-          deadlineMs: plannerBudget,
-          maxExpansions: plannerMaxExp,
-          posCell: tuning.plannerPosCell,
-          headingBuckets: tuning.plannerHeadingBuckets,
-          goalRadius: tuning.plannerGoalRadius,
-          goalHeadingTol: tuning.plannerGoalHeadingTol,
-          enableHeuristicTable: tuning.enableHeuristicTable,
-          // Soft hysteresis toward the last committed plan so the multi-cusp
-          // parking maneuver stays stable across replans instead of flipping
-          // between near-equal-cost back-in alternatives every 300 ms.
-          referencePath,
-          referenceWeight: tuning.consistencyWeight,
-        })
+      ? course.goal
+        ? // NEW: plan toward the canonical Scenario goal through the
+          // ScenarioEnvironment bridge (the goal is described in the
+          // kinocat/scenario layer and read by both planner + visualizer).
+          planRaceScenario({
+            ...singleGoalParams,
+            goal: course.goal,
+            invariants: course.invariants,
+            prefer: course.prefer,
+          })
+        : // Legacy fallback: single goal pose.
+          planRace({ ...singleGoalParams, goal: gates[0]! })
       : planRaceMultiGoal({
           state: startState,
           gates,

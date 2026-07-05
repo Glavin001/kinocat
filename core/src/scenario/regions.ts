@@ -45,26 +45,38 @@ export interface Pose {
   heading: number;
 }
 export interface PoseMargins {
-  dx: number;
-  dz: number;
+  /** Position box half-width in x (m). Use with `dz`. */
+  dx?: number;
+  /** Position box half-width in z (m). Use with `dx`. */
+  dz?: number;
+  /** Position DISK radius (m) — an alternative to the `dx`/`dz` box. Matches a
+   *  classic hybrid-A* `goalRadius` (Euclidean), the natural "park within r of
+   *  the spot" tolerance. If set, takes precedence over `dx`/`dz`. */
+  radius?: number;
   /** Heading half-tolerance, radians. Omit / Infinity = any heading. */
   dheading?: number;
 }
 
-/** A pose box in SE(2): |x-x0|<dx & |z-z0|<dz & |angleDiff(theta,theta0)|<dheading.
- *  The canonical "park here, aligned" / "dock at this pose" region. */
+/** A pose region in SE(2): position within a box (`dx`/`dz`) OR a disk
+ *  (`radius`), AND `|angleDiff(theta,theta0)| < dheading`. The canonical
+ *  "park here, aligned" / "dock at this pose" region. The disk form matches a
+ *  hybrid-A* `goalRadius`+heading goal test exactly. */
 export function at(pose: Pose, m: PoseMargins): Region {
   const dh = m.dheading ?? Infinity;
+  const r = m.radius;
+  const dx = m.dx ?? 0;
+  const dz = m.dz ?? 0;
+  const posKey = r !== undefined ? `r${r}` : `${dx},${dz}`;
   return {
     kind: 'at',
-    key: `at:${pose.x},${pose.z},${pose.heading},${m.dx},${m.dz},${dh}`,
+    key: `at:${pose.x},${pose.z},${pose.heading},${posKey},${dh}`,
     dynamic: false,
     contains(s) {
-      return (
-        Math.abs(s.x - pose.x) <= m.dx &&
-        Math.abs(s.z - pose.z) <= m.dz &&
-        Math.abs(angleDiff(pose.heading, s.heading)) <= dh
-      );
+      const posOk =
+        r !== undefined
+          ? Math.hypot(s.x - pose.x, s.z - pose.z) <= r
+          : Math.abs(s.x - pose.x) <= dx && Math.abs(s.z - pose.z) <= dz;
+      return posOk && Math.abs(angleDiff(pose.heading, s.heading)) <= dh;
     },
     costToGo(s) {
       return rsCost(s, pose.x, pose.z, pose.heading);

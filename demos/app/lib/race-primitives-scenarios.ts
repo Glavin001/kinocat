@@ -16,10 +16,11 @@
 // (`RacePrimitives.tsx`) and the headless test import the course + AI helpers
 // from here.
 
-import { planVehicleOnce, planVehicleMultiGoal } from 'kinocat/planner';
+import { planVehicleOnce, planVehicleMultiGoal, planVehicleScenarioCar } from 'kinocat/planner';
 import type { PlanResult } from 'kinocat/planner';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavPolygon, NavWorld } from 'kinocat/environment';
+import type { Goal, Invariant, CostTerm } from 'kinocat/scenario';
 import { defaultVehicleAgent, kinematicForwardSim, learnedForwardSimV2 } from 'kinocat/agent';
 import type {
   LearnedVehicleParams,
@@ -75,6 +76,14 @@ export interface RaceCourse {
   obstacles: Array<[number, number][]>;
   waypoints: CarKinematicState[];
   spawn: CarKinematicState;
+  /** OPTIONAL canonical goal (kinocat/scenario AST). When present, the runtime
+   *  plans toward it through the ScenarioEnvironment bridge instead of the
+   *  legacy single-goal / multi-goal planners — the goal is described in the
+   *  new system and read by both the planner and the visualizer. `waypoints`
+   *  is still kept (for rendering + as the legacy fallback). */
+  goal?: Goal;
+  invariants?: Invariant[];
+  prefer?: CostTerm[];
 }
 
 export function buildRaceCourse(): RaceCourse {
@@ -459,6 +468,50 @@ export function planRace(req: RacePlanRequest): PlanResult<CarKinematicState> {
   return planVehicleOnce({
     start: req.state,
     goal: req.goal,
+    world,
+    agent: req.agent ?? RACE_AGENT,
+    lib: req.lib,
+    deadlineMs: req.deadlineMs ?? RACE_REPLAN_BUDGET_MS,
+    maxExpansions: req.maxExpansions ?? RACE_MAX_EXPANSIONS,
+    envOptions: Object.keys(envOpts).length > 0 ? envOpts : undefined,
+  });
+}
+
+export interface RaceScenarioPlanRequest
+  extends Omit<RacePlanRequest, 'goal'> {
+  /** Canonical objective (kinocat/scenario AST) — compiled to the goal
+   *  automaton the ScenarioEnvironment searches. */
+  goal: Goal;
+  invariants?: Invariant[];
+  prefer?: CostTerm[];
+}
+
+/** Like `planRace`, but plans toward a canonical Scenario goal through the
+ *  ScenarioEnvironment product-search bridge (`planVehicleScenarioCar`), and
+ *  returns a flat `PlanResult<CarKinematicState>` the runtime post-processes
+ *  exactly like a `planRace` result (analytic-shot lift → smooth → track). */
+export function planRaceScenario(
+  req: RaceScenarioPlanRequest,
+): PlanResult<CarKinematicState> {
+  const world = req.world ?? new InMemoryNavWorld(req.polygons, req.obstacles);
+  const envOpts: import('kinocat/environment').VehicleEnvOptions = {
+    ...(req.posCell !== undefined && { posCell: req.posCell }),
+    ...(req.headingBuckets !== undefined && { headingBuckets: req.headingBuckets }),
+    ...(req.goalRadius !== undefined && { goalRadius: req.goalRadius }),
+    ...(req.goalHeadingTol !== undefined && { goalHeadingTol: req.goalHeadingTol }),
+    ...(req.enableHeuristicTable === false ? { heuristicTable: false } : { heuristicTable: {} }),
+    ...(req.posCell !== undefined && req.posCell < 1.0
+      ? { sweepSegmentCheck: true, analyticExpansion: { everyN: 3, step: 0.15 } }
+      : {}),
+    ...(req.referencePath && req.referencePath.length >= 2
+      ? { referencePath: req.referencePath, referenceWeight: req.referenceWeight }
+      : {}),
+  };
+  return planVehicleScenarioCar({
+    start: req.state,
+    goal: req.goal,
+    invariants: req.invariants,
+    prefer: req.prefer,
     world,
     agent: req.agent ?? RACE_AGENT,
     lib: req.lib,
