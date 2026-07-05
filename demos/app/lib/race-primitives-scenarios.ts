@@ -701,6 +701,10 @@ export interface RaceMultiGoalRequest {
    *  by default in `planVehicleMultiGoal`). Used by ablation harnesses
    *  to measure the cache's contribution. */
   disableHeuristicTable?: boolean;
+  /** WS-2 — dynamic rollouts. When set, a search node carrying slip (the
+   *  mid-corner replan root) expands via this live-characterized rollout
+   *  instead of the baked zero-slip library. See VehicleEnvOptions.rootRollout. */
+  rootRollout?: (state: CarKinematicState) => import('kinocat/primitives').MotionPrimitive[];
   /** Agent the planner reasons about — must match the agent the supplied
    *  `lib` was characterised from (see `RacePlanRequest.agent`). Defaults to
    *  `RACE_AGENT`. */
@@ -729,6 +733,10 @@ export function planRaceMultiGoal(req: RaceMultiGoalRequest): PlanResult<CarKine
   }
   if (req.disableHeuristicTable) {
     envOptions.heuristicTable = false;
+    usedEnvOptions = true;
+  }
+  if (req.rootRollout) {
+    envOptions.rootRollout = req.rootRollout;
     usedEnvOptions = true;
   }
   return planVehicleMultiGoal({

@@ -63,6 +63,7 @@ import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavWorld, AnalyticEdgeData } from 'kinocat/environment';
 import type { PlanResult } from 'kinocat/planner';
 import type { MotionPrimitiveLibrary, ForwardSim } from 'kinocat/primitives';
+import { characterizeVehicleFromState } from 'kinocat/primitives';
 import {
   buildRaceCourse,
   planRaceMultiGoal,
@@ -404,6 +405,12 @@ export interface RaceTuning {
   bangBangThrottle?: boolean;
   /** WS-1 — coast-band half-width (m/s) for bang-bang throttle. */
   coastBand?: number;
+  /** WS-2 — dynamic rollouts. When true, mid-corner replans expand the root
+   *  node by rolling the car's OWN forward model live from its true dynamic
+   *  state (speed + yaw rate + sideslip) across the library's control sets,
+   *  instead of the baked zero-slip primitives. Requires the entry to carry a
+   *  `forwardModel`. Default false. */
+  dynamicRootRollout?: boolean;
   /** WS-0/WS-1 — tracker longitudinal caps (m/s²). Default to the
    *  parking-safe PURE_PURSUIT_CONFIG values; race raises them toward the
    *  measured plant envelope (plant-envelope.json). `maxDecel` governs how
@@ -517,6 +524,15 @@ export const DEFAULT_TUNING: RaceTuning = {
   // just stops discarding that decision.
   noGoalBrakeOnDriveThrough: true,
   bangBangThrottle: true,
+  // WS-2 — dynamic root rollouts: capability landed + unit-tested
+  // (characterizeVehicleFromState, dynamic-rollout.test.ts) but DISABLED by
+  // default. Measured: enabling it root-only regresses the closed loop
+  // (predErr up, laps slower) because the slip-aware first primitive is
+  // chained with zero-slip baked primitives after it — an inconsistent seam.
+  // Completing it needs "carry slip through successor states" (roadmap WS-2
+  // item 2) so the whole plan is slip-consistent, plus a yaw-frame audit.
+  // Kept off so the WS-1 gains stand; flip on with the follow-up.
+  dynamicRootRollout: false,
   // WS-0 — raise the race tracker's longitudinal caps toward the MEASURED
   // plant envelope (launch ≈13.8, threshold-brake ≥15 m/s²), kept below the
   // measurement for margin. Parking keeps the gentle 6/8 (see PURE_PURSUIT_CONFIG).
@@ -1128,6 +1144,30 @@ export async function createRaceScenario(
   let simTime = 0;
   const replanIntervalSec = (tuning.replanIntervalMs ?? REPLAN_INTERVAL_MS) / 1000;
 
+  // WS-2 — dynamic rollouts. Build a root-expansion closure for a car when the
+  // feature is enabled and the entry carries its own forward model. The
+  // closure reuses the entry library's own control sets (from the baked
+  // primitives at the current speed bucket) but rolls them live from the
+  // chassis's true dynamic state, so a mid-corner replan expands with slip and
+  // yaw rate accounted for — leveraging the v2 model where the baked
+  // zero-slip library is wrong. Returns undefined when disabled / no model.
+  function rootRolloutFor(
+    c: CarInternal,
+  ): ((state: CarKinematicState) => import('kinocat/primitives').MotionPrimitive[]) | undefined {
+    if (!tuning.dynamicRootRollout) return undefined;
+    const model = c.entry.forwardModel;
+    if (!model) return undefined;
+    const lib = c.entry.lib;
+    return (state: CarKinematicState) => {
+      const baked = lib.lookup(state.speed);
+      if (baked.length === 0) return [];
+      const controlSets = baked.map((p) => p.controls);
+      const duration = baked[0]!.duration;
+      const substeps = Math.max(1, (baked[0]!.sweep.length ?? 7) - 1);
+      return characterizeVehicleFromState(model, state, controlSets, duration, substeps);
+    };
+  }
+
   function replanCar(c: CarInternal): void {
     if (c.holdingForSync || c.finished) return;
     // Commit-window plan stitching. If a plan is already committed, we
@@ -1253,6 +1293,7 @@ export async function createRaceScenario(
           referencePath,
           referenceWeight: tuning.consistencyWeight,
           disableHeuristicTable: !tuning.enableHeuristicTable,
+          rootRollout: rootRolloutFor(c),
         });
     const replanMs = performance.now() - tStart;
     c.diagnostics.lastReplanMs = replanMs;

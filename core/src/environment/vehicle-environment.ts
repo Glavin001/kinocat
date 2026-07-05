@@ -2,6 +2,7 @@ import type { Environment, EdgeRef, Node } from './types';
 import type { NavWorld } from './nav-world';
 import type { VehicleAgent, CarKinematicState } from '../agent/types';
 import type { MotionPrimitiveLibrary } from '../primitives/library';
+import type { MotionPrimitive } from '../primitives/types';
 import { makeNode } from '../planner/node';
 import { pack3 } from '../planner/resolution';
 import { placeFootprintInto } from '../internal/geom';
@@ -88,6 +89,20 @@ export interface VehicleEnvOptions {
   /** Cost per metre of perpendicular deviation from `referencePath`.
    *  Default 0.1 (s/m if you read the time-cost as seconds). */
   referenceWeight?: number;
+  /**
+   * WS-2 — DYNAMIC ROLLOUTS. When provided, any node whose state carries
+   * meaningful slip (|yawRate| or |lateralVelocity| above a small threshold)
+   * is expanded by rolling THIS function's live-characterized primitives
+   * instead of the baked, zero-slip `lib.lookup(speed)`. Because successors
+   * drop the slip dims, this fires only at the search root (a mid-corner
+   * replan start state), which is exactly where the baked zero-slip library
+   * mis-predicts — the committed first primitive becomes model-consistent
+   * with the chassis's true dynamic state. The callback receives the node
+   * state (with slip) and must return primitives in the node's LOCAL frame
+   * (start at origin, heading 0), as `characterizeVehicleFromState` does.
+   * Pure + deterministic. Omitted ⇒ classic baked-library expansion.
+   */
+  rootRollout?: (state: CarKinematicState) => MotionPrimitive[];
 }
 
 interface DriveEdgeData {
@@ -144,6 +159,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
   private rec: PerfRecorder = NULL_RECORDER;
   private readonly refPath: ReadonlyArray<{ x: number; z: number }>;
   private readonly refWeight: number;
+  private readonly rootRollout?: (state: CarKinematicState) => MotionPrimitive[];
 
   constructor(
     private readonly world: NavWorld,
@@ -190,6 +206,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     this.ghWeight = this.ghEnabled ? ((gh as { weight?: number }).weight ?? 1) : 1;
     this.refPath = opts.referencePath ?? [];
     this.refWeight = this.refPath.length >= 2 ? (opts.referenceWeight ?? 0.1) : 0;
+    this.rootRollout = opts.rootRollout;
     this.levels = this.divisors.length;
   }
 
@@ -316,7 +333,18 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
         : undefined;
     const out: Node<CarKinematicState>[] = [];
 
-    for (const prim of this.lib.lookup(st.speed)) {
+    // WS-2: expand from the chassis's true dynamic state when it carries
+    // meaningful slip (the mid-corner replan root), rolling the caller's live
+    // model instead of the baked zero-slip library. Successors drop the slip
+    // dims, so this naturally scopes to the root node.
+    const hasSlip =
+      this.rootRollout !== undefined &&
+      (Math.abs(st.yawRate ?? 0) > 1e-3 || Math.abs(st.lateralVelocity ?? 0) > 1e-3);
+    const prims: readonly MotionPrimitive[] = hasSlip
+      ? this.rootRollout!(st)
+      : this.lib.lookup(st.speed);
+
+    for (const prim of prims) {
       if (!this.sweepClear(st, prim.sweep)) continue;
 
       const ex = st.x + prim.end.dx * c - prim.end.dz * s;
