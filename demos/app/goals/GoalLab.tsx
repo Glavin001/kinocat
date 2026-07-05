@@ -1,0 +1,308 @@
+'use client';
+
+// GoalLab — a dedicated 3D surface for AUTHORING, VISUALIZING, and DEBUGGING
+// canonical scenario goals. Pick a goal expressed in the `kinocat/scenario` AST;
+// GoalLab compiles it, plans toward it with the real ScenarioEnvironment product
+// search, renders every region (objective / avoid / bounds) color-coded, and
+// animates the car along the plan while the compiled automaton lights up
+// phase-by-phase — the planner's internal objective state, made visible.
+
+import { useEffect, useRef, useState } from 'react';
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import {
+  createGroundPlaneHelper,
+  createCarMeshHelper,
+  syncCarMesh,
+  createPlanPathHelper,
+  createRegionHelper,
+  createGoalMarkerHelper,
+  REGION_COLORS,
+} from 'kinocat/adapters/three';
+import {
+  compile,
+  evaluateProgress,
+  collectScenarioRegions,
+  validate,
+  type CompiledAutomaton,
+  type ProgressSnapshot,
+  type ScenarioState,
+} from 'kinocat/scenario';
+import type { CarKinematicState } from 'kinocat/agent';
+import { hermitePose, densifyPath } from '../lib/path-anim';
+import { goalLabPresets, type GoalPreset } from '../lib/goallab-presets';
+import { GoalProgressPanel } from '../components/GoalProgressPanel';
+
+interface HudState {
+  preset: string;
+  automaton: CompiledAutomaton;
+  snapshot: ProgressSnapshot;
+  partial: boolean;
+  tracked: boolean;
+  cost: number;
+  expansions: number;
+  diagnostics: string[];
+}
+
+const PRESETS = goalLabPresets();
+
+export default function GoalLab() {
+  const mountRef = useRef<HTMLDivElement>(null);
+  const [presetId, setPresetId] = useState(PRESETS[0]!.id);
+  const [paused, setPaused] = useState(false);
+  const [hud, setHud] = useState<HudState | null>(null);
+
+  const presetIdRef = useRef(presetId);
+  const pausedRef = useRef(paused);
+  presetIdRef.current = presetId;
+  pausedRef.current = paused;
+  const loadRef = useRef<((id: string) => void) | null>(null);
+
+  useEffect(() => {
+    const mount = mountRef.current;
+    if (!mount) return;
+    const W = mount.clientWidth || window.innerWidth;
+    const H = mount.clientHeight || 520;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0e14);
+    const camera = new THREE.PerspectiveCamera(55, W / H, 0.1, 800);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(W, H);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    mount.appendChild(renderer.domElement);
+
+    const orbit = new OrbitControls(camera, renderer.domElement);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+    sun.position.set(40, 120, 30);
+    scene.add(sun);
+
+    const car = createCarMeshHelper({ color: 0x4488ff });
+    scene.add(car.group);
+    const targetMarker = createGoalMarkerHelper({ color: 0xffcc33 });
+    targetMarker.visible = false;
+    scene.add(targetMarker);
+
+    let content = new THREE.Group();
+    scene.add(content);
+
+    // Per-preset animation state.
+    let automaton: CompiledAutomaton | null = null;
+    let path: CarKinematicState[] = [];
+    let preset: GoalPreset | null = null;
+    let animClock = 0;
+    let planCost = 0;
+    let planExpansions = 0;
+    let planPartial = false;
+    let planTracked = false;
+    let diagnostics: string[] = [];
+
+    function clear(g: THREE.Group) {
+      g.traverse((o) => {
+        const m = o as THREE.Mesh;
+        if (m.geometry) m.geometry.dispose();
+        const mat = m.material as THREE.Material | THREE.Material[] | undefined;
+        if (Array.isArray(mat)) mat.forEach((x) => x.dispose());
+        else mat?.dispose();
+      });
+      scene.remove(g);
+    }
+
+    function load(id: string) {
+      preset = PRESETS.find((p) => p.id === id) ?? PRESETS[0]!;
+      clear(content);
+      content = new THREE.Group();
+      scene.add(content);
+
+      const b = preset.bounds;
+      content.add(createGroundPlaneHelper({ bounds: b, color: 0x141a26, gridDivisions: 24, gridColor: 0x223044, gridSubColor: 0x1a2330 }));
+
+      // Regions, color-coded by plane.
+      const regions = collectScenarioRegions(preset.scenario);
+      for (const r of regions.objective) content.add(createRegionHelper(r, { color: REGION_COLORS.objective, y: 0.08 }));
+      for (const r of regions.avoid) content.add(createRegionHelper(r, { color: REGION_COLORS.avoid, y: 0.08 }));
+      for (const r of regions.maintain) content.add(createRegionHelper(r, { color: 0x556677, y: 0.04 }));
+
+      // Compile + validate + plan.
+      automaton = compile(preset.scenario.goal);
+      diagnostics = validate(preset.scenario, { posCell: 0.3 }).map((d) => `[${d.severity}] ${d.check}: ${d.message}`);
+      const result = preset.plan();
+      path = result.path; // chassis states to animate
+      planCost = result.cost;
+      planExpansions = result.expansions;
+      planPartial = result.partial;
+      planTracked = result.tracked ?? false;
+
+      if (path.length > 0) content.add(createPlanPathHelper(densifyPath(path), { color: 0x66ffaa, y: 0.12 }));
+      targetMarker.visible = !!preset.movingTarget;
+
+      // Camera frame.
+      const cx = (b.x0 + b.x1) / 2;
+      const cz = (b.z0 + b.z1) / 2;
+      const span = Math.max(b.x1 - b.x0, b.z1 - b.z0);
+      orbit.target.set(cx, 0, cz);
+      camera.position.set(cx, span * 1.1, cz + span * 0.9);
+      orbit.update();
+
+      animClock = path.length ? path[0]!.t : 0;
+      if (path.length) syncCarMesh(car.group, path[0]!);
+    }
+    loadRef.current = load;
+    // NB: initial load is driven by the [presetId] effect below (which fires on
+    // mount), so we don't call load() here — doing both double-plans on mount.
+
+    function poseAt(tSim: number): CarKinematicState {
+      return hermitePose(path, tSim);
+    }
+
+    function prefixIndex(tSim: number): number {
+      let idx = 0;
+      for (let i = 0; i < path.length; i++) {
+        if (path[i]!.t <= tSim) idx = i;
+        else break;
+      }
+      return idx;
+    }
+
+    let raf = 0;
+    let last = performance.now();
+    let lastHud = 0;
+    function tick() {
+      raf = requestAnimationFrame(tick);
+      const now = performance.now();
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+
+      const tEnd = path.length ? path[path.length - 1]!.t : 0;
+      if (!pausedRef.current && path.length) {
+        animClock += dt;
+        if (animClock > tEnd + 0.4) animClock = path[0]!.t; // loop (brief settle pause)
+      }
+
+      const pose = poseAt(animClock);
+      syncCarMesh(car.group, pose);
+
+      // Dynamic target marker.
+      if (preset?.movingTarget) {
+        const tp = preset.movingTarget.predict(Math.min(animClock, tEnd));
+        if (tp) targetMarker.position.set(tp.x, 0.6, tp.z);
+      }
+
+      // Deterministic progress via the shared evaluator. Throttle the React
+      // state update to ~10 Hz so the render loop doesn't thrash 60 setState/s.
+      if (automaton && now - lastHud >= 100) {
+        lastHud = now;
+        const idx = prefixIndex(animClock);
+        const prefix: ScenarioState[] = path.slice(0, Math.max(1, idx + 1));
+        const p = evaluateProgress(automaton, prefix);
+        setHud({
+          preset: preset?.title ?? '',
+          automaton,
+          snapshot: p,
+          partial: planPartial,
+          tracked: planTracked,
+          cost: planCost,
+          expansions: planExpansions,
+          diagnostics,
+        });
+      }
+
+      orbit.update();
+      renderer.render(scene, camera);
+    }
+    tick();
+
+    function onResize() {
+      const el = mountRef.current;
+      if (!el) return;
+      const w = el.clientWidth || window.innerWidth;
+      const h = el.clientHeight || 520;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    }
+    window.addEventListener('resize', onResize);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('resize', onResize);
+      orbit.dispose();
+      renderer.dispose();
+      if (renderer.domElement.parentElement === mount) mount.removeChild(renderer.domElement);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Reload when the preset changes.
+  useEffect(() => {
+    loadRef.current?.(presetId);
+  }, [presetId]);
+
+  return (
+    <div style={{ position: 'relative', width: '100%', height: '85vh', minHeight: 520 }}>
+      <div ref={mountRef} style={{ position: 'absolute', inset: 0 }} />
+      <div
+        style={{
+          position: 'absolute',
+          top: 12,
+          left: 12,
+          padding: 12,
+          background: 'rgba(10,14,20,0.82)',
+          color: '#cfe',
+          font: '12px ui-monospace, monospace',
+          borderRadius: 8,
+          maxWidth: 360,
+          lineHeight: 1.5,
+        }}
+      >
+        <div style={{ marginBottom: 8 }}>
+          <label>
+            Goal:{' '}
+            <select value={presetId} onChange={(e) => setPresetId(e.target.value)}>
+              {PRESETS.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.title}
+                </option>
+              ))}
+            </select>
+          </label>{' '}
+          <button onClick={() => setPaused((p) => !p)}>{paused ? '▶ play' : '⏸ pause'}</button>
+        </div>
+        {hud && (
+          <>
+            <GoalProgressPanel
+              automaton={hud.automaton}
+              snapshot={hud.snapshot}
+              description={PRESETS.find((p) => p.id === presetId)?.description}
+              maxRows={12}
+            />
+            <div style={{ marginTop: 6 }}>
+              {hud.tracked ? (
+                <>follow controller · {hud.cost.toFixed(1)}s tracked</>
+              ) : (
+                <>
+                  plan: cost {hud.cost === Infinity ? '∞' : hud.cost.toFixed(1)} · {hud.expansions} exp
+                  {hud.partial && <span style={{ color: '#fc6' }}> · best-progress (partial)</span>}
+                </>
+              )}
+            </div>
+            {hud.diagnostics.length > 0 && (
+              <div style={{ marginTop: 6, color: '#fc8' }}>
+                {hud.diagnostics.map((d, i) => (
+                  <div key={i}>{d}</div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+        <div style={{ marginTop: 8, color: '#789' }}>
+          <span style={{ color: '#4df' }}>■</span> objective &nbsp;
+          <span style={{ color: '#f46' }}>■</span> avoid &nbsp;
+          <span style={{ color: '#6fa' }}>■</span> plan
+        </div>
+      </div>
+    </div>
+  );
+}
+

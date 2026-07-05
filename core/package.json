@@ -33,6 +33,10 @@
       "types": "./dist/environment/index.d.ts",
       "default": "./dist/environment/index.js"
     },
+    "./scenario": {
+      "types": "./dist/scenario/index.d.ts",
+      "default": "./dist/scenario/index.js"
+    },
     "./predict": {
       "types": "./dist/predict/index.d.ts",
       "default": "./dist/predict/index.js"
