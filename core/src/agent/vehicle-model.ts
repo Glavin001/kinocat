@@ -35,6 +35,11 @@ import {
 
 const G = 9.81;
 
+/** Fraction of `maxBrakeForce` at which the raycast vehicle's wheels lock and
+ *  braking decel saturates at the grip ceiling. Measured: ~0.25 (a quarter of
+ *  full brake already produces grip-limited deceleration). */
+const BRAKE_LOCK_FRACTION = 0.25;
+
 /** Parameters of the extended parametric backbone. ~16 coefficients,
  *  all expressed as multipliers/exponents of physical config quantities
  *  so the model can generalize across vehicles. */
@@ -293,7 +298,25 @@ export function parametricForwardV2(
       const dir = c.driveForce >= 0 ? params.engineScale : params.engineScale * params.reverseEffScale;
       driveAccel = (dir * fEff) / m;
     }
-    const brakeAccel = (params.brakeScale * c.brakeForce) / m;
+    // Braking: the Rapier raycast vehicle applies the commanded brake force
+    // to ALL FOUR wheels (`setWheelBrake` per wheel), and even a moderate
+    // command locks the wheels — so the executed deceleration saturates near
+    // the tire grip ceiling rather than scaling ~1:1 with a single wheel's
+    // force. MEASURED: brakeForce 1000 of 2000 stops a 24 m/s chassis inside
+    // 0.8 s (~26 m/s² ≈ grip-limited), yet the old `brakeScale·F/m` term
+    // (≈2.8 m/s²) under-braked ~10× — the dominant error on the brake-in-turn
+    // channel. Model brake as a grip-scaled ramp that saturates by a small
+    // fraction of full force; the friction-circle clamp below then limits the
+    // executed brake+turn to the grip ellipse (correct combined-slip
+    // behaviour). `brakeScale` is now the braking grip multiplier
+    // (decel ceiling = brakeScale·µ·g); its bounds map to a physical
+    // 14–35 m/s² brake ceiling.
+    const brakeCeil = params.brakeScale * config.frictionSlip * G;
+    const brakeSat = Math.min(
+      1,
+      Math.abs(c.brakeForce) / (BRAKE_LOCK_FRACTION * Math.max(1, config.maxBrakeForce)),
+    );
+    const brakeAccel = brakeCeil * brakeSat;
     // Brake opposes motion; if speed is 0 and brake applied, no motion.
     const brakeSigned = -Math.sign(v) * brakeAccel;
     const rolling = -Math.sign(v) * params.rollingResistance * Math.abs(v);
