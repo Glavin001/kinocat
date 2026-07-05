@@ -22,7 +22,7 @@ architectural, not a retune: **v3**, a purely data-driven neural transition
 model with no parametric backbone and no hand-set constants. See
 `docs/v3-purely-learned-model.md` for design, implementation map, and
 measured results (0.8 s endpoint fidelity: v3 0.63 m vs v2 1.07 m vs
-kinematic 4.16 m mean).
+kinematic 6.13 m mean).
 
 ## Implementation status (this branch)
 

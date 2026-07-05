@@ -106,7 +106,8 @@ chassis, across the full probe grid (14 speeds × 4 control probes):
 
 | model | mean | worst |
 |---|---|---|
-| kinematic | 4.16 m | 11.9 m |
+| kinematic | 6.13 m | 22.8 m |
+| v2 untrained prior | 2.87 m | 6.58 m |
 | v2 trained (backbone + residual) | 1.07 m | 3.33 m |
 | **v3 purely learned** | **0.63 m** | **2.27 m** |
 
