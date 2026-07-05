@@ -653,7 +653,9 @@ export async function createRaceScenario(
     goalTolerance: tuning.goalTolerance ?? PURE_PURSUIT_CONFIG.goalTolerance,
     respectPathSpeed: tuning.respectPathSpeed,
     headingGain: tuning.terminalHeadingGain ?? 0,
-    headingRadius: tuning.terminalHeadingRadius ?? Infinity,
+    // The runner gates the heading term on distance to the TRUE goal (see the
+    // controller loop), so pure-pursuit's own per-path-end radius stays open.
+    headingRadius: Infinity,
   };
   const arriveRadius = tuning.arriveRadius ?? RACE_ARRIVE_RADIUS;
 
@@ -1193,7 +1195,24 @@ export async function createRaceScenario(
             targetSpeed: cmdRaw.targetSpeed,
           };
         } else {
-          const trk = purePursuit(stateBefore, live, trackerConfig);
+          // Gate the terminal heading-alignment term on distance to the TRUE
+          // goal (the final waypoint), not the per-segment path end. The executor
+          // feeds `purePursuit` per-SEGMENT paths, so its built-in `headingRadius`
+          // (keyed on distance-to-path-end) would also fire within range of every
+          // forward↔reverse cusp, rotating the chassis toward a cusp tangent
+          // mid-maneuver rather than only straightening onto the goal heading.
+          // Keying on the real goal engages the term on the terminal approach
+          // (whichever segment is near the goal) and nowhere else. `purePursuit`'s
+          // own radius is left open (Infinity, above) so this is the sole gate.
+          let trkCfg = trackerConfig;
+          if (trackerConfig.headingGain) {
+            const wp = course.waypoints[c.loopIndex % course.waypoints.length]!;
+            const dGoal = Math.hypot(stateBefore.x - wp.x, stateBefore.z - wp.z);
+            if (dGoal > (tuning.terminalHeadingRadius ?? Infinity)) {
+              trkCfg = { ...trackerConfig, headingGain: 0 };
+            }
+          }
+          const trk = purePursuit(stateBefore, live, trkCfg);
           // pure-pursuit returns `throttle` as a non-negative MAGNITUDE and
           // encodes the drive direction in the SIGN of `targetSpeed` (it also
           // flips the steering body-frame for reverse, so `trk.steering` is the

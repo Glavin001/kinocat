@@ -30,12 +30,11 @@
 //
 // Fixing all five (see race-scenario.ts / race-primitives-scenarios.ts /
 // parking-scenarios.ts / core analytic-shot poses) makes `forward-pullin` and
-// `reverse-perp` park cleanly with a healthy planner. `parallel` now reaches
-// the slot collision-free under a healthy planner but still can't nail the
-// terminal-heading straightening shunt (pure-pursuit brakes to rest at its
-// approach angle, ~16° off). That residual is kept HONEST as an `it.fails` so
-// it stays exercised and flips to green the moment terminal-pose precision
-// (e.g. an MPC final stage) lands.
+// `reverse-perp` park cleanly with a healthy planner. `parallel` used to reach
+// the slot but rest ~16° off the curb; a Stanley-style terminal heading term
+// (`terminalHeadingGain`, gated by the runner on distance to the TRUE goal) now
+// straightens it onto the curb, so all three park square + centred and the
+// predicate (`evaluateParked`, incl. a centering bound) agrees.
 
 import { describe, expect, it } from 'vitest';
 import { ensureRapier } from 'kinocat/adapters/rapier';
@@ -138,12 +137,11 @@ describe.skipIf(!RAPIER_OK)('parking invariants', () => {
     expect(report.failedReplanRatio, ctx).toBeLessThan(0.3);
   });
 
-  // PARTIALLY FIXED — parallel parking. The replan storm is gone, the chassis
-  // reaches the slot position under a healthy planner, AND it no longer grazes
-  // a neighbour on the way in (these invariants pass). What it still can't do is
-  // the final straightening shunt — pure-pursuit brakes to rest at whatever
-  // approach angle it arrives with (no terminal-heading control), ~16° off the
-  // curb. See the `it.fails` below.
+  // Parallel parking. The replan storm is gone, the chassis reaches the slot
+  // under a healthy planner without grazing a neighbour, AND comes to rest
+  // CENTRED (terminalPosError < 0.6 m) — the centering that the terminal heading
+  // term + the `evaluateParked` centering bound now guarantee. Squareness is
+  // asserted separately below.
   it('parallel: reaches the slot cleanly under a healthy planner (no storm, no graze)', OPTS, async () => {
     const { report } = await park('parallel', 1600);
     const ctx = `\n${formatReport(report)}`;
