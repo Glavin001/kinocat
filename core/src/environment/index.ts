@@ -8,6 +8,8 @@ export { VehicleEnvironment } from './vehicle-environment';
 export type { VehicleEnvOptions, AnalyticEdgeData } from './vehicle-environment';
 export { HumanoidEnvironment } from './humanoid-environment';
 export type { HumanoidEnvOptions } from './humanoid-environment';
+export { MomentumHumanoidEnvironment } from './momentum-humanoid-environment';
+export type { MomentumHumanoidEnvOptions } from './momentum-humanoid-environment';
 export { AircraftEnvironment } from './aircraft-environment';
 export type { AircraftEnvOptions } from './aircraft-environment';
 export { InMemoryAirspace } from './airspace-world';

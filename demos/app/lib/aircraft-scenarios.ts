@@ -74,8 +74,8 @@ function envOpts(over: AircraftEnvOptions = {}): AircraftEnvOptions {
     levelDivisors: [4, 2, 1],
     goalRadius: 9,
     goalHeadingTol: Infinity,
-    primDuration: 1,
-    substeps: 4,
+    primDuration: AIRCRAFT_PRIM_DURATION,
+    substeps: AIRCRAFT_PRIM_SUBSTEPS,
     ...over,
   };
 }
@@ -369,31 +369,120 @@ export function planInteractive(
 // aircraftForwardSim with the controls backed out from each segment so the
 // rendered trajectory IS the arc the planner committed to.
 
+/** Recover an attitude SETPOINT that reproduces the segment's ramp when
+ *  re-integrated: a ramp that settled within the segment is reproduced by
+ *  commanding the end value; a ramp still saturated at the end (|Δ| ≈
+ *  rate·dt) is reproduced by commanding the envelope limit in that
+ *  direction (any target at or beyond the end value yields the identical
+ *  max-rate ramp). Infinity rates never saturate → end value (legacy). */
+function rampedSetpoint(
+  from: number,
+  to: number,
+  rate: number,
+  dt: number,
+  limit: number,
+): number {
+  if (Math.abs(to - from) >= rate * dt - 1e-9) {
+    return to > from ? limit : -limit;
+  }
+  return to;
+}
+
+/** The substep resolution the demo planner collision-certifies (see
+ *  planAircraftLeg's env options). densifyPath re-integrates at EXACTLY this
+ *  resolution so its points are the planner's certified sample points —
+ *  finer requested densities are linear subdivisions of that certified
+ *  polygon, never a re-integration at a different Euler step (which drifts
+ *  onto trajectories the planner never checked). */
+export const AIRCRAFT_PRIM_SUBSTEPS = 4;
+
+/** Duration of one demo motion primitive (see planAircraftLeg env options).
+ *  densifyPath uses it to tell primitive segments (re-integrate the sim)
+ *  from analytic-shot segments (linear, as certified). */
+export const AIRCRAFT_PRIM_DURATION = 1;
+
 export function densifyPath(
   path: AircraftState[],
-  substepsPerSegment = 10,
+  substepsPerSegment = AIRCRAFT_PRIM_SUBSTEPS,
 ): AircraftState[] {
   if (path.length < 2) return [...path];
   const sim = aircraftForwardSim(AIRCRAFT_AGENT);
+  const lerpN = Math.max(
+    1,
+    Math.round(substepsPerSegment / AIRCRAFT_PRIM_SUBSTEPS),
+  );
   const out: AircraftState[] = [path[0]!];
   for (let i = 0; i < path.length - 1; i++) {
     const a = path[i]!;
     const b = path[i + 1]!;
     const dt = b.t - a.t;
     if (dt <= 1e-9) continue;
-    const speed = a.speed > 1 ? a.speed : AIRCRAFT_AGENT.maxSpeed;
-    // Recover the primitive's curvature from the heading delta and the climb
-    // angle from the next state's pitch (pitch tracks the commanded climb in
-    // a single substep, so b.pitch IS the commanded climb).
+    // Analytic-shot segments (recognizable by a non-primitive duration) are
+    // certified by the planner as straight lines with synthetic poses — the
+    // sim cannot re-fly them, so reproduce exactly what was certified.
+    if (Math.abs(dt - AIRCRAFT_PRIM_DURATION) > 1e-6) {
+      let dhh = b.heading - a.heading;
+      if (dhh > Math.PI) dhh -= 2 * Math.PI;
+      if (dhh < -Math.PI) dhh += 2 * Math.PI;
+      for (let m = 1; m <= substepsPerSegment; m++) {
+        const u = m / substepsPerSegment;
+        out.push({
+          x: a.x + (b.x - a.x) * u,
+          y: a.y + (b.y - a.y) * u,
+          z: a.z + (b.z - a.z) * u,
+          heading: a.heading + dhh * u,
+          pitch: a.pitch + (b.pitch - a.pitch) * u,
+          roll: a.roll + (b.roll - a.roll) * u,
+          speed: b.speed,
+          t: a.t + dt * u,
+        });
+      }
+      continue;
+    }
+    // The segment's commanded speed (speed snaps to its setpoint, so the
+    // SUCCESSOR carries it; `a.speed` is the previous segment's command).
+    const speed = b.speed > 1 ? b.speed : AIRCRAFT_AGENT.maxSpeed;
+    // Recover the primitive's curvature from the heading delta; attitude is
+    // rate-limited state, so back out setpoints that reproduce each ramp.
     let dh = ((b.heading - a.heading + Math.PI) % (2 * Math.PI)) - Math.PI;
     if (dh < -Math.PI) dh += 2 * Math.PI;
     const k = dh / (speed * dt);
-    const climb = b.pitch;
-    const roll = b.roll;
-    const dtSub = dt / substepsPerSegment;
+    const climb = rampedSetpoint(
+      a.pitch,
+      b.pitch,
+      AIRCRAFT_AGENT.maxPitchRate,
+      dt,
+      AIRCRAFT_AGENT.maxClimbAngle,
+    );
+    const roll = rampedSetpoint(
+      a.roll,
+      b.roll,
+      AIRCRAFT_AGENT.maxRollRate,
+      dt,
+      AIRCRAFT_AGENT.maxBank,
+    );
+    const dtSub = dt / AIRCRAFT_PRIM_SUBSTEPS;
     let s = a;
-    for (let j = 0; j < substepsPerSegment; j++) {
+    for (let j = 0; j < AIRCRAFT_PRIM_SUBSTEPS; j++) {
+      const prev = s;
       s = sim(s, [k, climb, roll, speed], dtSub);
+      // Linear subdivision of the certified step for rendering smoothness.
+      for (let m = 1; m < lerpN; m++) {
+        const u = m / lerpN;
+        let dhh = s.heading - prev.heading;
+        if (dhh > Math.PI) dhh -= 2 * Math.PI;
+        if (dhh < -Math.PI) dhh += 2 * Math.PI;
+        out.push({
+          x: prev.x + (s.x - prev.x) * u,
+          y: prev.y + (s.y - prev.y) * u,
+          z: prev.z + (s.z - prev.z) * u,
+          heading: prev.heading + dhh * u,
+          pitch: prev.pitch + (s.pitch - prev.pitch) * u,
+          roll: prev.roll + (s.roll - prev.roll) * u,
+          speed,
+          t: prev.t + (s.t - prev.t) * u,
+        });
+      }
       out.push(s);
     }
   }

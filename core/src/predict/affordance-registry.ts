@@ -18,8 +18,12 @@ export enum AffordanceType {
   Decoy = 'decoy',
 }
 
-export interface AffordanceUseResult {
-  resultState: CarKinematicState;
+/** Generic over the agent's search-state type `S`. The default keeps every
+ *  existing car call site compiling unchanged; non-car domains instantiate
+ *  `Affordance<TheirState>` and register it in an
+ *  `AffordanceRegistry<TheirState>`. */
+export interface AffordanceUseResult<S = CarKinematicState> {
+  resultState: S;
   /** Sampled (x, y, z, t) along the use, for tracking/visualization. */
   trajectory: Array<{ x: number; y: number; z: number; t: number }>;
   duration: number;
@@ -27,7 +31,7 @@ export interface AffordanceUseResult {
   cost: number;
 }
 
-export interface Affordance {
+export interface Affordance<S = CarKinematicState> {
   id: string;
   type: AffordanceType;
   predict: Predict<AffordanceState>;
@@ -36,13 +40,13 @@ export interface Affordance {
   /** Proximity bound (world XZ + radius) for `queryNearby`. */
   spatialBound: { x: number; z: number; radius: number };
   /** Try to use this affordance from `agentState` at `useTime`. */
-  tryUse(agentState: CarKinematicState, useTime: number): AffordanceUseResult | null;
+  tryUse(agentState: S, useTime: number): AffordanceUseResult<S> | null;
 }
 
-export class AffordanceRegistry {
-  private readonly items = new Map<string, Affordance>();
+export class AffordanceRegistry<S = CarKinematicState> {
+  private readonly items = new Map<string, Affordance<S>>();
 
-  add(a: Affordance): void {
+  add(a: Affordance<S>): void {
     this.items.set(a.id, a);
   }
 
@@ -50,13 +54,13 @@ export class AffordanceRegistry {
     this.items.delete(id);
   }
 
-  all(): Affordance[] {
+  all(): Affordance<S>[] {
     return [...this.items.values()];
   }
 
   /** Affordances usable near (x,z) at time `t` (within `radius`). */
-  queryNearby(x: number, z: number, t: number, radius = 15): Affordance[] {
-    const out: Affordance[] = [];
+  queryNearby(x: number, z: number, t: number, radius = 15): Affordance<S>[] {
+    const out: Affordance<S>[] = [];
     for (const a of this.items.values()) {
       if (t < a.validFrom || t > a.validTo) continue;
       const b = a.spatialBound;

@@ -7,7 +7,12 @@ export type {
 } from './types';
 export { MotionPrimitiveLibrary } from './library';
 export {
+  characterize,
+  crossRuns,
   characterizeVehicle,
+  type CharacterizeOptions,
+  type CharacterizeRun,
+  type CharacterizedPrimitive,
   type CharacterizeVehicleOptions,
 } from './characterize';
 
