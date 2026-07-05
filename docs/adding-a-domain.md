@@ -29,14 +29,30 @@ export interface AircraftState {
 ## 2. Write (or learn) a `ForwardSim<S>` (`core/src/agent/`)
 
 A pure function `(state, controls, dt) => state`. Clamp to the envelope
-inside the sim — the planner then cannot ever command the impossible.
+inside the sim — the planner then cannot ever command the impossible. Treat
+controls as SETPOINTS and every state variable as evolving from its current
+value at bounded rates (the aircraft's `maxRollRate`/`maxPitchRate` pattern):
+the sim is the single definition of what a primitive can express, so
+maneuver timing (begin the roll before the slot; hold the bank between
+nearby slots) falls out of the search instead of being scripted.
 
 Honor the **equivariance contract** (documented on `characterize()`): output
 must not depend on absolute position or heading, or cached primitives cannot
 be rigidly transformed. Learned models (see `agent/vehicle-model.ts` and the
 `kinocat/learning` pipeline) plug in the same way.
 
-## 3. Build primitives with `characterize<S>` (`core/src/primitives/characterize.ts`)
+## 3. Turn the sim into primitives — live rollout or `characterize<S>`
+
+**Decide how `succ()` applies primitives** (see `docs/architecture.md`
+Seam 2): roll the sim LIVE from each node's actual state when the sim is
+cheap next to your collision narrowphase or depends on continuous state
+dims (the aircraft), or pre-characterize per start bucket when rollouts are
+costly and the start-dependence is coarse (car speed buckets, momentum
+humanoid speed × direction buckets). Either way, wire the
+`checkSuccessorFidelity` hook in step 7 so the choice is verified, not
+assumed.
+
+For the cached strategy (`core/src/primitives/characterize.ts`):
 
 ```ts
 const rolled = characterize<MyState, MyLocalSample>({
@@ -107,6 +123,14 @@ Run it standalone AND wrapped (`TimeAware(MyEnvironment)`) — wrappers must
 conform too. Keep fixture worlds small: the battery replans each scenario
 ~8 times, and kinodynamic domains with more exact-hash dims are
 expansion-hungrier than geometric ones.
+
+Supply the **fidelity hooks** so the battery also proves succ() applies the
+forward sim faithfully: put enough in `edge.data` to reconstruct the edge's
+controls, re-simulate from the actual parent state, and declare the
+tolerance (machine-eps for live rollout; the bucket-teleport bound for
+cached primitives — see the three in-repo harnesses in
+`core/test/conformance/` for both flavors, and `angularFields` for
+heading-like dims that compare on the circle).
 
 ## 8. Ship a demo + headless scenario test
 

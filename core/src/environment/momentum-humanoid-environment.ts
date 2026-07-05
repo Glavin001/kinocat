@@ -60,7 +60,10 @@ interface CachedPrimitive {
   samples: LocalSample[];
   end: LocalSample;
   cost: number;
-  edgeData: { ci: number };
+  /** `controls` is the shared control vector of this primitive (built once
+   *  at cache time) — enough to re-simulate the edge from any parent state
+   *  (checkSuccessorFidelity relies on this). */
+  edgeData: { ci: number; controls: number[] };
 }
 
 /** Body-local octagon approximating the round footprint (heading-invariant,
@@ -177,7 +180,7 @@ export class MomentumHumanoidEnvironment
             samples: r.samples,
             end: e,
             cost: this.primDuration,
-            edgeData: { ci },
+            edgeData: { ci, controls: r.controls },
           });
         });
         byRelDir.set(relDir, prims);

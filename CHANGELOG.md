@@ -31,8 +31,36 @@ seams instead of three parallel ad-hoc implementations.
 - **Docs:** `docs/architecture.md` (the five seams + contract fine print)
   and `docs/adding-a-domain.md` (eight-step recipe; aircraft as the worked
   example).
+- **`checkSuccessorFidelity`** in `kinocat/testing`: re-simulates each
+  successor edge from the ACTUAL parent state (harness supplies
+  `resimulate` + a tolerance, with `angularFields` compared on the circle)
+  and reports per-field deviation — exact for live-rollout environments,
+  a declared bucket-teleport bound for cached-primitive ones. Wired into
+  the vehicle, aircraft, and momentum-humanoid conformance harnesses.
 
 ### Changed
+
+- **Aircraft attitude is evolving state, not a snap-to output.**
+  `AircraftAgent` gains `maxRollRate` / `maxPitchRate`;
+  `aircraftForwardSim` integrates pitch and roll toward their setpoints
+  (`Infinity` recovers the legacy quasi-static model bit-exactly). A
+  primitive commanding a bank gets `maxRollRate·dt` of it per step — so
+  knife-edge maneuvers are a matter of TIMING: the plane begins its roll
+  before the slot, holds the bank through a double slot whose gap is too
+  short to unroll and re-roll, and relaxes to level when the gap affords
+  it (all emergent from search; pinned by tests).
+- **`AircraftEnvironment` rolls primitives live through the sim** from each
+  node's actual state instead of rigid-transforming cached canonical
+  rollouts — with rate-limited attitude a cache misrepresents every
+  mid-ramp start, and the sim is a rounding error next to the OBB
+  narrowphase it feeds. `FlyEdgeData` now carries the full control quad
+  (incl. `v`) so any edge can be re-simulated; the analytic shot fires only
+  when settling to the segment attitude is a small fraction of the flight.
+- demos `densifyPath` re-integrates at the planner's certified substep
+  resolution (finer densities are linear subdivisions of the certified
+  polygon), recovers rate-aware attitude setpoints, and reproduces
+  analytic-shot segments linearly as certified — the rendered trajectory
+  can no longer drift onto paths the planner never collision-checked.
 
 - **Dynamic-world layer generalized beyond ground vehicles.**
   `MovingObstacle` predictions may carry an optional `y`; when both the

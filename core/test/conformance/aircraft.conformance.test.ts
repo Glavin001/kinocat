@@ -9,7 +9,10 @@ import {
   type AircraftEnvOptions,
 } from '../../src/environment/aircraft-environment';
 import { InMemoryAirspace } from '../../src/environment/airspace-world';
-import { defaultAircraftAgent } from '../../src/agent/aircraft';
+import {
+  aircraftForwardSim,
+  defaultAircraftAgent,
+} from '../../src/agent/aircraft';
 import type { AircraftState } from '../../src/agent/types';
 
 const agent = defaultAircraftAgent({
@@ -35,6 +38,12 @@ function airspace() {
   });
 }
 
+// Env defaults (primDuration 1, substeps 6) — the fidelity hook must
+// re-integrate with the exact same partition succ() uses.
+const PRIM_DURATION = 1;
+const SUBSTEPS = 6;
+const sim = aircraftForwardSim(agent);
+
 function harness(opts: AircraftEnvOptions = {}): DomainHarness<AircraftState> {
   return {
     makeEnv: () => new AircraftEnvironment(airspace(), agent, opts),
@@ -43,11 +52,27 @@ function harness(opts: AircraftEnvOptions = {}): DomainHarness<AircraftState> {
       y: 10 + rand() * 40,
       z: -40 + rand() * 80,
       heading: (rand() - 0.5) * 2 * Math.PI,
-      pitch: 0,
-      roll: 0,
+      // Attitude is rate-limited state — sample the whole envelope so the
+      // fidelity check exercises mid-ramp starts, not just level flight.
+      pitch: (rand() - 0.5) * 1.8 * agent.maxClimbAngle,
+      roll: (rand() - 0.5) * 1.8 * agent.maxBank,
       speed: agent.maxSpeed,
       t: rand() * 50,
     }),
+    // succ() rolls the sim live from the actual state, so re-simulation is
+    // EXACT — machine-eps tolerance, no bucket slack.
+    fidelity: {
+      tolerance: 1e-9,
+      angularFields: ['heading', 'pitch', 'roll'],
+      resimulate: (parent, edge) => {
+        if (edge.kind !== 'fly') return null;
+        const d = edge.data as { k: number; climb: number; roll: number; v: number };
+        const dt = PRIM_DURATION / SUBSTEPS;
+        let s = parent;
+        for (let i = 0; i < SUBSTEPS; i++) s = sim(s, [d.k, d.climb, d.roll, d.v], dt);
+        return s;
+      },
+    },
     scenarios: [
       {
         name: 'through-the-gap',

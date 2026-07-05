@@ -9,12 +9,40 @@ import { runConformance, type DomainHarness } from '../../src/testing';
 import { MomentumHumanoidEnvironment } from '../../src/environment/momentum-humanoid-environment';
 import { TimeAwareEnvironment } from '../../src/environment/time-aware';
 import { InMemoryNavWorld } from '../../src/environment/nav-world';
-import { defaultMomentumHumanoidAgent } from '../../src/agent/momentum-humanoid';
+import {
+  defaultMomentumHumanoidAgent,
+  momentumHumanoidForwardSim,
+} from '../../src/agent/momentum-humanoid';
+import type { FidelityHooks } from '../../src/testing';
 import { linearObstacle } from '../../src/predict/factories';
 import type { MomentumHumanoidState } from '../../src/agent/types';
 import { rect } from '../fixtures/vehicle-sweep';
 
 const agent = defaultMomentumHumanoidAgent();
+
+// This environment DELIBERATELY applies primitives from nearest-bucket
+// canonical starts (speed × velocity-direction buckets) — a fidelity/speed
+// trade the fidelity check MEASURES rather than forbids. Velocity teleport
+// ceiling per edge: ~1.5 m/s of speed-bucket rounding, plus the sprint
+// bucket's direction quantization (relDir 0 only, so a sampled sprint with
+// full lateral strafe is ~0.4 rad off at 5 m/s ≈ 2 m/s), amplified by up to
+// maxDecel·0.5 s of divergent braking response — call it 5. A frame or
+// rotation bug produces deviations at position scale (tens), far past it.
+const sim = momentumHumanoidForwardSim(agent);
+const PRIM_DURATION = 0.5; // env defaults; the hook must match succ()'s
+const SUBSTEPS = 4;
+const fidelity: FidelityHooks<MomentumHumanoidState> = {
+  tolerance: 5,
+  angularFields: ['heading'],
+  resimulate: (parent, edge) => {
+    if (edge.kind !== 'move') return null;
+    const d = edge.data as { controls: number[] };
+    const dt = PRIM_DURATION / SUBSTEPS;
+    let s = parent;
+    for (let i = 0; i < SUBSTEPS; i++) s = sim(s, d.controls, dt);
+    return s;
+  },
+};
 
 function sample(rand: () => number): MomentumHumanoidState {
   const heading = (rand() - 0.5) * 2 * Math.PI;
@@ -60,6 +88,7 @@ describe('MomentumHumanoidEnvironment conformance', () => {
           agent,
         ),
       sampleState: sample,
+      fidelity,
       scenarios: [scenarios[0]!],
     };
     const report = runConformance(h);
@@ -82,6 +111,7 @@ describe('MomentumHumanoidEnvironment conformance', () => {
         const s = sample(rand);
         return { ...s, x: 1 + rand() * 10, z: 5 + rand() * 9 };
       },
+      fidelity,
       scenarios: [scenarios[1]!],
     };
     const report = runConformance(h);
@@ -102,6 +132,7 @@ describe('MomentumHumanoidEnvironment conformance', () => {
           },
         ),
       sampleState: sample,
+      fidelity,
       scenarios: [scenarios[0]!],
     };
     const report = runConformance(h);

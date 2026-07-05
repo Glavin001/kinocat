@@ -3,13 +3,35 @@
 // as the kit's reference usage example for docs/adding-a-domain.md.
 
 import { describe, it, expect } from 'vitest';
-import { runConformance, type DomainHarness } from '../../src/testing';
+import { runConformance, type DomainHarness, type FidelityHooks } from '../../src/testing';
 import { VehicleEnvironment } from '../../src/environment/vehicle-environment';
 import { InMemoryNavWorld } from '../../src/environment/nav-world';
+import { kinematicForwardSim } from '../../src/agent/vehicle';
 import type { CarKinematicState } from '../../src/agent/types';
 import { SWEEP_AGENT, buildSweepLib, rect } from '../fixtures/vehicle-sweep';
 
 const lib = buildSweepLib();
+
+// The sampler holds speed at 0 — exactly the library's only start-speed
+// bucket — so re-simulating a drive edge from the actual state must match
+// the rigid-transformed cached primitive to float noise. This pins the
+// transform machinery itself (a frame/rotation bug shows up immediately).
+const sim = kinematicForwardSim(SWEEP_AGENT);
+const PRIM_DURATION = 0.5; // buildSweepLib's characterization parameters
+const SUBSTEPS = 6;
+const fidelity: FidelityHooks<CarKinematicState> = {
+  tolerance: 1e-9,
+  angularFields: ['heading'],
+  resimulate: (parent, edge) => {
+    if (edge.kind !== 'drive' && edge.kind !== 'drive-reverse') return null;
+    const d = edge.data as { primId: number };
+    const controls = lib.primitives[d.primId]!.controls;
+    const dt = PRIM_DURATION / SUBSTEPS;
+    let s = parent;
+    for (let i = 0; i < SUBSTEPS; i++) s = sim(s, controls, dt);
+    return s;
+  },
+};
 
 function openWorld() {
   return new InMemoryNavWorld([rect(1, 0, 0, 40, 30)]);
@@ -35,6 +57,7 @@ function harness(world: () => InMemoryNavWorld): DomainHarness<CarKinematicState
       speed: 0,
       t: rand() * 50,
     }),
+    fidelity,
     scenarios: [
       {
         name: 'open-field',

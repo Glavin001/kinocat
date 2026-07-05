@@ -77,23 +77,43 @@ enforced by the conformance kit, `kinocat/testing`):
   `level` argument must be forwarded too — dropping it silently disables
   per-level primitive sets (this was a real bug in `TimeAwareEnvironment`).
 
-## Seam 2 — `ForwardSim<S>` + `characterize<S>` (`core/src/primitives/`)
+## Seam 2 — `ForwardSim<S>` (`core/src/primitives/`, `core/src/agent/`)
 
-Dynamics are a pure function `(state, controls, dt) => state`. Primitives are
-pre-characterized rollouts: `characterize()` rolls the sim from canonical
-start states across a control grid, recording local-frame samples;
-environments then apply primitives by rigid-transforming the cached sweeps by
-a node's world pose instead of re-simulating.
+Dynamics are a pure function `(state, controls, dt) => state`, and **the sim
+is the single definition of what a primitive can express**. Controls are
+SETPOINTS; every state variable evolves continuously from its actual current
+value under the agent's envelope. There is no "magical" instant maneuver: a
+primitive commanding a bank gets `maxRollRate·dt` of it per step, exactly as
+a primitive commanding thrust gets displacement (see `aircraftForwardSim` —
+`Infinity` rates recover a quasi-static snap model). Don't hand-add per-DOF
+features to environments; put the physics in the sim and let primitives
+inherit it.
 
-**Equivariance contract**: this is only valid when the sim is translation-
-and yaw-equivariant — no absolute-position or absolute-heading dependence
-(no global wind, no position-dependent grip). If a learned model gains such
-dependence, characterize at plan time from the actual state instead.
+**Applying primitives — two strategies, one contract.** An environment's
+`succ()` must produce successors that are what the sim actually yields from
+the parent's ACTUAL state (`checkSuccessorFidelity` in `kinocat/testing`
+verifies this):
 
-**Bucketing**: primitives are cached per start bucket (speed for the car;
-speed × relative-velocity-direction for the momentum humanoid; per
-resolution level for the aircraft). Bucketing trades fidelity for
-precomputation; its heuristic consequence is documented under Seam 1.
+- **Live rollout** (aircraft): integrate the sim per substep inside `succ()`.
+  Exact by construction — right whenever the sim is cheap relative to the
+  collision narrowphase it feeds (a few dozen flops vs an OBB SAT test), or
+  when the sim's output depends on continuous state dims (rate-limited
+  attitude) that a cache would quantize. The aircraft tried an
+  attitude-bucketed cache first; its teleport error clipped near-margin
+  obstacles, and the cache was buying nothing.
+- **Cached characterization** (car, momentum humanoid): `characterize()`
+  rolls the sim from canonical start-bucket states across a control grid,
+  recording local-frame samples that `succ()` rigid-transforms by the node's
+  pose. Right when rollouts are expensive or the start-dependence is
+  low-dimensional (speed buckets). Two contracts apply:
+  - **Equivariance**: rigid transform is only valid when the sim is
+    translation- and yaw-equivariant — no absolute-position or
+    absolute-heading dependence (no global wind, no position-dependent
+    grip).
+  - **Bucket coverage**: cache per start bucket over every state dim the
+    sim's output depends on; the bucket teleport is a declared, measured
+    tolerance in the domain's fidelity hook, not an invisible lie. Its
+    heuristic consequence is documented under Seam 1.
 
 ## Seam 3 — the world seam (two fidelities, pick one per domain)
 
@@ -145,9 +165,12 @@ hash for standalone use; pass `timeInHash: false` when wrapping it with
 `runConformance(harness)` is the definition of "this environment works":
 heuristic consistency and admissibility, successor invariants (positive
 costs, monotone time, g/h/f bookkeeping, index arity), hash stability,
-cross-instance determinism, anytime monotonicity, and budgeted scenario
-solvability — all framework-agnostic (no test-runner dependency) so game
-projects can run it against their own domains. See
+cross-instance determinism, anytime monotonicity, budgeted scenario
+solvability, and — when the harness supplies re-simulation hooks —
+successor fidelity (succ()'s output vs the forward sim run from the actual
+parent state; exact for live-rollout environments, a declared tolerance for
+bucket-cached ones). All framework-agnostic (no test-runner dependency) so
+game projects can run it against their own domains. See
 `docs/adding-a-domain.md` for the recipe and
 `core/test/conformance/*.conformance.test.ts` for the four in-repo
 harnesses.

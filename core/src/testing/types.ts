@@ -7,7 +7,7 @@
 // structured report instead of throwing, so the kit runs under any test
 // runner (or in a game's own CI) with zero dependencies.
 
-import type { Environment } from '../environment/types';
+import type { EdgeRef, Environment } from '../environment/types';
 
 /** A representative planning problem the domain must solve within budget. */
 export interface DomainScenario<State> {
@@ -36,6 +36,29 @@ export interface DomainHarness<State> {
   scenarios: DomainScenario<State>[];
   /** Numeric tolerance for cost / state comparisons (default 1e-9). */
   eps?: number;
+  /** Optional hooks for `checkSuccessorFidelity`: prove that succ()'s
+   *  cached/transformed successors match what the domain's forward sim
+   *  actually produces from the parent state. Supplying this makes the
+   *  fidelity check part of `runConformance`. */
+  fidelity?: FidelityHooks<State>;
+}
+
+/** Hooks for the successor-fidelity check. `resimulate` re-runs the edge's
+ *  dynamics from the ACTUAL parent state (reconstruct the controls from
+ *  `edge.data` and roll the domain's ForwardSim); return null for edge kinds
+ *  that cannot be re-simulated (affordances, analytic shots) — they are
+ *  skipped. `tolerance` is the max |cached − resimulated| per numeric state
+ *  field: near machine-eps for environments that integrate live or from
+ *  exact buckets; the bucket-quantization magnitude for environments that
+ *  deliberately apply primitives from nearest-bucket canonical starts (the
+ *  check then MEASURES the teleport error and pins it from growing). */
+export interface FidelityHooks<State> {
+  resimulate: (parent: State, edge: EdgeRef) => State | null;
+  tolerance: number;
+  /** State fields to compare on the circle (deviation taken mod 2π), e.g.
+   *  ['heading'] — a cached −3.08 rad and a re-simulated +3.06 rad are the
+   *  same physical angle. */
+  angularFields?: string[];
 }
 
 export interface ConformanceFailure {

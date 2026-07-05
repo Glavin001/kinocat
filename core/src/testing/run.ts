@@ -10,6 +10,7 @@
 
 import { checkAnytimeMonotonic } from './anytime';
 import { checkDeterminism } from './determinism';
+import { checkSuccessorFidelity } from './fidelity';
 import { checkHeuristicAdmissible, checkHeuristicConsistency } from './heuristic';
 import { runScenarioBudget } from './scenario-budget';
 import { checkNodeStability, checkSuccessorInvariants } from './successors';
@@ -32,6 +33,10 @@ export function runConformance<State>(
     ['anytime-monotonic', () => checkAnytimeMonotonic(h)],
     ['scenario-budget', () => runScenarioBudget(h)],
   ];
+  // Opt-in: runs only when the harness supplies resimulation hooks.
+  if (h.fidelity) {
+    checks.push(['successor-fidelity', () => checkSuccessorFidelity(h, opts)]);
+  }
   const report: ConformanceReport = { ok: true, checks: [], failures: [] };
   for (const [name, fn] of checks) {
     report.checks.push(name);

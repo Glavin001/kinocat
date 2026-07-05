@@ -11,6 +11,7 @@ import {
   checkHeuristicAdmissible,
   checkSuccessorInvariants,
   checkNodeStability,
+  checkSuccessorFidelity,
   type DomainHarness,
 } from '../../src/testing';
 
@@ -138,5 +139,33 @@ describe('conformance kit self-test', () => {
     const report = runConformance(harness({ hScale: 10 }));
     expect(report.ok).toBe(false);
     expect(report.failures.length).toBeGreaterThan(0);
+  });
+
+  it('successor fidelity passes a faithful hook and fails a drifted one', () => {
+    // LineEnv has no per-edge data, so wrap succ to record the direction —
+    // the resimulate hook then reconstructs the exact ±1 step dynamics.
+    class DirectedLineEnv extends LineEnv {
+      override succ(node: Node<LineState>, goal: Node<LineState>): Node<LineState>[] {
+        const out = super.succ(node, goal);
+        out.forEach((n) => {
+          n.edge = { ...n.edge!, data: { dx: n.state.x - node.state.x } };
+        });
+        return out;
+      }
+    }
+    const directed = (drift: number): DomainHarness<LineState> => ({
+      ...harness(),
+      makeEnv: () => new DirectedLineEnv(),
+      fidelity: {
+        tolerance: 1e-12,
+        resimulate: (parent, edge) => {
+          const d = edge.data as { dx: number };
+          return { x: parent.x + d.dx + drift, z: parent.z, t: parent.t + 1 };
+        },
+      },
+    });
+    expect(checkSuccessorFidelity(directed(0))).toEqual([]);
+    const fails = checkSuccessorFidelity(directed(0.5));
+    expect(fails.some((f) => f.message.includes('deviates'))).toBe(true);
   });
 });

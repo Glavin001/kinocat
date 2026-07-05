@@ -113,10 +113,13 @@ interface ControlQuad {
   v: number;
 }
 
+/** The full control quad taken on a 'fly' edge — enough to re-simulate the
+ *  edge from any parent state (checkSuccessorFidelity relies on this). */
 interface FlyEdgeData {
   k: number;
   climb: number;
   roll: number;
+  v: number;
 }
 
 /** One primitive action: a control quad with its precomputed edge cost and
@@ -287,7 +290,7 @@ export class AircraftEnvironment implements Environment<AircraftState> {
       ctlArray: [c.k, c.climb, c.roll, c.v] as const,
       cost:
         this.primDuration + this.rollCost * Math.abs(c.roll) * this.primDuration,
-      edgeData: { k: c.k, climb: c.climb, roll: c.roll },
+      edgeData: { k: c.k, climb: c.climb, roll: c.roll, v: c.v },
     }));
   }
 
