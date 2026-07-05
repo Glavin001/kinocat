@@ -29,12 +29,14 @@ checklist items that prove it:
 | P7 | Primitive segments may be too long / compose imprecisely (seams) | WS-2 (dynamic state through seams; root rollouts) | A2.1, A2.2, A2.5 |
 | P8 | The plan's rich control knowledge (exact steer/drive/brake per primitive) must actually drive the actuators, not be re-derived from geometry | WS-1½ (control feedforward) | A1½.1–A1½.5 |
 | P9 | 0.55 s chunks may be too coarse/noisy — maneuvers needing in-between switch times (e.g. a flick at t = 0.25 s into a chunk) aren't representable in-plan | §0c (architecture: chunked deliberation + continuous execution); WS-3 (50 ms control resolution); WS-2 optional interruptible primitives | A3.3, A3.6, A2.7 |
+| P10 | No hacky overrides: the planner must have full discretion (go slow if it wants). We provide capability + accuracy + incentive and remove artificial constraints — never forced speeds, scripted throttle, or injected behavior | §0d (design principle: authority stays with the planner); every WS audited against it | A5.6; A1.3 framed as a canary, not a command |
 
 **Definition of done for the phase** (the headline claims, all deterministic,
 all ratcheted):
 
 - **D1 — Floor it.** ≥ 95% drive command until the braking point and
-  ≥ 28 m/s peak on the 105 m straight (gate 7→8).
+  ≥ 28 m/s peak on the 105 m straight (gate 7→8) — emergent from the
+  planner's own time-optimal choice, never injected (§0d).
 - **D2 — At the limit.** v2 g-g mean utilization ≥ 0.60 (today 0.44),
   peak ≥ 0.95, on a clean run.
 - **D3 — Dynamic rollouts.** Root expansions roll the car's own model from
@@ -94,7 +96,48 @@ gives ~0.09 s in-plan switch granularity at zero extra model-rollout cost.
 
 ---
 
-## 0d. Expected end state (behavior contract)
+## 0d. Design principle: authority stays with the planner (P10)
+
+The planner already has everything a free agent needs — this plan adds
+none of it, and must never substitute its own decisions:
+
+- **Capability exists**: primitive libraries span the full envelope —
+  `[0, 30]` kinematic full-speed straights
+  (`race-primitives-scenarios.ts:288`), `[0, maxDriveForce, 0]`
+  full-throttle straights in every v2 bucket
+  (`race-primitives-scenarios.ts:444,462,485,512-515`).
+- **Incentive exists**: edge cost is seconds —
+  `prim.duration · reverseMult + gearFlipPenalty`
+  (`vehicle-environment.ts:333-335`). Time-optimal search wants to finish
+  fast without being told to.
+- **The constraint is the executor discarding the planner's authority**
+  (the five model-agnostic caps, `pure-pursuit.ts:245-253`). The work is
+  to remove those self-imposed constraints — not to inject behavior.
+
+Rules every workstream is audited against:
+
+1. **No forced behavior anywhere in the race path**: no minimum speeds, no
+   scripted throttle, no spawn-at-speed, no hand-authored racing line. If
+   the planner chooses slow, the car drives slow and the lap time judges
+   it.
+2. **Executor = faithful attainment.** "Bang-bang" (WS-1) means: when the
+   planner commands 30 m/s from 12, faithful execution is full throttle;
+   when it commands 8 into a hairpin, deliver 8. The current P-law
+   (`throttle = Δv/maxAccel`) is the executor unilaterally softening the
+   planner's decision — that is what gets removed.
+3. **Remaining caps are one-directional safety clamps** toward the
+   measured physical envelope (may only reduce commanded speed, never
+   raise it), and are interim pure-pursuit scaffolding. Under WS-3 MPPI
+   there are no caps at all: the car's own model + progress(time) cost
+   decides every command — full discretion, incentivized only by
+   finishing sooner.
+4. **Benchmark thresholds are canaries, not commands.** A1.3's "≥ 95%
+   drive command on the straight" asserts *emergent* behavior: if a
+   time-incentivized planner with full-speed primitives won't floor a
+   straight of its own accord, an artificial constraint still exists and
+   the test must fail. Nothing anywhere injects the throttle.
+
+## 0e. Expected end state (behavior contract)
 
 What the stack looks like when every checklist item is green — the
 before/after this plan is accountable to:
@@ -109,12 +152,14 @@ cars finally *behave differently*: under per-car-model MPPI, the v2 car
 rides the true limit while the kinematic car's delusion — free at 9 m/s —
 costs wall strikes and recovery time at 28 m/s on the circuit.
 
-**Current → committed floor → predicted:**
+**Current → benchmark assertion → predicted.** ("Assertion" = the
+threshold the *emergent* behavior must reach for the test to pass — a
+measurement, never a control input; see §0d.)
 
-| Signal | Today | Committed | Predicted |
+| Signal | Today | Asserted (emergent) | Predicted |
 |---|---|---|---|
 | Mean speed (open) | 8.8–9.3 m/s | ≥ 12.5 (A1.4) | 15–18 m/s |
-| Peak on straight | ~27 m/s brief | ≥ 28, floored (A1.3) | 29–30 sustained |
+| Peak on straight | ~27 m/s brief | ≥ 28 (A1.3) | 29–30 sustained |
 | g-g mean util (v2) | 0.44 | ≥ 0.60 (A3.5) | 0.65–0.75 |
 | Technical/circuit ratio | 1.12 | < 1.0 (A3.8/A4.5) | 0.85–0.95 + kin strikes |
 | v2 pred err | 0.92 m | not regressed (A1½.6) | drops |
@@ -260,7 +305,10 @@ disabled on the open course (`race-scenario.ts:470`).
 - [ ] **A1.3** (D1, P1) New assertion in
   `closed-loop-race-benchmark.test.ts`: on the gate 7→8 straight, drive
   command ≥ 0.95 for ≥ 60% of the straight's arc length AND peak speed
-  ≥ 28 m/s, for BOTH cars.
+  ≥ 28 m/s, for BOTH cars. This is a **canary of emergent behavior**
+  (§0d rule 4): nothing injects the throttle — the assertion exists to
+  fail if any artificial constraint still prevents a time-incentivized
+  planner from choosing full speed on a straight.
 - [ ] **A1.4** Open-course benchmark: both cars' mean speed ≥ 12.5 m/s
   (≥ +40% over 8.8/9.3); avg laps < 33.0 s (kin) and < 39.2 s (v2);
   0 off-track; failed replans ≤ 2; determinism test bit-identical.
@@ -603,6 +651,12 @@ The measurement layer that locks every claim in place.
 - [ ] **A5.5** Per-workstream benchmark runs recorded:
   `pnpm run race -- --seed=42 --laps=3` on open + technical + circuit
   after each workstream lands; tables in each PR.
+- [ ] **A5.6** (P10) Non-forcing audit passes on the final diff: no
+  minimum-speed constants, scripted throttle, spawn-at-speed, or
+  hand-authored line anywhere in the race path; every remaining cap is a
+  one-directional clamp toward the measured envelope (may only reduce
+  commanded speed); all speed/line decisions trace to the planner or the
+  car's own model + time cost (§0d rules 1–4).
 
 ---
 
