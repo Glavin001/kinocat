@@ -55,6 +55,7 @@ export {
   PARAMS_V2_ORDER,
   paramsV2ToVec,
   paramsV2FromVec,
+  paramsV2OutOfBounds,
   parametricForwardV2,
   learnedForwardSimV2,
   predictWithUncertainty,
@@ -63,6 +64,16 @@ export {
   MLP_INPUT_DIM,
   MLP_OUTPUT_DIM,
 } from './vehicle-model';
+
+// Physical capability envelope derived from the vehicle config — the
+// single source of truth for planner/tracker limits (mass, wheelbase,
+// min turn radius, accel/decel/lateral ceilings).
+export type { VehicleCapabilities } from './capabilities';
+export {
+  deriveVehicleCapabilities,
+  plannerVehicleCapabilities,
+  DEFAULT_PLANNER_CAPABILITY_MARGIN,
+} from './capabilities';
 
 // MLP serialization (used by the demo's v2-model-persistence to round-trip
 // trained residual ensembles through localStorage / JSON download).

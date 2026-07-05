@@ -202,8 +202,15 @@ export function raceControlSets(agent: VehicleAgent = RACE_AGENT): number[][] {
 
 /** Start-speed buckets covering the full envelope from rest to top speed.
  *  The planner picks the bucket nearest the car's current speed when
- *  expanding a node. */
-export const RACE_START_SPEEDS = [0, 10, 20, 28];
+ *  expanding a node — so the bucket spacing IS the model's sampling
+ *  density. The old [0, 10, 20, 28] grid quantized away most of what a
+ *  speed-dependent model knows (understeer ∝ v², friction circle): a
+ *  node at 15 m/s expanded with arcs baked at 10 or 20 m/s, an endpoint
+ *  error that dwarfs the v2 model's sub-meter 1 s accuracy. 4 m/s
+ *  spacing keeps nearest-bucket error ≤ 2 m/s — matching the training
+ *  grid ([0,4,…,28] in training-driver) — at zero search cost (lookup
+ *  stays nearest-bucket; branching per node is unchanged). */
+export const RACE_START_SPEEDS = [0, 4, 8, 12, 16, 20, 24, 28];
 
 export function buildKinematicLibrary(): MotionPrimitiveLibrary {
   return characterizeVehicle({
@@ -256,23 +263,27 @@ export function buildLearnedRaceLibraryV2(
 ): MotionPrimitiveLibrary {
   const inner = learnedForwardSimV2(model);
   const cfg = model.config;
+  // Duration tuned per-regime: enough time for control differences to
+  // produce DISTINGUISHABLE endpoints (so the planner has real choices)
+  // but not so long that the planner can't react to nearby gates.
+  // At v=0 the chassis needs ~1.5 s to accelerate to a speed where turn
+  // dynamics differentiate. At speed, brake-into-corner trajectories need
+  // ~0.8 s to develop (5.5 m/s² brake decel × 0.8 s = 4.4 m/s of speed
+  // change, enough to discriminate plans). The regime → control-set
+  // mapping follows the same physics rationale as the original 4-bucket
+  // layout; the denser RACE_START_SPEEDS grid just samples each regime
+  // at more start speeds so nearest-bucket quantization stays ≤ 2 m/s.
+  const regimeFor = (v: number): { duration: number; controls: number[][] } => {
+    if (v < 2) return { duration: 1.5, controls: lowSpeedV2Controls(cfg) };
+    if (v < 14) return { duration: v < 6 ? 1.0 : 0.8, controls: midSpeedV2Controls(cfg) };
+    if (v < 23) return { duration: 0.8, controls: highSpeedV2Controls(cfg) };
+    return { duration: 0.8, controls: topSpeedV2Controls(cfg) };
+  };
   const buckets: Array<{
     startSpeed: number;
     duration: number;
     controls: number[][];
-  }> = [
-    // Duration tuned per-bucket: enough time for control differences to
-    // produce DISTINGUISHABLE endpoints (so the planner has real choices)
-    // but not so long that the planner can't react to nearby gates.
-    // At v=0 the chassis needs ~1.5 s to accelerate to a speed where turn
-    // dynamics differentiate. At v=28 brake-into-corner trajectories need
-    // ~0.8 s to develop (5.5 m/s² brake decel × 0.8 s = 4.4 m/s of speed
-    // change, enough to discriminate plans).
-    { startSpeed: 0,  duration: 1.5,  controls: lowSpeedV2Controls(cfg) },
-    { startSpeed: 10, duration: 0.8,  controls: midSpeedV2Controls(cfg) },
-    { startSpeed: 20, duration: 0.8,  controls: highSpeedV2Controls(cfg) },
-    { startSpeed: 28, duration: 0.8,  controls: topSpeedV2Controls(cfg) },
-  ];
+  }> = RACE_START_SPEEDS.map((v) => ({ startSpeed: v, ...regimeFor(v) }));
   const all: import('kinocat/primitives').MotionPrimitive[] = [];
   let id = 0;
   for (const b of buckets) {
