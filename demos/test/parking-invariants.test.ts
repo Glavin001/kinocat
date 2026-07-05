@@ -30,12 +30,11 @@
 //
 // Fixing all five (see race-scenario.ts / race-primitives-scenarios.ts /
 // parking-scenarios.ts / core analytic-shot poses) makes `forward-pullin` and
-// `reverse-perp` park cleanly with a healthy planner. `parallel` now reaches
-// the slot collision-free under a healthy planner but still can't nail the
-// terminal-heading straightening shunt (pure-pursuit brakes to rest at its
-// approach angle, ~16° off). That residual is kept HONEST as an `it.fails` so
-// it stays exercised and flips to green the moment terminal-pose precision
-// (e.g. an MPC final stage) lands.
+// `reverse-perp` park cleanly with a healthy planner. `parallel` used to reach
+// the slot but rest ~16° off the curb; a Stanley-style terminal heading term
+// (`terminalHeadingGain`, gated by the runner on distance to the TRUE goal) now
+// straightens it onto the curb, so all three park square + centred and the
+// predicate (`evaluateParked`, incl. a centering bound) agrees.
 
 import { describe, expect, it } from 'vitest';
 import { ensureRapier } from 'kinocat/adapters/rapier';
@@ -138,12 +137,11 @@ describe.skipIf(!RAPIER_OK)('parking invariants', () => {
     expect(report.failedReplanRatio, ctx).toBeLessThan(0.3);
   });
 
-  // PARTIALLY FIXED — parallel parking. The replan storm is gone, the chassis
-  // reaches the slot position under a healthy planner, AND it no longer grazes
-  // a neighbour on the way in (these invariants pass). What it still can't do is
-  // the final straightening shunt — pure-pursuit brakes to rest at whatever
-  // approach angle it arrives with (no terminal-heading control), ~16° off the
-  // curb. See the `it.fails` below.
+  // Parallel parking. The replan storm is gone, the chassis reaches the slot
+  // under a healthy planner without grazing a neighbour, AND comes to rest
+  // CENTRED (terminalPosError < 0.6 m) — the centering that the terminal heading
+  // term + the `evaluateParked` centering bound now guarantee. Squareness is
+  // asserted separately below.
   it('parallel: reaches the slot cleanly under a healthy planner (no storm, no graze)', OPTS, async () => {
     const { report } = await park('parallel', 1600);
     const ctx = `\n${formatReport(report)}`;
@@ -160,21 +158,21 @@ describe.skipIf(!RAPIER_OK)('parking invariants', () => {
     expect(report.teleports, ctx).toBe(0);
   });
 
-  // KNOWN BROKEN — parallel TERMINAL HEADING. With the tightened terminal brake
-  // the chassis now reaches the slot POSITION precisely (~0.15 m, perfect after
-  // the goalTolerance fix that parked reverse-perp) but comes to rest ~16° off
-  // the curb: pure-pursuit is a position-chasing law with no heading target and
-  // no final back-and-forth straightening shunt, so it cannot null the residual
-  // orientation. (A single-stage smooth pose-regulator was prototyped and shown
-  // by its own kinematic tests to over-rotate / limit-cycle on this geometry, so
-  // it was not adopted — the real fix is a maneuver-based terminal stage.)
-  // Encoded as the CORRECT-behaviour assertion under `it.fails`: it throws today
-  // and flips red the moment terminal-heading control lands, signalling the
-  // `.fails` should drop.
-  it.fails('parallel: fits squarely inside the stall silhouette', OPTS, async () => {
+  // FIXED — parallel terminal heading. The chassis reaches the slot position and
+  // now squares up with the curb (heading → ~0°). The fix is a Stanley-style
+  // heading-alignment term added to pure-pursuit (`terminalHeadingGain`),
+  // confined to within 2 m of the goal so it corrects the short terminal
+  // straightening curve — which pure-pursuit's lookahead otherwise cuts, leaving
+  // the car ~16° off — without perturbing the tight clearance-critical dive past
+  // the parked cars. (An earlier free-space smooth pose-regulator was rejected:
+  // its own kinematic tests showed it over-rotates / limit-cycles. This works
+  // because it follows the planner's collision-free path tangent instead.)
+  it('parallel: ends square with the curb — fits squarely inside the stall', OPTS, async () => {
     const { report, status } = await park('parallel', 1600);
     const ev = evaluateParked(status.state, buildParkingScenario('parallel'));
     const ctx = `\n${formatReport(report)}\nparked=${JSON.stringify(ev)}`;
     expect(ev.parked, ctx).toBe(true);
+    expect(report.collided, ctx).toBe(false);
+    expect(report.teleports, ctx).toBe(0);
   });
 });

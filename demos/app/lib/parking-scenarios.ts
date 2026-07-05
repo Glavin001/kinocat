@@ -429,33 +429,44 @@ export interface ParkingSuccess {
   headingTol: number;
   /** Max |speed| to count as stopped (m/s). */
   speedTol: number;
+  /** Max offset ALONG the stall's long axis from its centre (m). Coverage alone
+   *  can't catch this in a long slot (a parallel-park bay is ~7 m of stall for a
+   *  4.8 m car), so a chassis parked square but 1.4 m off-centre still overlaps
+   *  ~85% and would read "parked" without this bound. */
+  centeringTol: number;
 }
 
-/** The tight bar, calibrated against the real (deterministic) Rapier sim so it
- *  separates a cleanly-parked car from one that stops offset/angled:
- *    forward-pullin → coverage 0.90, heading 0°  ⇒ PARKED
- *    reverse-perp   → coverage 0.75              ⇒ not parked (footprint pokes out)
- *    parallel       → heading 16°                ⇒ not parked (not squared up)
- *  `headingTol` ≈ 8°. The two failing scenarios are the deliberate signal that
- *  pure-pursuit still lacks terminal-heading control (see the `it.fails` tests
- *  in `parking-invariants.test.ts`). */
+/** The tight bar, calibrated against the real (deterministic) Rapier sim: a
+ *  cleanly-parked chassis clears coverage ≥ 0.85, heading ≤ ~8°, |v| ≤ 0.3, and
+ *  centre-offset ≤ 0.6 m, while a chassis that stops offset / angled / off-centre
+ *  does not. All three scenarios now clear it (forward-pullin ~0.97 coverage,
+ *  reverse-perp ~0.92, parallel ~0.96 @ ~3°) — the terminal-brake and
+ *  terminal-heading fixes closed the gaps the demo showed. */
 export const PARKING_SUCCESS: ParkingSuccess = {
   coverageMin: 0.85,
   headingTol: 0.14,
   speedTol: 0.3,
+  // Matches the "reaches slot cleanly" invariant's 0.6 m position bound. Cleanly
+  // parked chassis sit ~0.15–0.22 m off-centre, so this has wide margin while
+  // rejecting the ~1.4 m mid-maneuver cusp pauses in the long parallel slot.
+  centeringTol: 0.6,
 };
 
 export interface ParkedEval {
-  /** footprintInStall AND stopped — the headline result. */
+  /** footprintInStall AND stopped AND centered — the headline result. */
   parked: boolean;
   /** coverage ≥ coverageMin AND headingError ≤ headingTol. */
   footprintInStall: boolean;
   /** |speed| ≤ speedTol. */
   stopped: boolean;
+  /** |offset along the stall long axis| ≤ centeringTol. */
+  centered: boolean;
   /** Fraction of the car footprint area overlapping the stall box (0..1). */
   coverage: number;
   /** Euclidean distance from the chassis to the goal/stall centre (m). */
   posError: number;
+  /** Offset along the stall's long axis from its centre (m). */
+  centerOffset: number;
   /** |heading − stall.heading|, wrapped to [0, π] (rad). */
   headingError: number;
 }
@@ -502,15 +513,24 @@ export function evaluateParked(
   const coverage = carArea > 0 ? Math.min(1, inter / carArea) : 0;
   const headingError = Math.abs(wrapPi(state.heading - stall.heading));
   const posError = Math.hypot(state.x - stall.x, state.z - stall.z);
+  // Offset along the stall's long axis (heading direction) — the drift coverage
+  // can't see in a long slot.
+  const centerOffset = Math.abs(
+    (state.x - stall.x) * Math.cos(stall.heading) +
+      (state.z - stall.z) * Math.sin(stall.heading),
+  );
   const stopped = Math.abs(state.speed) <= success.speedTol;
+  const centered = centerOffset <= success.centeringTol;
   const footprintInStall =
     coverage >= success.coverageMin && headingError <= success.headingTol;
   return {
-    parked: footprintInStall && stopped,
+    parked: footprintInStall && stopped && centered,
     footprintInStall,
     stopped,
+    centered,
     coverage,
     posError,
+    centerOffset,
     headingError,
   };
 }
@@ -621,11 +641,24 @@ export const PARKING_RACE_TUNING: Partial<RaceTuning> = {
   // onto the goal: forward-pullin → 0.97 coverage, reverse-perp → 0.89 (it now
   // PARKS). `arriveRadius` is kept well above `goalTolerance` (0.25 vs 0.08) so
   // the cusp-advance logic still triggers through each forward↔reverse gear
-  // change — they're decoupled knobs. (This is a position fix only; parallel's
-  // residual is a ~16° HEADING error that pure-pursuit structurally can't null —
-  // tracked by the `it.fails` in parking-invariants.test.ts.)
+  // change — they're decoupled knobs. (Position fix; reverse-perp's residual was
+  // position, parallel's was heading — see `terminalHeadingGain` below.)
   goalTolerance: 0.08,
   arriveRadius: 0.25,
+  // Stanley-style terminal heading alignment. Pure-pursuit chases a lookahead
+  // POINT and ignores the plan's heading, so on a parking final approach — where
+  // the lookahead overshoots the short (~1 m, curvature-limited) terminal
+  // straightening curve — it cuts the corner and rests at its approach angle
+  // (parallel-park came to rest ~16° off the curb). This adds a curvature term
+  // proportional to the heading error vs the local path tangent so the chassis
+  // rotates onto the planned heading. The RUNNER gates it on distance to the
+  // TRUE goal (`terminalHeadingRadius`, 2 m), not the per-segment path end, so it
+  // engages only on the terminal approach and never near a forward↔reverse cusp
+  // (whose local tangent isn't the goal heading). Effect: parallel 16° → ~3° (now
+  // PARKS, centred); forward/reverse unaffected (straight-in / reverse arrive
+  // aligned and the term is forward-gear only). Gain sits on a stable plateau.
+  terminalHeadingGain: 4.0,
+  terminalHeadingRadius: 2.0,
   plannerPosCell: 0.3,
   plannerHeadingBuckets: 36,
   plannerGoalRadius: 0.35,

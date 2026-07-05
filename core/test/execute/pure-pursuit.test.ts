@@ -115,4 +115,59 @@ describe('purePursuit', () => {
     expect(cmd.brake).toBe(1);
     expect(cmd.targetSpeed).toBe(0);
   });
+
+  describe('terminal heading term (headingGain)', () => {
+    // A path whose tangent points along +x (heading 0) but the chassis sits on
+    // it pointed 0.3 rad off. Pure-pursuit's lookahead point is straight ahead
+    // (no cross-track), so WITHOUT a heading term it commands ~0 curvature and
+    // never corrects the orientation; WITH the term it commands curvature toward
+    // the path heading.
+    const straight: PlanPath = [
+      { x: 0, z: 0, heading: 0, speed: 1, t: 0 },
+      { x: 1, z: 0, heading: 0, speed: 1, t: 1 },
+      { x: 2, z: 0, heading: 0, speed: 1, t: 2 },
+    ];
+    const offHeading: CarKinematicState = { x: 0, z: 0, heading: 0.3, speed: 1, t: 0 };
+
+    it('adds curvature toward the path tangent when the chassis is mis-aligned', () => {
+      // Unclamped config so the exact delta is observable (the curvature limit
+      // is exercised by its own test below).
+      const noClamp: PurePursuitConfig = { ...cfg, minTurnRadius: undefined };
+      const base = purePursuit(offHeading, straight, noClamp).steering;
+      const withTerm = purePursuit(offHeading, straight, { ...noClamp, headingGain: 1.0 }).steering;
+      // Chassis heading (+0.3) exceeds the path tangent (0) ⇒ correction is a
+      // negative-curvature (turn back toward the path heading) delta of exactly
+      // headingGain · (tangent − heading) = 1.0 · (0 − 0.3).
+      expect(withTerm).toBeLessThan(base);
+      expect(withTerm - base).toBeCloseTo(-0.3, 6);
+    });
+
+    it('is gated off beyond headingRadius', () => {
+      // distToGoal from (0,0) to (2,0) is 2; a 1.5 m radius gates the term off.
+      const gated = purePursuit(offHeading, straight, { ...cfg, headingGain: 1.0, headingRadius: 1.5 });
+      const base = purePursuit(offHeading, straight, cfg);
+      expect(gated.steering).toBeCloseTo(base.steering, 9);
+    });
+
+    it('respects the minimum turn radius after adding the term', () => {
+      const kMax = 1 / cfg.minTurnRadius!;
+      const cmd = purePursuit(
+        { x: 0, z: 0, heading: 1.2, speed: 1, t: 0 },
+        straight,
+        { ...cfg, headingGain: 5.0 },
+      );
+      expect(Math.abs(cmd.steering)).toBeLessThanOrEqual(kMax + 1e-9);
+    });
+
+    it('does not apply in reverse gear (term is forward-only)', () => {
+      const revPath: PlanPath = [
+        { x: 0, z: 0, heading: 0, speed: -1, t: 0 },
+        { x: -1, z: 0, heading: 0, speed: -1, t: 1 },
+        { x: -2, z: 0, heading: 0, speed: -1, t: 2 },
+      ];
+      const base = purePursuit(offHeading, revPath, cfg).steering;
+      const withTerm = purePursuit(offHeading, revPath, { ...cfg, headingGain: 1.0 }).steering;
+      expect(withTerm).toBeCloseTo(base, 9);
+    });
+  });
 });
