@@ -51,8 +51,65 @@ import { RAMP_AGENT } from '../app/lib/ramp-scenarios';
 import { createSimMonitor } from '../app/lib/sim-monitor';
 import { modelFromJson } from '../app/lib/v2-model-file';
 import type { PersistedV2Model } from '../app/lib/v2-model-persistence';
+import {
+  checkFeasibility,
+  toReferenceTrajectory,
+  referenceLength,
+  limitsFromAgent,
+  type DynamicLimits,
+} from 'kinocat/eval';
+import { smoothTrajectory } from 'kinocat/execute';
+import type { CarKinematicState } from 'kinocat/agent';
+import { TRACKER_MAX_LATERAL_ACCEL } from '../app/lib/race-scenario';
+import { RACE_AGENT } from '../app/lib/race-primitives-scenarios';
 
 type EntryKind = 'kinematic' | 'parametric-only' | 'v2-default';
+
+// Plan-feasibility limits for the RACE_AGENT-planned bench scenarios (race +
+// parking both plan with RACE_AGENT). Lets the bench measure the PLANNER half of
+// the decomposition — whether the committed plan was dynamically executable —
+// via the same kinocat/eval check the harness and tests use, instead of only
+// measuring terminal outcome + safety.
+const BENCH_PLAN_LIMITS: DynamicLimits = limitsFromAgent(RACE_AGENT, {
+  frictionLimit: TRACKER_MAX_LATERAL_ACCEL,
+  maxAccel: 6,
+  maxDecel: 8,
+});
+
+/** Accumulate plan feasibility over a run by scoring each newly-committed plan
+ *  with kinocat/eval. Guards short / near-degenerate stubs exactly like
+ *  eval-harness (≥10 samples, smoothed ≥6, arc-length ≥5 m) so their meaningless
+ *  curvature can't skew the fraction. */
+function makePlanFeasibilityMeter(limits: DynamicLimits) {
+  let lastRef: readonly CarKinematicState[] | null = null;
+  let scored = 0;
+  let feasible = 0;
+  let worst = 0;
+  return {
+    observe(plan: readonly CarKinematicState[] | null): void {
+      if (!plan || plan === lastRef || plan.length < 10) return;
+      lastRef = plan;
+      const tracked = smoothTrajectory(plan as CarKinematicState[], {
+        sampleSpacing: 0.5,
+        iterations: 8,
+      });
+      if (tracked.length < 6) return;
+      const ref = toReferenceTrajectory(tracked);
+      if (referenceLength(ref) < 5) return;
+      const rep = checkFeasibility(ref, limits);
+      scored++;
+      if (rep.feasible) feasible++;
+      if (rep.worstRatio > worst) worst = rep.worstRatio;
+    },
+    result() {
+      return {
+        plansScored: scored,
+        planFeasibleFrac: scored > 0 ? feasible / scored : 1,
+        planWorstRatio: worst,
+      };
+    },
+  };
+}
 
 function loadEntry(kind: EntryKind, forScenario: 'race' | 'parking'): RaceEntry {
   if (forScenario === 'parking') {
@@ -124,6 +181,14 @@ interface BenchResult {
   maxJerk?: number;
   /** Teleports observed — must be 0 (we removed all teleportation). */
   teleports?: number;
+  /** Fraction of committed plans that were dynamically feasible (kinocat/eval).
+   *  < 1 attributes trouble to the PLANNER (an inexecutable plan), independent
+   *  of how well the controller tracked it. */
+  planFeasibleFrac?: number;
+  /** How many committed plans were scored for `planFeasibleFrac`. */
+  plansScored?: number;
+  /** Worst demand/limit ratio across all scored plans (≤ 1 ⇒ all feasible). */
+  planWorstRatio?: number;
   /** Scenario-specific notes. */
   note: string;
 }
@@ -142,13 +207,16 @@ const raceScenario: BenchScenario = {
       offTrackRecovery: 'spawn',
       tuning,
     });
+    const meter = makePlanFeasibilityMeter(BENCH_PLAN_LIMITS);
     while (scenario.simTime() < MAX_SIM) {
       const r = scenario.tick();
+      meter.observe(scenario.status()[0]!.plan);
       if (r.allFinished) break;
     }
     const status = scenario.status()[0]!;
     const simTime = scenario.simTime();
     scenario.dispose();
+    const feas = meter.result();
     const completed = status.laps.length >= 1;
     const passed = completed && simTime <= 90 && status.offTrackEvents === 0;
     return {
@@ -160,7 +228,10 @@ const raceScenario: BenchScenario = {
       terminalSpeed: Math.abs(status.state.speed),
       offTrackEvents: status.offTrackEvents,
       totalReplans: status.diagnostics.totalReplans,
-      note: completed ? `${status.laps[0]!.duration.toFixed(1)}s lap` : 'DNF',
+      ...feas,
+      note: completed
+        ? `${status.laps[0]!.duration.toFixed(1)}s lap · plan ${(feas.planFeasibleFrac * 100).toFixed(0)}% feasible`
+        : 'DNF',
     };
   },
 };
@@ -192,10 +263,12 @@ function makeParkingScenario(
       // enough that it's clearly done maneuvering (settled — captures the true
       // terminal for scenarios that don't square up, without breaking mid-settle
       // the way a loose `|v|<0.5` did, which mis-read reverse-perp as failing).
+      const meter = makePlanFeasibilityMeter(BENCH_PLAN_LIMITS);
       let settledTicks = 0;
       while (scenario.simTime() < maxSim) {
         scenario.tick();
         const status = scenario.status()[0]!;
+        meter.observe(status.plan);
         if (evaluateParked(status.state, parkScenario).parked) break;
         settledTicks = Math.abs(status.state.speed) < 0.03 ? settledTicks + 1 : 0;
         if (settledTicks >= 45) break;
@@ -203,6 +276,7 @@ function makeParkingScenario(
       const status = scenario.status()[0]!;
       const simTime = scenario.simTime();
       scenario.dispose();
+      const feas = meter.result();
       const dist = Math.hypot(status.state.x - goal.x, status.state.z - goal.z);
       // Shared "in-the-stall" predicate — the SAME `evaluateParked` the web page
       // and the Vitest tests use, so the bench can't drift to a looser,
@@ -218,8 +292,9 @@ function makeParkingScenario(
         terminalSpeed: Math.abs(status.state.speed),
         offTrackEvents: status.offTrackEvents,
         totalReplans: status.diagnostics.totalReplans,
+        ...feas,
         note: passed
-          ? `parked (${(ev.coverage * 100).toFixed(0)}% in stall)`
+          ? `parked (${(ev.coverage * 100).toFixed(0)}% in stall), plan ${(feas.planFeasibleFrac * 100).toFixed(0)}% feasible`
           : `${(ev.coverage * 100).toFixed(0)}% in stall, ${((ev.headingError * 180) / Math.PI).toFixed(0)}° off, |v|=${status.state.speed.toFixed(2)}`,
       };
     },
