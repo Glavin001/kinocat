@@ -5,7 +5,7 @@
 // grid broadphase + SAT; moving spherical no-fly zones use closest-point-
 // on-OBB.
 
-import type { Predict } from '../predict/types';
+import type { MovingObstacle, Predict } from '../predict/types';
 import {
   computeOBBSepAxes,
   makeOBB,
@@ -27,10 +27,13 @@ export interface AABB {
   max: [number, number, number];
 }
 
-/** A moving spherical no-fly zone: centre over time + radius. */
-export interface MovingZone {
+/** A moving spherical no-fly zone: centre over time + radius. Structurally a
+ *  `MovingObstacle` whose predictions always carry `y`, so the same zone can
+ *  be handed to a `TimeAwareEnvironment` (dominance-participating, padded-
+ *  AABB broadphase, circumscribed-sphere proxy) or kept here for the exact
+ *  per-substep sphere-vs-OBB narrowphase — two fidelity levels, one type. */
+export interface MovingZone extends MovingObstacle {
   predict: Predict<{ x: number; y: number; z: number }>;
-  radius: number;
 }
 
 /** Is the agent's OBB at (pose) at absolute time `t` free of obstacles? The

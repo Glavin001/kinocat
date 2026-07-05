@@ -12,7 +12,9 @@ import type { AffordanceRegistry } from '../predict/affordance-registry';
 import type { CarKinematicState } from '../agent/types';
 import { NULL_RECORDER, type PerfRecorder } from '../planner/perf';
 
-export interface TimeAwareOptions {
+export interface TimeAwareOptions<State = CarKinematicState> {
+  /** Obstacles are XZ circles for planar states; when both an obstacle's
+   *  prediction and the wrapped state carry `y`, the test is a 3D sphere. */
   obstacles?: MovingObstacle[];
   /** Circumscribed agent radius added to each obstacle radius. */
   agentRadius?: number;
@@ -21,8 +23,9 @@ export interface TimeAwareOptions {
   /** Per-level time-bucket divisors (coarse → fine); length = base.levels.
    *  Defaults to coupled halving (2^(levels-1-L)). */
   levelTimeDivisors?: number[];
-  /** Lazily-generated affordance edges (ramps/jumps/boosts/…). */
-  affordances?: AffordanceRegistry;
+  /** Lazily-generated affordance edges (ramps/jumps/boosts/…), typed to the
+   *  wrapped state so any domain can publish them. */
+  affordances?: AffordanceRegistry<State>;
   /** Proximity radius for affordance queries (world units). */
   affordanceRadius?: number;
   /**
@@ -49,11 +52,19 @@ interface ObstacleBound {
   maxX: number;
   minZ: number;
   maxZ: number;
+  /** Altitude bounds — used for rejection only when EVERY sampled
+   *  prediction carried `y` (see `hasY`); otherwise some exact tests fall
+   *  back to the XZ circle and a Y-based reject would be unsound. */
+  hasY: boolean;
+  minY: number;
+  maxY: number;
   pad: number;
   rr: number;
 }
 
-type HasXZT = { x: number; z: number; t: number };
+/** Planar states satisfy this as-is; 3D states (e.g. AircraftState) also
+ *  expose `y` and get spherical obstacle tests + altitude broadphase. */
+type HasXZT = { x: number; z: number; t: number; y?: number };
 
 export class TimeAwareEnvironment<State extends HasXZT>
   implements Environment<State>
@@ -63,7 +74,7 @@ export class TimeAwareEnvironment<State extends HasXZT>
   private readonly agentRadius: number;
   private readonly timeQuantum: number;
   private readonly divisors: number[];
-  private readonly affordances?: AffordanceRegistry;
+  private readonly affordances?: AffordanceRegistry<State>;
   private readonly affordanceRadius: number;
   private readonly bp: ObstacleBound[] | null;
   private rec: PerfRecorder = NULL_RECORDER;
@@ -75,7 +86,7 @@ export class TimeAwareEnvironment<State extends HasXZT>
 
   constructor(
     private readonly base: Environment<State>,
-    opts: TimeAwareOptions = {},
+    opts: TimeAwareOptions<State> = {},
   ) {
     this.levels = base.levels;
     if (base.progress) {
@@ -111,8 +122,11 @@ export class TimeAwareEnvironment<State extends HasXZT>
       let maxX = -Infinity;
       let minZ = Infinity;
       let maxZ = -Infinity;
+      let minY = Infinity;
+      let maxY = -Infinity;
+      let hasY = true;
       let maxStep = 0;
-      let prev: { x: number; z: number } | null = null;
+      let prev: { x: number; z: number; y?: number } | null = null;
       for (let k = 0; k < maxSamples; k++) {
         const t = k * step;
         const p = obs.predict(t);
@@ -126,8 +140,16 @@ export class TimeAwareEnvironment<State extends HasXZT>
         if (p.x > maxX) maxX = p.x;
         if (p.z < minZ) minZ = p.z;
         if (p.z > maxZ) maxZ = p.z;
+        if (p.y === undefined) {
+          hasY = false;
+        } else {
+          if (p.y < minY) minY = p.y;
+          if (p.y > maxY) maxY = p.y;
+        }
         if (prev) {
-          const d = Math.hypot(p.x - prev.x, p.z - prev.z);
+          const dy =
+            p.y !== undefined && prev.y !== undefined ? p.y - prev.y : 0;
+          const d = Math.hypot(p.x - prev.x, dy, p.z - prev.z);
           if (d > maxStep) maxStep = d;
         }
         prev = p;
@@ -144,6 +166,9 @@ export class TimeAwareEnvironment<State extends HasXZT>
               maxX: 0,
               minZ: 0,
               maxZ: 0,
+              hasY: false,
+              minY: 0,
+              maxY: 0,
               pad: 0,
               rr,
             }
@@ -156,6 +181,9 @@ export class TimeAwareEnvironment<State extends HasXZT>
               maxX,
               minZ,
               maxZ,
+              hasY,
+              minY,
+              maxY,
               pad: rr + maxStep,
               rr,
             },
@@ -181,10 +209,14 @@ export class TimeAwareEnvironment<State extends HasXZT>
     return node;
   }
 
-  /** True if `state` overlaps any predicted obstacle at its own time. */
+  /** True if `state` overlaps any predicted obstacle at its own time.
+   *  XZ circle for planar states; 3D sphere when both the state and the
+   *  prediction carry `y` (a y-less pairing degrades to the circle, i.e.
+   *  an infinite vertical cylinder — conservative). */
   private collides(state: State): boolean {
     const bp = this.bp;
     const counters = this.rec.counters;
+    const sy = state.y;
     if (!bp) {
       for (const obs of this.obstacles) {
         counters.predictCalls++;
@@ -193,7 +225,8 @@ export class TimeAwareEnvironment<State extends HasXZT>
         const rr = obs.radius + this.agentRadius;
         const dx = state.x - p.x;
         const dz = state.z - p.z;
-        if (dx * dx + dz * dz <= rr * rr) return true;
+        const dy = sy !== undefined && p.y !== undefined ? sy - p.y : 0;
+        if (dx * dx + dy * dy + dz * dz <= rr * rr) return true;
       }
       return false;
     }
@@ -219,6 +252,18 @@ export class TimeAwareEnvironment<State extends HasXZT>
           counters.broadphaseSkips++;
           continue; // provably farther than rr from the obstacle
         }
+        // Altitude reject — only when every sampled prediction carried `y`
+        // (so every exact test in this window uses the sphere) AND the
+        // state does too. An XZ-only reject above is always sound because
+        // adding dy² can only increase the distance.
+        if (
+          b.hasY &&
+          sy !== undefined &&
+          (sy < b.minY - b.pad || sy > b.maxY + b.pad)
+        ) {
+          counters.broadphaseSkips++;
+          continue; // provably farther than rr in altitude alone
+        }
       }
       // Inside the uncertain band, or beyond the sampled window: exact test.
       counters.predictCalls++;
@@ -226,7 +271,8 @@ export class TimeAwareEnvironment<State extends HasXZT>
       if (!p) continue;
       const dx = state.x - p.x;
       const dz = state.z - p.z;
-      if (dx * dx + dz * dz <= b.rr * b.rr) return true;
+      const dy = sy !== undefined && p.y !== undefined ? sy - p.y : 0;
+      if (dx * dx + dy * dy + dz * dz <= b.rr * b.rr) return true;
     }
     return false;
   }
@@ -265,12 +311,10 @@ export class TimeAwareEnvironment<State extends HasXZT>
     const reg = this.affordances;
     if (!reg) return;
     const st = node.state;
-    if (!('speed' in st)) return; // affordances are vehicle-typed for now
-    const vs = st as unknown as CarKinematicState;
     for (const aff of reg.queryNearby(st.x, st.z, st.t, this.affordanceRadius)) {
-      const r = aff.tryUse(vs, st.t);
+      const r = aff.tryUse(st, st.t);
       if (!r) continue;
-      const resState = r.resultState as unknown as State;
+      const resState = r.resultState;
       if (this.collides(resState)) continue;
       const edge: EdgeRef = {
         cost: r.cost,
@@ -279,7 +323,7 @@ export class TimeAwareEnvironment<State extends HasXZT>
       };
       const n = this.createNode(resState, node, edge);
       n.g = node.g + r.cost;
-      n.h = this.base.heuristic(r.resultState as unknown as State, goal.state);
+      n.h = this.base.heuristic(resState, goal.state);
       n.f = n.g + n.h;
       out.push(n);
     }

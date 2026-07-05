@@ -89,6 +89,15 @@ export interface AircraftEnvOptions {
     rollFractions?: number[];
     speeds?: number[];
   }>;
+  /**
+   * Include a time bucket in the exact hash (default true — standalone
+   * behavior). Set false when composing with `TimeAwareEnvironment`, which
+   * appends its own time buckets to both the hash AND the per-level
+   * dominance index; the inner bucket then only adds redundant hash
+   * entropy. Leaving it true under composition is sound (dedup is strictly
+   * finer), just wasteful.
+   */
+  timeInHash?: boolean;
 }
 
 interface ControlQuad {
@@ -159,6 +168,7 @@ export class AircraftEnvironment implements Environment<AircraftState> {
   private readonly primDuration: number;
   private readonly substeps: number;
   private readonly rollCost: number;
+  private readonly timeInHash: boolean;
   private readonly controls: ControlQuad[];
   /** One primitive cache per resolution level (length == levels). Coarse
    *  passes may use a sparse subset; the finest pass uses the full set.
@@ -200,6 +210,7 @@ export class AircraftEnvironment implements Environment<AircraftState> {
     this.primDuration = opts.primDuration ?? 1;
     this.substeps = opts.substeps ?? 6;
     this.rollCost = opts.rollCost ?? 0.5;
+    this.timeInHash = opts.timeInHash ?? true;
     this.sim = aircraftForwardSim(agent);
     this.invMaxSpeed = 1 / agent.maxSpeed;
     this.half = [agent.halfLength, agent.halfSpan, agent.halfHeight];
@@ -395,7 +406,6 @@ export class AircraftEnvironment implements Environment<AircraftState> {
       (state.roll / Math.max(this.agent.maxBank, 1e-6)) * this.rollBuckets,
     );
     const isp = Math.round(state.speed / this.speedQuant);
-    const it = Math.round(state.t / 0.25);
     const index: string[] = new Array(this.divisors.length);
     for (let L = 0; L < this.divisors.length; L++) {
       const d = this.divisors[L]!;
@@ -411,13 +421,10 @@ export class AircraftEnvironment implements Environment<AircraftState> {
         index[L] = `${ix}:${iy}:${iz}:${ih}`;
       }
     }
-    return makeNode(
-      state,
-      parent,
-      edge,
-      index,
-      `${ix},${iy},${iz},${ih},${ip},${ir},${isp},${it}`,
-    );
+    const hash = this.timeInHash
+      ? `${ix},${iy},${iz},${ih},${ip},${ir},${isp},${Math.round(state.t / 0.25)}`
+      : `${ix},${iy},${iz},${ih},${ip},${ir},${isp}`;
+    return makeNode(state, parent, edge, index, hash);
   }
 
   succ(
