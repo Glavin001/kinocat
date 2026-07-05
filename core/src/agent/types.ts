@@ -119,6 +119,15 @@ export interface AircraftAgent {
   /** Max |bank angle| (radians). At ±π/2 the wings go vertical so the OBB
    *  footprint can slip through a tall narrow slot. */
   maxBank: number;
+  /** Max roll rate (rad/s). Attitude is STATE, not a snap-to output: a
+   *  primitive commanding a bank only gets `maxRollRate · duration` of it,
+   *  so knife-edge maneuvers must be set up in advance and holding a bank
+   *  between nearby slots can beat unrolling and re-rolling — timing falls
+   *  out of the search. `Infinity` recovers the legacy quasi-static model. */
+  maxRollRate: number;
+  /** Max pitch (flight-path angle) rate (rad/s). Same evolving-state
+   *  treatment as `maxRollRate`. */
+  maxPitchRate: number;
   /** Body-frame half-extents of the oriented collision box, in world units:
    *  along body forward (X), lateral wingspan (Y), and vertical thickness (Z). */
   halfLength: number;

@@ -318,8 +318,11 @@ describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
     expect(atWallB.length).toBeGreaterThan(0);
     expect(Math.max(...atWallA.map((p) => p.z))).toBeGreaterThan(4);
     expect(Math.min(...atWallB.map((p) => p.z))).toBeLessThan(-4);
+    // With rate-limited pitch the climb crests above the ridge rather than
+    // the snap model's steeper overshoot — assert clearing (top y=34 + OBB
+    // half-height), not a tuned overshoot.
     // The final ridge (top y=34) spans the full width — altitude is searched.
-    expect(Math.max(...s.path.map((p) => p.y))).toBeGreaterThan(36);
+    expect(Math.max(...s.path.map((p) => p.y))).toBeGreaterThan(34.3);
     for (let i = 1; i < s.path.length; i++) {
       expect(s.path[i]!.t).toBeGreaterThan(s.path[i - 1]!.t - 1e-9);
     }
@@ -362,8 +365,9 @@ describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
     // assert the dense arc itself is collision-free, so the visual plane
     // can't appear to clip walls between primitive endpoints.
     const s = buildCanyon();
-    const dense = densifyPath(s.path, 12);
-    expect(dense.length).toBeGreaterThan(s.path.length * 5);
+    const dense = densifyPath(s.path);
+    // Certified resolution: AIRCRAFT_PRIM_SUBSTEPS (4) points per segment.
+    expect(dense.length).toBeGreaterThan(s.path.length * 3);
     const air = aircraftAirspace(s.boxes);
     for (const p of dense) {
       expect(air.clear(aircraftPose(p), AIRCRAFT_HALF, p.t)).toBe(true);
@@ -372,7 +376,7 @@ describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
 
   it('densified rendering path clears walls AND the moving zone (gauntlet)', () => {
     const s = buildGauntlet();
-    const dense = densifyPath(s.path, 12);
+    const dense = densifyPath(s.path);
     const zones =
       s.zoneAt && s.zoneRadius != null
         ? [{ radius: s.zoneRadius, predict: s.zoneAt }]
@@ -388,7 +392,7 @@ describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
     expect(s.found).toBe(true);
     // Sample the dense rendering path inside the slot (the coarse planner
     // path stores only primitive endpoints, which may straddle the slot).
-    const dense = densifyPath(s.path, 12);
+    const dense = densifyPath(s.path);
     const inSlot = dense.filter((p) => p.x >= 78 && p.x <= 92);
     expect(inSlot.length).toBeGreaterThan(0);
     const maxBank = Math.max(...inSlot.map((p) => Math.abs(p.roll)));
@@ -415,7 +419,10 @@ describe('aircraft demo: true 3D flight planning (altitude searched)', () => {
     expect(atB.length).toBeGreaterThan(0);
     expect(Math.max(...atA.map((p) => p.z))).toBeGreaterThan(4); // weave +z
     expect(Math.min(...atB.map((p) => p.z))).toBeLessThan(-4); // weave -z
-    expect(Math.max(...s.path.map((p) => p.y))).toBeGreaterThan(36); // ridge
+    // Ridge top is y=34 (aircraft-scenarios gauntlet boxes); with rate-
+    // limited pitch the climb crests just above it rather than the snap
+    // model's steeper overshoot — assert clearing, not a tuned overshoot.
+    expect(Math.max(...s.path.map((p) => p.y))).toBeGreaterThan(34.3); // ridge
     // Every planned state clears all obstacles AND the moving zone at its t.
     const zones =
       s.zoneAt && s.zoneRadius != null

@@ -4,16 +4,21 @@
 // routes that differ only in attitude collapse on coarse passes) but the
 // finest-level exact hash keeps all 8 dimensions — preserving optimality.
 // Collision uses an OBB oriented by yaw + pitch + roll so the planner can
-// knife-edge through slots too narrow for level wings. Motion primitives are
-// pre-characterized as local-frame sweeps (mirror of the vehicle pattern),
-// so `succ()` is rigid-transform + collision-check per substep, not
-// forward-sim per substep.
+// knife-edge through slots too narrow for level wings.
+//
+// Motion primitives are rolled LIVE through the forward sim from each node's
+// ACTUAL state — attitude is rate-limited state (see aircraftForwardSim), so
+// a cached canonical rollout would misrepresent every mid-ramp start (the
+// bucket-teleport error kinocat/testing's checkSuccessorFidelity measures).
+// The sim is a few dozen flops per substep; the OBB narrowphase it feeds
+// dominates the cost, so live rollout buys exactness for ~nothing. What IS
+// precomputed per resolution level is the control-quad set (levelControls)
+// with its edge costs.
 
 import type { Environment, EdgeRef, Node } from './types';
 import type { AirspaceWorld } from './airspace-world';
 import type { AircraftAgent, AircraftState } from '../agent/types';
 import { aircraftForwardSim } from '../agent/aircraft';
-import { characterize } from '../primitives/characterize';
 import type { ForwardSim } from '../primitives/types';
 import { makeNode } from '../planner/node';
 import { wrapAngle, angleDiff } from '../internal/math';
@@ -114,45 +119,15 @@ interface FlyEdgeData {
   roll: number;
 }
 
-/** A local-frame swept pose along one primitive (start-relative). */
-interface LocalSweep {
-  dx: number; // forward (body +x at heading 0)
-  dz: number; // lateral (body +z at heading 0; world +z when heading 0)
-  dy: number; // altitude delta
-  dHeading: number;
-  pitch: number; // absolute (controls clamp; constant within primitive)
-  roll: number; // absolute
-  dt: number;
-}
-
-interface CachedPrimitive {
+/** One primitive action: a control quad with its precomputed edge cost and
+ *  reusable arrays. The trajectory itself is NOT cached — it is rolled live
+ *  through the forward sim from each node's actual state. */
+interface PrimitiveAction {
   control: ControlQuad;
-  /** Per-substep local-frame poses; length = substeps. */
-  samples: LocalSweep[];
-  /** End-of-primitive deltas in local frame (== samples[last] for convenience). */
-  end: LocalSweep;
-  /** Pre-built `controls` array for legacy/sim use; reused, not reallocated. */
+  /** Pre-built `controls` array handed to the sim; reused, not reallocated. */
   ctlArray: readonly [number, number, number, number];
-  /** Edge data preset (the `data` is mutated per use? No — it's read-only). */
   cost: number;
   edgeData: FlyEdgeData;
-  /**
-   * Local-frame swept envelope AABB (parent at origin, heading 0).
-   * Conservative for any world heading: each substep's OBB is bounded by
-   * a sphere of radius `R = sqrt(halfL² + halfS² + halfH²)` (orientation-
-   * independent), so the swept envelope is `union(center_i ± R)`.
-   * Includes the start pose `(0,0,0) ± R` for completeness.
-   * At runtime, rotated by parent heading + translated to parent position
-   * → world-frame AABB, queried via `world.clearAABB`.
-   */
-  sweptLocal: {
-    xmin: number;
-    xmax: number;
-    ymin: number;
-    ymax: number;
-    zmin: number;
-    zmax: number;
-  };
 }
 
 export class AircraftEnvironment implements Environment<AircraftState> {
@@ -171,11 +146,17 @@ export class AircraftEnvironment implements Environment<AircraftState> {
   private readonly rollCost: number;
   private readonly timeInHash: boolean;
   private readonly controls: ControlQuad[];
-  /** One primitive cache per resolution level (length == levels). Coarse
-   *  passes may use a sparse subset; the finest pass uses the full set.
-   *  If `levelControls` was not supplied, every level points at the same
-   *  CachedPrimitive[] (the global default). */
-  private readonly levelPrimitives: CachedPrimitive[][];
+  /** One primitive-action set per resolution level (length == levels).
+   *  Coarse passes may use a sparse control subset; the finest pass uses
+   *  the full set. If `levelControls` was not supplied, every level points
+   *  at the same set (the global default). */
+  private readonly levelActions: PrimitiveAction[][];
+  /** Orientation-independent OBB bound: a sphere of radius R contains the
+   *  agent box at every yaw/pitch/roll. */
+  private readonly rCirc: number;
+  /** Scratch: the live rollout's per-substep states (length = substeps),
+   *  reused across successors to avoid per-primitive array churn. */
+  private readonly _sweep: AircraftState[];
   private readonly sim: ForwardSim<AircraftState>;
   private readonly invMaxSpeed: number;
   private readonly half: [number, number, number];
@@ -246,7 +227,7 @@ export class AircraftEnvironment implements Environment<AircraftState> {
     // defaults. Length is clamped to `this.levels`.
     if (opts.levelControls && opts.levelControls.length > 0) {
       const lc = opts.levelControls;
-      this.levelPrimitives = new Array(this.levels);
+      this.levelActions = new Array(this.levels);
       for (let L = 0; L < this.levels; L++) {
         const entry = lc[Math.min(L, lc.length - 1)]!;
         const t = entry.turnFractions ?? defaultTurns;
@@ -254,12 +235,18 @@ export class AircraftEnvironment implements Environment<AircraftState> {
         const r = entry.rollFractions ?? defaultRolls;
         const v = entry.speeds ?? defaultSpeeds;
         const quads = this.makeControlQuads(kMax, t, c, r, v);
-        this.levelPrimitives[L] = this.buildPrimitiveCacheFor(quads);
+        this.levelActions[L] = this.buildActionsFor(quads);
       }
     } else {
-      const shared = this.buildPrimitiveCacheFor(this.controls);
-      this.levelPrimitives = new Array(this.levels).fill(shared);
+      const shared = this.buildActionsFor(this.controls);
+      this.levelActions = new Array(this.levels).fill(shared);
     }
+    this.rCirc = Math.sqrt(
+      agent.halfLength * agent.halfLength +
+        agent.halfSpan * agent.halfSpan +
+        agent.halfHeight * agent.halfHeight,
+    );
+    this._sweep = new Array(this.substeps);
   }
 
   private makeControlQuads(
@@ -292,95 +279,16 @@ export class AircraftEnvironment implements Environment<AircraftState> {
     this.world.attachRecorder?.(rec);
   }
 
-  /**
-   * Pre-characterize each control quad against the kinematic forward sim,
-   * recording substep-by-substep local-frame deltas via the shared
-   * `characterize` harness (same one behind `characterizeVehicle`). At
-   * runtime `succ()` rigid-transforms these by the parent node's heading +
-   * position rather than re-simulating.
-   *
-   * Soundness: `aircraftForwardSim` (in `core/src/agent/aircraft.ts`) is a
-   * pure function of input state, control, and dt. The XZ-plane translation
-   * depends only on heading + speed + pitch; rotating the world-frame
-   * outputs by the parent's heading reproduces the simulated trajectory
-   * exactly because the body-axes' yaw appears linearly in (cos h, sin h)
-   * factors. Altitude is heading-independent. This is exactly the
-   * equivariance contract documented on `characterize` — if the sim gains
-   * global-wind or absolute-position dependence, stop caching.
-   */
-  private buildPrimitiveCacheFor(quads: ControlQuad[]): CachedPrimitive[] {
-    // Simulate from a canonical start (heading 0, origin, level wings, the
-    // quad's target speed); the world-frame deltas ARE the local-frame ones.
-    const rolled = characterize<AircraftState, LocalSweep>({
-      forwardSim: this.sim,
-      runs: quads.map((c) => ({
-        startState: {
-          x: 0,
-          y: 0,
-          z: 0,
-          heading: 0,
-          pitch: 0,
-          roll: 0,
-          speed: c.v,
-          t: 0,
-        },
-        controls: [c.k, c.climb, c.roll, c.v],
-      })),
-      duration: this.primDuration,
-      substeps: this.substeps,
-      record: (s) => ({
-        dx: s.x,
-        dz: s.z,
-        dy: s.y,
-        dHeading: s.heading,
-        pitch: s.pitch,
-        roll: s.roll,
-        dt: s.t,
-      }),
-    });
-    // Orientation-independent bound on the agent OBB: a sphere of radius R
-    // contains the OBB at every yaw/pitch/roll. Used to build a swept
-    // envelope that's valid for ANY world heading the primitive is applied
-    // at (the runtime rotation only changes the substep centers).
-    const R = Math.sqrt(
-      this.agent.halfLength * this.agent.halfLength +
-        this.agent.halfSpan * this.agent.halfSpan +
-        this.agent.halfHeight * this.agent.halfHeight,
-    );
-    const out: CachedPrimitive[] = [];
-    for (let qi = 0; qi < quads.length; qi++) {
-      const c = quads[qi]!;
-      const { samples } = rolled[qi]!;
-      // Seed the envelope with the start pose (parent origin, heading 0).
-      let xmin = -R;
-      let xmax = R;
-      let ymin = -R;
-      let ymax = R;
-      let zmin = -R;
-      let zmax = R;
-      for (const sp of samples) {
-        if (sp.dx - R < xmin) xmin = sp.dx - R;
-        if (sp.dx + R > xmax) xmax = sp.dx + R;
-        if (sp.dy - R < ymin) ymin = sp.dy - R;
-        if (sp.dy + R > ymax) ymax = sp.dy + R;
-        if (sp.dz - R < zmin) zmin = sp.dz - R;
-        if (sp.dz + R > zmax) zmax = sp.dz + R;
-      }
-      const end = samples[samples.length - 1]!;
-      const cost =
-        this.primDuration +
-        this.rollCost * Math.abs(c.roll) * this.primDuration;
-      out.push({
-        control: c,
-        samples,
-        end,
-        ctlArray: [c.k, c.climb, c.roll, c.v] as const,
-        cost,
-        edgeData: { k: c.k, climb: c.climb, roll: c.roll },
-        sweptLocal: { xmin, xmax, ymin, ymax, zmin, zmax },
-      });
-    }
-    return out;
+  /** Wrap each control quad with its precomputed edge cost and reusable
+   *  arrays. No trajectories are cached — succ() rolls the sim live. */
+  private buildActionsFor(quads: ControlQuad[]): PrimitiveAction[] {
+    return quads.map((c) => ({
+      control: c,
+      ctlArray: [c.k, c.climb, c.roll, c.v] as const,
+      cost:
+        this.primDuration + this.rollCost * Math.abs(c.roll) * this.primDuration,
+      edgeData: { k: c.k, climb: c.climb, roll: c.roll },
+    }));
   }
 
   private headingBucket(h: number): number {
@@ -437,66 +345,65 @@ export class AircraftEnvironment implements Environment<AircraftState> {
   ): Node<AircraftState>[] {
     const out: Node<AircraftState>[] = [];
     const st = node.state;
-    const ch = Math.cos(st.heading);
-    const sh = Math.sin(st.heading);
-    const absCh = Math.abs(ch);
-    const absSh = Math.abs(sh);
     const pose = this._scratchPose;
     const half = this.half;
     const clearAABB = this.world.clearAABB;
-    // Select per-level primitive set (Item 4). Coarse passes may use a
-    // sparse subset for low branching; finest pass uses the full set.
+    const R = this.rCirc;
+    const dt = this.primDuration / this.substeps;
+    const sweep = this._sweep;
+    // Select the per-level action set (coarse passes may use a sparse
+    // subset for low branching; finest pass uses the full set).
     const L = level === undefined ? this.levels - 1 : level;
-    const primitives = this.levelPrimitives[Math.min(L, this.levels - 1)]!;
+    const actions = this.levelActions[Math.min(L, this.levels - 1)]!;
 
-    for (let pi = 0; pi < primitives.length; pi++) {
-      const prim = primitives[pi]!;
+    for (let pi = 0; pi < actions.length; pi++) {
+      const prim = actions[pi]!;
 
-      // Per-primitive swept-AABB pre-check (Item 1): rotate the local-frame
-      // swept envelope by the parent heading and ask the world for a fast
-      // static-only clearance. If clear, skip the per-substep narrowphase
-      // entirely. Sound because the swept envelope contains every OBB at
-      // every substep — AABB-clear ⇒ OBB-clear.
+      // Roll the sim LIVE from the node's actual state. Attitude is
+      // rate-limited state, so this — not a cached canonical rollout — is
+      // the only trajectory the airframe can actually fly from here. The
+      // sim is a few dozen flops per substep; the narrowphase below
+      // dominates. Accumulate the swept envelope (each substep's OBB is
+      // contained in a sphere of radius R at its centre) as we integrate.
+      let s: AircraftState = st;
+      let xmin = st.x - R;
+      let xmax = st.x + R;
+      let ymin = st.y - R;
+      let ymax = st.y + R;
+      let zmin = st.z - R;
+      let zmax = st.z + R;
+      for (let i = 0; i < this.substeps; i++) {
+        s = this.sim(s, prim.ctlArray as unknown as number[], dt);
+        sweep[i] = s;
+        if (s.x - R < xmin) xmin = s.x - R;
+        if (s.x + R > xmax) xmax = s.x + R;
+        if (s.y - R < ymin) ymin = s.y - R;
+        if (s.y + R > ymax) ymax = s.y + R;
+        if (s.z - R < zmin) zmin = s.z - R;
+        if (s.z + R > zmax) zmax = s.z + R;
+      }
+
+      // Swept-AABB pre-check: if the whole R-padded envelope is clear of
+      // static geometry, skip the per-substep narrowphase entirely
+      // (AABB-clear ⇒ OBB-clear at every substep, any orientation).
       let fastClear = false;
       if (clearAABB) {
-        const sw = prim.sweptLocal;
-        const lxMid = (sw.xmin + sw.xmax) * 0.5;
-        const lzMid = (sw.zmin + sw.zmax) * 0.5;
-        const lxHalf = (sw.xmax - sw.xmin) * 0.5;
-        const lzHalf = (sw.zmax - sw.zmin) * 0.5;
-        const wxCenter = st.x + lxMid * ch - lzMid * sh;
-        const wzCenter = st.z + lxMid * sh + lzMid * ch;
-        const wxHalf = lxHalf * absCh + lzHalf * absSh;
-        const wzHalf = lxHalf * absSh + lzHalf * absCh;
-        fastClear = clearAABB.call(
-          this.world,
-          wxCenter - wxHalf,
-          st.y + sw.ymin,
-          wzCenter - wzHalf,
-          wxCenter + wxHalf,
-          st.y + sw.ymax,
-          wzCenter + wzHalf,
-        );
+        fastClear = clearAABB.call(this.world, xmin, ymin, zmin, xmax, ymax, zmax);
       }
 
       let clear = true;
       if (fastClear) {
         this.rec.counters.primitiveSweptSkips++;
       } else {
-        // Rigid-transform each local-frame substep pose into world space
-        // and collision-check. The primitive cache stored (dx, dz, dy,
-        // dHeading, pitch, roll) at heading 0; rotate (dx, dz) by parent
-        // heading.
-        for (let i = 0; i < prim.samples.length; i++) {
-          const sp = prim.samples[i]!;
-          pose.x = st.x + sp.dx * ch - sp.dz * sh;
-          pose.z = st.z + sp.dx * sh + sp.dz * ch;
-          pose.y = st.y + sp.dy;
-          pose.yaw = wrapAngle(st.heading + sp.dHeading);
+        for (let i = 0; i < this.substeps; i++) {
+          const sp = sweep[i]!;
+          pose.x = sp.x;
+          pose.y = sp.y;
+          pose.z = sp.z;
+          pose.yaw = sp.heading;
           pose.pitch = sp.pitch;
           pose.roll = sp.roll;
-          const tNow = st.t + sp.dt;
-          if (!this.world.clear(pose, half, tNow)) {
+          if (!this.world.clear(pose, half, sp.t)) {
             clear = false;
             break;
           }
@@ -504,17 +411,7 @@ export class AircraftEnvironment implements Environment<AircraftState> {
       }
       if (!clear) continue;
 
-      const end = prim.end;
-      const nextState: AircraftState = {
-        x: st.x + end.dx * ch - end.dz * sh,
-        y: st.y + end.dy,
-        z: st.z + end.dx * sh + end.dz * ch,
-        heading: wrapAngle(st.heading + end.dHeading),
-        pitch: end.pitch,
-        roll: end.roll,
-        speed: prim.control.v,
-        t: st.t + end.dt,
-      };
+      const nextState = sweep[this.substeps - 1]!;
       const edge: EdgeRef = {
         cost: prim.cost,
         kind: 'fly',
@@ -572,6 +469,15 @@ export class AircraftEnvironment implements Environment<AircraftState> {
     // straight is kinematically infeasible. Steep descents to a goal below
     // an obstacle (e.g. canyon) won't shoot — the lattice handles them.
     if (Math.abs(pitch) > this.agent.maxClimbAngle + 1e-6) return null;
+    // The shot's synthetic poses assume wings level at the segment pitch
+    // from the first sample. Attitude is rate-limited state, so only fire
+    // when settling to that attitude is a small fraction of the flight —
+    // otherwise the pose sequence (and the teleported end attitude) would
+    // misrepresent the airframe. Infinity rates ⇒ settle 0 (legacy model).
+    const settle =
+      Math.abs(a.roll) / this.agent.maxRollRate +
+      Math.abs(a.pitch - pitch) / this.agent.maxPitchRate;
+    if (settle > 0.1 * (len / this.agent.maxSpeed)) return null;
 
     // Cheap swept-AABB pre-reject: build the segment's bounding box
     // (extended by the agent's circumscribed radius) and ask the world's

@@ -40,9 +40,13 @@ describe('characterizeVehicle equivalence', () => {
 });
 
 describe('aircraft primitive-cache equivalence (via succ)', () => {
+  // Infinity attitude rates reproduce the legacy quasi-static snap model
+  // bit-exactly, so this fixture keeps pinning the rigid-transform
+  // machinery itself; the rate-limited behavior has its own tests.
   const air = defaultAircraftAgent({
     minTurnRadius: 12, minSpeed: 6, maxSpeed: 18,
     maxClimbAngle: Math.PI / 6, maxBank: Math.PI / 2,
+    maxRollRate: Infinity, maxPitchRate: Infinity,
     halfLength: 2, halfSpan: 1.5, halfHeight: 0.3,
   });
   function aircraftSucc(opts: AircraftEnvOptions, from: AircraftState, level?: number) {
