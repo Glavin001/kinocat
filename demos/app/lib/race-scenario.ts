@@ -54,6 +54,7 @@ import {
   DEFAULT_LEARNABLE_CONFIG,
   type VehicleAgent,
 } from 'kinocat/agent';
+import { buildPlan, segmentByGear, type Plan } from 'kinocat/plan';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavWorld, AnalyticEdgeData } from 'kinocat/environment';
 import type { PlanResult } from 'kinocat/planner';
@@ -160,27 +161,22 @@ const PURE_PURSUIT_CONFIG = {
  * the cusp pose before the next-segment gear change. Plans with no
  * cusps return `[plan]` and downstream code is unchanged.
  *
- * Borrowed verbatim from the WIP parking branch
- * (claude/fervent-cori-KXMEy → `splitAtGearCusps` in Parking.tsx).
+ * Delegates to `segmentByGear` from `kinocat/plan` — the single source of
+ * truth for gear splitting, shared with the rich `Plan` builder. Unlike the
+ * previous local logic, it splits correctly across an exact rest sample
+ * (`speed ≈ 0`, the stop pose the chassis reverses from): the boundary lands
+ * ON that rest sample, so adjacent segments share it (the forward segment
+ * ends at the stop; the reverse segment starts there). Segments shorter than
+ * two samples are dropped, matching the prior contract.
  */
 export function splitAtGearCusps(plan: CarKinematicState[]): CarKinematicState[][] {
   if (plan.length < 2) return [plan.slice()];
+  const segs = segmentByGear(plan.map((p) => ({ vRef: p.speed })));
   const out: CarKinematicState[][] = [];
-  let cur: CarKinematicState[] = [plan[0]!];
-  for (let i = 1; i < plan.length; i++) {
-    const s = plan[i]!;
-    const prev = cur[cur.length - 1]!;
-    const flipped =
-      (prev.speed > 1e-3 && s.speed < -1e-3) ||
-      (prev.speed < -1e-3 && s.speed > 1e-3);
-    if (flipped) {
-      if (cur.length >= 2) out.push(cur);
-      cur = [s];
-    } else {
-      cur.push(s);
-    }
+  for (const seg of segs) {
+    const slice = plan.slice(seg.startIdx, seg.endIdx + 1);
+    if (slice.length >= 2) out.push(slice);
   }
-  if (cur.length >= 2) out.push(cur);
   return out.length > 0 ? out : [plan.slice()];
 }
 
@@ -490,6 +486,10 @@ export interface RaceCarStatus {
   metrics: RaceMetrics;
   /** Latest plan (lifted to a sequence of state samples for visualization). */
   plan: CarKinematicState[] | null;
+  /** Rich Plan built from `plan` (kinocat/plan): per-point curvature,
+   *  feedforward, dynamic-state slots, and single-gear segment/cusp
+   *  structure — for the debug overlay and future controllers. */
+  richPlan: Plan | null;
   /** Sim time at which the current plan was committed. */
   planStartSimTime: number;
   /** Most recent predicted state at the first primitive's boundary. */
@@ -592,6 +592,15 @@ interface CarInternal {
    * unchanged.
    */
   segments: CarKinematicState[][];
+  /**
+   * Rich Plan (kinocat/plan) built from the committed `plan` for
+   * visualization / future controllers. Produce-but-don't-consume:
+   * pure-pursuit / MPPI still track `plan`/`segments`; this carries the
+   * per-point curvature, feedforward, and cusp structure the bare state
+   * array discards, so the debug overlay can plot it. Null until the first
+   * plan commits.
+   */
+  richPlan: Plan | null;
   activeSegIdx: number;
   /** Sim time of the chassis state when the active segment was
    *  entered — used to gate the "segment done, advance" check on
@@ -753,6 +762,7 @@ export async function createRaceScenario(
       pendingPlan: null,
       pendingPlanStartSimTime: 0,
       segments: [],
+      richPlan: null,
       activeSegIdx: 0,
       activeSegStartSimTime: 0,
       predictedEnd: null,
@@ -990,6 +1000,7 @@ export async function createRaceScenario(
         c.planStartSimTime = planStartSimTime;
         c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
         c.segments = splitAtGearCusps(smoothed);
+        c.richPlan = buildPlan(smoothed, { wheelBase: 2 * WHEEL_BASE });
         c.activeSegIdx = 0;
         c.activeSegStartSimTime = simTime;
       }
@@ -1008,6 +1019,7 @@ export async function createRaceScenario(
       c.planStartSimTime = c.pendingPlanStartSimTime;
       c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
       c.segments = splitAtGearCusps(c.plan);
+      c.richPlan = buildPlan(c.plan, { wheelBase: 2 * WHEEL_BASE });
       c.activeSegIdx = 0;
       c.activeSegStartSimTime = simTime;
     }
@@ -1328,6 +1340,7 @@ export async function createRaceScenario(
       diagnostics: c.diagnostics,
       metrics: c.metrics,
       plan: c.plan,
+      richPlan: c.richPlan,
       planStartSimTime: c.planStartSimTime,
       predictedEnd: c.predictedEnd,
       lastAdvanceSimTime: c.lastMoveSimTime,
@@ -1347,6 +1360,7 @@ export async function createRaceScenario(
       c.plan = null;
       c.planStartSimTime = 0;
       c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
+      c.richPlan = null;
       c.pendingPlanStartSimTime = 0;
       c.predictedEnd = null;
       c.predErrSumSq = 0;
@@ -1377,6 +1391,7 @@ export async function createRaceScenario(
           if (!c.finished) c.holdingForSync = false;
           c.plan = null;
           c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
+          c.richPlan = null;
         }
         // Force an immediate replan so neither car coasts on a stale plan.
         for (const c of cars) replanCar(c);
