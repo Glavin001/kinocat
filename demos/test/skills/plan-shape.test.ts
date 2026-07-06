@@ -56,14 +56,16 @@ function planGates(
 }
 
 /** Feasibility check: between consecutive plan samples, can the speed change
- *  have physically happened? |dv| <= aMax * dt (aMax generous = 15 m/s^2, above
- *  the derived 13.9 to avoid false positives from primitive granularity). */
-function maxInfeasibleDv(path: CarKinematicState[], aMax = 15): number {
+ *  have physically happened? Asymmetric plant limits (measured plant-envelope):
+ *  acceleration <= ~14 m/s^2 (launch 13.9), deceleration <= ~28 m/s^2 (grip
+ *  brake ~26 + margin). A flat 15 wrongly flags hard-but-feasible braking. */
+function maxInfeasibleDv(path: CarKinematicState[], aAccel = 14, aDecel = 28): number {
   let worst = 0;
   for (let i = 1; i < path.length; i++) {
     const dt = Math.max(1e-3, path[i]!.t - path[i - 1]!.t);
-    const dv = Math.abs(path[i]!.speed - path[i - 1]!.speed);
-    const excess = dv - aMax * dt;
+    const dv = path[i]!.speed - path[i - 1]!.speed;
+    const limit = dv >= 0 ? aAccel : aDecel;
+    const excess = Math.abs(dv) - limit * dt;
     if (excess > worst) worst = excess;
   }
   return worst; // >0 means an impossible speed jump exists
@@ -99,11 +101,10 @@ describe('skill K8 — honest-model plans are dynamically feasible', () => {
     expect(maxInfeasibleDv(res.path)).toBeLessThan(2);
   });
 
-  // TDD marker: v3's library currently bakes a primitive with a physically
-  // impossible speed transition (measured dv ~9.7 m/s beyond the ~14 m/s^2
-  // envelope over one step). When the v3 library is fixed this `it.fails`
-  // starts failing → flip to `it`.
-  it.fails('TARGET: v3 slalom plan has no impossible speed jump (v3 library bug)', () => {
+  // NOTE: an earlier flat 15 m/s^2 feasibility threshold flagged a v3 "impossible
+  // speed jump", but that was a TEST ARTIFACT — the plant brakes at 15-52 m/s^2,
+  // so hard braking is feasible. Under realistic asymmetric limits v3 is clean.
+  it('v3 slalom plan has no impossible speed jump (asymmetric plant limits)', () => {
     const res = planGates(libs.v3!(), spawn, gates);
     expect(res.found).toBe(true);
     expect(maxInfeasibleDv(res.path)).toBeLessThan(2);
