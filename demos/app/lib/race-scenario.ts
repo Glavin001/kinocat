@@ -34,6 +34,7 @@ import {
   wheeledFromNormalized,
   trimPlan,
   samplePlanAt,
+  expandPlanSweeps,
   type CarForceTuning,
   type CarKinematicState,
   type WheeledCarControls,
@@ -1060,13 +1061,20 @@ export async function createRaceScenario(
       // analytic shot there may include a reverse sub-segment that the
       // forward-only race controller can't execute — collapsing it to the
       // straight chord (res.path) is what keeps racing flowing.
+      // Race (non-parking): expand each motion-primitive edge into its true
+      // swept-arc poses BEFORE smoothing, so the reference hugs where the car
+      // actually travels through the primitive rather than a straight chord
+      // between sparse endpoints. Parking keeps `liftAnalyticPath`, which
+      // expands the Reeds-Shepp analytic shot's stored `poses`.
       const liftedPath = isParking
         ? liftAnalyticPath(
             res,
             (c.entry.agent ?? RACE_AGENT).maxSpeed,
             (c.entry.agent ?? RACE_AGENT).maxReverseSpeed ?? (c.entry.agent ?? RACE_AGENT).maxSpeed,
           )
-        : res.path;
+        : res.nodes && res.nodes.length > 1
+          ? expandPlanSweeps(res.nodes, c.entry.lib.primitives)
+          : res.path;
       let smoothed = liftedPath;
       const kRaw = tuning.enableSpeedProfile ? curvaturePerSample(liftedPath) : null;
       if (tuning.enableTrajectorySmoother) {
