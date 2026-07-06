@@ -737,6 +737,11 @@ export interface RaceMultiGoalRequest {
    *  mid-corner replan root) expands via this live-characterized rollout
    *  instead of the baked zero-slip library. See VehicleEnvOptions.rootRollout. */
   rootRollout?: (state: CarKinematicState) => import('kinocat/primitives').MotionPrimitive[];
+  /** K5 — price the analytic (Reeds-Shepp) shot as a drive-through (honest
+   *  decel-to-stop cost) instead of the optimistic length/maxSpeed, so the
+   *  planner carries speed through gates instead of taking a mispriced analytic
+   *  stop to each. Correct for racing; heavier search — behind a flag. */
+  analyticDriveThrough?: boolean;
   /** Agent the planner reasons about — must match the agent the supplied
    *  `lib` was characterised from (see `RacePlanRequest.agent`). Defaults to
    *  `RACE_AGENT`. */
@@ -769,6 +774,10 @@ export function planRaceMultiGoal(req: RaceMultiGoalRequest): PlanResult<CarKine
   }
   if (req.rootRollout) {
     envOptions.rootRollout = req.rootRollout;
+    usedEnvOptions = true;
+  }
+  if (req.analyticDriveThrough) {
+    envOptions.analyticDriveThrough = true;
     usedEnvOptions = true;
   }
   return planVehicleMultiGoal({

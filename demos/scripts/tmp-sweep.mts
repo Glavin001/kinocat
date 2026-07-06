@@ -28,7 +28,7 @@ const scenario = await createRaceScenario({
   targetLaps: 2,
   syncHold: false,
   course,
-  tuning: { plannerBudgetMs: 10_000, tracker: 'mpc', mpcOverrides: overrides },
+  tuning: { plannerBudgetMs: 10_000, tracker: 'mpc', mpcOverrides: overrides, analyticDriveThrough: process.env.KINOCAT_ANALYTIC_DT === '1' },
 });
 const rec = plotPath ? new TrajectoryRecorder() : null;
 while (scenario.simTime() < maxSec) {

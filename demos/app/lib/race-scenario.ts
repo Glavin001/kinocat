@@ -339,6 +339,11 @@ export interface RaceTuning {
   enableAdaptiveReplan: boolean;
   /** Trigger an extra replan on waypoint advance (subset of adaptive). */
   enableWaypointAdvanceReplan: boolean;
+  /** K5 (correctness branch, default off) — price the analytic Reeds-Shepp
+   *  shot as a drive-through so the planner carries speed through gates instead
+   *  of a mispriced analytic stop. Correct for racing but heavier search;
+   *  validate with a generous planner budget, optimize runtime separately. */
+  analyticDriveThrough?: boolean;
   /** Reeds-Shepp heuristic lookup table inside `VehicleEnvironment`
    *  (faster heuristic evaluation; admissible). */
   enableHeuristicTable: boolean;
@@ -1497,6 +1502,7 @@ export async function createRaceScenario(
           referenceWeight: tuning.consistencyWeight,
           disableHeuristicTable: !tuning.enableHeuristicTable,
           rootRollout: rootRolloutFor(c),
+          analyticDriveThrough: tuning.analyticDriveThrough,
         });
     const replanMs = performance.now() - tStart;
     c.diagnostics.lastReplanMs = replanMs;

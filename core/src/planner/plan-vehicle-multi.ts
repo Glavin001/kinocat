@@ -61,6 +61,10 @@ const DEFAULT_ENV_OPTIONS: VehicleEnvOptions = {
   goalHeadingTol: Infinity,
   sweepSegmentCheck: false,
   analyticExpansion: { everyN: 6, step: 0.6 },
+  // analyticDriveThrough is left to the caller (default false). It is
+  // theoretically correct for racing (gates are drive-through) but makes the
+  // search work harder, so it ships behind a flag we validate for correctness
+  // first (generous planner budget) and optimize for runtime separately.
   // Reeds-Shepp heuristic lookup table (Dolgov et al. Hybrid A*; spec
   // §12.3). The RS shortest-path heuristic is the dominant per-successor
   // cost in this environment; caching it by quantised source pose turns

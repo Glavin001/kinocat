@@ -11,6 +11,11 @@ import { reedsSheppShortestPath } from '../curves/reeds-shepp';
 import { sampleCurveWithGear } from '../curves/sample';
 import { NULL_RECORDER, type PerfRecorder } from '../planner/perf';
 
+/** Minimum traversal speed (m/s) used when pricing a drive-through analytic
+ *  shot by decel-to-stop time — guards the division when the entry speed is
+ *  near rest so the cost stays finite and the maneuver stays selectable. */
+const ANALYTIC_DRIVETHROUGH_VFLOOR = 4;
+
 export interface VehicleEnvOptions {
   posCell?: number;
   headingBuckets?: number;
@@ -33,6 +38,19 @@ export interface VehicleEnvOptions {
    * `{ everyN, step }`) to enable; `false` is the explicit disable.
    */
   analyticExpansion?: false | { everyN?: number; step?: number };
+  /**
+   * Price the analytic (Reeds-Shepp) shot as a DRIVE-THROUGH rather than a
+   * stop. The analytic shot always ends at `speed: 0` and is normally
+   * time-costed `length / maxSpeed` — free-flowing pricing for a maneuver that
+   * actually comes to rest. For a STOP goal (parking) that is correct. For a
+   * drive-through goal (racing gates) it mis-sells the stop as fast, so the
+   * planner takes an analytic stop-shortcut to every gate instead of a
+   * speed-carrying spline. When true, the analytic edge is instead costed by
+   * the honest decel-to-stop time (~`length / (vEntry/2)`), so a stop only wins
+   * where the maneuver genuinely must slow. Default false (parking / single-goal
+   * unchanged). Set by the multi-goal race planner.
+   */
+  analyticDriveThrough?: boolean;
   /**
    * Reeds-Shepp heuristic lookup table (Dolgov et al. Hybrid A*; spec §12.3).
    * The RS shortest-path heuristic is the dominant per-successor cost. Since
@@ -135,6 +153,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
   private readonly analyticEnabled: boolean;
   private readonly analyticEveryN: number;
   private readonly analyticStep: number;
+  private readonly analyticDriveThrough: boolean;
   private succCount = 0;
   private readonly htEnabled: boolean;
   private readonly htPos: number;
@@ -179,6 +198,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     this.analyticEnabled = ae !== undefined && ae !== false;
     this.analyticEveryN = this.analyticEnabled ? ((ae as { everyN?: number }).everyN ?? 6) : 0;
     this.analyticStep = this.analyticEnabled ? ((ae as { step?: number }).step ?? 0.4) : 0;
+    this.analyticDriveThrough = opts.analyticDriveThrough ?? false;
     const ht = opts.heuristicTable; // opt-in: disabled unless provided
     this.htEnabled = ht !== undefined && ht !== false;
     this.htPos = this.htEnabled ? ((ht as { posCell?: number }).posCell ?? this.posCell) : 1;
@@ -437,10 +457,20 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     let cost = 0;
     let hasReverse = false;
     let prevReverse = parentReverse;
+    // Speed used to convert analytic path length → time cost. A stop goal
+    // (default) is priced optimistically at maxSpeed — cheap-is-right, you were
+    // stopping anyway. A DRIVE-THROUGH goal must pay the honest decel-to-stop
+    // time: the shot ends at rest (see `next` below), so from entry speed the
+    // average traversal speed is ~vEntry/2. Without this the planner takes a
+    // mispriced analytic stop-shortcut to every drive-through gate instead of
+    // carrying speed through a spline (skill K5).
+    const vTraverse = this.analyticDriveThrough
+      ? Math.max(a.speed * 0.5, ANALYTIC_DRIVETHROUGH_VFLOOR)
+      : this.agent.maxSpeed;
     for (const seg of path.segments) {
       const rev = seg.gear < 0;
       hasReverse ||= rev;
-      cost += (seg.length * (rev ? this.agent.reverseCostMultiplier : 1)) / this.agent.maxSpeed;
+      cost += (seg.length * (rev ? this.agent.reverseCostMultiplier : 1)) / vTraverse;
       if (rev !== prevReverse) cost += this.agent.directionChangePenalty;
       prevReverse = rev;
     }
