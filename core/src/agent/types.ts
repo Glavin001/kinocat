@@ -20,6 +20,17 @@ export interface CarKinematicState {
   yawRate?: number;
   /** m/s along chassis +right (slip indicator). Defaults to 0 when absent. */
   lateralVelocity?: number;
+  /**
+   * Optional feedforward actuator command `[steer, driveForce, brakeForce]`
+   * the plan proved (open-loop through the planning model) reaches this state.
+   * A plan post-processor attaches the generating motion primitive's constant
+   * control to each sample; the MPPI tracker can then warm-start its prior from
+   * these controls instead of re-deriving them from geometry — so a
+   * demonstrably model-faithful plan's own controls become the executor's
+   * feedforward baseline (feedback only corrects disturbances). Undefined for
+   * samples with no model-driven control (e.g. Reeds-Shepp analytic segments).
+   */
+  ff?: readonly [number, number, number];
 }
 
 /** Humanoid search state — no inertial `speed` dimension (M7). */

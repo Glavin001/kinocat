@@ -13,6 +13,9 @@ these scripts:
 - `.cursor/skills/headless-race-debugging/SKILL.md`
 - `.cursor/skills/mppi-diagnosis-and-tuning/SKILL.md`
 - `.cursor/skills/model-vs-plant-fidelity/SKILL.md`
+- `.cursor/skills/plan-feedforward/SKILL.md` — prove a plan is open-loop
+  faithful (`plan-vs-plant.mts`), then wire + measure control feedforward
+  (`feedforward-compare.mts`).
 
 ## Reusable analysis tools (keepers — not `tmp-`)
 
@@ -45,6 +48,33 @@ correctness branch.
   28 m/s).
 - **`library-feasibility.mts`** — scans a library for the worst |dv/dt|
   primitive (checks bakes stay within the plant's accel/brake envelope).
+- **`plan-inspect.mts <kin|v2|v3>`** — dumps a plan's TRUE per-primitive
+  profile: endpoint speeds, segment length, heading change (curvature radius),
+  per-step accel, and edge kind (primitive arc vs Reeds-Shepp analytic). Reveals
+  what the coarse straight-chord render hides (e.g. the interior speed dip and
+  which segments are analytic).
+- **`perf-profile.mts [secs] [kin|v2|v3]`** — where does the wall-clock go?
+  Runs a short closed-loop segment and reports the REPLAN-ms distribution
+  (min/med/p90/p99/max + total) and the MPPI solve-ms/tick distribution, per
+  model. Turns "why is v3 slow" into planning-bound vs MPPI-bound.
+- **`plan-vs-plant.mts <v2|v3>`** — is the plan PLAUSIBLE or the model
+  optimistic? Takes the planner's exact primitive controls and rolls them
+  OPEN-LOOP through (a) the model that planned them and (b) the real Rapier
+  plant, reporting where the plant diverges from the model's prediction. Small
+  divergence ⇒ the plan is feasible and any wedge is a CONTROLLER problem
+  (→ control feedforward); large divergence at a fast turn ⇒ the model rounded
+  up its capability. Measured: v3 diverges only ~2.3 m over a 42 m maneuver
+  (plausible, slightly conservative); v2 diverges ~47 m (engineScale
+  under-prediction). This is what justified control feedforward.
+- **`feedforward-compare.mts <kin|v2|v3> [secs] [open|technical] [budgetMs]`** —
+  WS-1½ control-feedforward A/B. Runs the SAME closed-loop segment twice for one
+  model, `controlFeedforward` OFF vs ON, and prints the tracking-fidelity
+  (`predErrRms`), pace (`meanSpeed`, `bestLap`), and stability
+  (`planChurnMean`, `recoveries`, `timeStopped`) deltas with a ✓/✗ per metric,
+  then plots both executed lines (`/tmp/ff-<model>-<variant>-{off,on}.png`).
+  The closed-loop counterpart to `plan-vs-plant.mts`: once the plan is proven
+  open-loop faithful, this measures whether executing its OWN controls (instead
+  of re-deriving them from geometry) actually improves the driven line.
 
 ## The current, load-bearing kit (`tmp-*`, experimental)
 

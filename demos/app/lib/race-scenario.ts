@@ -305,6 +305,79 @@ export function liftAnalyticPath(
 }
 
 // ---------------------------------------------------------------------------
+// Control feedforward (WS-1½).
+
+/**
+ * Attach the plan's own per-primitive actuator commands to each sample of the
+ * post-processed (smoothed) plan, so the MPPI tracker can warm-start its prior
+ * from controls the plan already proved feasible instead of re-deriving them
+ * from geometry every tick.
+ *
+ * Each planner drive edge carries the `primId` of the constant-control motion
+ * primitive it rolled; that primitive's `controls` ([steer, driveForce,
+ * brakeForce]) are exactly the actuator command the planning model integrated
+ * to reach the edge's end. We build that feedforward per RAW node (the control
+ * on the edge ENTERING the node) and resample it — by matched arc-length,
+ * piecewise-constant HOLD (controls are constant across a primitive, not
+ * interpolable between a full-throttle and a brake primitive) — onto the dense
+ * smoothed samples. Reeds-Shepp analytic edges are geometric, not model-driven,
+ * so they contribute no feedforward (those samples keep `ff` undefined and the
+ * tracker falls back to warm-start there).
+ *
+ * Mutates `smoothed` in place. `res.path` (the raw node states) is the
+ * arc-length reference; for a drive-only racing plan it is the same physical
+ * span as `smoothed`, so the map is exact.
+ */
+export function attachPlanFeedforward(
+  smoothed: CarKinematicState[],
+  res: PlanResult<CarKinematicState>,
+  lib: { primitives: ReadonlyArray<{ id: number; controls: number[] }> },
+): void {
+  const nodes = res.nodes;
+  const raw = res.path;
+  const m = raw.length;
+  if (!nodes || m < 2 || smoothed.length === 0) return;
+  const byId = new Map<number, readonly [number, number, number]>();
+  for (const p of lib.primitives) {
+    byId.set(p.id, [p.controls[0] ?? 0, p.controls[1] ?? 0, p.controls[2] ?? 0]);
+  }
+  // ffFrom[i] = control on the edge ENTERING raw node i (undefined for node 0
+  // and for non-drive edges).
+  const ffFrom: (readonly [number, number, number] | undefined)[] = new Array(m).fill(undefined);
+  for (let i = 1; i < m; i++) {
+    const edge = nodes[i]?.edge;
+    // Both forward ('drive') and reverse ('drive-reverse') primitive edges
+    // carry a `primId` → model control; Reeds-Shepp analytic edges do not.
+    if (edge?.kind !== 'drive' && edge?.kind !== 'drive-reverse') continue;
+    const primId = (edge.data as { primId?: number } | undefined)?.primId;
+    const ff = primId !== undefined ? byId.get(primId) : undefined;
+    if (ff) ffFrom[i] = ff;
+  }
+  // Cumulative arc lengths on both polylines.
+  const fromCum = new Array<number>(m).fill(0);
+  for (let i = 1; i < m; i++) {
+    fromCum[i] = fromCum[i - 1]! + Math.hypot(raw[i]!.x - raw[i - 1]!.x, raw[i]!.z - raw[i - 1]!.z);
+  }
+  const fromTotal = fromCum[m - 1]!;
+  const n = smoothed.length;
+  const toCum = new Array<number>(n).fill(0);
+  for (let i = 1; i < n; i++) {
+    toCum[i] = toCum[i - 1]! + Math.hypot(smoothed[i]!.x - smoothed[i - 1]!.x, smoothed[i]!.z - smoothed[i - 1]!.z);
+  }
+  const toTotal = toCum[n - 1]!;
+  for (let i = 0; i < n; i++) {
+    const u = toTotal > 1e-9 ? toCum[i]! / toTotal : 0;
+    const s = u * fromTotal;
+    let j = 0;
+    while (j < m - 2 && fromCum[j + 1]! < s) j++;
+    // The chassis at arc s (between raw nodes j and j+1) is driven by the
+    // control on the edge INTO node j+1; fall back to the edge into j.
+    const ff = ffFrom[j + 1] ?? ffFrom[j];
+    if (ff) smoothed[i]!.ff = ff;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Feature flags — for ablation studies.
 //
 // Every "best-in-class" planner improvement landed on this branch is gated
@@ -381,6 +454,16 @@ export interface RaceTuning {
   mpcCorridorHalfWidth?: number;
   /** WS-3 — progress reward per metre of arc advanced. Default 6. */
   mpcWProgress?: number;
+  /**
+   * WS-1½ — control feedforward (MPPI tracker only). When true, each committed
+   * plan carries its generating motion primitives' actuator commands per
+   * sample (`ff`), and the MPPI tracker seeds its warm-start prior from those
+   * controls instead of re-deriving them from geometry every tick. Leverages a
+   * model-faithful plan (measured: v3's open-loop plan diverges only ~2.3 m
+   * from the real plant over a 42 m maneuver) by executing the plan's OWN
+   * proven controls as the feedforward baseline, with MPPI feedback correcting
+   * disturbances. Default false (pinned benchmarks untouched). */
+  controlFeedforward?: boolean;
   /**
    * Scenario-level tracker / waypoint knobs. These belong in the
    * tuning bundle (not in MPC config alone) because they govern
@@ -1192,6 +1275,10 @@ export async function createRaceScenario(
     // 0.9 m/s sample pinned the whole approach to a crawl via the backward
     // braking envelope.
     usePlanSpeeds: tuning.enableSpeedProfile ?? false,
+    // WS-1½ — seed the MPPI prior from the plan's own primitive controls (the
+    // plan must be tagged with `ff`, done in the commit block above). Default
+    // off; pinned benchmarks are unaffected.
+    useFeedforward: tuning.controlFeedforward ?? false,
     // Tuning-sweep escape hatch: raw MPPI knob overrides applied last.
     ...(tuning.mpcOverrides ?? {}),
   };
@@ -1599,6 +1686,14 @@ export async function createRaceScenario(
           honorEntrySpeed: true,
           curvatureOverride: kForProfile,
         });
+      }
+      // WS-1½ — control feedforward: tag the smoothed plan with the generating
+      // primitives' actuator commands so the MPPI tracker warm-starts from the
+      // plan's own proven controls. Attach AFTER smoothing + speed profile (the
+      // resample maps by arc-length onto the final samples). MPPI-only; the
+      // segment splitter's `slice()` preserves the `ff` field for free.
+      if (tuning.controlFeedforward && tuning.tracker === 'mpc') {
+        attachPlanFeedforward(smoothed, res, c.entry.lib);
       }
       c.diagnostics.successfulReplans += 1;
       c.diagnostics.consecutiveFailedReplans = 0;

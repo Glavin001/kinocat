@@ -182,6 +182,19 @@ export interface MPCTrackerConfig {
    *  extension and disables terminal-cost activation. Default false. */
   noStopAtEnd?: boolean;
   /**
+   * Control feedforward (progress mode). When true AND the plan samples carry
+   * a per-sample `ff` actuator command (attached by a plan post-processor from
+   * the generating motion primitive's controls), the warm-start PRIOR is
+   * seeded from those feedforward controls sampled along the horizon arc —
+   * instead of only the shifted previous solution. The sampler then explores
+   * AROUND the plan's own proven controls and the progress cost only corrects
+   * disturbances, so a plan whose model faithfully predicts the plant (v3) has
+   * its fidelity advantage flow straight into the executed line rather than
+   * being re-derived (and re-approximated) from geometry every tick. Horizon
+   * steps whose arc position has no `ff` (reference extension, Reeds-Shepp
+   * gaps) keep the shifted warm-start value. Default false. */
+  useFeedforward?: boolean;
+  /**
    * Progress-mode longitudinal sampling std, in units of the single
    * accel channel a ∈ [−1, 1] (a ≥ 0 → driveForce = a·maxDriveForce;
    * a < 0 → brakeForce = −a·maxBrakeForce). Progress mode samples ONE
@@ -948,6 +961,33 @@ export function mpcTrack(
     state.lastPlan = planRaw;
     state.lastAnchorIdx = anchor.idx;
     progressStart = { s: anchor.s, idx: anchor.idx };
+    // Control feedforward: seed the prior from the plan's OWN per-sample
+    // actuator commands (`ff`), walked along the arc from the anchor at the
+    // plan's projected speed. The plan proved these controls open-loop through
+    // the planning model; using them as the sampling baseline lets a
+    // model-faithful plan drive its exact controls (feedback only corrects
+    // disturbances) instead of MPPI re-deriving them from geometry every tick.
+    // Steps whose arc has no `ff` (extension tail, RS gaps) keep the warm-start
+    // value already in `prior`.
+    if (config.useFeedforward) {
+      const cum = progressGeom.cum;
+      const pts = progressGeom.pts;
+      let s = progressStart.s;
+      let idx = progressStart.idx;
+      for (let i = 0; i < H; i++) {
+        while (idx < pts.length - 2 && cum[idx + 1]! < s) idx++;
+        const ff = pts[idx]!.ff ?? pts[Math.min(idx + 1, pts.length - 1)]!.ff;
+        if (ff) {
+          prior[i * 3]! = clamp(ff[0]!, -config.maxSteer, config.maxSteer);
+          prior[i * 3 + 1]! = clamp(ff[1]!, -config.maxDriveForce, config.maxDriveForce);
+          prior[i * 3 + 2]! = clamp(ff[2]!, 0, config.maxBrakeForce);
+        }
+        // Advance the arc cursor by one control step at the plan's projected
+        // speed there (floored so a rest/near-stop sample still walks forward).
+        const vExpect = Math.max(Math.abs(pts[idx]!.speed), Math.abs(current.speed), 2);
+        s += dt * vExpect;
+      }
+    }
     progressWeights = {
       wProgress: config.wProgress ?? 6,
       wCorridor: config.wCorridor ?? 20,

@@ -127,6 +127,79 @@ describe('mpcTrack', () => {
     expect(state.lastGear).toBe(-1);
   });
 
+  it('feedforward seeds the prior so the plan launch throttle fires from rest', () => {
+    // WS-1½ control feedforward. From a dead stop one 0.05 s MPC step barely
+    // moves, so the progress reward can't distinguish coast from throttle and a
+    // zero-seeded prior emits ~no drive at the first tick (the classic
+    // launch-from-rest weakness). When the plan carries its generating
+    // primitive's full-throttle control as `ff`, the prior is seeded from it and
+    // the tracker commits real throttle immediately. Same seed + state isolate
+    // the feedforward as the cause.
+    const sim = buildForwardSim();
+    const MAXD = 4000;
+    const straight = (ff?: readonly [number, number, number]): CarKinematicState[] => {
+      const out: CarKinematicState[] = [];
+      for (let i = 0; i < 40; i++) {
+        out.push({ x: 0.75 * i, z: 0, heading: 0, speed: 12, t: 0.05 * i, ff });
+      }
+      return out;
+    };
+    const cfg = {
+      maxSteer: 0.6,
+      maxDriveForce: MAXD,
+      maxBrakeForce: 2000,
+      samples: 32,
+      horizonSteps: 30,
+      costMode: 'progress' as const,
+      cruiseSpeed: 20,
+      noStopAtEnd: true,
+      referenceExtension: 40,
+    };
+    const rest: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
+    const noFF = mpcTrack(rest, straight(), sim, createMPCTrackerState(30, 3), {
+      ...cfg,
+      useFeedforward: false,
+    });
+    const withFF = mpcTrack(rest, straight([0, MAXD, 0]), sim, createMPCTrackerState(30, 3), {
+      ...cfg,
+      useFeedforward: true,
+    });
+    // The plan's own full-throttle control fires immediately …
+    expect(withFF.driveForce).toBeGreaterThan(0.5 * MAXD);
+    // … and clearly harder than the geometry-only baseline from the same seed.
+    expect(withFF.driveForce).toBeGreaterThan(noFF.driveForce + 0.25 * MAXD);
+    expect(withFF.brakeForce).toBe(0);
+  });
+
+  it('feedforward respects a brake-hold plan control (does not invent throttle)', () => {
+    // The feedforward baseline is the plan's control, not a throttle bias: a
+    // plan sample carrying a hard-brake `ff` must not launch. Guards against a
+    // feedforward implementation that only ever seeds drive.
+    const sim = buildForwardSim();
+    const MAXD = 4000;
+    const MAXB = 2000;
+    const braking: CarKinematicState[] = [];
+    for (let i = 0; i < 40; i++) {
+      braking.push({ x: 0.2 * i, z: 0, heading: 0, speed: 2, t: 0.1 * i, ff: [0, 0, MAXB] });
+    }
+    const cfg = {
+      maxSteer: 0.6,
+      maxDriveForce: MAXD,
+      maxBrakeForce: MAXB,
+      samples: 32,
+      horizonSteps: 30,
+      costMode: 'progress' as const,
+      cruiseSpeed: 20,
+      noStopAtEnd: true,
+      referenceExtension: 40,
+      useFeedforward: true,
+    };
+    const cur: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 6, t: 0 };
+    const cmd = mpcTrack(cur, braking, sim, createMPCTrackerState(30, 3), cfg);
+    // The prior is a brake-hold, so the emitted longitudinal is not a launch.
+    expect(cmd.driveForce).toBeLessThan(0.3 * MAXD);
+  });
+
   it('deterministic with the same RNG seed', () => {
     const path = straightPath(20, 6);
     const sim = buildForwardSim();
