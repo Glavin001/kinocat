@@ -37,10 +37,21 @@ for (const cfg of CONFIGS) {
     entries: [cfg.mk()], targetLaps: 3, syncHold: false, course: buildRaceCourse('open'), tuning,
   });
   const wall0 = performance.now();
-  // Stop once 2 laps are in (a clean best-lap sample) or the time cap hits.
+  const log = (m: string) => process.stderr.write(m + '\n'); // unbuffered → live
+  log(`\n[${cfg.label}] running (cap ${secsCap}s sim, budget ${budgetMs}ms)…`);
+  let nextBeat = 15;
+  // Stop once the target laps are in, or the time cap hits. Target 1 lap keeps
+  // wall time tractable at the generous budget; the launch is part of it (same
+  // basis as the feedforward-compare best-lap figure).
+  const targetLaps = Number(process.env.KINOCAT_BENCH_LAPS ?? 1);
   while (scenario.simTime() < secsCap) {
     const r = scenario.tick();
-    if (r.cars[0]!.laps.length >= 2 || r.allFinished) break;
+    if (r.cars[0]!.laps.length >= targetLaps || r.allFinished) break;
+    if (scenario.simTime() >= nextBeat) {
+      const c0 = scenario.status()[0]!;
+      log(`  … sim ${scenario.simTime().toFixed(0)}s  laps ${c0.laps.length}  mean ${c0.quality.meanSpeed.toFixed(1)}  wall ${((performance.now() - wall0) / 1000).toFixed(0)}s`);
+      nextBeat += 15;
+    }
   }
   const wall = (performance.now() - wall0) / 1000;
   const s = scenario.status()[0]!;
@@ -48,17 +59,17 @@ for (const cfg of CONFIGS) {
   const lapDurs = s.laps.map((l) => l.duration);
   const best = lapDurs.length ? Math.min(...lapDurs) : 0;
   scenario.dispose();
-  console.log(`\n=== ${cfg.label} — open course, ${budgetMs}ms budget${dt ? ', reprice' : ''}${sp ? ', speedprofile' : ''} ===`);
-  console.log(`  laps completed      ${s.laps.length}   (sim ${scenario === undefined ? '' : ''}${secsCap}s cap, wall ${wall.toFixed(0)}s)`);
-  console.log(`  best lap            ${best ? best.toFixed(2) + ' s' : '— (no full lap)'}`);
-  console.log(`  lap durations       ${lapDurs.map((d) => d.toFixed(1)).join(', ') || '—'}`);
-  console.log(`  mean speed          ${q.meanSpeed.toFixed(2)} m/s`);
-  console.log(`  predErrRms          ${s.diagnostics.predErrorRms.toFixed(2)} m   (plan vs actual, lower = truer tracking)`);
-  console.log(`  plan churn (mean)   ${q.planChurnMean.toFixed(2)} m`);
-  console.log(`  time stopped        ${q.timeStopped.toFixed(2)} s`);
-  console.log(`  time reversing      ${q.timeReversing.toFixed(2)} s`);
-  console.log(`  recoveries          ${q.recoveryCount}`);
-  console.log(`  distance travelled  ${q.distanceTravelled.toFixed(0)} m`);
-  console.log(`  g-g utilization     mean ${(q.ggMeanUtil * 100).toFixed(0)}%  peak ${(q.ggPeakUtil * 100).toFixed(0)}%`);
-  console.log(`  MPPI solve ms/tick  ${s.diagnostics.mpcSolveMsAvg.toFixed(1)}`);
+  log(`\n=== ${cfg.label} — open course, ${budgetMs}ms budget${dt ? ', reprice' : ''}${sp ? ', speedprofile' : ''} ===`);
+  log(`  laps completed      ${s.laps.length}   (sim ${secsCap}s cap, wall ${wall.toFixed(0)}s)`);
+  log(`  best lap            ${best ? best.toFixed(2) + ' s' : '— (no full lap)'}`);
+  log(`  lap durations       ${lapDurs.map((d) => d.toFixed(1)).join(', ') || '—'}`);
+  log(`  mean speed          ${q.meanSpeed.toFixed(2)} m/s`);
+  log(`  predErrRms          ${s.diagnostics.predErrorRms.toFixed(2)} m   (plan vs actual, lower = truer tracking)`);
+  log(`  plan churn (mean)   ${q.planChurnMean.toFixed(2)} m`);
+  log(`  time stopped        ${q.timeStopped.toFixed(2)} s`);
+  log(`  time reversing      ${q.timeReversing.toFixed(2)} s`);
+  log(`  recoveries          ${q.recoveryCount}`);
+  log(`  distance travelled  ${q.distanceTravelled.toFixed(0)} m`);
+  log(`  g-g utilization     mean ${(q.ggMeanUtil * 100).toFixed(0)}%  peak ${(q.ggPeakUtil * 100).toFixed(0)}%`);
+  log(`  MPPI solve ms/tick  ${s.diagnostics.mpcSolveMsAvg.toFixed(1)}`);
 }
