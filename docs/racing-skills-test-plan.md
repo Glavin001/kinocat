@@ -78,6 +78,22 @@ Net: **both honest models complete clean laps on the correctness branch**
 (v2 48.1 s, v3 55.4 s) — the project thesis, working. The gate to shipping it
 as default is runtime perf, not correctness.
 
+### Runtime-perf progress + remaining gap
+
+- **Landed:** gentler analytic reprice (`ANALYTIC_DRIVETHROUGH_AVG_FRAC = 0.7`
+  vs 0.5) cuts the reprice's search **−68%** (11.3K→3.5K expansions, 2.8→0.9 s
+  solve) while keeping the fix (v3 slalom minInteriorV 8.1→**12.0**, smoother).
+- **Remaining:** v3 laps clean at a 12 s budget but still fails at **2.5 s**
+  (0 laps, 12 recov) — the *worst-case* replans (in the slalom, and when the
+  car is off-line mid-recovery) exceed 2.5 s, and one timed-out replan cascades
+  (car overshoots → shoots off-course → recovery loop). v2 tolerates a tighter
+  budget; v3's heavier model + aggressive line need more. Next levers, in
+  order: (1) cap expansions per replan with graceful best-effort (bound the
+  worst case); (2) drive-through-aware heuristic (the heuristic still divides by
+  maxSpeed, under-guiding the repriced search); (3) `clearanceBroadphase` to cut
+  the ~42 collision-checks/expansion; (4) `commitWindowMs` so a slow replan
+  doesn't strand the car. Each is a slow (~10 min/lap) validation cycle.
+
 ## Confirmed by the fast skill suite (measured this session)
 
 The skill tests (committed under `core/test/execute/skills-*.test.ts` and
