@@ -328,6 +328,15 @@ export function raceControlSets(agent: VehicleAgent = RACE_AGENT): number[][] {
  *  stays nearest-bucket; branching per node is unchanged). */
 export const RACE_START_SPEEDS = [0, 4, 8, 12, 16, 20, 24, 28];
 
+/** Denser 2 m/s start-speed grid (≤ 1 m/s nearest-bucket snap error, half the
+ *  default). Used by the generated-controls correctness branch. Costs ~2x
+ *  one-time baking + memory but ZERO extra per-node search cost — lookup finds
+ *  ONE nearest bucket and returns its primitives, so the branching factor is
+ *  primitives-per-bucket regardless of how many buckets exist. */
+export const RACE_START_SPEEDS_DENSE = [
+  0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28,
+];
+
 export function buildKinematicLibrary(): MotionPrimitiveLibrary {
   return characterizeVehicle({
     forwardSim: kinematicForwardSim(RACE_AGENT),
@@ -445,9 +454,12 @@ function buildRaceLibraryFromSim(
     if (v < 23) return { duration, controls: highSpeedV2Controls(cfg) };
     return { duration, controls: topSpeedV2Controls(cfg) };
   };
+  // Denser start-speed buckets on the generated (correctness) branch — half
+  // the snap error at zero per-node search cost. Default path unchanged.
+  const startSpeeds = gen ? RACE_START_SPEEDS_DENSE : RACE_START_SPEEDS;
   const all: import('kinocat/primitives').MotionPrimitive[] = [];
   let id = 0;
-  for (const startSpeed of RACE_START_SPEEDS) {
+  for (const startSpeed of startSpeeds) {
     const b = regimeFor(startSpeed);
     const lib = characterizeVehicle({
       forwardSim: inner,
@@ -460,7 +472,7 @@ function buildRaceLibraryFromSim(
       all.push({ ...p, id: id++ });
     }
   }
-  return new MotionPrimitiveLibrary(all, RACE_START_SPEEDS);
+  return new MotionPrimitiveLibrary(all, startSpeeds);
 }
 
 type CfgLike = import('kinocat/agent').LearnableVehicleConfig;
