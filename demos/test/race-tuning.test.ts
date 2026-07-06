@@ -49,7 +49,7 @@ describe.skipIf(!RAPIER_OK)('RaceTuning flags', () => {
     expect(positionDelta > 0.05 || Math.abs(a.planLen - b.planLen) > 10).toBe(true);
   });
 
-  it('the trajectory smoother produces MUCH denser plans than legacy', { timeout: 60000 }, async () => {
+  it('the trajectory smoother resamples to a denser plan than un-smoothed', { timeout: 60000 }, async () => {
     async function runWithTuning(tuning: typeof DEFAULT_TUNING) {
       const scenario = await createRaceScenario({
         entries: [kinematicEntry('kin')],
@@ -63,8 +63,13 @@ describe.skipIf(!RAPIER_OK)('RaceTuning flags', () => {
     }
     const dense = await runWithTuning({ ...DEFAULT_TUNING, enableTrajectorySmoother: true });
     const sparse = await runWithTuning({ ...DEFAULT_TUNING, enableTrajectorySmoother: false });
-    // Smoother resamples to ~0.4m spacing — a ~30m plan goes from ~15
-    // sparse endpoints to ~75 dense samples.
-    expect(dense).toBeGreaterThan(sparse * 2);
+    // The planner's node sequence is now sweep-expanded (`expandPlanSweeps`)
+    // into per-primitive swept poses BEFORE the smoother runs, so the
+    // un-smoothed plan already carries intermediate samples — no longer the
+    // ~15 raw endpoints it used to be. The trajectory smoother then C¹-smooths
+    // and RESAMPLES that to uniform ~0.4m spacing, which is still observably
+    // denser than the variable-spaced un-smoothed path (the legacy ~2× gap no
+    // longer applies now that both paths are dense).
+    expect(dense).toBeGreaterThan(sparse * 1.3);
   });
 });
