@@ -167,9 +167,6 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
   private readonly htHead: number;
   private readonly htSlack: number;
   private readonly hCache = new Map<string, number>();
-  private hGoalX = NaN;
-  private hGoalZ = NaN;
-  private hGoalH = NaN;
   private readonly cbEnabled: boolean;
   private readonly rCirc: number;
   // Scratch buffer reused by every collision-check footprint placement to
@@ -509,17 +506,18 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     const euclid = dist(from.x, from.z, to.x, to.z);
     let tRS: number;
     if (this.htEnabled) {
-      if (to.x !== this.hGoalX || to.z !== this.hGoalZ || to.heading !== this.hGoalH) {
-        this.hCache.clear();
-        this.hGoalX = to.x;
-        this.hGoalZ = to.z;
-        this.hGoalH = to.heading;
-      }
       const cx = Math.round(from.x / this.htPos);
       const cz = Math.round(from.z / this.htPos);
       const stepH = (2 * Math.PI) / this.htHead;
       const ch = Math.round(wrapAngle(from.heading) / stepH);
-      const key = `${cx}:${cz}:${ch}`;
+      // Key on BOTH the source cell AND the goal pose. A multi-goal search
+      // flips the goal between gates as interleaved gateIndex nodes expand;
+      // keying only on the source and clearing the cache on every goal change
+      // (the old behaviour) wiped it on each flip — defeating the table in
+      // exactly the multi-goal case where it's enabled by default. Goals are
+      // few (the gates), so a goal-prefixed key stays small and the RS solves
+      // are reused across flips instead of recomputed.
+      const key = `${to.x}:${to.z}:${to.heading}|${cx}:${cz}:${ch}`;
       let rs = this.hCache.get(key);
       if (rs === undefined) {
         rs = reedsSheppShortestPath(
