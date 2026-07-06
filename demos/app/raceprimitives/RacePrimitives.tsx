@@ -12,7 +12,13 @@ import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import type { LearnedVehicleParams, CarKinematicState } from 'kinocat/agent';
-import { DEFAULT_LEARNED_PARAMS } from 'kinocat/agent';
+import {
+  DEFAULT_LEARNED_PARAMS,
+  DEFAULT_LEARNABLE_CONFIG,
+  KINEMATIC_NATIVE_PARAMS,
+  learnedForwardSimV2,
+  parametricForwardV2,
+} from 'kinocat/agent';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import { MotionPrimitiveLibrary } from 'kinocat/primitives';
 import { purePursuit } from 'kinocat/execute';
@@ -132,6 +138,17 @@ const PARAMS_KEY = 'kinocat:learned-params:v2';
 const LIBRARY_KEY = 'kinocat:learned-library:v2';
 
 type Phase = 'loading' | 'learning' | 'ready' | 'racing' | 'finished';
+
+/** Path-tracking executor for this mount, selectable via `?tracker=mpc`
+ *  (default pure-pursuit). MPPI runs each car's own forward model in the
+ *  loop — the fidelity-becomes-control-quality mode (roadmap WS-3); the HUD
+ *  labels which stack is live so runs are never ambiguous. */
+function trackerFromUrl(): 'pure-pursuit' | 'mpc' {
+  if (typeof window === 'undefined') return 'pure-pursuit';
+  return new URLSearchParams(window.location.search).get('tracker') === 'mpc'
+    ? 'mpc'
+    : 'pure-pursuit';
+}
 
 interface CarRuntime {
   id: 'kinematic' | 'learned';
@@ -269,6 +286,10 @@ export default function RacePrimitives() {
     learned: EvalSnapshot | null;
   }>({ kinematic: null, learned: null });
   const [winner, setWinner] = useState<'kinematic' | 'learned' | 'tie' | null>(null);
+  // Which path-tracking executor this mount runs (`?tracker=mpc` → MPPI).
+  // Read in an effect (not at render) so SSR + hydration stay consistent.
+  const [trackerMode, setTrackerMode] = useState<'pure-pursuit' | 'mpc'>('pure-pursuit');
+  useEffect(() => setTrackerMode(trackerFromUrl()), []);
   // v2 model state (Phase-2 addition). When `useV2 && v2Model != null`, the
   // learned car's library is built from v2 instead of legacy.
   const [v2Model, setV2Model] = useState<LearnedVehicleModel | null>(null);
@@ -377,6 +398,7 @@ export default function RacePrimitives() {
         const learnedLibraryOverride = v2Active
           ? buildLearnedRaceLibraryV2(v2Model!)
           : undefined;
+        const learnedForwardModel = v2Active ? learnedForwardSimV2(v2Model!) : undefined;
         const setup = await setupScene(mount, params, {
           onMetrics: (km, lm) => setMetrics({ kinematic: km, learned: lm }),
           onLearner: (snap) => setLearner(snap),
@@ -385,7 +407,7 @@ export default function RacePrimitives() {
             setWinner(w);
             setPhase('finished');
           },
-        }, { learnedLibraryOverride });
+        }, { learnedLibraryOverride, learnedForwardModel });
         sceneRef.current = setup;
         cleanup = setup.cleanup;
       } catch (e) {
@@ -585,6 +607,7 @@ export default function RacePrimitives() {
       }}
     >
       <TopBar
+        trackerMode={trackerMode}
         phase={phase}
         learnProgress={learnProgress}
         winner={winner}
@@ -616,6 +639,21 @@ export default function RacePrimitives() {
           }}
           rollbackActive={learner?.rollbackActive ?? false}
           bestLapNumber={learner?.bestLapNumber ?? 0}
+          stacks={{
+            kinematic: {
+              tracker: trackerMode === 'mpc' ? 'MPPI (progress)' : 'pure-pursuit',
+              library: 'kinematic bicycle',
+              rolloutModel: trackerMode === 'mpc' ? 'kinematic bicycle' : undefined,
+            },
+            learned: {
+              tracker: trackerMode === 'mpc' ? 'MPPI (progress)' : 'pure-pursuit',
+              library: v2Active ? 'v2 learned' : 'online-refit (legacy)',
+              rolloutModel:
+                trackerMode === 'mpc'
+                  ? (v2Active ? 'v2 learned' : 'v2 default (shared)')
+                  : undefined,
+            },
+          }}
         />
         {(phase === 'racing' || phase === 'finished') && learner && (
           <LearnerPanel snap={learner} v2Active={v2Active} v2Meta={v2Meta} isMobile={isMobile} />
@@ -782,6 +820,10 @@ interface SceneOptions {
    *  refits of the legacy 5-param model would race a stale v1 library while
    *  the v2-derived primitive library is what the planner is searching). */
   learnedLibraryOverride?: MotionPrimitiveLibrary;
+  /** Forward dynamics model the LEARNED car's MPPI tracker rolls when the
+   *  mount runs with `?tracker=mpc` (the trained v2 sim — its fidelity
+   *  reaching the wheels). Unused under pure-pursuit. */
+  learnedForwardModel?: import('kinocat/primitives').ForwardSim<CarKinematicState>;
 }
 
 async function setupScene(
@@ -840,14 +882,28 @@ async function setupScene(
   // not part of the scenario: per-lap legacy 5-param refits were
   // removed in favor of the offline-trained v2 model (see
   // `pnpm run train` / Model Lab).
+  // Tracker selection (`?tracker=mpc`). Under MPPI each car tracks with its
+  // OWN forward model — the kinematic car with the naive idealised-bicycle
+  // params, the learned car with the trained v2 sim — so model fidelity
+  // reaches the wheels, not just the plan.
+  const tracker = trackerFromUrl();
   const scenario = await createRaceScenario({
     entries: [
-      { name: 'kinematic', lib: kinematicLib },
-      { name: 'learned', lib: initialLearnedLib },
+      {
+        name: 'kinematic',
+        lib: kinematicLib,
+        forwardModel: parametricForwardV2(KINEMATIC_NATIVE_PARAMS, DEFAULT_LEARNABLE_CONFIG),
+      },
+      {
+        name: 'learned',
+        lib: initialLearnedLib,
+        forwardModel: options.learnedForwardModel,
+      },
     ],
     syncHold: true,
     offTrackRecovery: 'waypoint',
     course,
+    tuning: { tracker },
   });
 
   // ---- Per-car setup ----
@@ -1433,6 +1489,7 @@ function TopBar({
   params,
   error,
   v2Active,
+  trackerMode,
   isMobile,
   onLearn,
   onStart,
@@ -1457,6 +1514,8 @@ function TopBar({
    *  library — online refitting is disabled in that mode, so the status
    *  text changes accordingly. */
   v2Active: boolean;
+  /** Which path-tracking executor this mount runs (HUD label). */
+  trackerMode: 'pure-pursuit' | 'mpc';
   isMobile: boolean;
   onLearn: () => void;
   onStart: () => void;
@@ -1471,12 +1530,13 @@ function TopBar({
   debugExportedAt: number;
 }) {
   const justExported = debugExportedAt > 0 && Date.now() - debugExportedAt < 3000;
-  const subtitle = v2Active
+  const trackerTag = trackerMode === 'mpc' ? 'MPPI executor' : 'pure-pursuit executor';
+  const subtitle = (v2Active
     ? 'kinematic vs offline-trained v2 · online refit off'
-    : 'kinematic vs online-learning · learned car refits each lap';
+    : 'kinematic vs online-learning · learned car refits each lap') + ` · ${trackerTag}`;
   const racingStatus = v2Active
-    ? (isMobile ? 'racing · v2' : 'racing… (learned car using v2 library — offline-trained, no online refit)')
-    : (isMobile ? 'racing · online' : 'racing… (the learned car refits every lap)');
+    ? (isMobile ? `racing · v2 · ${trackerMode === 'mpc' ? 'MPPI' : 'PP'}` : `racing… (learned car using v2 library — offline-trained, no online refit · ${trackerTag})`)
+    : (isMobile ? `racing · online · ${trackerMode === 'mpc' ? 'MPPI' : 'PP'}` : `racing… (the learned car refits every lap · ${trackerTag})`);
   return (
     <div
       style={{
@@ -1550,6 +1610,19 @@ function TopBar({
   );
 }
 
+/** Human-readable description of each car's live control stack: which
+ *  path tracker executes the plan, and which planning/rollout model the
+ *  car reasons with. Rendered in the HUD so a screenshot of a run is
+ *  never ambiguous about WHAT was being tested. */
+interface StackInfo {
+  /** Path-tracking executor. */
+  tracker: string;
+  /** Planner primitive library (what A* searches). */
+  library: string;
+  /** MPPI rollout model (only meaningful under the mpc tracker). */
+  rolloutModel?: string;
+}
+
 function MetricsOverlay({
   metrics,
   winner,
@@ -1558,6 +1631,7 @@ function MetricsOverlay({
   lapTimes,
   rollbackActive,
   bestLapNumber,
+  stacks,
 }: {
   metrics: { kinematic: RaceMetrics; learned: RaceMetrics };
   winner: 'kinematic' | 'learned' | 'tie' | null;
@@ -1566,6 +1640,7 @@ function MetricsOverlay({
   lapTimes: { kinematic: number[]; learned: number[] };
   rollbackActive: boolean;
   bestLapNumber: number;
+  stacks: { kinematic: StackInfo; learned: StackInfo };
 }) {
   // Mobile: compact stacked summary row at the top of the viewport. Tap a
   // card to expand its full stats (LIVE CONTROLS + tracking error + …).
@@ -1592,6 +1667,7 @@ function MetricsOverlay({
           holding={holding.kinematic}
           recentLaps={lapTimes.kinematic}
           rollbackBadge={null}
+          stack={stacks.kinematic}
         />
         <CompactCarCard
           title="LEARNED"
@@ -1601,6 +1677,7 @@ function MetricsOverlay({
           holding={holding.learned}
           recentLaps={lapTimes.learned}
           rollbackBadge={rollbackActive ? `BEST l${bestLapNumber}` : null}
+          stack={stacks.learned}
         />
       </div>
     );
@@ -1616,6 +1693,7 @@ function MetricsOverlay({
         holding={holding.kinematic}
         recentLaps={lapTimes.kinematic}
         rollbackBadge={null}
+        stack={stacks.kinematic}
       />
       <SideMetrics
         side="right"
@@ -1626,6 +1704,7 @@ function MetricsOverlay({
         holding={holding.learned}
         recentLaps={lapTimes.learned}
         rollbackBadge={rollbackActive ? `USING BEST (lap ${bestLapNumber})` : null}
+        stack={stacks.learned}
       />
     </>
   );
@@ -1633,10 +1712,11 @@ function MetricsOverlay({
 
 /** Tightly-packed per-car card for mobile. Tap to expand for full stats. */
 function CompactCarCard({
-  title, color, m, highlight, holding, recentLaps, rollbackBadge,
+  title, color, m, highlight, holding, recentLaps, rollbackBadge, stack,
 }: {
   title: string; color: string; m: RaceMetrics; highlight: boolean;
   holding: boolean; recentLaps: number[]; rollbackBadge: string | null;
+  stack: StackInfo;
 }) {
   const [open, setOpen] = useState(false);
   const last5 = recentLaps.slice(-5);
@@ -1670,6 +1750,16 @@ function CompactCarCard({
         <span style={{ textAlign: 'right' }}>{m.laps} · {Number.isFinite(m.bestLapTime) ? `${m.bestLapTime.toFixed(2)}s` : '—'}</span>
         {open && (
           <>
+            <span style={{ opacity: 0.6 }}>tracker</span>
+            <span style={{ textAlign: 'right', color }}>{stack.tracker}</span>
+            <span style={{ opacity: 0.6 }}>lib</span>
+            <span style={{ textAlign: 'right' }}>{stack.library}</span>
+            {stack.rolloutModel && (
+              <>
+                <span style={{ opacity: 0.6 }}>model</span>
+                <span style={{ textAlign: 'right' }}>{stack.rolloutModel}</span>
+              </>
+            )}
             <span style={{ opacity: 0.6 }}>last</span>
             <span style={{ textAlign: 'right' }}>{Number.isFinite(m.lastLapTime) ? `${m.lastLapTime.toFixed(2)}s` : '—'}</span>
             <span style={{ opacity: 0.6 }}>mean5</span>
@@ -1723,6 +1813,7 @@ function SideMetrics({
   holding,
   recentLaps,
   rollbackBadge,
+  stack,
 }: {
   side: 'left' | 'right';
   title: string;
@@ -1732,6 +1823,7 @@ function SideMetrics({
   holding: boolean;
   recentLaps: number[];
   rollbackBadge: string | null;
+  stack: StackInfo;
 }) {
   // Stability over the last 5 laps — low std-dev means the car has
   // settled into a consistent racing line, high means it's still
@@ -1814,6 +1906,15 @@ function SideMetrics({
       />
       <KV k="0.55s pred err (rms)" v={`${m.trackingErrorRms.toFixed(2)} m`} />
       <KV k="peak speed" v={`${m.peakSpeed.toFixed(1)} m/s`} />
+      <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid #1f2735', opacity: 0.85 }}>
+        <div style={{ fontSize: 10, opacity: 0.7, marginBottom: 2 }}>CONTROL STACK</div>
+        <KV k="tracker" v={<span style={{ color }}>{stack.tracker}</span>} />
+        <KV k="plan library" v={stack.library} />
+        {stack.rolloutModel && <KV k="MPPI model" v={stack.rolloutModel} />}
+        {m.mpcSolveCount > 0 && (
+          <KV k="MPPI solve" v={`${m.mpcSolveMsAvg.toFixed(1)} ms · ${m.mpcSolveCount}`} />
+        )}
+      </div>
       <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid #1f2735', opacity: 0.85 }}>
         <div style={{ fontSize: 10, opacity: 0.7, marginBottom: 2 }}>LIVE CONTROLS</div>
         <KV

@@ -2086,6 +2086,10 @@ export async function createRaceScenario(
     c.diagnostics.mpcSolveCount = c.mpcSolveCount;
     c.diagnostics.mpcSolveMsAvg =
       c.mpcSolveCount > 0 ? c.mpcSolveMsTotal / c.mpcSolveCount : 0;
+    // Mirror into RaceMetrics so HUD consumers that only receive metrics
+    // (the React overlay) can label the live control stack.
+    c.metrics.mpcSolveMsAvg = c.diagnostics.mpcSolveMsAvg;
+    c.metrics.mpcSolveCount = c.diagnostics.mpcSolveCount;
     return {
       name: c.entry.name,
       state: c.car.readState(simTime),

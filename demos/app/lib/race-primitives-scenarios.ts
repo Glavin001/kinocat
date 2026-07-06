@@ -921,6 +921,11 @@ export interface RaceMetrics {
     /** Total replan attempts this race. */
     totalReplans: number;
   };
+  /** MPPI executor diagnostics — populated only while the scenario runs
+   *  the `'mpc'` tracker (0 under pure-pursuit). Surfaced in the HUD so
+   *  the active control stack is never ambiguous. */
+  mpcSolveMsAvg: number;
+  mpcSolveCount: number;
 }
 
 export function emptyMetrics(): RaceMetrics {
@@ -942,6 +947,8 @@ export function emptyMetrics(): RaceMetrics {
       successfulReplans: 0,
       totalReplans: 0,
     },
+    mpcSolveMsAvg: 0,
+    mpcSolveCount: 0,
   };
 }
 
