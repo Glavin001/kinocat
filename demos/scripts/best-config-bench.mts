@@ -13,8 +13,11 @@ import { kinematicEntry, v2Entry, v3Entry } from '../app/lib/headless-race';
 import { buildRaceCourse } from '../app/lib/race-primitives-scenarios';
 import { modelFromJson } from '../app/lib/v2-model-file';
 import { v3FromJson } from 'kinocat/agent';
+import { openRunLog } from './lib/run-log';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
+// Unique, live-tailable progress log (stdout is buffered until exit).
+const { path: logPath, log } = openRunLog('best-config-bench');
 const readModel = (f: string) => JSON.parse(readFileSync(resolve(root, 'demos/public/models', f), 'utf-8'));
 const secsCap = Number(process.argv[2] ?? 90);
 const budgetMs = Number(process.argv[3] ?? 12000);
@@ -37,7 +40,6 @@ for (const cfg of CONFIGS) {
     entries: [cfg.mk()], targetLaps: 3, syncHold: false, course: buildRaceCourse('open'), tuning,
   });
   const wall0 = performance.now();
-  const log = (m: string) => process.stderr.write(m + '\n'); // unbuffered → live
   log(`\n[${cfg.label}] running (cap ${secsCap}s sim, budget ${budgetMs}ms)…`);
   let nextBeat = 15;
   // Stop once the target laps are in, or the time cap hits. Target 1 lap keeps
@@ -73,3 +75,5 @@ for (const cfg of CONFIGS) {
   log(`  g-g utilization     mean ${(q.ggMeanUtil * 100).toFixed(0)}%  peak ${(q.ggPeakUtil * 100).toFixed(0)}%`);
   log(`  MPPI solve ms/tick  ${s.diagnostics.mpcSolveMsAvg.toFixed(1)}`);
 }
+
+log(`\nDone. Full log: ${logPath}`);

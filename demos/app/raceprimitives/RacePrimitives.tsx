@@ -18,7 +18,10 @@ import {
   KINEMATIC_NATIVE_PARAMS,
   learnedForwardSimV2,
   parametricForwardV2,
+  v3FromJson,
+  forwardSimV3Rollout,
 } from 'kinocat/agent';
+import type { LearnedVehicleModelV3 } from 'kinocat/agent';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import { MotionPrimitiveLibrary } from 'kinocat/primitives';
 import { purePursuit } from 'kinocat/execute';
@@ -44,6 +47,7 @@ import {
   buildKinematicLibrary,
   buildLearnedRaceLibrary,
   buildLearnedRaceLibraryV2,
+  buildLearnedRaceLibraryV3,
   buildRaceCourse,
   emptyMetrics,
   pickNextWaypoint,
@@ -141,8 +145,23 @@ type Phase = 'loading' | 'learning' | 'ready' | 'racing' | 'finished';
 
 type TrackerMode = 'pure-pursuit' | 'mpc';
 type CourseVariant = 'open' | 'technical';
-/** Which primitive library / rollout model the LEARNED car drives with. */
-type LearnedModelChoice = 'v2' | 'kinematic';
+/** Which primitive library / rollout model the LEARNED car drives with.
+ *  'v3' is the purely-learned MLP-ensemble model (highest plant fidelity —
+ *  loaded from the preloaded `/models/v3-default.json`, no online training). */
+type LearnedModelChoice = 'v2' | 'v3' | 'kinematic';
+
+/** Load the preloaded v3 model artifact for the browser demo. Returns null if
+ *  it isn't reachable (the page falls back to kinematic/v2). */
+async function loadV3ModelFromUrl(): Promise<LearnedVehicleModelV3 | null> {
+  if (typeof window === 'undefined') return null;
+  try {
+    const res = await fetch('/models/v3-default.json');
+    if (!res.ok) return null;
+    return v3FromJson(await res.json());
+  } catch {
+    return null;
+  }
+}
 
 /** Path-tracking executor this mount runs. The GUI (top-bar Race Setup) is
  *  the primary control; the `?tracker=mpc` query param only SEEDS the initial
@@ -367,7 +386,30 @@ export default function RacePrimitives() {
       } catch { /* quota; ignore */ }
     }
   };
-  const v2Active = useV2 && v2Model !== null;
+  // v3 model state (the purely-learned MLP ensemble — highest plant fidelity).
+  // Preloaded artifact only (no online training path); selecting it swaps the
+  // learned car's library + MPPI rollout model to v3. Mutually exclusive with
+  // v2 via the RaceSetup handler.
+  const [v3Model, setV3Model] = useState<LearnedVehicleModelV3 | null>(null);
+  const [useV3, setUseV3State] = useState(false);
+  const setUseV3 = (v: boolean) => {
+    setUseV3State(v);
+    if (typeof window !== 'undefined') {
+      try {
+        window.localStorage.setItem('kinocat:v3-toggle:v1', v ? '1' : '0');
+      } catch { /* quota; ignore */ }
+    }
+  };
+  const v2Active = useV2 && !useV3 && v2Model !== null;
+  const v3Active = useV3 && v3Model !== null;
+  // The RaceSetup selector's current value (v3 wins if active, else v2, else
+  // the kinematic baseline).
+  const learnedModelChoice: LearnedModelChoice = v3Active ? 'v3' : v2Active ? 'v2' : 'kinematic';
+  const setLearnedModelChoice = (m: LearnedModelChoice) => {
+    // Mutually exclusive: exactly one learned model (or the kinematic baseline).
+    setUseV3(m === 'v3');
+    setUseV2(m === 'v2');
+  };
 
   const sceneRef = useRef<{
     cleanup: () => void;
@@ -421,6 +463,20 @@ export default function RacePrimitives() {
         if (toggle === null) setUseV2State(true);
       }
     });
+    // Load the preloaded v3 model in the background so the RaceSetup selector
+    // can offer it. Restore the user's explicit v3 choice; if v3 was selected
+    // last session, it takes precedence over the v2 default-on above.
+    let v3Toggle: string | null = null;
+    if (typeof window !== 'undefined') {
+      try {
+        v3Toggle = window.localStorage.getItem('kinocat:v3-toggle:v1');
+      } catch { /* ignore */ }
+    }
+    void loadV3ModelFromUrl().then((model) => {
+      if (cancelled || !model) return;
+      setV3Model(model);
+      if (v3Toggle === '1') setUseV3State(true);
+    });
     return () => {
       cancelled = true;
     };
@@ -453,10 +509,18 @@ export default function RacePrimitives() {
       try {
         await ensureRapier();
         if (disposed) return;
-        const learnedLibraryOverride = v2Active
-          ? buildLearnedRaceLibraryV2(v2Model!)
-          : undefined;
-        const learnedForwardModel = v2Active ? learnedForwardSimV2(v2Model!) : undefined;
+        // v3 wins if selected (highest fidelity), else v2, else the kinematic
+        // baseline (undefined override → the online-refit legacy library).
+        const learnedLibraryOverride = v3Active
+          ? buildLearnedRaceLibraryV3(v3Model!)
+          : v2Active
+            ? buildLearnedRaceLibraryV2(v2Model!)
+            : undefined;
+        const learnedForwardModel = v3Active
+          ? forwardSimV3Rollout(v3Model!)
+          : v2Active
+            ? learnedForwardSimV2(v2Model!)
+            : undefined;
         const setup = await setupScene(mount, params, {
           onMetrics: (km, lm) => setMetrics({ kinematic: km, learned: lm }),
           onLearner: (snap) => setLearner(snap),
@@ -479,7 +543,7 @@ export default function RacePrimitives() {
     };
     // Re-mount when params, v2 toggle, v2 model identity, or a Race Setup
     // selector (tracker / course / feedforward) change — each rebuilds the scenario.
-  }, [params, useV2, v2Model, trackerMode, courseVariant, feedforward, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [params, useV2, v2Model, useV3, v3Model, trackerMode, courseVariant, feedforward, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function runInlineLearn() {
     setError(null);
@@ -670,9 +734,10 @@ export default function RacePrimitives() {
         onTrackerMode={setTrackerMode}
         courseVariant={courseVariant}
         onCourseVariant={setCourseVariant}
-        learnedModel={v2Active ? 'v2' : 'kinematic'}
-        onLearnedModel={(m) => setUseV2(m === 'v2')}
+        learnedModel={learnedModelChoice}
+        onLearnedModel={setLearnedModelChoice}
         canUseV2={v2Model !== null}
+        canUseV3={v3Model !== null}
         feedforward={feedforward}
         onFeedforward={setFeedforward}
         phase={phase}
@@ -715,10 +780,10 @@ export default function RacePrimitives() {
             },
             learned: {
               tracker: trackerMode === 'mpc' ? 'MPPI (progress)' : 'pure-pursuit',
-              library: v2Active ? 'v2 learned' : 'online-refit (legacy)',
+              library: v3Active ? 'v3 learned' : v2Active ? 'v2 learned' : 'online-refit (legacy)',
               rolloutModel:
                 trackerMode === 'mpc'
-                  ? (v2Active ? 'v2 learned' : 'v2 default (shared)')
+                  ? (v3Active ? 'v3 learned' : v2Active ? 'v2 learned' : 'v2 default (shared)')
                   : undefined,
             },
           }}
@@ -1572,6 +1637,7 @@ function TopBar({
   learnedModel,
   onLearnedModel,
   canUseV2,
+  canUseV3,
   feedforward,
   onFeedforward,
   isMobile,
@@ -1610,6 +1676,7 @@ function TopBar({
   onLearnedModel: (m: LearnedModelChoice) => void;
   /** Whether a trained v2 model is available to select. */
   canUseV2: boolean;
+  canUseV3: boolean;
   /** Race Setup: WS-1½ control feedforward (MPPI only). */
   feedforward: boolean;
   onFeedforward: (on: boolean) => void;
@@ -1636,7 +1703,7 @@ function TopBar({
   // dropdown trigger so the config is visible without opening it.
   const setupSummary = [
     trackerMode === 'mpc' ? 'MPPI' : 'PP',
-    learnedModel === 'v2' ? 'v2' : 'kin',
+    learnedModel === 'kinematic' ? 'kin' : learnedModel,
     courseVariant === 'technical' ? 'Tech' : 'Open',
     ...(feedforward && trackerMode === 'mpc' ? ['FF'] : []),
   ].join(' · ');
@@ -1690,6 +1757,7 @@ function TopBar({
             learnedModel={learnedModel}
             onLearnedModel={onLearnedModel}
             canUseV2={canUseV2}
+            canUseV3={canUseV3}
             feedforward={feedforward}
             onFeedforward={onFeedforward}
           />
@@ -2645,6 +2713,7 @@ function RaceSetup({
   learnedModel,
   onLearnedModel,
   canUseV2,
+  canUseV3,
   feedforward,
   onFeedforward,
 }: {
@@ -2655,6 +2724,7 @@ function RaceSetup({
   learnedModel: LearnedModelChoice;
   onLearnedModel: (m: LearnedModelChoice) => void;
   canUseV2: boolean;
+  canUseV3: boolean;
   feedforward: boolean;
   onFeedforward: (on: boolean) => void;
 }) {
@@ -2677,11 +2747,19 @@ function RaceSetup({
           { value: 'kinematic', label: 'Kinematic', title: 'Learned car uses the kinematic-bicycle library (baseline — same as the control car).' },
           {
             value: 'v2',
-            label: 'v2 learned',
+            label: 'v2',
             title: canUseV2
               ? 'Learned car uses the offline-trained v2 library + (under MPPI) the v2 rollout model.'
               : 'Train or load a v2 model first (Model Lab).',
             disabled: !canUseV2,
+          },
+          {
+            value: 'v3',
+            label: 'v3',
+            title: canUseV3
+              ? 'Learned car uses the purely-learned v3 MLP-ensemble library + rollout model (highest plant fidelity — best paired with MPPI + control feedforward).'
+              : 'v3 model unavailable (/models/v3-default.json not reachable).',
+            disabled: !canUseV3,
           },
         ]}
       />

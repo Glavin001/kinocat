@@ -13,3 +13,6 @@ node_modules/
 # Machine-generated eval / bench history artifacts (regenerate with pnpm run eval:json / controller-bench:json)
 demos/docs/eval-results/
 demos/docs/controller-bench/
+
+# Debug-script run logs (unique per run, not for CI)
+demos/scripts/logs/
