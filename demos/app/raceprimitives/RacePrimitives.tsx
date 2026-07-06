@@ -164,6 +164,15 @@ function courseFromUrl(): CourseVariant {
     : 'open';
 }
 
+/** Control-feedforward seed (GUI-primary; `?ff=1` seeds it ON). Under MPPI the
+ *  tracker warm-starts its prior from the plan's own primitive controls
+ *  (WS-1½) instead of re-deriving them from geometry — a no-op under
+ *  pure-pursuit. */
+function feedforwardFromUrl(): boolean {
+  if (typeof window === 'undefined') return false;
+  return new URLSearchParams(window.location.search).get('ff') === '1';
+}
+
 /** Reflect a Race Setup choice back into the URL (via replaceState, no
  *  navigation) so the current configuration stays shareable. The GUI state
  *  is the source of truth — this is a convenience mirror, not the config
@@ -321,9 +330,11 @@ export default function RacePrimitives() {
   // the URL seeds in an effect, not at render, so SSR + hydration agree.
   const [trackerMode, setTrackerModeState] = useState<TrackerMode>('pure-pursuit');
   const [courseVariant, setCourseVariantState] = useState<CourseVariant>('open');
+  const [feedforward, setFeedforwardState] = useState(false);
   useEffect(() => {
     setTrackerModeState(trackerFromUrl());
     setCourseVariantState(courseFromUrl());
+    setFeedforwardState(feedforwardFromUrl());
   }, []);
   const setTrackerMode = (m: TrackerMode) => {
     setTrackerModeState(m);
@@ -332,6 +343,10 @@ export default function RacePrimitives() {
   const setCourseVariant = (c: CourseVariant) => {
     setCourseVariantState(c);
     syncSetupParam('course', c, c === 'open');
+  };
+  const setFeedforward = (on: boolean) => {
+    setFeedforwardState(on);
+    syncSetupParam('ff', on ? '1' : '0', !on);
   };
   // v2 model state (Phase-2 addition). When `useV2 && v2Model != null`, the
   // learned car's library is built from v2 instead of legacy.
@@ -450,7 +465,7 @@ export default function RacePrimitives() {
             setWinner(w);
             setPhase('finished');
           },
-        }, { learnedLibraryOverride, learnedForwardModel, tracker: trackerMode, courseVariant });
+        }, { learnedLibraryOverride, learnedForwardModel, tracker: trackerMode, courseVariant, feedforward });
         sceneRef.current = setup;
         cleanup = setup.cleanup;
       } catch (e) {
@@ -463,8 +478,8 @@ export default function RacePrimitives() {
       sceneRef.current = null;
     };
     // Re-mount when params, v2 toggle, v2 model identity, or a Race Setup
-    // selector (tracker / course) change — each rebuilds the scenario.
-  }, [params, useV2, v2Model, trackerMode, courseVariant, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
+    // selector (tracker / course / feedforward) change — each rebuilds the scenario.
+  }, [params, useV2, v2Model, trackerMode, courseVariant, feedforward, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function runInlineLearn() {
     setError(null);
@@ -658,6 +673,8 @@ export default function RacePrimitives() {
         learnedModel={v2Active ? 'v2' : 'kinematic'}
         onLearnedModel={(m) => setUseV2(m === 'v2')}
         canUseV2={v2Model !== null}
+        feedforward={feedforward}
+        onFeedforward={setFeedforward}
         phase={phase}
         learnProgress={learnProgress}
         winner={winner}
@@ -883,6 +900,10 @@ interface SceneOptions {
   /** Course layout. Chosen in the Race Setup GUI (top bar). Defaults to the
    *  open flat pad. */
   courseVariant?: CourseVariant;
+  /** WS-1½ control feedforward (MPPI only). When true, the tracker warm-starts
+   *  its prior from the plan's own primitive controls instead of re-deriving
+   *  them from geometry. Chosen in the Race Setup GUI (top bar). Default off. */
+  feedforward?: boolean;
 }
 
 async function setupScene(
@@ -958,7 +979,7 @@ async function setupScene(
     syncHold: true,
     offTrackRecovery: 'waypoint',
     course,
-    tuning: { tracker },
+    tuning: { tracker, controlFeedforward: options.feedforward ?? false },
   });
 
   // ---- Per-car setup ----
@@ -1551,6 +1572,8 @@ function TopBar({
   learnedModel,
   onLearnedModel,
   canUseV2,
+  feedforward,
+  onFeedforward,
   isMobile,
   onLearn,
   onStart,
@@ -1587,6 +1610,9 @@ function TopBar({
   onLearnedModel: (m: LearnedModelChoice) => void;
   /** Whether a trained v2 model is available to select. */
   canUseV2: boolean;
+  /** Race Setup: WS-1½ control feedforward (MPPI only). */
+  feedforward: boolean;
+  onFeedforward: (on: boolean) => void;
   isMobile: boolean;
   onLearn: () => void;
   onStart: () => void;
@@ -1612,6 +1638,7 @@ function TopBar({
     trackerMode === 'mpc' ? 'MPPI' : 'PP',
     learnedModel === 'v2' ? 'v2' : 'kin',
     courseVariant === 'technical' ? 'Tech' : 'Open',
+    ...(feedforward && trackerMode === 'mpc' ? ['FF'] : []),
   ].join(' · ');
 
   // Single-row toolbar. Everything that used to overflow now lives behind two
@@ -1663,6 +1690,8 @@ function TopBar({
             learnedModel={learnedModel}
             onLearnedModel={onLearnedModel}
             canUseV2={canUseV2}
+            feedforward={feedforward}
+            onFeedforward={onFeedforward}
           />
         )}
       </Popover>
@@ -2616,6 +2645,8 @@ function RaceSetup({
   learnedModel,
   onLearnedModel,
   canUseV2,
+  feedforward,
+  onFeedforward,
 }: {
   trackerMode: TrackerMode;
   onTrackerMode: (m: TrackerMode) => void;
@@ -2624,6 +2655,8 @@ function RaceSetup({
   learnedModel: LearnedModelChoice;
   onLearnedModel: (m: LearnedModelChoice) => void;
   canUseV2: boolean;
+  feedforward: boolean;
+  onFeedforward: (on: boolean) => void;
 }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12, minWidth: 210 }}>
@@ -2659,6 +2692,22 @@ function RaceSetup({
         options={[
           { value: 'open', label: 'Open', title: 'Flat pad — pure dynamics + waypoint chase.' },
           { value: 'technical', label: 'Technical', title: 'Walled chicane — corner overshoot becomes a physical wall strike.' },
+        ]}
+      />
+      <Segmented
+        label="control feedforward"
+        value={feedforward ? 'on' : 'off'}
+        onChange={(v) => onFeedforward(v === 'on')}
+        options={[
+          { value: 'off', label: 'Off', title: 'MPPI re-derives controls from plan geometry each tick (baseline).' },
+          {
+            value: 'on',
+            label: 'On',
+            title: trackerMode === 'mpc'
+              ? 'MPPI warm-starts its prior from the plan’s OWN primitive controls (WS-1½) — a faithful model’s plan drives its proven controls. Best with the v3/learned model.'
+              : 'Feedforward applies under MPPI only — switch the tracker to MPPI to see an effect.',
+            disabled: trackerMode !== 'mpc',
+          },
         ]}
       />
       <div style={{ fontSize: 10, opacity: 0.5, lineHeight: 1.4 }}>
