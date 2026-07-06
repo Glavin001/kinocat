@@ -139,15 +139,41 @@ const LIBRARY_KEY = 'kinocat:learned-library:v2';
 
 type Phase = 'loading' | 'learning' | 'ready' | 'racing' | 'finished';
 
-/** Path-tracking executor for this mount, selectable via `?tracker=mpc`
- *  (default pure-pursuit). MPPI runs each car's own forward model in the
- *  loop — the fidelity-becomes-control-quality mode (roadmap WS-3); the HUD
- *  labels which stack is live so runs are never ambiguous. */
-function trackerFromUrl(): 'pure-pursuit' | 'mpc' {
+type TrackerMode = 'pure-pursuit' | 'mpc';
+type CourseVariant = 'open' | 'technical';
+/** Which primitive library / rollout model the LEARNED car drives with. */
+type LearnedModelChoice = 'v2' | 'kinematic';
+
+/** Path-tracking executor this mount runs. The GUI (top-bar Race Setup) is
+ *  the primary control; the `?tracker=mpc` query param only SEEDS the initial
+ *  value so a run is shareable/deep-linkable. MPPI runs each car's own forward
+ *  model in the loop — the fidelity-becomes-control-quality mode (roadmap
+ *  WS-3). */
+function trackerFromUrl(): TrackerMode {
   if (typeof window === 'undefined') return 'pure-pursuit';
   return new URLSearchParams(window.location.search).get('tracker') === 'mpc'
     ? 'mpc'
     : 'pure-pursuit';
+}
+
+/** Course variant seed (GUI-primary; `?course=technical` seeds it). */
+function courseFromUrl(): CourseVariant {
+  if (typeof window === 'undefined') return 'open';
+  return new URLSearchParams(window.location.search).get('course') === 'technical'
+    ? 'technical'
+    : 'open';
+}
+
+/** Reflect a Race Setup choice back into the URL (via replaceState, no
+ *  navigation) so the current configuration stays shareable. The GUI state
+ *  is the source of truth — this is a convenience mirror, not the config
+ *  path. */
+function syncSetupParam(key: string, value: string, isDefault: boolean): void {
+  if (typeof window === 'undefined') return;
+  const url = new URL(window.location.href);
+  if (isDefault) url.searchParams.delete(key);
+  else url.searchParams.set(key, value);
+  window.history.replaceState(null, '', url.toString());
 }
 
 interface CarRuntime {
@@ -286,10 +312,25 @@ export default function RacePrimitives() {
     learned: EvalSnapshot | null;
   }>({ kinematic: null, learned: null });
   const [winner, setWinner] = useState<'kinematic' | 'learned' | 'tie' | null>(null);
-  // Which path-tracking executor this mount runs (`?tracker=mpc` → MPPI).
-  // Read in an effect (not at render) so SSR + hydration stay consistent.
-  const [trackerMode, setTrackerMode] = useState<'pure-pursuit' | 'mpc'>('pure-pursuit');
-  useEffect(() => setTrackerMode(trackerFromUrl()), []);
+  // Race Setup (GUI-primary). Executor + course seed from the URL on mount
+  // (so `?tracker=mpc&course=technical` deep-links still work) but the GUI
+  // selectors in the top bar are the source of truth thereafter; changing
+  // one re-mounts the scene (same as the existing v2-library toggle). Read
+  // the URL seeds in an effect, not at render, so SSR + hydration agree.
+  const [trackerMode, setTrackerModeState] = useState<TrackerMode>('pure-pursuit');
+  const [courseVariant, setCourseVariantState] = useState<CourseVariant>('open');
+  useEffect(() => {
+    setTrackerModeState(trackerFromUrl());
+    setCourseVariantState(courseFromUrl());
+  }, []);
+  const setTrackerMode = (m: TrackerMode) => {
+    setTrackerModeState(m);
+    syncSetupParam('tracker', m, m === 'pure-pursuit');
+  };
+  const setCourseVariant = (c: CourseVariant) => {
+    setCourseVariantState(c);
+    syncSetupParam('course', c, c === 'open');
+  };
   // v2 model state (Phase-2 addition). When `useV2 && v2Model != null`, the
   // learned car's library is built from v2 instead of legacy.
   const [v2Model, setV2Model] = useState<LearnedVehicleModel | null>(null);
@@ -407,7 +448,7 @@ export default function RacePrimitives() {
             setWinner(w);
             setPhase('finished');
           },
-        }, { learnedLibraryOverride, learnedForwardModel });
+        }, { learnedLibraryOverride, learnedForwardModel, tracker: trackerMode, courseVariant });
         sceneRef.current = setup;
         cleanup = setup.cleanup;
       } catch (e) {
@@ -419,8 +460,9 @@ export default function RacePrimitives() {
       cleanup?.();
       sceneRef.current = null;
     };
-    // Re-mount when params, v2 toggle, or v2 model identity change.
-  }, [params, useV2, v2Model, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
+    // Re-mount when params, v2 toggle, v2 model identity, or a Race Setup
+    // selector (tracker / course) change — each rebuilds the scenario.
+  }, [params, useV2, v2Model, trackerMode, courseVariant, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function runInlineLearn() {
     setError(null);
@@ -608,6 +650,12 @@ export default function RacePrimitives() {
     >
       <TopBar
         trackerMode={trackerMode}
+        onTrackerMode={setTrackerMode}
+        courseVariant={courseVariant}
+        onCourseVariant={setCourseVariant}
+        learnedModel={v2Active ? 'v2' : 'kinematic'}
+        onLearnedModel={(m) => setUseV2(m === 'v2')}
+        canUseV2={v2Model !== null}
         phase={phase}
         learnProgress={learnProgress}
         winner={winner}
@@ -821,9 +869,15 @@ interface SceneOptions {
    *  the v2-derived primitive library is what the planner is searching). */
   learnedLibraryOverride?: MotionPrimitiveLibrary;
   /** Forward dynamics model the LEARNED car's MPPI tracker rolls when the
-   *  mount runs with `?tracker=mpc` (the trained v2 sim — its fidelity
-   *  reaching the wheels). Unused under pure-pursuit. */
+   *  tracker is `'mpc'` (the trained v2 sim — its fidelity reaching the
+   *  wheels). Unused under pure-pursuit. */
   learnedForwardModel?: import('kinocat/primitives').ForwardSim<CarKinematicState>;
+  /** Path-tracking executor for both cars. Chosen in the Race Setup GUI
+   *  (top bar). Defaults to pure-pursuit. */
+  tracker?: TrackerMode;
+  /** Course layout. Chosen in the Race Setup GUI (top bar). Defaults to the
+   *  open flat pad. */
+  courseVariant?: CourseVariant;
 }
 
 async function setupScene(
@@ -848,15 +902,11 @@ async function setupScene(
   mount.appendChild(renderer.domElement);
 
   // ---- Shared course ----
-  // Course variant is selectable via `?course=technical` — the walled /
-  // chicane / thread-the-gate layout that turns corner overshoot into a
-  // physical wall strike (see race-primitives-scenarios.ts). Defaults to the
-  // open flat pad.
-  const courseVariant: 'open' | 'technical' =
-    (typeof window !== 'undefined' &&
-      new URLSearchParams(window.location.search).get('course') === 'technical')
-      ? 'technical'
-      : 'open';
+  // Course variant comes from the Race Setup GUI (top bar). The walled /
+  // chicane / thread-the-gate `technical` layout turns corner overshoot into
+  // a physical wall strike (see race-primitives-scenarios.ts); `open` is the
+  // flat pad. The `?course=` param only seeds the GUI's initial value.
+  const courseVariant: CourseVariant = options.courseVariant ?? courseFromUrl();
   const course = buildRaceCourse(courseVariant);
   const navWorld = new InMemoryNavWorld(course.polygons, course.obstacles);
   const kinematicLib = buildKinematicLibrary();
@@ -882,11 +932,11 @@ async function setupScene(
   // not part of the scenario: per-lap legacy 5-param refits were
   // removed in favor of the offline-trained v2 model (see
   // `pnpm run train` / Model Lab).
-  // Tracker selection (`?tracker=mpc`). Under MPPI each car tracks with its
-  // OWN forward model — the kinematic car with the naive idealised-bicycle
-  // params, the learned car with the trained v2 sim — so model fidelity
-  // reaches the wheels, not just the plan.
-  const tracker = trackerFromUrl();
+  // Tracker from the Race Setup GUI (top bar). Under MPPI each car tracks
+  // with its OWN forward model — the kinematic car with the naive idealised-
+  // bicycle params, the learned car with the trained v2 sim — so model
+  // fidelity reaches the wheels, not just the plan. `?tracker=` seeds it.
+  const tracker: TrackerMode = options.tracker ?? trackerFromUrl();
   const scenario = await createRaceScenario({
     entries: [
       {
@@ -1490,6 +1540,12 @@ function TopBar({
   error,
   v2Active,
   trackerMode,
+  onTrackerMode,
+  courseVariant,
+  onCourseVariant,
+  learnedModel,
+  onLearnedModel,
+  canUseV2,
   isMobile,
   onLearn,
   onStart,
@@ -1514,8 +1570,17 @@ function TopBar({
    *  library — online refitting is disabled in that mode, so the status
    *  text changes accordingly. */
   v2Active: boolean;
-  /** Which path-tracking executor this mount runs (HUD label). */
-  trackerMode: 'pure-pursuit' | 'mpc';
+  /** Race Setup: which path-tracking executor this mount runs. */
+  trackerMode: TrackerMode;
+  onTrackerMode: (m: TrackerMode) => void;
+  /** Race Setup: which course layout. */
+  courseVariant: CourseVariant;
+  onCourseVariant: (c: CourseVariant) => void;
+  /** Race Setup: the LEARNED car's plan library / rollout model. */
+  learnedModel: LearnedModelChoice;
+  onLearnedModel: (m: LearnedModelChoice) => void;
+  /** Whether a trained v2 model is available to select. */
+  canUseV2: boolean;
   isMobile: boolean;
   onLearn: () => void;
   onStart: () => void;
@@ -1558,6 +1623,16 @@ function TopBar({
         )}
       </div>
       {!isMobile && <div style={{ flex: 1 }} />}
+      <RaceSetup
+        trackerMode={trackerMode}
+        onTrackerMode={onTrackerMode}
+        courseVariant={courseVariant}
+        onCourseVariant={onCourseVariant}
+        learnedModel={learnedModel}
+        onLearnedModel={onLearnedModel}
+        canUseV2={canUseV2}
+        isMobile={isMobile}
+      />
       <div
         style={{
           display: 'flex',
@@ -2449,6 +2524,128 @@ function KV({ k, v }: { k: string; v: string | React.ReactNode }) {
     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
       <span style={{ opacity: 0.7 }}>{k}</span>
       <span style={{ color: '#cdeaff' }}>{v}</span>
+    </div>
+  );
+}
+
+/** Race Setup control cluster (top bar). The GUI source of truth for the
+ *  three run-defining choices: which path tracker executes the plan, which
+ *  course layout to race, and which plan library / rollout model the LEARNED
+ *  car drives with. Changing any selector re-mounts the scene (resets the
+ *  race), matching the existing behaviour of the v2-library toggle. URL query
+ *  params only SEED these on first load. */
+function RaceSetup({
+  trackerMode,
+  onTrackerMode,
+  courseVariant,
+  onCourseVariant,
+  learnedModel,
+  onLearnedModel,
+  canUseV2,
+  isMobile,
+}: {
+  trackerMode: TrackerMode;
+  onTrackerMode: (m: TrackerMode) => void;
+  courseVariant: CourseVariant;
+  onCourseVariant: (c: CourseVariant) => void;
+  learnedModel: LearnedModelChoice;
+  onLearnedModel: (m: LearnedModelChoice) => void;
+  canUseV2: boolean;
+  isMobile: boolean;
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: isMobile ? 6 : 10,
+        flexWrap: 'wrap',
+        padding: isMobile ? '4px 0' : '0 4px',
+      }}
+    >
+      <Segmented
+        label="tracker"
+        value={trackerMode}
+        onChange={onTrackerMode}
+        options={[
+          { value: 'pure-pursuit', label: 'Pure-pursuit', title: 'Geometric path tracker — fast, reactive, no dynamics model.' },
+          { value: 'mpc', label: 'MPPI', title: 'Sampling MPC that rolls each car’s OWN forward model in the loop (model fidelity → control quality).' },
+        ]}
+      />
+      <Segmented
+        label="learned car"
+        value={learnedModel}
+        onChange={onLearnedModel}
+        options={[
+          { value: 'kinematic', label: 'Kinematic', title: 'Learned car uses the kinematic-bicycle library (baseline — same as the control car).' },
+          {
+            value: 'v2',
+            label: 'v2 learned',
+            title: canUseV2
+              ? 'Learned car uses the offline-trained v2 library + (under MPPI) the v2 rollout model.'
+              : 'Train or load a v2 model first (Model Lab).',
+            disabled: !canUseV2,
+          },
+        ]}
+      />
+      <Segmented
+        label="course"
+        value={courseVariant}
+        onChange={onCourseVariant}
+        options={[
+          { value: 'open', label: 'Open', title: 'Flat pad — pure dynamics + waypoint chase.' },
+          { value: 'technical', label: 'Technical', title: 'Walled chicane — corner overshoot becomes a physical wall strike.' },
+        ]}
+      />
+    </div>
+  );
+}
+
+/** Compact segmented (radio-group) selector — a labelled row of mutually-
+ *  exclusive pill buttons. Keyboard + pointer accessible via native buttons.
+ */
+function Segmented<T extends string>({
+  label,
+  value,
+  onChange,
+  options,
+}: {
+  label: string;
+  value: T;
+  onChange: (v: T) => void;
+  options: Array<{ value: T; label: string; title?: string; disabled?: boolean }>;
+}) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 5 }} role="group" aria-label={label}>
+      <span style={{ fontSize: 10, opacity: 0.6, textTransform: 'uppercase', letterSpacing: 0.4 }}>{label}</span>
+      <div style={{ display: 'inline-flex', border: '1px solid #223044', borderRadius: 5, overflow: 'hidden' }}>
+        {options.map((opt, i) => {
+          const active = opt.value === value;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => !opt.disabled && !active && onChange(opt.value)}
+              disabled={opt.disabled}
+              title={opt.title}
+              aria-pressed={active}
+              style={{
+                padding: '4px 9px',
+                border: 'none',
+                borderLeft: i > 0 ? '1px solid #223044' : 'none',
+                background: active ? '#55dcff' : 'transparent',
+                color: opt.disabled ? '#4a5364' : active ? '#0a0d14' : '#cdd3de',
+                font: '11px ui-monospace, monospace',
+                fontWeight: active ? 700 : 400,
+                cursor: opt.disabled ? 'not-allowed' : active ? 'default' : 'pointer',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }
