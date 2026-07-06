@@ -511,8 +511,12 @@ export default function RacePrimitives() {
         if (disposed) return;
         // v3 wins if selected (highest fidelity), else v2, else the kinematic
         // baseline (undefined override → the online-refit legacy library).
+        // v3 uses the dispersion-designed generated control set (dense buckets)
+        // — the library that, with analytic-reprice + weighted-A*, actually
+        // laps the technical course at a real-time budget (see the realtime
+        // profile passed to setupScene below).
         const learnedLibraryOverride = v3Active
-          ? buildLearnedRaceLibraryV3(v3Model!)
+          ? buildLearnedRaceLibraryV3(v3Model!, { generatedControls: true })
           : v2Active
             ? buildLearnedRaceLibraryV2(v2Model!)
             : undefined;
@@ -529,7 +533,7 @@ export default function RacePrimitives() {
             setWinner(w);
             setPhase('finished');
           },
-        }, { learnedLibraryOverride, learnedForwardModel, tracker: trackerMode, courseVariant, feedforward });
+        }, { learnedLibraryOverride, learnedForwardModel, tracker: trackerMode, courseVariant, feedforward, v3Realtime: v3Active });
         sceneRef.current = setup;
         cleanup = setup.cleanup;
       } catch (e) {
@@ -969,6 +973,13 @@ interface SceneOptions {
    *  its prior from the plan's own primitive controls instead of re-deriving
    *  them from geometry. Chosen in the Race Setup GUI (top bar). Default off. */
   feedforward?: boolean;
+  /** Real-time v3 profile. When the learned car is v3, enable the config that
+   *  laps the technical course inside a real-time planner budget: the analytic
+   *  drive-through reprice (so gates carry speed) + weighted-A* (w≈2, which
+   *  cuts search expansions ~94% so the reprice-heavier search still finishes
+   *  in ~120 ms). Paired with the generated v3 library above. See
+   *  docs/v3-realtime-performance-plan.md. */
+  v3Realtime?: boolean;
 }
 
 async function setupScene(
@@ -1044,7 +1055,19 @@ async function setupScene(
     syncHold: true,
     offTrackRecovery: 'waypoint',
     course,
-    tuning: { tracker, controlFeedforward: options.feedforward ?? false },
+    tuning: {
+      tracker,
+      controlFeedforward: options.feedforward ?? false,
+      // Real-time v3 profile (core-search optimization, no worker / big budget):
+      // reprice gates as drive-throughs, and run weighted-A* so the search fits
+      // the real-time budget. Measured: v3 laps technical at a 120 ms budget
+      // with these (best lap ~54 s vs ~49.5 s at the 100×-larger pause-clock
+      // budget). Applies to both cars' planning; the kinematic control car is
+      // unaffected in practice (pure-pursuit, short searches).
+      ...(options.v3Realtime
+        ? { analyticDriveThrough: true, plannerWeight: 2 }
+        : {}),
+    },
   });
 
   // ---- Per-car setup ----

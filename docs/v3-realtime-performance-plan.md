@@ -243,6 +243,44 @@ Stop and re-measure between phases; the target is a *reliable* real-time plan
 
 ---
 
+## 6b. Results — core optimization (measured)
+
+Implemented and measured, **core search only** (no worker, no enlarged budget):
+
+**Per-expansion cost cuts** (identical plans, pure speedups):
+- Multi-goal double-heuristic eliminated (the Reeds-Shepp heuristic was
+  recomputed ~2× per successor) + hCache goal-flip thrash fixed + clearance
+  broadphase in the multi-goal env.
+
+**Expansion-COUNT cut — the decisive lever (`plan-weight-sweep.mts`):**
+- Weighted-A* on the technical course: **w=2 → 94% fewer expansions**
+  (91.4k → 5.9k total; the worst-case pose 40.8k → 3.5k) at ≤13% cost. The tail
+  that blew the budget collapses.
+
+**Real-time outcome (`realtime-probe.mts`, headless at a fixed 120 ms budget):**
+- The obstacle-aware grid heuristic was a dud here (<2%, cost-perturbing) —
+  reverted; this course is kinodynamic-cost-dominated.
+- Faster planning on the *hand-picked, no-reprice* library did NOT lap (the
+  library can't thread the tight gates at any budget).
+- On the *generated + reprice* library (the config that laps under pause-clock),
+  weighted-A* makes it fit real time:
+
+  | config | success | laps | best lap | mean | stopped |
+  |---|---|---|---|---|---|
+  | gen+reprice, w=1, 120 ms | 9% | 0 | — | 2.4 | 40 s |
+  | **gen+reprice, w=2, 120 ms** | 70% | **1** | **53.9 s** | 5.6 | 19 s |
+  | gen+reprice, w=2, 500 ms | 56% | 1 | 60.2 s | 6.4 | 9 s |
+
+  **v3 laps the technical course at a 120 ms real-time budget** (best 53.9 s vs
+  49.5 s at the 100×-larger 12 s pause-clock budget) — via core search
+  optimization alone. Wired into the browser: selecting v3 enables the
+  generated library + reprice + weighted-A* (w≈2) real-time profile.
+
+Residual (for the LAST-resort levers, now justified because the core is
+squeezed): success is 70%, not ~95% — the hardest reprice poses still miss the
+120 ms budget occasionally, and the 50 ms MPPI solve competes for the browser
+frame. That is where the worker offload + MPPI trim come in.
+
 ## 7. Risks / guardrails
 
 - **Longer commit window + staler plan** could reintroduce divergence — but this
