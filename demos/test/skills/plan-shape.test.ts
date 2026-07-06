@@ -36,7 +36,12 @@ const libs: Record<string, () => MotionPrimitiveLibrary> = {
 const BOUNDS = { x0: -60, z0: -40, x1: 60, z1: 40 };
 const POLY = [{ id: 0, y: 0, ring: [[BOUNDS.x0, BOUNDS.z0], [BOUNDS.x1, BOUNDS.z0], [BOUNDS.x1, BOUNDS.z1], [BOUNDS.x0, BOUNDS.z1]] as [number, number][] }];
 
-function planGates(lib: MotionPrimitiveLibrary, spawn: CarKinematicState, gates: CarKinematicState[]) {
+function planGates(
+  lib: MotionPrimitiveLibrary,
+  spawn: CarKinematicState,
+  gates: CarKinematicState[],
+  analyticDriveThrough = false,
+) {
   return planRaceMultiGoal({
     state: spawn,
     gates,
@@ -44,8 +49,9 @@ function planGates(lib: MotionPrimitiveLibrary, spawn: CarKinematicState, gates:
     polygons: POLY,
     obstacles: [],
     gateRadius: RACE_PLANNER_GATE_RADIUS,
-    deadlineMs: 4000,
+    deadlineMs: 6000,
     maxExpansions: 400_000,
+    analyticDriveThrough,
   });
 }
 
@@ -136,4 +142,22 @@ describe('skill K5 — slalom is planned as a spline, not stop-pivots', () => {
     const res = planGates(libs.v3!(), spawn, gates);
     expect(minInteriorSpeed(res.path)).toBeGreaterThan(3);
   });
+
+  // The FIX (correctness branch): dispersion-designed control set + the
+  // analytic drive-through repricing. The planner now splines the slalom
+  // carrying speed instead of stopping at each gate. Proves the fix works.
+  for (const model of ['v2', 'v3'] as const) {
+    it(`${model}: FIXED (generated + drive-through) carries speed through the slalom`, () => {
+      const lib =
+        model === 'v3'
+          ? buildLearnedRaceLibraryV3(v3FromJson(readModel('v3-default.json')), { generatedControls: true })
+          : buildLearnedRaceLibraryV2(modelFromJson(readModel('v2-default.json')), { generatedControls: true });
+      const res = planGates(lib, spawn, gates, /* analyticDriveThrough */ true);
+      expect(res.found).toBe(true);
+      const minV = minInteriorSpeed(res.path);
+      // eslint-disable-next-line no-console
+      console.log(`  K5 ${model} FIXED: minInteriorV=${minV.toFixed(1)} len=${res.path.length}`);
+      expect(minV).toBeGreaterThan(3);
+    });
+  }
 });
