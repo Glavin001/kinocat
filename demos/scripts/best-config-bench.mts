@@ -1,8 +1,14 @@
-// Best one-lap stats per model at its optimal control-feedforward setting.
-// Feedforward helps only when the plan is model-faithful, so the winning config
-// is: kinematic OFF, v2 OFF, v3 ON (see plan-vs-plant.mts / feedforward-compare.mts).
-// Runs each single-car on the open course until it completes laps (or a time
-// cap) and prints the full one-lap driving-quality stats.
+// Best one-lap stats per model at ITS OWN best CONFIGURATION (not a fixed
+// tracker). The three models want different control stacks:
+//   - kinematic: the model is delusional, so a model-in-the-loop tracker (MPPI)
+//     over-drives every corner and wedges. Its home is pure-pursuit — geometric,
+//     no model — where it's fast (the main-branch config).
+//   - v2: decent but its MPPI rollout under-predicts accel + is slow; try both
+//     pure-pursuit and MPPI-without-feedforward and keep whichever laps best.
+//   - v3: the accurate model — the whole point is MPPI + control feedforward,
+//     which turns its fidelity into the driven line.
+// Runs each config single-car on the open course to a lap (or a time cap) and
+// prints the full one-lap driving-quality stats + a winner-per-model summary.
 //
 // usage: KINOCAT_GEN_CONTROLS=1 KINOCAT_ANALYTIC_DT=1 npx tsx scripts/best-config-bench.mts [secsCap] [budgetMs]
 import { readFileSync } from 'node:fs';
@@ -24,23 +30,30 @@ const budgetMs = Number(process.argv[3] ?? 12000);
 const dt = process.env.KINOCAT_ANALYTIC_DT === '1';
 const sp = process.env.KINOCAT_SPEED_PROFILE === '1';
 
-// (label, entry factory, feedforward) — each model at its BEST feedforward.
-const CONFIGS = [
-  { label: 'kinematic (FF off)', mk: () => kinematicEntry('kin'), ff: false },
-  { label: 'v2 learned (FF off)', mk: () => v2Entry('v2', modelFromJson(readModel('v2-default.json'))), ff: false },
-  { label: 'v3 learned (FF on)', mk: () => v3Entry('v3', v3FromJson(readModel('v3-default.json'))), ff: true },
-] as const;
+type Tracker = 'pure-pursuit' | 'mpc';
+// (model, label, entry factory, tracker, feedforward). Multiple candidate
+// configs per model where the best isn't obvious (v2); the summary picks the
+// fastest per model.
+const CONFIGS: { model: string; label: string; mk: () => ReturnType<typeof kinematicEntry>; tracker: Tracker; ff: boolean }[] = [
+  { model: 'kinematic', label: 'kinematic · pure-pursuit', mk: () => kinematicEntry('kin'), tracker: 'pure-pursuit', ff: false },
+  { model: 'v2', label: 'v2 · pure-pursuit', mk: () => v2Entry('v2', modelFromJson(readModel('v2-default.json'))), tracker: 'pure-pursuit', ff: false },
+  { model: 'v2', label: 'v2 · MPPI (no FF)', mk: () => v2Entry('v2', modelFromJson(readModel('v2-default.json'))), tracker: 'mpc', ff: false },
+  { model: 'v3', label: 'v3 · MPPI + feedforward', mk: () => v3Entry('v3', v3FromJson(readModel('v3-default.json'))), tracker: 'mpc', ff: true },
+];
+
+interface Result { model: string; label: string; laps: number; best: number; meanSpeed: number; predErr: number }
+const results: Result[] = [];
 
 for (const cfg of CONFIGS) {
   const tuning: Partial<RaceTuning> = {
-    plannerBudgetMs: budgetMs, tracker: 'mpc',
+    plannerBudgetMs: budgetMs, tracker: cfg.tracker,
     analyticDriveThrough: dt, enableSpeedProfile: sp, controlFeedforward: cfg.ff,
   };
   const scenario = await createRaceScenario({
     entries: [cfg.mk()], targetLaps: 3, syncHold: false, course: buildRaceCourse('open'), tuning,
   });
   const wall0 = performance.now();
-  log(`\n[${cfg.label}] running (cap ${secsCap}s sim, budget ${budgetMs}ms)…`);
+  log(`\n[${cfg.label}] running (${cfg.tracker}${cfg.ff ? ' +FF' : ''}, cap ${secsCap}s sim, budget ${budgetMs}ms)…`);
   let nextBeat = 15;
   // Stop once the target laps are in, or the time cap hits. Target 1 lap keeps
   // wall time tractable at the generous budget; the launch is part of it (same
@@ -61,6 +74,7 @@ for (const cfg of CONFIGS) {
   const lapDurs = s.laps.map((l) => l.duration);
   const best = lapDurs.length ? Math.min(...lapDurs) : 0;
   scenario.dispose();
+  results.push({ model: cfg.model, label: cfg.label, laps: s.laps.length, best, meanSpeed: q.meanSpeed, predErr: s.diagnostics.predErrorRms });
   log(`\n=== ${cfg.label} — open course, ${budgetMs}ms budget${dt ? ', reprice' : ''}${sp ? ', speedprofile' : ''} ===`);
   log(`  laps completed      ${s.laps.length}   (sim ${secsCap}s cap, wall ${wall.toFixed(0)}s)`);
   log(`  best lap            ${best ? best.toFixed(2) + ' s' : '— (no full lap)'}`);
@@ -76,4 +90,19 @@ for (const cfg of CONFIGS) {
   log(`  MPPI solve ms/tick  ${s.diagnostics.mpcSolveMsAvg.toFixed(1)}`);
 }
 
+// Winner per model (fastest completed lap; a config with no full lap loses to
+// any that lapped).
+log(`\n======== BEST CONFIG PER MODEL (open course) ========`);
+const rank = (r: Result) => (r.laps > 0 && r.best > 0 ? r.best : Infinity);
+for (const model of ['kinematic', 'v2', 'v3']) {
+  const cands = results.filter((r) => r.model === model).sort((a, b) => rank(a) - rank(b));
+  if (!cands.length) continue;
+  const win = cands[0]!;
+  const bestStr = rank(win) === Infinity ? 'no clean lap' : `${win.best.toFixed(2)}s best lap`;
+  log(`  ${model.padEnd(10)} → ${win.label.padEnd(26)} ${bestStr}  (mean ${win.meanSpeed.toFixed(1)} m/s, predErr ${win.predErr.toFixed(2)} m)`);
+  for (const alt of cands.slice(1)) {
+    const altStr = rank(alt) === Infinity ? 'no clean lap' : `${alt.best.toFixed(2)}s`;
+    log(`             alt: ${alt.label.padEnd(26)} ${altStr}`);
+  }
+}
 log(`\nDone. Full log: ${logPath}`);
