@@ -96,6 +96,65 @@ shunts, and the gear-flip prior reseed makes shunts actually execute
    and unit-guarded; the remaining half is the **entry**: arriving hot at an
    infeasible kink at all.
 
+## Artificial-constraint audit (nothing may cap the planner but physics)
+
+The principle (max-pace-roadmap §0d): remove artificial constraints; provide
+capability + accuracy + incentive; the model + time cost decide everything.
+Within the MPPI horizon the model rollout IS the physics — cost caps are only
+legitimate as *beyond-horizon anticipation*, and then must be derived from the
+**measured** plant envelope, never hand-set. Audit of every constant that can
+bind, against `demos/public/models/plant-envelope.json`:
+
+| Constant | Where | Value | Measured plant | Verdict |
+|---|---|---|---|---|
+| `envelopeDecel` | MPPI cost backward pass (`mpc-tracker.ts` `allowedSpeedAt`; wired from `SPEED_PROFILE_DECEL` at `race-scenario.ts:1169`) | **8** | brake decel **15.7–52.9** m/s² | **ARTIFICIAL, 2–6× timid** — braking-onset penalty starts ~3× further from every corner than physics requires; the single biggest inappropriate limiter found. Fix: derive from measured brake curve with a named margin (K10). |
+| `envelopeLateralAccel` | MPPI cost corner cap (wired from `previewLateralAccel` at `:1170`) | 12 | sustained **13.698** | mildly conservative (−7% corner speed); re-derive from envelope (K2). |
+| `vAllow` model-agnosticism | MPPI cost | geometric | — | the cap is identical for every model, so the honest model gets no credit for knowing its true limit. Long-term: within-horizon pricing belongs to the model; the cap covers only beyond-horizon corners. |
+| `cruiseSpeed` | MPPI `speedCap` | 30 | vMax **97** | POLICY cap (documented as such) — keep, but keep explicit. |
+| curvature action space | `raceControlSets` (`race-primitives-scenarios.ts:282`) | 3 levels: 0, R=9, R=4.5 | — | **GRANULARITY GAP**: no native medium-radius (R≈15–35) arc, no explicit trail-brake control; sweepers are zigzag-approximated then smoothed. Candidate: add κ/4 arcs + brake-in-turn controls, measure plan-shape + search-cost delta. |
+| `RACE_START_SPEEDS` 4 m/s buckets + zero-slip seams | `library.ts` nearest-bucket, `vehicle-environment.ts:352` | ≤2 m/s snap error | — | known WS-2 gap; root dynamic rollouts landed but OFF. Acceptable short-term; revisit after K-suite. |
+| 0.55 s chunk | `characterize` duration | one control/chunk | — | in-plan switch granularity ~0.55 s; replans (300 ms) + MPPI (50 ms) refine timing; interruptible primitives (roadmap A2.7) is the queued fix. |
+| `minTurnRadius` | `RACE_AGENT` = 4.5 | — | executed min radius **10.1** at ≥8 m/s | the kinematic library offers geometry the plant can't execute at pace (part of the intended delusion for kin; honest libs bake real arcs per bucket). |
+| `reverseCostMultiplier=3×`, `directionChangePenalty=1.0 s` | `vehicle-environment.ts:360` | flat | true cost = real decel+leg time | **hand-set compensation for the kinematic teleport**; for honest models it distorts (their reverses already pay true time via chained braking samples). Candidate: per-library values — honest libs closer to 1×, keep 3× only for kin (K6 decides with data). |
+| kinematic `speed = target` teleport | `vehicle.ts:38` | — | — | the intended "delusion" baseline — keep, document. |
+
+### Temporal resolution: is 0.55 s per primitive too coarse?
+
+Shrinking the chunk uniformly to ~0.1 s is the wrong lever, for measured and
+architectural reasons — but the *precision instinct* behind it is right and
+has two cheaper answers:
+
+- **Search cost**: a 2-gate horizon is ~5–10 s of driving. At 0.55 s that is
+  10–18 edges deep; at 0.1 s it is 50–100 deep — branching^depth blows past
+  any expansion budget, and each endpoint moves so little (0.5 m at 5 m/s)
+  that it falls below the dedup grid (`posCell=1.5 m`) and the states collapse.
+- **Distinguishability (measured)**: at 4 m/s the 0.55 s endpoint fan was
+  ALREADY at the usability floor (hull 0.19 m² < 0.5 m²,
+  `race-primitives-scenarios.ts:403-404`). Shorter chunks make the planner's
+  choices *indistinguishable*, not more precise.
+- **Industry practice** (state-lattice AVs — Pivtoraiko/Kelly, CMU Boss,
+  Apollo/Autoware; racing — AutoRally/Williams MPPI, TUM Indy): the search
+  layer decides *maneuver topology* at coarse resolution (0.5–2 s edges or
+  fixed-arc-length stations, replanned ~3–10 Hz); a smoothing/optimization
+  pass produces the fine trajectory; an MPC/MPPI layer at 20–60 Hz
+  (0.02–0.05 s controls, 1–3 s horizon) owns exact brake-point timing. Chunks
+  quantize the planner's *intent*, never when the pedals move. This codebase
+  already has exactly that hierarchy (0.55 s lattice → smoother → 300 ms
+  replans → 50 ms MPPI solves — max-pace-roadmap §0c).
+
+The two cheap precision levers if plan-level timing proves binding:
+1. **Interruptible primitives** (roadmap A2.7): primitives already record 6
+   substep samples ~0.09 s apart (`characterize.ts:63-66`); allowing early
+   termination at substep boundaries — root node first — gives **~0.09 s
+   in-plan switch granularity** (the 0.1 s instinct) at zero extra rollout
+   cost and bounded branching.
+2. **Fixed arc-length primitives** (candidate experiment): 0.55 s spans 16.5 m
+   at 30 m/s but 2.2 m at 4 m/s — spatially wildly uneven. Baking primitives
+   to constant *length* (~5 m) instead of constant time gives uniform spatial
+   resolution (~0.17 s chunks at speed, ~1.2 s when slow, where the fan floor
+   needs it anyway). Requires re-baking libraries + duration-per-primitive in
+   the cost (already supported — cost reads `prim.duration`).
+
 ## Layer taxonomy (what each test attributes a failure to)
 
 - **L0 — plant/model ground truth.** What the real Rapier plant can physically
@@ -131,6 +190,7 @@ layer(s) + test tier + measured current state + fix hypothesis.
 | **K7** | **Waypoint-advance stability** — cross a gate so the 2-gate lookahead shifts | `planChurnMean` bounded (< ~2 m); no stop/overcorrection at the shift | L3 | capped closed-loop, assert churn + no-stop | churn 1.28–1.48 m at advance, tolerated (kin churns MORE and is clean) | only if churn ever induces a stop: reference-path hysteresis / commit window at the advance |
 | **K8** | **Plan feasibility invariant** — any committed honest-model plan | Consecutive samples obey `|Δv| ≤ maxDecel·Δt` and curvature ≤ 1/minRadius at that speed | L1 | plan-only unit (cross-cutting) | honest libs ~ok; kinematic **violates by design** | assert on v2/v3 plans; this is the "is the spline physically real" gate for every other skill |
 | **K9** | **Reverse-shunt commit (wedge ESCAPE)** — wedged pose, plan is a short reverse leg | Tracker actually backs up (not brake-in-place); recovery does not interrupt | L2 | executor-unit | **fixed + guarded this session** (`core/test/execute/mpc-tracker.test.ts:88-128`; recoveries 13→5) | done — keep the guard |
+| **K10** | **Late braking** — long straight into a genuine tight corner | Full speed until the *measured-envelope* brake point: braking onset distance ≈ (v²−vc²)/(2·aBrake_measured·margin), NOT the timid `envelopeDecel=8` distance (~3× too early) | L2, L0 | `buildProgressGeometry` unit (vAllow profile shape) + capped closed-loop (brake-onset distance) | **fails** — the audit's #1 artificial limiter | derive `envelopeDecel` from the measured brake curve (15.7–52.9 m/s²) with a named margin; assert onset distance in both tiers |
 
 ## The fast test harness (what to build, reusing existing blocks)
 
@@ -194,13 +254,19 @@ New `demos/test/skills/` suite (fast tier) + one shared helper
    so committed plans stop carrying infeasible kinks; executor side: sweep
    `corridorHalfWidth` (1.2–1.5 proven for kin) and gate-kink allowed-speed
    margin. Gate every change on the K4/K5 tests + K8 feasibility.
-3. **K3 — kill phantom-curvature approach throttling** (second lever: it taxes
-   every gate approach ~51 m out). The unit test must separate real corner
-   caps (correct!) from chord-noise phantoms (bug).
-4. **K2 — pin the envelope gap** (small: 12 vs 13.7 measured); raise with
-   margin only if the K2 test shows it binding.
-5. **K7 — only if** advance-churn ever induces a stop; the metric is live.
-6. **Integration gates, in order:**
+3. **K10 — late braking** (second lever, and cheap): derive `envelopeDecel`
+   from the measured brake curve instead of the timid 8 — this alone moves
+   every brake point ~3× closer to the corner. One constant + named margin,
+   gated by the K10 onset-distance test.
+4. **K3 — kill phantom-curvature approach throttling** (it taxes every gate
+   approach tens of metres out). The unit test must separate real corner caps
+   (correct!) from chord-noise phantoms (bug).
+5. **K2 — pin the lateral-envelope gap** (small: 12 vs 13.7 measured); raise
+   with margin only if the K2 test shows it binding. Action-space granularity
+   (add κ/4 arcs / trail-brake controls) is a follow-on experiment gated on
+   K5 plan-shape results, not a default change.
+6. **K7 — only if** advance-churn ever induces a stop; the metric is live.
+7. **Integration gates, in order:**
    a. kin under MPPI ≥ kin under pure-pursuit on the open course (MPPI stops
       leaving pace on the table);
    b. v2/v3 clean (0 recov, <2 s stopped) on open;
