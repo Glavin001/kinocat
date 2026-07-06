@@ -32,8 +32,8 @@ const entry = which === 'v3' ? v3Entry('v3', v3FromJson(readModel('v3-default.js
 const g = (x: number, z: number): CarKinematicState => ({ x, z, heading: 0, speed: 5, t: 0 });
 const waypoints = process.env.KINOCAT_CORNER === 'single'
   ? [g(0, 0), g(55, 0), g(72, -14), g(66, -34), g(45, -42)]
-  : [g(0, 0), g(48, 0), g(60, 7), g(74, -7), g(88, 7), g(102, -7), g(116, 3)];
-const bounds = { x0: -20, z0: -60, x1: 130, z1: 25 };
+  : [g(0, 0), g(45, 0), g(63, 6), g(85, -6), g(107, 6), g(129, -6), g(150, 2)];
+const bounds = { x0: -20, z0: -60, x1: 165, z1: 25 };
 const course = {
   bounds,
   polygons: [{ id: 0, y: 0, ring: [[bounds.x0, bounds.z0], [bounds.x1, bounds.z0], [bounds.x1, bounds.z1], [bounds.x0, bounds.z1]] as [number, number][] }],
