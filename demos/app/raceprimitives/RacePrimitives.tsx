@@ -1110,14 +1110,19 @@ async function setupScene(
     while (car.planAnnotations.children.length > 0) {
       car.planAnnotations.remove(car.planAnnotations.children[0]!);
     }
-    if (status.plan && status.plan.length >= 2) {
+    // Prefer the dense true-arc `vizPlan` (sweep-expanded from the planner
+    // nodes) for the rendered spline — it hugs where the car actually travels
+    // through each primitive. Falls back to the tracked `plan` if absent.
+    const drawPlan = status.vizPlan ?? status.plan;
+    const drawPlanStart = status.vizPlan ? status.vizPlanStartSimTime : status.planStartSimTime;
+    if (drawPlan && drawPlan.length >= 2) {
       if (car.pathLine) {
         car.scene.remove(car.pathLine);
         car.pathLine.geometry.dispose();
         (car.pathLine.material as THREE.Material).dispose();
       }
-      const elapsed = Math.max(0, scenario.simTime() - status.planStartSimTime);
-      const tail = trimPlan(status.plan, elapsed);
+      const elapsed = Math.max(0, scenario.simTime() - drawPlanStart);
+      const tail = trimPlan(drawPlan, elapsed);
       // Build a vertex-colored line: speed → blue (slow) → green → red (fast).
       // Reverse segments are shown in magenta instead.
       const positions: number[] = [after.x, 0.4, after.z];

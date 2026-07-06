@@ -541,6 +541,12 @@ export interface RaceCarStatus {
    *  feedforward, dynamic-state slots, and single-gear segment/cusp
    *  structure — for the debug overlay and future controllers. */
   richPlan: Plan | null;
+  /** VISUALIZATION-ONLY dense true-arc plan path (sweep-expanded from the
+   *  planner nodes). Not tracked — renderers prefer this over `plan` for a
+   *  more precise spline; the tracker never sees it. Null until first plan. */
+  vizPlan: CarKinematicState[] | null;
+  /** Sim time at which `vizPlan` was computed (for elapsed-time trimming). */
+  vizPlanStartSimTime: number;
   /** Sim time at which the current plan was committed. */
   planStartSimTime: number;
   /** Most recent predicted state at the first primitive's boundary. */
@@ -676,6 +682,16 @@ interface CarInternal {
    * plan commits.
    */
   richPlan: Plan | null;
+  /**
+   * VISUALIZATION-ONLY dense plan path: the planner's node sequence expanded
+   * into per-primitive swept-arc poses (`expandPlanSweeps`), so the rendered
+   * spline hugs where the car actually travels through each primitive rather
+   * than a straight chord between sparse endpoints. NOT tracked — pure-pursuit
+   * / MPPI follow `plan`/`segments` exactly as before, so this never changes
+   * closed-loop behaviour. Null until the first plan commits.
+   */
+  vizPlan: CarKinematicState[] | null;
+  vizPlanStartSimTime: number;
   activeSegIdx: number;
   /** Sim time of the chassis state when the active segment was
    *  entered — used to gate the "segment done, advance" check on
@@ -858,6 +874,8 @@ export async function createRaceScenario(
       pendingPlanStartSimTime: 0,
       segments: [],
       richPlan: null,
+      vizPlan: null,
+      vizPlanStartSimTime: 0,
       activeSegIdx: 0,
       activeSegStartSimTime: 0,
       predictedEnd: null,
@@ -1067,20 +1085,13 @@ export async function createRaceScenario(
       // analytic shot there may include a reverse sub-segment that the
       // forward-only race controller can't execute — collapsing it to the
       // straight chord (res.path) is what keeps racing flowing.
-      // Race (non-parking): expand each motion-primitive edge into its true
-      // swept-arc poses BEFORE smoothing, so the reference hugs where the car
-      // actually travels through the primitive rather than a straight chord
-      // between sparse endpoints. Parking keeps `liftAnalyticPath`, which
-      // expands the Reeds-Shepp analytic shot's stored `poses`.
       const liftedPath = isParking
         ? liftAnalyticPath(
             res,
             (c.entry.agent ?? RACE_AGENT).maxSpeed,
             (c.entry.agent ?? RACE_AGENT).maxReverseSpeed ?? (c.entry.agent ?? RACE_AGENT).maxSpeed,
           )
-        : res.nodes && res.nodes.length > 1
-          ? expandPlanSweeps(res.nodes, c.entry.lib.primitives)
-          : res.path;
+        : res.path;
       let smoothed = liftedPath;
       const kRaw = tuning.enableSpeedProfile ? curvaturePerSample(liftedPath) : null;
       if (tuning.enableTrajectorySmoother) {
@@ -1106,6 +1117,14 @@ export async function createRaceScenario(
       }
       c.diagnostics.successfulReplans += 1;
       c.diagnostics.consecutiveFailedReplans = 0;
+      // Visualization-only: dense true-arc path expanded from the planner's
+      // node sequence. Refreshed on every successful replan, independent of
+      // the tracked plan's commit window — it never feeds the tracker, so it
+      // cannot change closed-loop behaviour.
+      c.vizPlan = res.nodes && res.nodes.length > 1
+        ? expandPlanSweeps(res.nodes, c.entry.lib.primitives)
+        : smoothed;
+      c.vizPlanStartSimTime = planStartSimTime;
       if (commitWindowSec > 0 && c.plan && c.plan.length > 1) {
         // Promote later — keep the current plan active through the
         // commit window. `stepOne` will swap when simTime crosses
@@ -1544,6 +1563,8 @@ export async function createRaceScenario(
       metrics: c.metrics,
       plan: c.plan,
       richPlan: c.richPlan,
+      vizPlan: c.vizPlan,
+      vizPlanStartSimTime: c.vizPlanStartSimTime,
       planStartSimTime: c.planStartSimTime,
       predictedEnd: c.predictedEnd,
       lastAdvanceSimTime: c.lastMoveSimTime,
@@ -1572,6 +1593,8 @@ export async function createRaceScenario(
       c.planStartSimTime = 0;
       c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
       c.richPlan = null;
+      c.vizPlan = null;
+      c.vizPlanStartSimTime = 0;
       c.pendingPlanStartSimTime = 0;
       c.predictedEnd = null;
       c.predErrSumSq = 0;
@@ -1603,6 +1626,7 @@ export async function createRaceScenario(
           c.plan = null;
           c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
           c.richPlan = null;
+          c.vizPlan = null;
         }
         // Force an immediate replan so neither car coasts on a stale plan.
         for (const c of cars) replanCar(c);
