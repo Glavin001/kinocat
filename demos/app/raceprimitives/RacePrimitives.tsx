@@ -312,6 +312,8 @@ export default function RacePrimitives() {
     learned: EvalSnapshot | null;
   }>({ kinematic: null, learned: null });
   const [winner, setWinner] = useState<'kinematic' | 'learned' | 'tie' | null>(null);
+  // Model Lab drawer open/close (launched from the toolbar).
+  const [modelLabOpen, setModelLabOpen] = useState(false);
   // Race Setup (GUI-primary). Executor + course seed from the URL on mount
   // (so `?tracker=mpc&course=technical` deep-links still work) but the GUI
   // selectors in the top bar are the source of truth thereafter; changing
@@ -669,6 +671,7 @@ export default function RacePrimitives() {
         onReset={resetRace}
         onClearCache={clearCache}
         onExportDebug={onExportDebug}
+        onOpenModelLab={() => setModelLabOpen(true)}
         debugExportedAt={debugExportedAt}
       />
       <div style={{ flex: 1, position: 'relative' }}>
@@ -718,6 +721,8 @@ export default function RacePrimitives() {
           <PretrainOverlay progress={learnProgress} />
         )}
         <ModelLab
+          open={modelLabOpen}
+          onOpenChange={setModelLabOpen}
           onTrained={onV2Trained}
           loadedMeta={v2Meta}
           onClearLoaded={v2Meta ? onV2Clear : undefined}
@@ -1553,6 +1558,7 @@ function TopBar({
   onReset,
   onClearCache,
   onExportDebug,
+  onOpenModelLab,
   debugExportedAt,
 }: {
   phase: Phase;
@@ -1590,120 +1596,166 @@ function TopBar({
   /** Generate + download + clipboard-copy a Markdown debug report of
    *  the live page state (model, race, libraries, planner config). */
   onExportDebug: () => void;
+  /** Open the Model Lab drawer (train / load / inspect the v2 model). */
+  onOpenModelLab: () => void;
   /** ms-since-epoch the last export fired — used to show a brief
    *  "copied + downloaded" confirmation. */
   debugExportedAt: number;
 }) {
   const justExported = debugExportedAt > 0 && Date.now() - debugExportedAt < 3000;
-  // Subtitle no longer repeats the tracker — the Race Setup selector shows it
-  // explicitly, so duplicating it here only crowded the bar.
   const subtitle = v2Active
     ? 'kinematic vs offline-trained v2 · online refit off'
     : 'kinematic vs online-learning · learned car refits each lap';
-  const racingStatus = isMobile ? 'racing' : 'racing…';
-  // Two-row header: brand + status/actions on top, Race Setup selectors on a
-  // dedicated row below. Previously everything shared one row and overflowed
-  // (title + long subtitle + 3 selectors + 5 buttons), pushing the action
-  // buttons off the right edge.
+  // Compact one-glance summary of the current setup, shown on the Setup
+  // dropdown trigger so the config is visible without opening it.
+  const setupSummary = [
+    trackerMode === 'mpc' ? 'MPPI' : 'PP',
+    learnedModel === 'v2' ? 'v2' : 'kin',
+    courseVariant === 'technical' ? 'Tech' : 'Open',
+  ].join(' · ');
+
+  // Single-row toolbar. Everything that used to overflow now lives behind two
+  // dropdowns (Setup + overflow ⋯) and a Model Lab launcher, so the header is
+  // one line at every width. On narrow screens the brand + subtitle collapse
+  // and an overflowX guard keeps it usable.
   return (
     <div
       style={{
         display: 'flex',
-        flexDirection: 'column',
-        gap: isMobile ? 8 : 10,
-        padding: isMobile ? '8px 10px' : '10px 14px',
+        alignItems: 'center',
+        gap: 8,
+        padding: isMobile ? '6px 8px' : '8px 14px',
         borderBottom: '1px solid #1f2735',
         background: '#0d1119',
+        // No overflow clip here: a scroll container (overflow-x:auto forces
+        // overflow-y:auto too) would clip the Setup / overflow dropdown panels
+        // that drop BELOW the bar. The compact dropdown design keeps the row
+        // within ~360px, so clipping is unnecessary.
       }}
     >
-      {/* Row 1 — brand + subtitle (left), status + action buttons (right). */}
-      <div
-        style={{
-          display: 'flex',
-          flexDirection: isMobile ? 'column' : 'row',
-          alignItems: isMobile ? 'stretch' : 'center',
-          gap: isMobile ? 8 : 12,
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0 }}>
-          <div style={{ color: '#7fd6ff', fontWeight: 700, whiteSpace: 'nowrap' }}>race the primitives</div>
-          {!isMobile && (
-            <div style={{ opacity: 0.6, fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-              {subtitle}
-            </div>
-          )}
-        </div>
-        {!isMobile && <div style={{ flex: 1 }} />}
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            flexWrap: 'wrap',
-            minWidth: 0,
-          }}
-        >
-          {phase === 'loading' && <Status>loading…</Status>}
-          {phase === 'learning' && (
-            <Status>
-              {isMobile
-                ? `pre-training ${learnProgress.done}/${learnProgress.total || '?'}`
-                : `pre-training… collecting trials ${learnProgress.done}/${learnProgress.total || '?'}`}
-            </Status>
-          )}
-          {phase === 'ready' && params && (
-            <>
-              <Status>ready{v2Active ? ' · v2' : ''}</Status>
-              <Btn onClick={onStart}>start race</Btn>
-              <Btn onClick={onLearn} secondary>pre-train</Btn>
-              <Btn onClick={onReset} secondary>reset</Btn>
-              <Btn onClick={onClearCache} secondary>clear</Btn>
-            </>
-          )}
-          {phase === 'racing' && (
-            <>
-              <Status>{racingStatus}</Status>
-              <Btn onClick={onStop}>stop</Btn>
-            </>
-          )}
-          {phase === 'finished' && (
-            <>
-              <Status>stopped{v2Active ? ' · v2' : ''}</Status>
-              <Btn onClick={onStart}>race again</Btn>
-              <Btn onClick={onReset} secondary>reset</Btn>
-            </>
-          )}
-          {error && <Status warning>err: {error}</Status>}
-          {/* Export-debug button — always present so diagnosis works in
-              every phase. Shows a brief "copied · saved" confirmation. */}
-          <Btn onClick={onExportDebug} secondary title="Generate Markdown debug report — copied to clipboard and downloaded as .md">
-            {justExported ? '✓ copied · saved' : '🐛 export debug'}
-          </Btn>
-        </div>
+      <div style={{ color: '#7fd6ff', fontWeight: 700, whiteSpace: 'nowrap' }}>
+        {isMobile ? 'race' : 'race the primitives'}
       </div>
+      {!isMobile && (
+        <div style={{ opacity: 0.5, fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 300, flexShrink: 1 }}>
+          {subtitle}
+        </div>
+      )}
 
-      {/* Row 2 — Race Setup selectors on their own line so they never fight
-          the action buttons for horizontal space. */}
-      <div
-        style={{
-          display: 'flex',
-          borderTop: '1px solid #161d2b',
-          paddingTop: isMobile ? 8 : 8,
-          overflowX: isMobile ? 'auto' : 'visible',
-        }}
+      {/* Setup dropdown — the three run-defining selectors. */}
+      <Popover
+        align="left"
+        triggerTitle="Race setup — tracker, learned-car model, course"
+        triggerLabel={
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <span aria-hidden>⚙</span>
+            {!isMobile && <span>Setup</span>}
+            <span style={{ opacity: 0.7, color: '#7fd6ff' }}>{setupSummary}</span>
+          </span>
+        }
       >
-        <RaceSetup
-          trackerMode={trackerMode}
-          onTrackerMode={onTrackerMode}
-          courseVariant={courseVariant}
-          onCourseVariant={onCourseVariant}
-          learnedModel={learnedModel}
-          onLearnedModel={onLearnedModel}
-          canUseV2={canUseV2}
-          isMobile={isMobile}
-        />
-      </div>
+        {() => (
+          <RaceSetup
+            trackerMode={trackerMode}
+            onTrackerMode={onTrackerMode}
+            courseVariant={courseVariant}
+            onCourseVariant={onCourseVariant}
+            learnedModel={learnedModel}
+            onLearnedModel={onLearnedModel}
+            canUseV2={canUseV2}
+          />
+        )}
+      </Popover>
+
+      <div style={{ flex: 1, minWidth: 8 }} />
+
+      {/* Phase status + the single primary action for the current phase. */}
+      {phase === 'loading' && <Status>loading…</Status>}
+      {phase === 'learning' && (
+        <Status>
+          {isMobile
+            ? `pre-train ${learnProgress.done}/${learnProgress.total || '?'}`
+            : `pre-training… ${learnProgress.done}/${learnProgress.total || '?'}`}
+        </Status>
+      )}
+      {phase === 'ready' && params && (
+        <>
+          {!isMobile && <Status>ready{v2Active ? ' · v2' : ''}</Status>}
+          <Btn onClick={onStart}>start race</Btn>
+        </>
+      )}
+      {phase === 'racing' && (
+        <>
+          {!isMobile && <Status>racing…</Status>}
+          <Btn onClick={onStop}>stop</Btn>
+        </>
+      )}
+      {phase === 'finished' && (
+        <>
+          {!isMobile && <Status>stopped{v2Active ? ' · v2' : ''}</Status>}
+          <Btn onClick={onStart}>{isMobile ? 'race' : 'race again'}</Btn>
+        </>
+      )}
+      {error && <Status warning>err</Status>}
+
+      {/* Model Lab launcher — opens the drawer (train / load / inspect the v2
+          model). Replaces the old floating top-right panel that overlapped
+          the LEARNED metrics. */}
+      <Btn onClick={onOpenModelLab} secondary title="Open Model Lab — train, load, or inspect the v2 model">
+        {isMobile ? 'Lab' : 'Model Lab'}
+        {canUseV2 && <span style={{ marginLeft: 6, color: '#55dcff' }}>●</span>}
+      </Btn>
+
+      {/* Overflow menu — secondary actions that don't need to be one click. */}
+      <Popover align="right" triggerLabel={<span aria-hidden style={{ fontSize: 16, lineHeight: 1 }}>⋯</span>} triggerTitle="More actions">
+        {(close) => (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 170 }}>
+            <MenuItem onClick={() => { onLearn(); close(); }} disabled={phase === 'learning'}>Pre-train v2…</MenuItem>
+            <MenuItem onClick={() => { onReset(); close(); }}>Reset race</MenuItem>
+            <MenuItem onClick={() => { onClearCache(); close(); }}>Clear cached model</MenuItem>
+            <div style={{ height: 1, background: '#223044', margin: '2px 0' }} />
+            <MenuItem onClick={() => { onExportDebug(); close(); }}>
+              {justExported ? '✓ copied · saved' : '🐛 Export debug report'}
+            </MenuItem>
+          </div>
+        )}
+      </Popover>
     </div>
+  );
+}
+
+/** A full-width row button used inside the overflow / setup popovers. */
+function MenuItem({
+  children,
+  onClick,
+  disabled,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        textAlign: 'left',
+        padding: '7px 10px',
+        background: 'transparent',
+        border: 'none',
+        borderRadius: 4,
+        color: disabled ? '#4a5364' : '#cdd3de',
+        font: '12px ui-monospace, monospace',
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        whiteSpace: 'nowrap',
+      }}
+      onMouseEnter={(e) => { if (!disabled) e.currentTarget.style.background = '#1b2740'; }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -2550,12 +2602,12 @@ function KV({ k, v }: { k: string; v: string | React.ReactNode }) {
   );
 }
 
-/** Race Setup control cluster (top bar). The GUI source of truth for the
- *  three run-defining choices: which path tracker executes the plan, which
- *  course layout to race, and which plan library / rollout model the LEARNED
- *  car drives with. Changing any selector re-mounts the scene (resets the
- *  race), matching the existing behaviour of the v2-library toggle. URL query
- *  params only SEED these on first load. */
+/** Race Setup selectors, laid out vertically for the top-bar "Setup"
+ *  dropdown. The GUI source of truth for the three run-defining choices:
+ *  which path tracker executes the plan, which plan library / rollout model
+ *  the LEARNED car drives with, and which course layout to race. Changing any
+ *  selector re-mounts the scene (resets the race), matching the v2-library
+ *  toggle. URL query params only SEED these on first load. */
 function RaceSetup({
   trackerMode,
   onTrackerMode,
@@ -2564,7 +2616,6 @@ function RaceSetup({
   learnedModel,
   onLearnedModel,
   canUseV2,
-  isMobile,
 }: {
   trackerMode: TrackerMode;
   onTrackerMode: (m: TrackerMode) => void;
@@ -2573,22 +2624,9 @@ function RaceSetup({
   learnedModel: LearnedModelChoice;
   onLearnedModel: (m: LearnedModelChoice) => void;
   canUseV2: boolean;
-  isMobile: boolean;
 }) {
   return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: isMobile ? 10 : 18,
-        flexWrap: 'wrap',
-      }}
-    >
-      {!isMobile && (
-        <span style={{ fontSize: 10, opacity: 0.45, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 1 }}>
-          setup
-        </span>
-      )}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, minWidth: 210 }}>
       <Segmented
         label="tracker"
         value={trackerMode}
@@ -2599,7 +2637,7 @@ function RaceSetup({
         ]}
       />
       <Segmented
-        label="learned car"
+        label="learned car model"
         value={learnedModel}
         onChange={onLearnedModel}
         options={[
@@ -2623,13 +2661,16 @@ function RaceSetup({
           { value: 'technical', label: 'Technical', title: 'Walled chicane — corner overshoot becomes a physical wall strike.' },
         ]}
       />
+      <div style={{ fontSize: 10, opacity: 0.5, lineHeight: 1.4 }}>
+        Changing a setting restarts the race.
+      </div>
     </div>
   );
 }
 
-/** Compact segmented (radio-group) selector — a labelled row of mutually-
- *  exclusive pill buttons. Keyboard + pointer accessible via native buttons.
- */
+/** Compact segmented (radio-group) selector — a label above a row of
+ *  mutually-exclusive pill buttons. Keyboard + pointer accessible via native
+ *  buttons; fills its container so it reads cleanly inside a dropdown. */
 function Segmented<T extends string>({
   label,
   value,
@@ -2642,9 +2683,9 @@ function Segmented<T extends string>({
   options: Array<{ value: T; label: string; title?: string; disabled?: boolean }>;
 }) {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 5 }} role="group" aria-label={label}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }} role="group" aria-label={label}>
       <span style={{ fontSize: 10, opacity: 0.6, textTransform: 'uppercase', letterSpacing: 0.4 }}>{label}</span>
-      <div style={{ display: 'inline-flex', border: '1px solid #223044', borderRadius: 5, overflow: 'hidden' }}>
+      <div style={{ display: 'flex', border: '1px solid #223044', borderRadius: 5, overflow: 'hidden' }}>
         {options.map((opt, i) => {
           const active = opt.value === value;
           return (
@@ -2656,7 +2697,8 @@ function Segmented<T extends string>({
               title={opt.title}
               aria-pressed={active}
               style={{
-                padding: '4px 9px',
+                flex: 1,
+                padding: '5px 10px',
                 border: 'none',
                 borderLeft: i > 0 ? '1px solid #223044' : 'none',
                 background: active ? '#55dcff' : 'transparent',
@@ -2672,6 +2714,86 @@ function Segmented<T extends string>({
           );
         })}
       </div>
+    </div>
+  );
+}
+
+/** Lightweight popover: a trigger button + a floating panel that closes on
+ *  outside-click or Escape. No dependency; used for the toolbar's Setup and
+ *  overflow menus so the header stays a single row on every viewport. */
+function Popover({
+  triggerLabel,
+  triggerTitle,
+  align = 'right',
+  badge,
+  children,
+}: {
+  triggerLabel: React.ReactNode;
+  triggerTitle?: string;
+  align?: 'left' | 'right';
+  badge?: React.ReactNode;
+  children: (close: () => void) => React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+  return (
+    <div ref={ref} style={{ position: 'relative', display: 'inline-flex' }}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title={triggerTitle}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        style={{
+          padding: '6px 10px',
+          background: open ? '#1b2740' : 'transparent',
+          border: '1px solid #223044',
+          borderRadius: 4,
+          color: '#cdd3de',
+          font: 'inherit',
+          cursor: 'pointer',
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {triggerLabel}
+        {badge}
+        <span style={{ opacity: 0.6, fontSize: 10 }}>{open ? '▲' : '▼'}</span>
+      </button>
+      {open && (
+        <div
+          role="menu"
+          style={{
+            position: 'absolute',
+            top: 'calc(100% + 6px)',
+            [align]: 0,
+            zIndex: 80,
+            background: '#0d1119',
+            border: '1px solid #223044',
+            borderRadius: 8,
+            padding: 12,
+            boxShadow: '0 8px 24px rgba(0, 0, 0, 0.5)',
+            maxWidth: 'calc(100vw - 24px)',
+          }}
+        >
+          {children(() => setOpen(false))}
+        </div>
+      )}
     </div>
   );
 }
