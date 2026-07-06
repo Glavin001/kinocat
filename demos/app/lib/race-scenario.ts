@@ -547,6 +547,12 @@ export interface RaceCarStatus {
   predictedEnd: { state: CarKinematicState; dueSimTime: number } | null;
   /** Sim time the most recent waypoint advance happened. */
   lastAdvanceSimTime: number;
+  /** Index of the gear-segment the tracker is currently following. */
+  activeSegmentIndex: number;
+  /** Total number of gear-segments in the current plan. */
+  totalSegments: number;
+  /** Gear of the active segment: 'fwd' | 'rev' | 'unknown'. */
+  activeSegmentGear: 'fwd' | 'rev' | 'unknown';
 }
 
 export interface RaceTickResult {
@@ -1541,6 +1547,14 @@ export async function createRaceScenario(
       planStartSimTime: c.planStartSimTime,
       predictedEnd: c.predictedEnd,
       lastAdvanceSimTime: c.lastMoveSimTime,
+      activeSegmentIndex: c.activeSegIdx,
+      totalSegments: c.segments.length,
+      activeSegmentGear: (() => {
+        const seg = c.segments[c.activeSegIdx];
+        if (!seg || seg.length < 2) return 'unknown' as const;
+        const sample = seg[1];
+        return sample && sample.speed >= 0 ? ('fwd' as const) : ('rev' as const);
+      })(),
     };
   }
 
