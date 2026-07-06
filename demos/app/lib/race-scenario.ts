@@ -1430,7 +1430,9 @@ export async function createRaceScenario(
         });
     const replanMs = performance.now() - tStart;
     c.diagnostics.lastReplanMs = replanMs;
-    // TEMP DEBUG
+    // Opt-in replan trace (diagnostics only; inert unless a debug script sets
+    // `globalThis.__replanLog = true`). Used by demos/scripts/tmp-solve-probe.mts
+    // to correlate wedge moments with the planner output that produced them.
     if ((globalThis as Record<string, unknown>).__replanLog) {
       console.log(
         `    [replan t=${simTime.toFixed(2)} ${c.entry.name}] found=${res.found} pathLen=${res.path.length} cost=${res.cost.toFixed(2)} ` +
@@ -1678,7 +1680,7 @@ export async function createRaceScenario(
       cadenceUseful = dLat > 0.25 || nearExhaustion || failing;
     }
     if ((cadenceDue && cadenceUseful) || shouldEarlyReplan(c, stateBefore)) {
-      // TEMP DEBUG
+      // Opt-in replan-reason trace (see the `__replanLog` note above).
       if ((globalThis as Record<string, unknown>).__replanLog) {
         const why = cadenceDue && cadenceUseful ? 'cadence' : 'early';
         console.log(`    [replan-reason t=${simTime.toFixed(2)} ${c.entry.name}] ${why} dLat=${lateralFromPlan(c, stateBefore.x, stateBefore.z).toFixed(2)} segIdx=${c.activeSegIdx}/${c.segments.length} failed=${c.diagnostics.consecutiveFailedReplans}`);
@@ -1815,23 +1817,30 @@ export async function createRaceScenario(
         const segEnd = seg[seg.length - 1]!;
         const segElapsed = simTime - c.activeSegStartSimTime;
         const dist = Math.hypot(stateBefore.x - segEnd.x, stateBefore.z - segEnd.z);
-        // Cusp-advance radius scales with the segment's own length. A short
-        // recovery leg (a 1.5 m reverse shunt out of a wedge) is ENTIRELY
-        // inside the waypoint arrive radius (2.5 m), so a fixed radius
-        // advanced past it instantly — the gear change was skipped, the car
-        // tried to drive the next forward leg from the un-executed pose,
-        // drifted off it, and the resulting replan produced the same shunt
-        // again, forever (measured: the learned models' wedge-loop at every
-        // slalom gate). Requiring the chassis to consume ≥ 60% of the leg
-        // before advancing executes the shunt for real.
-        let segLen = 0;
-        for (let i = 1; i < seg.length; i++) {
-          segLen += Math.hypot(seg[i]!.x - seg[i - 1]!.x, seg[i]!.z - seg[i - 1]!.z);
+        // Cusp-advance radius. Under MPPI it scales with the segment's own
+        // length: a short recovery leg (a ~1.5 m reverse shunt out of a
+        // wedge) is ENTIRELY inside the waypoint arrive radius (2.5 m), so a
+        // fixed radius advanced past it instantly — the gear change was
+        // skipped, the car tried to drive the next forward leg from the
+        // un-executed pose, drifted off it, and the resulting replan produced
+        // the same shunt again, forever (measured: the learned models'
+        // wedge-loop at every slalom gate). Requiring the chassis to consume
+        // ≥ 60% of the leg before advancing executes the shunt for real.
+        //
+        // Pure-pursuit keeps the legacy fixed radius: the length-scaled rule
+        // measurably changed the kinematic car's cusp handling on the walled
+        // course (it stopped striking walls), which is a WS-3 MPPI-only
+        // concern — scoping it keeps the pure-pursuit fidelity benchmark
+        // (kinematic delusion pays a physical cost) intact.
+        const baseAdvRadius = tuning.arriveRadius ?? RACE_ARRIVE_RADIUS;
+        let advRadius = baseAdvRadius;
+        if (tuning.tracker === 'mpc') {
+          let segLen = 0;
+          for (let i = 1; i < seg.length; i++) {
+            segLen += Math.hypot(seg[i]!.x - seg[i - 1]!.x, seg[i]!.z - seg[i - 1]!.z);
+          }
+          advRadius = Math.min(baseAdvRadius, Math.max(0.3, 0.4 * segLen));
         }
-        const advRadius = Math.min(
-          tuning.arriveRadius ?? RACE_ARRIVE_RADIUS,
-          Math.max(0.3, 0.4 * segLen),
-        );
         if (
           segElapsed >= 0.2 &&
           dist <= advRadius &&
