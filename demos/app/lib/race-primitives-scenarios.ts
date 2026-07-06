@@ -754,6 +754,11 @@ export interface RaceMultiGoalRequest {
    *  planner carries speed through gates instead of taking a mispriced analytic
    *  stop to each. Correct for racing; heavier search — behind a flag. */
   analyticDriveThrough?: boolean;
+  /** Weighted-A* heuristic multiplier (Pohl 1970): `f = g + weight·h`. 1 =
+   *  admissible/optimal (default). weight > 1 is ε-suboptimal but expands far
+   *  fewer nodes (2-10× at 1.5), turning "no plan in the real-time budget" into
+   *  "a good-enough plan fast" — the Tier-1 lever for real-time replanning. */
+  weight?: number;
   /** Agent the planner reasons about — must match the agent the supplied
    *  `lib` was characterised from (see `RacePlanRequest.agent`). Defaults to
    *  `RACE_AGENT`. */
@@ -804,6 +809,7 @@ export function planRaceMultiGoal(req: RaceMultiGoalRequest): PlanResult<CarKine
     maxExpansions: req.maxExpansions ?? RACE_MAX_EXPANSIONS * 2,
     gateRadius: req.gateRadius,
     envOptions: usedEnvOptions ? envOptions : undefined,
+    plannerOptions: req.weight && req.weight !== 1 ? { weight: req.weight } : undefined,
   });
 }
 

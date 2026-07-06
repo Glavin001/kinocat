@@ -584,6 +584,14 @@ export interface RaceTuning {
    * cusps; the adaptive lateral-drift trigger still forces a replan if the
    * chassis genuinely diverges from the plan. */
   replanIntervalMs?: number;
+  /**
+   * Weighted-A* heuristic multiplier for the race planner (`f = g + weight·h`).
+   * 1 = admissible/optimal (default). weight > 1 is ε-suboptimal but expands
+   * far fewer nodes, so the planner returns a good-enough plan inside a tight
+   * real-time budget instead of hitting the deadline with nothing. The Tier-1
+   * lever for real-time v3 replanning (see docs/v3-realtime-performance-plan.md).
+   * Only wired for the multi-goal (race) path. */
+  plannerWeight?: number;
 }
 
 /**
@@ -1590,6 +1598,7 @@ export async function createRaceScenario(
           disableHeuristicTable: !tuning.enableHeuristicTable,
           rootRollout: rootRolloutFor(c),
           analyticDriveThrough: tuning.analyticDriveThrough,
+          weight: tuning.plannerWeight,
         });
     const replanMs = performance.now() - tStart;
     c.diagnostics.lastReplanMs = replanMs;
