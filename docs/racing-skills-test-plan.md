@@ -48,6 +48,26 @@ already landed fixes this session: recovery no longer interrupts reverse
 shunts, and the gear-flip prior reseed makes shunts actually execute
 (recoveries 13→5).
 
+## The correctness branch (opt-in flags) + status
+
+The K5/coverage work ships behind default-off flags so the pinned benchmarks
+stay on the fast path. The **correctness branch** = all three of:
+`KINOCAT_GEN_CONTROLS=1` (dispersion-designed control sets + dense 2 m/s
+buckets), `KINOCAT_ANALYTIC_DT=1` (analytic drive-through repricing), and
+`enableSpeedProfile` (anticipatory corner-braking smoothing of the plan's
+speeds). Validate correctness with a generous planner budget (the sim decouples
+plan wall-clock from sim time); optimize runtime separately.
+
+Results so far, open course, MPPI, correctness branch:
+- **v2: 48.1 s lap, 2 recoveries, hits ~30 m/s on the straight** (baseline
+  71.5 s / 11 recov / ~5 m/s). The whole thesis working.
+- **v3: still hardening.** The K5 fix raises v3's pace too, but its more
+  *aggressive* plan (slalom viz: peak 24.6 / min 8.1 vs v2's smooth 21 / 11.8)
+  enters tight sequences hot and overshoots. `enableSpeedProfile` recovers most
+  of it (harness: recov 1→0, stopped 3.5→0.1 s, peak 27.8→21.1) — the v3 fix is
+  reconciling plan aggression with execution via anticipatory speed smoothing.
+  Reproduce fast with `corner-entry.mts` (high-speed slalom).
+
 ## Confirmed by the fast skill suite (measured this session)
 
 The skill tests (committed under `core/test/execute/skills-*.test.ts` and
