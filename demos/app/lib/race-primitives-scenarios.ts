@@ -37,6 +37,7 @@ import type {
 import {
   characterizeVehicle,
   MotionPrimitiveLibrary,
+  designControlSet,
 } from 'kinocat/primitives';
 import { buildLearnedLibrary } from './learn-primitives';
 
@@ -375,8 +376,9 @@ export function buildLearnedRaceLibrary(
  *     understands. */
 export function buildLearnedRaceLibraryV2(
   model: import('kinocat/agent').LearnedVehicleModel,
+  opts?: { generatedControls?: boolean },
 ): MotionPrimitiveLibrary {
-  return buildRaceLibraryFromSim(learnedForwardSimV2(model), model.config);
+  return buildRaceLibraryFromSim(learnedForwardSimV2(model), model.config, opts);
 }
 
 /** v3 race library: same per-bucket durations and speed-aware control sets
@@ -385,8 +387,9 @@ export function buildLearnedRaceLibraryV2(
  *  neural dynamics model — no parametric backbone anywhere in the loop. */
 export function buildLearnedRaceLibraryV3(
   model: import('kinocat/agent').LearnedVehicleModelV3,
+  opts?: { generatedControls?: boolean },
 ): MotionPrimitiveLibrary {
-  return buildRaceLibraryFromSim(forwardSimV3(model), model.config);
+  return buildRaceLibraryFromSim(forwardSimV3(model), model.config, opts);
 }
 
 /** Shared bucket layout for learned race libraries (v2 + v3).
@@ -405,19 +408,42 @@ export function buildLearnedRaceLibraryV3(
 function buildRaceLibraryFromSim(
   inner: import('kinocat/primitives').ForwardSim<CarKinematicState>,
   cfg: CfgLike,
+  opts?: { generatedControls?: boolean },
 ): MotionPrimitiveLibrary {
+  // Opt-in dispersion-designed control sets (skill K5). Default keeps the
+  // hand-authored tiers; `KINOCAT_GEN_CONTROLS=1` (or the explicit option)
+  // switches to farthest-point spanning sets rolled through THIS model's own
+  // dynamics, so the planner sees the chassis's real cornering envelope.
+  const gen =
+    opts?.generatedControls ??
+    (typeof process !== 'undefined' && process.env?.KINOCAT_GEN_CONTROLS === '1');
   const regimeFor = (v: number): { duration: number; controls: number[][] } => {
-    // Launch bucket keeps 1.5 s: from rest the acceleration phase
-    // dominates and a shorter window collapses the endpoint fan below
-    // the planner-usability floor (primitive-diagnostics asserts
-    // hull ≥ 0.5 m²; 1.0 s measured 0.26 m²).
-    if (v < 2) return { duration: 1.5, controls: lowSpeedV2Controls(cfg) };
-    // 4 m/s bucket needs 0.8 s for a non-degenerate endpoint fan
-    // (0.55 s measured hull 0.19 m² < the 0.5 m² usability floor).
-    if (v < 6) return { duration: 0.8, controls: midSpeedV2Controls(cfg) };
-    if (v < 14) return { duration: 0.55, controls: midSpeedV2Controls(cfg) };
-    if (v < 23) return { duration: 0.55, controls: highSpeedV2Controls(cfg) };
-    return { duration: 0.55, controls: topSpeedV2Controls(cfg) };
+    // Launch bucket keeps 1.5 s; 4 m/s bucket 0.8 s; the rest 0.55 s (the
+    // endpoint fan collapses below the usability floor with shorter chunks).
+    const duration = v < 2 ? 1.5 : v < 6 ? 0.8 : 0.55;
+    if (gen) {
+      // Reverse shunts only matter in the low-speed buckets; high-speed buckets
+      // spend the whole budget on forward coverage.
+      const budget = v < 2 ? 18 : 14;
+      const reverseSlots = v < 6 ? 5 : 0;
+      const controls = designControlSet({
+        forwardSim: inner,
+        startSpeed: v,
+        duration,
+        substeps: 6,
+        budget,
+        maxSteer: cfg.maxSteerAngle,
+        maxDrive: cfg.maxDriveForce,
+        maxBrake: cfg.maxBrakeForce,
+        reverseSlots,
+      });
+      return { duration, controls };
+    }
+    if (v < 2) return { duration, controls: lowSpeedV2Controls(cfg) };
+    if (v < 6) return { duration, controls: midSpeedV2Controls(cfg) };
+    if (v < 14) return { duration, controls: midSpeedV2Controls(cfg) };
+    if (v < 23) return { duration, controls: highSpeedV2Controls(cfg) };
+    return { duration, controls: topSpeedV2Controls(cfg) };
   };
   const all: import('kinocat/primitives').MotionPrimitive[] = [];
   let id = 0;

@@ -24,3 +24,13 @@ export {
   FINE_WHEELED_START_SPEEDS,
   type WheeledControlTierOptions,
 } from './control-sets-wheeled';
+
+export {
+  designControlSet,
+  coverageReport,
+  rollEndpoint,
+  endpointDistance,
+  type ControlSetDesignOptions,
+  type CoverageReport,
+  type Endpoint,
+} from './control-set-design';
