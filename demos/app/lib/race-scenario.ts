@@ -192,6 +192,18 @@ const GG_FRICTION_LIMIT =
 const SPEED_PROFILE_ACCEL = 6;
 const SPEED_PROFILE_DECEL = 8;
 
+// K10 — anticipatory-braking budget for the MPPI progress cost. The cost uses
+// this to decide how far ahead of a corner to start shedding speed
+// (sqrt(v_next^2 + 2*decel*ds_ahead)). The pure-pursuit speed profile keeps the
+// conservative hand-set 8; the MPPI executor rolls its own model and can brake
+// at the vehicle's REAL capability, so pin this to the derived deceleration
+// (deriveVehicleCapabilities.maxDecel ~13.9 m/s^2, itself conservative vs the
+// measured plant's 15.7-52.9) with a small safety margin. At 8 the cost
+// anticipated every corner ~1.7x too far out, holding the approach speed down
+// tens of metres before the braking point was physically real (skill K10).
+const MPPI_ENVELOPE_DECEL =
+  deriveVehicleCapabilities(DEFAULT_LEARNABLE_CONFIG).maxDecel * 0.9;
+
 // ---------------------------------------------------------------------------
 // Multi-cusp plan segmentation.
 
@@ -1166,7 +1178,7 @@ export async function createRaceScenario(
     // Same anticipatory-braking envelope the pure-pursuit preview uses:
     // conservative decel (the speed-profile budget) + the measured sustained
     // cornering boundary.
-    envelopeDecel: SPEED_PROFILE_DECEL,
+    envelopeDecel: MPPI_ENVELOPE_DECEL,
     envelopeLateralAccel: PURE_PURSUIT_CONFIG.previewLateralAccel,
     // Consume profiled plan speeds only where the friction-circle pass ran
     // (technical course). Raw open-course plan speeds are junk as caps:
