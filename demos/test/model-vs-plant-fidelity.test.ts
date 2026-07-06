@@ -31,11 +31,12 @@ import {
   type CarKinematicState,
   type WheeledCarControls,
 } from 'kinocat/agent';
-import { learnedForwardSimV2, deserializeMLP, type LearnedVehicleModel, type MLP } from 'kinocat/agent';
+import { learnedForwardSimV2, forwardSimV3, deserializeMLP, type LearnedVehicleModel, type MLP } from 'kinocat/agent';
 import type { ForwardSim } from 'kinocat/primitives';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { RACE_START_SPEEDS } from '../app/lib/race-primitives-scenarios';
+import { loadTrainedV3FromDisk, TRAINED_V3_ARTIFACT_PATH } from './helpers/trained-model';
 
 /** The shipped artifact, trained on Rapier trial data (overnight profile,
  *  3600 trials). Loaded raw — same values the demo pages run with. */
@@ -136,10 +137,17 @@ describe('model vs Rapier plant — endpoint fidelity across the speed envelope'
     const L = caps.wheelbaseLength;
 
     const trained = learnedForwardSimV2(loadTrainedModel());
+    // v3: the purely-learned neural dynamics model — no parametric
+    // backbone, no hand-set bounds. Guarded so a fresh checkout without
+    // the artifact still runs the v2 assertions.
+    const v3 = existsSync(TRAINED_V3_ARTIFACT_PATH)
+      ? forwardSimV3(loadTrainedV3FromDisk())
+      : undefined;
 
     const kinStats = mk();
     const v2Stats = mk();
     const trainedStats = mk();
+    const v3Stats = mk();
     const oldGridStats = mk();
     const newGridStats = mk();
     const rows: string[] = [];
@@ -168,12 +176,14 @@ describe('model vs Rapier plant — endpoint fidelity across the speed envelope'
         const kinErr = errOf(rollModel(kin, start, kinVec));
         const v2Err = errOf(rollModel(v2, start, ctrlVec));
         const trainedErr = errOf(rollModel(trained, start, ctrlVec));
+        const v3Err = v3 ? errOf(rollModel(v3, start, ctrlVec)) : NaN;
         const oldErr = errOf(bucketEndpoint(trained, start, nearestBucket(start.speed, OLD_GRID), ctrlVec));
         const newErr = errOf(bucketEndpoint(trained, start, nearestBucket(start.speed, [...RACE_START_SPEEDS]), ctrlVec));
         add(kinStats, kinErr); add(v2Stats, v2Err); add(trainedStats, trainedErr);
+        if (v3) add(v3Stats, v3Err);
         add(oldGridStats, oldErr); add(newGridStats, newErr);
         rows.push(
-          `${String(speed).padStart(2)} m/s  ${probe.name.padEnd(24)} kin=${kinErr.toFixed(2)}  v2-prior=${v2Err.toFixed(2)}  v2-trained=${trainedErr.toFixed(2)}  old-grid=${oldErr.toFixed(2)}  new-grid=${newErr.toFixed(2)}`,
+          `${String(speed).padStart(2)} m/s  ${probe.name.padEnd(24)} kin=${kinErr.toFixed(2)}  v2-prior=${v2Err.toFixed(2)}  v2-trained=${trainedErr.toFixed(2)}  v3=${v3Err.toFixed(2)}  old-grid=${oldErr.toFixed(2)}  new-grid=${newErr.toFixed(2)}`,
         );
       }
     }
@@ -182,10 +192,10 @@ describe('model vs Rapier plant — endpoint fidelity across the speed envelope'
     for (const r of rows) console.log('  ' + r);
     console.log(
       `\n  MEAN   kinematic=${mean(kinStats).toFixed(3)}  v2-prior=${mean(v2Stats).toFixed(3)}  ` +
-      `v2-trained=${mean(trainedStats).toFixed(3)}  ` +
+      `v2-trained=${mean(trainedStats).toFixed(3)}  v3=${mean(v3Stats).toFixed(3)}  ` +
       `old-grid=${mean(oldGridStats).toFixed(3)}  new-grid=${mean(newGridStats).toFixed(3)}\n` +
       `  WORST  kinematic=${kinStats.worst.toFixed(3)}  v2-prior=${v2Stats.worst.toFixed(3)}  ` +
-      `v2-trained=${trainedStats.worst.toFixed(3)}  ` +
+      `v2-trained=${trainedStats.worst.toFixed(3)}  v3=${v3Stats.worst.toFixed(3)}  ` +
       `old-grid=${oldGridStats.worst.toFixed(3)}  new-grid=${newGridStats.worst.toFixed(3)}`,
     );
 
@@ -222,5 +232,18 @@ describe('model vs Rapier plant — endpoint fidelity across the speed envelope'
     //    re-fits don't flap; tighten (never loosen) as fidelity improves.
     expect(mean(trainedStats)).toBeLessThan(1.4);
     expect(mean(newGridStats)).toBeLessThan(1.8);
+
+    // 6. The PURELY LEARNED v3 model (no parametric backbone, no hand-set
+    //    bounds — see docs/v3-purely-learned-model.md) must strictly beat
+    //    the v2 trained model on both mean and worst case. Measured
+    //    2026-07 (seed 42, 400 trials × 150 ticks): v3 mean 0.63 m /
+    //    worst 2.27 m vs v2 trained 1.07 m / 3.33 m. Budgets keep ~30%
+    //    headroom for retrain jitter; tighten, never loosen.
+    if (v3) {
+      expect(mean(v3Stats)).toBeLessThan(mean(trainedStats));
+      expect(v3Stats.worst).toBeLessThan(trainedStats.worst);
+      expect(mean(v3Stats)).toBeLessThan(0.9);
+      expect(v3Stats.worst).toBeLessThan(3.0);
+    }
   }, 120_000);
 });

@@ -12,7 +12,13 @@ import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import type { LearnedVehicleParams, CarKinematicState } from 'kinocat/agent';
-import { DEFAULT_LEARNED_PARAMS } from 'kinocat/agent';
+import {
+  DEFAULT_LEARNED_PARAMS,
+  DEFAULT_LEARNABLE_CONFIG,
+  KINEMATIC_NATIVE_PARAMS,
+  learnedForwardSimV2,
+  parametricForwardV2,
+} from 'kinocat/agent';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import { MotionPrimitiveLibrary } from 'kinocat/primitives';
 import { purePursuit } from 'kinocat/execute';
@@ -132,6 +138,43 @@ const PARAMS_KEY = 'kinocat:learned-params:v2';
 const LIBRARY_KEY = 'kinocat:learned-library:v2';
 
 type Phase = 'loading' | 'learning' | 'ready' | 'racing' | 'finished';
+
+type TrackerMode = 'pure-pursuit' | 'mpc';
+type CourseVariant = 'open' | 'technical';
+/** Which primitive library / rollout model the LEARNED car drives with. */
+type LearnedModelChoice = 'v2' | 'kinematic';
+
+/** Path-tracking executor this mount runs. The GUI (top-bar Race Setup) is
+ *  the primary control; the `?tracker=mpc` query param only SEEDS the initial
+ *  value so a run is shareable/deep-linkable. MPPI runs each car's own forward
+ *  model in the loop — the fidelity-becomes-control-quality mode (roadmap
+ *  WS-3). */
+function trackerFromUrl(): TrackerMode {
+  if (typeof window === 'undefined') return 'pure-pursuit';
+  return new URLSearchParams(window.location.search).get('tracker') === 'mpc'
+    ? 'mpc'
+    : 'pure-pursuit';
+}
+
+/** Course variant seed (GUI-primary; `?course=technical` seeds it). */
+function courseFromUrl(): CourseVariant {
+  if (typeof window === 'undefined') return 'open';
+  return new URLSearchParams(window.location.search).get('course') === 'technical'
+    ? 'technical'
+    : 'open';
+}
+
+/** Reflect a Race Setup choice back into the URL (via replaceState, no
+ *  navigation) so the current configuration stays shareable. The GUI state
+ *  is the source of truth — this is a convenience mirror, not the config
+ *  path. */
+function syncSetupParam(key: string, value: string, isDefault: boolean): void {
+  if (typeof window === 'undefined') return;
+  const url = new URL(window.location.href);
+  if (isDefault) url.searchParams.delete(key);
+  else url.searchParams.set(key, value);
+  window.history.replaceState(null, '', url.toString());
+}
 
 interface CarRuntime {
   id: 'kinematic' | 'learned';
@@ -269,6 +312,27 @@ export default function RacePrimitives() {
     learned: EvalSnapshot | null;
   }>({ kinematic: null, learned: null });
   const [winner, setWinner] = useState<'kinematic' | 'learned' | 'tie' | null>(null);
+  // Model Lab drawer open/close (launched from the toolbar).
+  const [modelLabOpen, setModelLabOpen] = useState(false);
+  // Race Setup (GUI-primary). Executor + course seed from the URL on mount
+  // (so `?tracker=mpc&course=technical` deep-links still work) but the GUI
+  // selectors in the top bar are the source of truth thereafter; changing
+  // one re-mounts the scene (same as the existing v2-library toggle). Read
+  // the URL seeds in an effect, not at render, so SSR + hydration agree.
+  const [trackerMode, setTrackerModeState] = useState<TrackerMode>('pure-pursuit');
+  const [courseVariant, setCourseVariantState] = useState<CourseVariant>('open');
+  useEffect(() => {
+    setTrackerModeState(trackerFromUrl());
+    setCourseVariantState(courseFromUrl());
+  }, []);
+  const setTrackerMode = (m: TrackerMode) => {
+    setTrackerModeState(m);
+    syncSetupParam('tracker', m, m === 'pure-pursuit');
+  };
+  const setCourseVariant = (c: CourseVariant) => {
+    setCourseVariantState(c);
+    syncSetupParam('course', c, c === 'open');
+  };
   // v2 model state (Phase-2 addition). When `useV2 && v2Model != null`, the
   // learned car's library is built from v2 instead of legacy.
   const [v2Model, setV2Model] = useState<LearnedVehicleModel | null>(null);
@@ -377,6 +441,7 @@ export default function RacePrimitives() {
         const learnedLibraryOverride = v2Active
           ? buildLearnedRaceLibraryV2(v2Model!)
           : undefined;
+        const learnedForwardModel = v2Active ? learnedForwardSimV2(v2Model!) : undefined;
         const setup = await setupScene(mount, params, {
           onMetrics: (km, lm) => setMetrics({ kinematic: km, learned: lm }),
           onLearner: (snap) => setLearner(snap),
@@ -385,7 +450,7 @@ export default function RacePrimitives() {
             setWinner(w);
             setPhase('finished');
           },
-        }, { learnedLibraryOverride });
+        }, { learnedLibraryOverride, learnedForwardModel, tracker: trackerMode, courseVariant });
         sceneRef.current = setup;
         cleanup = setup.cleanup;
       } catch (e) {
@@ -397,8 +462,9 @@ export default function RacePrimitives() {
       cleanup?.();
       sceneRef.current = null;
     };
-    // Re-mount when params, v2 toggle, or v2 model identity change.
-  }, [params, useV2, v2Model, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
+    // Re-mount when params, v2 toggle, v2 model identity, or a Race Setup
+    // selector (tracker / course) change — each rebuilds the scenario.
+  }, [params, useV2, v2Model, trackerMode, courseVariant, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function runInlineLearn() {
     setError(null);
@@ -585,6 +651,13 @@ export default function RacePrimitives() {
       }}
     >
       <TopBar
+        trackerMode={trackerMode}
+        onTrackerMode={setTrackerMode}
+        courseVariant={courseVariant}
+        onCourseVariant={setCourseVariant}
+        learnedModel={v2Active ? 'v2' : 'kinematic'}
+        onLearnedModel={(m) => setUseV2(m === 'v2')}
+        canUseV2={v2Model !== null}
         phase={phase}
         learnProgress={learnProgress}
         winner={winner}
@@ -598,6 +671,7 @@ export default function RacePrimitives() {
         onReset={resetRace}
         onClearCache={clearCache}
         onExportDebug={onExportDebug}
+        onOpenModelLab={() => setModelLabOpen(true)}
         debugExportedAt={debugExportedAt}
       />
       <div style={{ flex: 1, position: 'relative' }}>
@@ -616,6 +690,21 @@ export default function RacePrimitives() {
           }}
           rollbackActive={learner?.rollbackActive ?? false}
           bestLapNumber={learner?.bestLapNumber ?? 0}
+          stacks={{
+            kinematic: {
+              tracker: trackerMode === 'mpc' ? 'MPPI (progress)' : 'pure-pursuit',
+              library: 'kinematic bicycle',
+              rolloutModel: trackerMode === 'mpc' ? 'kinematic bicycle' : undefined,
+            },
+            learned: {
+              tracker: trackerMode === 'mpc' ? 'MPPI (progress)' : 'pure-pursuit',
+              library: v2Active ? 'v2 learned' : 'online-refit (legacy)',
+              rolloutModel:
+                trackerMode === 'mpc'
+                  ? (v2Active ? 'v2 learned' : 'v2 default (shared)')
+                  : undefined,
+            },
+          }}
         />
         {(phase === 'racing' || phase === 'finished') && learner && (
           <LearnerPanel snap={learner} v2Active={v2Active} v2Meta={v2Meta} isMobile={isMobile} />
@@ -632,6 +721,8 @@ export default function RacePrimitives() {
           <PretrainOverlay progress={learnProgress} />
         )}
         <ModelLab
+          open={modelLabOpen}
+          onOpenChange={setModelLabOpen}
           onTrained={onV2Trained}
           loadedMeta={v2Meta}
           onClearLoaded={v2Meta ? onV2Clear : undefined}
@@ -782,6 +873,16 @@ interface SceneOptions {
    *  refits of the legacy 5-param model would race a stale v1 library while
    *  the v2-derived primitive library is what the planner is searching). */
   learnedLibraryOverride?: MotionPrimitiveLibrary;
+  /** Forward dynamics model the LEARNED car's MPPI tracker rolls when the
+   *  tracker is `'mpc'` (the trained v2 sim — its fidelity reaching the
+   *  wheels). Unused under pure-pursuit. */
+  learnedForwardModel?: import('kinocat/primitives').ForwardSim<CarKinematicState>;
+  /** Path-tracking executor for both cars. Chosen in the Race Setup GUI
+   *  (top bar). Defaults to pure-pursuit. */
+  tracker?: TrackerMode;
+  /** Course layout. Chosen in the Race Setup GUI (top bar). Defaults to the
+   *  open flat pad. */
+  courseVariant?: CourseVariant;
 }
 
 async function setupScene(
@@ -806,15 +907,11 @@ async function setupScene(
   mount.appendChild(renderer.domElement);
 
   // ---- Shared course ----
-  // Course variant is selectable via `?course=technical` — the walled /
-  // chicane / thread-the-gate layout that turns corner overshoot into a
-  // physical wall strike (see race-primitives-scenarios.ts). Defaults to the
-  // open flat pad.
-  const courseVariant: 'open' | 'technical' =
-    (typeof window !== 'undefined' &&
-      new URLSearchParams(window.location.search).get('course') === 'technical')
-      ? 'technical'
-      : 'open';
+  // Course variant comes from the Race Setup GUI (top bar). The walled /
+  // chicane / thread-the-gate `technical` layout turns corner overshoot into
+  // a physical wall strike (see race-primitives-scenarios.ts); `open` is the
+  // flat pad. The `?course=` param only seeds the GUI's initial value.
+  const courseVariant: CourseVariant = options.courseVariant ?? courseFromUrl();
   const course = buildRaceCourse(courseVariant);
   const navWorld = new InMemoryNavWorld(course.polygons, course.obstacles);
   const kinematicLib = buildKinematicLibrary();
@@ -840,14 +937,28 @@ async function setupScene(
   // not part of the scenario: per-lap legacy 5-param refits were
   // removed in favor of the offline-trained v2 model (see
   // `pnpm run train` / Model Lab).
+  // Tracker from the Race Setup GUI (top bar). Under MPPI each car tracks
+  // with its OWN forward model — the kinematic car with the naive idealised-
+  // bicycle params, the learned car with the trained v2 sim — so model
+  // fidelity reaches the wheels, not just the plan. `?tracker=` seeds it.
+  const tracker: TrackerMode = options.tracker ?? trackerFromUrl();
   const scenario = await createRaceScenario({
     entries: [
-      { name: 'kinematic', lib: kinematicLib },
-      { name: 'learned', lib: initialLearnedLib },
+      {
+        name: 'kinematic',
+        lib: kinematicLib,
+        forwardModel: parametricForwardV2(KINEMATIC_NATIVE_PARAMS, DEFAULT_LEARNABLE_CONFIG),
+      },
+      {
+        name: 'learned',
+        lib: initialLearnedLib,
+        forwardModel: options.learnedForwardModel,
+      },
     ],
     syncHold: true,
     offTrackRecovery: 'waypoint',
     course,
+    tuning: { tracker },
   });
 
   // ---- Per-car setup ----
@@ -1433,6 +1544,13 @@ function TopBar({
   params,
   error,
   v2Active,
+  trackerMode,
+  onTrackerMode,
+  courseVariant,
+  onCourseVariant,
+  learnedModel,
+  onLearnedModel,
+  canUseV2,
   isMobile,
   onLearn,
   onStart,
@@ -1440,6 +1558,7 @@ function TopBar({
   onReset,
   onClearCache,
   onExportDebug,
+  onOpenModelLab,
   debugExportedAt,
 }: {
   phase: Phase;
@@ -1457,6 +1576,17 @@ function TopBar({
    *  library — online refitting is disabled in that mode, so the status
    *  text changes accordingly. */
   v2Active: boolean;
+  /** Race Setup: which path-tracking executor this mount runs. */
+  trackerMode: TrackerMode;
+  onTrackerMode: (m: TrackerMode) => void;
+  /** Race Setup: which course layout. */
+  courseVariant: CourseVariant;
+  onCourseVariant: (c: CourseVariant) => void;
+  /** Race Setup: the LEARNED car's plan library / rollout model. */
+  learnedModel: LearnedModelChoice;
+  onLearnedModel: (m: LearnedModelChoice) => void;
+  /** Whether a trained v2 model is available to select. */
+  canUseV2: boolean;
   isMobile: boolean;
   onLearn: () => void;
   onStart: () => void;
@@ -1466,6 +1596,8 @@ function TopBar({
   /** Generate + download + clipboard-copy a Markdown debug report of
    *  the live page state (model, race, libraries, planner config). */
   onExportDebug: () => void;
+  /** Open the Model Lab drawer (train / load / inspect the v2 model). */
+  onOpenModelLab: () => void;
   /** ms-since-epoch the last export fired — used to show a brief
    *  "copied + downloaded" confirmation. */
   debugExportedAt: number;
@@ -1474,80 +1606,170 @@ function TopBar({
   const subtitle = v2Active
     ? 'kinematic vs offline-trained v2 · online refit off'
     : 'kinematic vs online-learning · learned car refits each lap';
-  const racingStatus = v2Active
-    ? (isMobile ? 'racing · v2' : 'racing… (learned car using v2 library — offline-trained, no online refit)')
-    : (isMobile ? 'racing · online' : 'racing… (the learned car refits every lap)');
+  // Compact one-glance summary of the current setup, shown on the Setup
+  // dropdown trigger so the config is visible without opening it.
+  const setupSummary = [
+    trackerMode === 'mpc' ? 'MPPI' : 'PP',
+    learnedModel === 'v2' ? 'v2' : 'kin',
+    courseVariant === 'technical' ? 'Tech' : 'Open',
+  ].join(' · ');
+
+  // Single-row toolbar. Everything that used to overflow now lives behind two
+  // dropdowns (Setup + overflow ⋯) and a Model Lab launcher, so the header is
+  // one line at every width. On narrow screens the brand + subtitle collapse
+  // and an overflowX guard keeps it usable.
   return (
     <div
       style={{
         display: 'flex',
-        flexDirection: isMobile ? 'column' : 'row',
-        alignItems: isMobile ? 'stretch' : 'center',
-        gap: isMobile ? 6 : 12,
-        padding: isMobile ? '8px 10px' : '10px 14px',
+        alignItems: 'center',
+        gap: 8,
+        padding: isMobile ? '6px 8px' : '8px 14px',
         borderBottom: '1px solid #1f2735',
         background: '#0d1119',
+        // No overflow clip here: a scroll container (overflow-x:auto forces
+        // overflow-y:auto too) would clip the Setup / overflow dropdown panels
+        // that drop BELOW the bar. The compact dropdown design keeps the row
+        // within ~360px, so clipping is unnecessary.
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
-        <div style={{ color: '#7fd6ff', fontWeight: 700, whiteSpace: 'nowrap' }}>race the primitives</div>
-        {!isMobile && (
-          <div style={{ opacity: 0.65, fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            {subtitle}
+      <div style={{ color: '#7fd6ff', fontWeight: 700, whiteSpace: 'nowrap' }}>
+        {isMobile ? 'race' : 'race the primitives'}
+      </div>
+      {!isMobile && (
+        <div style={{ opacity: 0.5, fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 300, flexShrink: 1 }}>
+          {subtitle}
+        </div>
+      )}
+
+      {/* Setup dropdown — the three run-defining selectors. */}
+      <Popover
+        align="left"
+        triggerTitle="Race setup — tracker, learned-car model, course"
+        triggerLabel={
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <span aria-hidden>⚙</span>
+            {!isMobile && <span>Setup</span>}
+            <span style={{ opacity: 0.7, color: '#7fd6ff' }}>{setupSummary}</span>
+          </span>
+        }
+      >
+        {() => (
+          <RaceSetup
+            trackerMode={trackerMode}
+            onTrackerMode={onTrackerMode}
+            courseVariant={courseVariant}
+            onCourseVariant={onCourseVariant}
+            learnedModel={learnedModel}
+            onLearnedModel={onLearnedModel}
+            canUseV2={canUseV2}
+          />
+        )}
+      </Popover>
+
+      <div style={{ flex: 1, minWidth: 8 }} />
+
+      {/* Phase status + the single primary action for the current phase. */}
+      {phase === 'loading' && <Status>loading…</Status>}
+      {phase === 'learning' && (
+        <Status>
+          {isMobile
+            ? `pre-train ${learnProgress.done}/${learnProgress.total || '?'}`
+            : `pre-training… ${learnProgress.done}/${learnProgress.total || '?'}`}
+        </Status>
+      )}
+      {phase === 'ready' && params && (
+        <>
+          {!isMobile && <Status>ready{v2Active ? ' · v2' : ''}</Status>}
+          <Btn onClick={onStart}>start race</Btn>
+        </>
+      )}
+      {phase === 'racing' && (
+        <>
+          {!isMobile && <Status>racing…</Status>}
+          <Btn onClick={onStop}>stop</Btn>
+        </>
+      )}
+      {phase === 'finished' && (
+        <>
+          {!isMobile && <Status>stopped{v2Active ? ' · v2' : ''}</Status>}
+          <Btn onClick={onStart}>{isMobile ? 'race' : 'race again'}</Btn>
+        </>
+      )}
+      {error && <Status warning>err</Status>}
+
+      {/* Model Lab launcher — opens the drawer (train / load / inspect the v2
+          model). Replaces the old floating top-right panel that overlapped
+          the LEARNED metrics. */}
+      <Btn onClick={onOpenModelLab} secondary title="Open Model Lab — train, load, or inspect the v2 model">
+        {isMobile ? 'Lab' : 'Model Lab'}
+        {canUseV2 && <span style={{ marginLeft: 6, color: '#55dcff' }}>●</span>}
+      </Btn>
+
+      {/* Overflow menu — secondary actions that don't need to be one click. */}
+      <Popover align="right" triggerLabel={<span aria-hidden style={{ fontSize: 16, lineHeight: 1 }}>⋯</span>} triggerTitle="More actions">
+        {(close) => (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 170 }}>
+            <MenuItem onClick={() => { onLearn(); close(); }} disabled={phase === 'learning'}>Pre-train v2…</MenuItem>
+            <MenuItem onClick={() => { onReset(); close(); }}>Reset race</MenuItem>
+            <MenuItem onClick={() => { onClearCache(); close(); }}>Clear cached model</MenuItem>
+            <div style={{ height: 1, background: '#223044', margin: '2px 0' }} />
+            <MenuItem onClick={() => { onExportDebug(); close(); }}>
+              {justExported ? '✓ copied · saved' : '🐛 Export debug report'}
+            </MenuItem>
           </div>
         )}
-      </div>
-      {!isMobile && <div style={{ flex: 1 }} />}
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          flexWrap: isMobile ? 'wrap' : 'nowrap',
-          overflowX: isMobile ? 'auto' : 'visible',
-          // Prevent flex shrink so buttons stay readable on mobile scroll.
-          minWidth: 0,
-        }}
-      >
-        {phase === 'loading' && <Status>loading…</Status>}
-        {phase === 'learning' && (
-          <Status>
-            {isMobile
-              ? `pre-training ${learnProgress.done}/${learnProgress.total || '?'}`
-              : `pre-training… collecting trials ${learnProgress.done}/${learnProgress.total || '?'}`}
-          </Status>
-        )}
-        {phase === 'ready' && params && (
-          <>
-            <Status>ready{v2Active ? ' · v2' : ''}</Status>
-            <Btn onClick={onStart}>start race</Btn>
-            <Btn onClick={onLearn} secondary>pre-train</Btn>
-            <Btn onClick={onReset} secondary>reset</Btn>
-            <Btn onClick={onClearCache} secondary>clear</Btn>
-          </>
-        )}
-        {phase === 'racing' && (
-          <>
-            <Status>{racingStatus}</Status>
-            <Btn onClick={onStop}>stop</Btn>
-          </>
-        )}
-        {phase === 'finished' && (
-          <>
-            <Status>stopped{v2Active ? ' · v2' : ''}</Status>
-            <Btn onClick={onStart}>race again</Btn>
-            <Btn onClick={onReset} secondary>reset</Btn>
-          </>
-        )}
-        {error && <Status warning>err: {error}</Status>}
-        {/* Export-debug button — always present so diagnosis works in
-            every phase. Shows a brief "copied · saved" confirmation. */}
-        <Btn onClick={onExportDebug} secondary title="Generate Markdown debug report — copied to clipboard and downloaded as .md">
-          {justExported ? '✓ copied · saved' : '🐛 export debug'}
-        </Btn>
-      </div>
+      </Popover>
     </div>
   );
+}
+
+/** A full-width row button used inside the overflow / setup popovers. */
+function MenuItem({
+  children,
+  onClick,
+  disabled,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        textAlign: 'left',
+        padding: '7px 10px',
+        background: 'transparent',
+        border: 'none',
+        borderRadius: 4,
+        color: disabled ? '#4a5364' : '#cdd3de',
+        font: '12px ui-monospace, monospace',
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        whiteSpace: 'nowrap',
+      }}
+      onMouseEnter={(e) => { if (!disabled) e.currentTarget.style.background = '#1b2740'; }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** Human-readable description of each car's live control stack: which
+ *  path tracker executes the plan, and which planning/rollout model the
+ *  car reasons with. Rendered in the HUD so a screenshot of a run is
+ *  never ambiguous about WHAT was being tested. */
+interface StackInfo {
+  /** Path-tracking executor. */
+  tracker: string;
+  /** Planner primitive library (what A* searches). */
+  library: string;
+  /** MPPI rollout model (only meaningful under the mpc tracker). */
+  rolloutModel?: string;
 }
 
 function MetricsOverlay({
@@ -1558,6 +1780,7 @@ function MetricsOverlay({
   lapTimes,
   rollbackActive,
   bestLapNumber,
+  stacks,
 }: {
   metrics: { kinematic: RaceMetrics; learned: RaceMetrics };
   winner: 'kinematic' | 'learned' | 'tie' | null;
@@ -1566,6 +1789,7 @@ function MetricsOverlay({
   lapTimes: { kinematic: number[]; learned: number[] };
   rollbackActive: boolean;
   bestLapNumber: number;
+  stacks: { kinematic: StackInfo; learned: StackInfo };
 }) {
   // Mobile: compact stacked summary row at the top of the viewport. Tap a
   // card to expand its full stats (LIVE CONTROLS + tracking error + …).
@@ -1592,6 +1816,7 @@ function MetricsOverlay({
           holding={holding.kinematic}
           recentLaps={lapTimes.kinematic}
           rollbackBadge={null}
+          stack={stacks.kinematic}
         />
         <CompactCarCard
           title="LEARNED"
@@ -1601,6 +1826,7 @@ function MetricsOverlay({
           holding={holding.learned}
           recentLaps={lapTimes.learned}
           rollbackBadge={rollbackActive ? `BEST l${bestLapNumber}` : null}
+          stack={stacks.learned}
         />
       </div>
     );
@@ -1616,6 +1842,7 @@ function MetricsOverlay({
         holding={holding.kinematic}
         recentLaps={lapTimes.kinematic}
         rollbackBadge={null}
+        stack={stacks.kinematic}
       />
       <SideMetrics
         side="right"
@@ -1626,6 +1853,7 @@ function MetricsOverlay({
         holding={holding.learned}
         recentLaps={lapTimes.learned}
         rollbackBadge={rollbackActive ? `USING BEST (lap ${bestLapNumber})` : null}
+        stack={stacks.learned}
       />
     </>
   );
@@ -1633,10 +1861,11 @@ function MetricsOverlay({
 
 /** Tightly-packed per-car card for mobile. Tap to expand for full stats. */
 function CompactCarCard({
-  title, color, m, highlight, holding, recentLaps, rollbackBadge,
+  title, color, m, highlight, holding, recentLaps, rollbackBadge, stack,
 }: {
   title: string; color: string; m: RaceMetrics; highlight: boolean;
   holding: boolean; recentLaps: number[]; rollbackBadge: string | null;
+  stack: StackInfo;
 }) {
   const [open, setOpen] = useState(false);
   const last5 = recentLaps.slice(-5);
@@ -1670,6 +1899,16 @@ function CompactCarCard({
         <span style={{ textAlign: 'right' }}>{m.laps} · {Number.isFinite(m.bestLapTime) ? `${m.bestLapTime.toFixed(2)}s` : '—'}</span>
         {open && (
           <>
+            <span style={{ opacity: 0.6 }}>tracker</span>
+            <span style={{ textAlign: 'right', color }}>{stack.tracker}</span>
+            <span style={{ opacity: 0.6 }}>lib</span>
+            <span style={{ textAlign: 'right' }}>{stack.library}</span>
+            {stack.rolloutModel && (
+              <>
+                <span style={{ opacity: 0.6 }}>model</span>
+                <span style={{ textAlign: 'right' }}>{stack.rolloutModel}</span>
+              </>
+            )}
             <span style={{ opacity: 0.6 }}>last</span>
             <span style={{ textAlign: 'right' }}>{Number.isFinite(m.lastLapTime) ? `${m.lastLapTime.toFixed(2)}s` : '—'}</span>
             <span style={{ opacity: 0.6 }}>mean5</span>
@@ -1723,6 +1962,7 @@ function SideMetrics({
   holding,
   recentLaps,
   rollbackBadge,
+  stack,
 }: {
   side: 'left' | 'right';
   title: string;
@@ -1732,6 +1972,7 @@ function SideMetrics({
   holding: boolean;
   recentLaps: number[];
   rollbackBadge: string | null;
+  stack: StackInfo;
 }) {
   // Stability over the last 5 laps — low std-dev means the car has
   // settled into a consistent racing line, high means it's still
@@ -1814,6 +2055,15 @@ function SideMetrics({
       />
       <KV k="0.55s pred err (rms)" v={`${m.trackingErrorRms.toFixed(2)} m`} />
       <KV k="peak speed" v={`${m.peakSpeed.toFixed(1)} m/s`} />
+      <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid #1f2735', opacity: 0.85 }}>
+        <div style={{ fontSize: 10, opacity: 0.7, marginBottom: 2 }}>CONTROL STACK</div>
+        <KV k="tracker" v={<span style={{ color }}>{stack.tracker}</span>} />
+        <KV k="plan library" v={stack.library} />
+        {stack.rolloutModel && <KV k="MPPI model" v={stack.rolloutModel} />}
+        {m.mpcSolveCount > 0 && (
+          <KV k="MPPI solve" v={`${m.mpcSolveMsAvg.toFixed(1)} ms · ${m.mpcSolveCount}`} />
+        )}
+      </div>
       <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid #1f2735', opacity: 0.85 }}>
         <div style={{ fontSize: 10, opacity: 0.7, marginBottom: 2 }}>LIVE CONTROLS</div>
         <KV
@@ -2348,6 +2598,202 @@ function KV({ k, v }: { k: string; v: string | React.ReactNode }) {
     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
       <span style={{ opacity: 0.7 }}>{k}</span>
       <span style={{ color: '#cdeaff' }}>{v}</span>
+    </div>
+  );
+}
+
+/** Race Setup selectors, laid out vertically for the top-bar "Setup"
+ *  dropdown. The GUI source of truth for the three run-defining choices:
+ *  which path tracker executes the plan, which plan library / rollout model
+ *  the LEARNED car drives with, and which course layout to race. Changing any
+ *  selector re-mounts the scene (resets the race), matching the v2-library
+ *  toggle. URL query params only SEED these on first load. */
+function RaceSetup({
+  trackerMode,
+  onTrackerMode,
+  courseVariant,
+  onCourseVariant,
+  learnedModel,
+  onLearnedModel,
+  canUseV2,
+}: {
+  trackerMode: TrackerMode;
+  onTrackerMode: (m: TrackerMode) => void;
+  courseVariant: CourseVariant;
+  onCourseVariant: (c: CourseVariant) => void;
+  learnedModel: LearnedModelChoice;
+  onLearnedModel: (m: LearnedModelChoice) => void;
+  canUseV2: boolean;
+}) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, minWidth: 210 }}>
+      <Segmented
+        label="tracker"
+        value={trackerMode}
+        onChange={onTrackerMode}
+        options={[
+          { value: 'pure-pursuit', label: 'Pure-pursuit', title: 'Geometric path tracker — fast, reactive, no dynamics model.' },
+          { value: 'mpc', label: 'MPPI', title: 'Sampling MPC that rolls each car’s OWN forward model in the loop (model fidelity → control quality).' },
+        ]}
+      />
+      <Segmented
+        label="learned car model"
+        value={learnedModel}
+        onChange={onLearnedModel}
+        options={[
+          { value: 'kinematic', label: 'Kinematic', title: 'Learned car uses the kinematic-bicycle library (baseline — same as the control car).' },
+          {
+            value: 'v2',
+            label: 'v2 learned',
+            title: canUseV2
+              ? 'Learned car uses the offline-trained v2 library + (under MPPI) the v2 rollout model.'
+              : 'Train or load a v2 model first (Model Lab).',
+            disabled: !canUseV2,
+          },
+        ]}
+      />
+      <Segmented
+        label="course"
+        value={courseVariant}
+        onChange={onCourseVariant}
+        options={[
+          { value: 'open', label: 'Open', title: 'Flat pad — pure dynamics + waypoint chase.' },
+          { value: 'technical', label: 'Technical', title: 'Walled chicane — corner overshoot becomes a physical wall strike.' },
+        ]}
+      />
+      <div style={{ fontSize: 10, opacity: 0.5, lineHeight: 1.4 }}>
+        Changing a setting restarts the race.
+      </div>
+    </div>
+  );
+}
+
+/** Compact segmented (radio-group) selector — a label above a row of
+ *  mutually-exclusive pill buttons. Keyboard + pointer accessible via native
+ *  buttons; fills its container so it reads cleanly inside a dropdown. */
+function Segmented<T extends string>({
+  label,
+  value,
+  onChange,
+  options,
+}: {
+  label: string;
+  value: T;
+  onChange: (v: T) => void;
+  options: Array<{ value: T; label: string; title?: string; disabled?: boolean }>;
+}) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }} role="group" aria-label={label}>
+      <span style={{ fontSize: 10, opacity: 0.6, textTransform: 'uppercase', letterSpacing: 0.4 }}>{label}</span>
+      <div style={{ display: 'flex', border: '1px solid #223044', borderRadius: 5, overflow: 'hidden' }}>
+        {options.map((opt, i) => {
+          const active = opt.value === value;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => !opt.disabled && !active && onChange(opt.value)}
+              disabled={opt.disabled}
+              title={opt.title}
+              aria-pressed={active}
+              style={{
+                flex: 1,
+                padding: '5px 10px',
+                border: 'none',
+                borderLeft: i > 0 ? '1px solid #223044' : 'none',
+                background: active ? '#55dcff' : 'transparent',
+                color: opt.disabled ? '#4a5364' : active ? '#0a0d14' : '#cdd3de',
+                font: '11px ui-monospace, monospace',
+                fontWeight: active ? 700 : 400,
+                cursor: opt.disabled ? 'not-allowed' : active ? 'default' : 'pointer',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/** Lightweight popover: a trigger button + a floating panel that closes on
+ *  outside-click or Escape. No dependency; used for the toolbar's Setup and
+ *  overflow menus so the header stays a single row on every viewport. */
+function Popover({
+  triggerLabel,
+  triggerTitle,
+  align = 'right',
+  badge,
+  children,
+}: {
+  triggerLabel: React.ReactNode;
+  triggerTitle?: string;
+  align?: 'left' | 'right';
+  badge?: React.ReactNode;
+  children: (close: () => void) => React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+  return (
+    <div ref={ref} style={{ position: 'relative', display: 'inline-flex' }}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title={triggerTitle}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        style={{
+          padding: '6px 10px',
+          background: open ? '#1b2740' : 'transparent',
+          border: '1px solid #223044',
+          borderRadius: 4,
+          color: '#cdd3de',
+          font: 'inherit',
+          cursor: 'pointer',
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {triggerLabel}
+        {badge}
+        <span style={{ opacity: 0.6, fontSize: 10 }}>{open ? '▲' : '▼'}</span>
+      </button>
+      {open && (
+        <div
+          role="menu"
+          style={{
+            position: 'absolute',
+            top: 'calc(100% + 6px)',
+            [align]: 0,
+            zIndex: 80,
+            background: '#0d1119',
+            border: '1px solid #223044',
+            borderRadius: 8,
+            padding: 12,
+            boxShadow: '0 8px 24px rgba(0, 0, 0, 0.5)',
+            maxWidth: 'calc(100vw - 24px)',
+          }}
+        >
+          {children(() => setOpen(false))}
+        </div>
+      )}
     </div>
   );
 }

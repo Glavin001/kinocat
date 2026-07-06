@@ -25,6 +25,7 @@ import {
   defaultVehicleAgent,
   kinematicForwardSim,
   learnedForwardSimV2,
+  forwardSimV3,
   DEFAULT_LEARNABLE_CONFIG,
   plannerVehicleCapabilities,
 } from 'kinocat/agent';
@@ -375,25 +376,36 @@ export function buildLearnedRaceLibrary(
 export function buildLearnedRaceLibraryV2(
   model: import('kinocat/agent').LearnedVehicleModel,
 ): MotionPrimitiveLibrary {
-  const inner = learnedForwardSimV2(model);
-  const cfg = model.config;
-  // Duration tuned per-regime: enough time for control differences to
-  // produce DISTINGUISHABLE endpoints (so the planner has real choices)
-  // but not so long that the planner can't react to nearby gates.
-  // At v=0 the chassis needs ~1.5 s to accelerate to a speed where turn
-  // dynamics differentiate. At speed, brake-into-corner trajectories need
-  // ~0.8 s to develop (5.5 m/s² brake decel × 0.8 s = 4.4 m/s of speed
-  // change, enough to discriminate plans). The regime → control-set
-  // mapping follows the same physics rationale as the original 4-bucket
-  // layout; the denser RACE_START_SPEEDS grid just samples each regime
-  // at more start speeds so nearest-bucket quantization stays ≤ 2 m/s.
-  // Duration parity with the kinematic library (0.55 s) once the chassis
-  // is moving: the planner's decision cadence is part of the "identical
-  // system" contract, and longer v2 primitives measurably cost agility
-  // in the slalom (fewer direction changes per second available to the
-  // search). Only the launch bucket keeps a longer window — from rest,
-  // 0.55 s of full throttle covers < 1 m and endpoints barely
-  // differentiate.
+  return buildRaceLibraryFromSim(learnedForwardSimV2(model), model.config);
+}
+
+/** v3 race library: same per-bucket durations and speed-aware control sets
+ *  as the v2 builder (those are planner-vocabulary policy, not model
+ *  internals), but every trajectory is rolled by the PURELY learned v3
+ *  neural dynamics model — no parametric backbone anywhere in the loop. */
+export function buildLearnedRaceLibraryV3(
+  model: import('kinocat/agent').LearnedVehicleModelV3,
+): MotionPrimitiveLibrary {
+  return buildRaceLibraryFromSim(forwardSimV3(model), model.config);
+}
+
+/** Shared bucket layout for learned race libraries (v2 + v3).
+ *
+ *  Duration tuned per-regime: enough time for control differences to
+ *  produce DISTINGUISHABLE endpoints (so the planner has real choices)
+ *  but not so long that the planner can't react to nearby gates.
+ *  At v=0 the chassis needs ~1.5 s to accelerate to a speed where turn
+ *  dynamics differentiate. The regime → control-set mapping follows the
+ *  same physics rationale as the original 4-bucket layout; the denser
+ *  RACE_START_SPEEDS grid just samples each regime at more start speeds
+ *  so nearest-bucket quantization stays ≤ 2 m/s. Duration parity with the
+ *  kinematic library (0.55 s) once the chassis is moving: the planner's
+ *  decision cadence is part of the "identical system" contract, and
+ *  longer primitives measurably cost agility in the slalom. */
+function buildRaceLibraryFromSim(
+  inner: import('kinocat/primitives').ForwardSim<CarKinematicState>,
+  cfg: CfgLike,
+): MotionPrimitiveLibrary {
   const regimeFor = (v: number): { duration: number; controls: number[][] } => {
     // Launch bucket keeps 1.5 s: from rest the acceleration phase
     // dominates and a shorter window collapses the endpoint fan below
@@ -402,27 +414,21 @@ export function buildLearnedRaceLibraryV2(
     if (v < 2) return { duration: 1.5, controls: lowSpeedV2Controls(cfg) };
     // 4 m/s bucket needs 0.8 s for a non-degenerate endpoint fan
     // (0.55 s measured hull 0.19 m² < the 0.5 m² usability floor).
-    // (Launch-style controls here were measured WORSE: 21 failed
-    // replans on the flying lap — the coast/brake options matter.)
     if (v < 6) return { duration: 0.8, controls: midSpeedV2Controls(cfg) };
     if (v < 14) return { duration: 0.55, controls: midSpeedV2Controls(cfg) };
     if (v < 23) return { duration: 0.55, controls: highSpeedV2Controls(cfg) };
     return { duration: 0.55, controls: topSpeedV2Controls(cfg) };
   };
-  const buckets: Array<{
-    startSpeed: number;
-    duration: number;
-    controls: number[][];
-  }> = RACE_START_SPEEDS.map((v) => ({ startSpeed: v, ...regimeFor(v) }));
   const all: import('kinocat/primitives').MotionPrimitive[] = [];
   let id = 0;
-  for (const b of buckets) {
+  for (const startSpeed of RACE_START_SPEEDS) {
+    const b = regimeFor(startSpeed);
     const lib = characterizeVehicle({
       forwardSim: inner,
       controlSets: b.controls,
       duration: b.duration,
       substeps: 6,
-      startSpeeds: [b.startSpeed],
+      startSpeeds: [startSpeed],
     });
     for (const p of lib.primitives) {
       all.push({ ...p, id: id++ });
@@ -701,6 +707,10 @@ export interface RaceMultiGoalRequest {
    *  by default in `planVehicleMultiGoal`). Used by ablation harnesses
    *  to measure the cache's contribution. */
   disableHeuristicTable?: boolean;
+  /** WS-2 — dynamic rollouts. When set, a search node carrying slip (the
+   *  mid-corner replan root) expands via this live-characterized rollout
+   *  instead of the baked zero-slip library. See VehicleEnvOptions.rootRollout. */
+  rootRollout?: (state: CarKinematicState) => import('kinocat/primitives').MotionPrimitive[];
   /** Agent the planner reasons about — must match the agent the supplied
    *  `lib` was characterised from (see `RacePlanRequest.agent`). Defaults to
    *  `RACE_AGENT`. */
@@ -729,6 +739,10 @@ export function planRaceMultiGoal(req: RaceMultiGoalRequest): PlanResult<CarKine
   }
   if (req.disableHeuristicTable) {
     envOptions.heuristicTable = false;
+    usedEnvOptions = true;
+  }
+  if (req.rootRollout) {
+    envOptions.rootRollout = req.rootRollout;
     usedEnvOptions = true;
   }
   return planVehicleMultiGoal({
@@ -907,6 +921,11 @@ export interface RaceMetrics {
     /** Total replan attempts this race. */
     totalReplans: number;
   };
+  /** MPPI executor diagnostics — populated only while the scenario runs
+   *  the `'mpc'` tracker (0 under pure-pursuit). Surfaced in the HUD so
+   *  the active control stack is never ambiguous. */
+  mpcSolveMsAvg: number;
+  mpcSolveCount: number;
 }
 
 export function emptyMetrics(): RaceMetrics {
@@ -928,6 +947,8 @@ export function emptyMetrics(): RaceMetrics {
       successfulReplans: 0,
       totalReplans: 0,
     },
+    mpcSolveMsAvg: 0,
+    mpcSolveCount: 0,
   };
 }
 

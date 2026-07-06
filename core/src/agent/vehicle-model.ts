@@ -209,7 +209,19 @@ export const PARAMS_V2_LO: LearnedVehicleParamsV2 = {
 };
 
 export const PARAMS_V2_HI: LearnedVehicleParamsV2 = {
-  engineScale: 1.05,          // > 100% means the model "amplifies" commanded force — unphysical
+  // The Rapier adapter applies `driveForce` to EACH driven wheel
+  // (`setWheelEngineForce` per wheel), so the true chassis acceleration is
+  // drivenWheelCount × F / m — the WS-0 plant envelope measured 13.9 m/s²
+  // at launch (= 2 × 4000 / 576) where this model's engineScale·F/m form
+  // can only express 7 m/s² at scale 1. The previous bound of 1.05
+  // ("amplifying commanded force is unphysical") baked in the false
+  // assumption that F is the TOTAL force; the fitter slammed into that
+  // ceiling and the residual MLP silently absorbed a 2× longitudinal
+  // error. Ceiling is now 2 driven wheels + 10% margin. (The shipped
+  // v2-default artifact predates this fix — its engineScale sits at the
+  // old 1.05 clamp. The v3 model avoids this entire failure class by
+  // having no parametric form at all.)
+  engineScale: 2.2,
   reverseEffScale: 1.1,
   brakeScale: 2.0,            // generous upper to allow some over-fit, well short of the old 3.5
   accelTau: 0.6,

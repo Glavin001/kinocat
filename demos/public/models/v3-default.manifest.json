@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "kind": "v3-dynamics",
+  "profile": "default",
+  "seed": 42,
+  "trials": 400,
+  "ticks": 150,
+  "epochs": 60,
+  "hidden": [
+    64,
+    64
+  ],
+  "ensemble": 3,
+  "speedSchedule": [
+    0,
+    4,
+    8,
+    12,
+    16,
+    20,
+    24,
+    28,
+    32,
+    36
+  ],
+  "vehicleOptions": {
+    "chassisHalf": {
+      "x": 2.4,
+      "y": 0.5,
+      "z": 1
+    },
+    "chassisDensity": 60,
+    "wheelBase": 1.6,
+    "wheelTrack": 0.85,
+    "wheelRadius": 0.35,
+    "engineForce": 4000,
+    "brakeForce": 2000,
+    "maxSteerAngle": 0.6,
+    "driveTrain": "rwd"
+  },
+  "fidelity": {
+    "v3": {
+      "mean": 0.6253418988327202,
+      "worst": 2.266300005898437
+    },
+    "v2-trained": {
+      "mean": 1.0664172087869814,
+      "worst": 3.3250533761093153
+    }
+  },
+  "valRmsRaw": [
+    0.00508573304993741,
+    0.00099100755976206,
+    0.0005756953200390157,
+    0.21915150595841643,
+    0.029807217326552872,
+    0.036450513064895336
+  ],
+  "finalTrainLoss": 0.36914927441746187,
+  "finalValLoss": 0.714849092326126,
+  "git": "e7f3763",
+  "runtimeMs": 702506,
+  "createdAt": 1783280085186
+}

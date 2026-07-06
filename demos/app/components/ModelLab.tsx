@@ -22,6 +22,11 @@ import type { ModelDiagnostics, FitProgressEvent } from 'kinocat/learning';
 import type { CoverageCellSummary } from 'kinocat/training';
 
 export interface ModelLabProps {
+  /** Controlled open state (drawer). When provided, ModelLab renders no
+   *  inline launcher — the host (e.g. the raceprimitives toolbar) owns the
+   *  trigger. Omit for the legacy self-launching floating panel. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   onTrained: (model: LearnedVehicleModel, diag: ModelDiagnostics, trialsUsed: number) => void;
   /** If a model was loaded from localStorage, show its meta + allow clearing. */
   loadedMeta?: { trialsUsed: number; openLoopRmsAt1s: number; legacyRmsAt1s?: number; kinematicRmsAt1s?: number; createdAt: number } | null;
@@ -57,7 +62,14 @@ type Phase = 'initializing' | 'collecting' | 'parametric' | 'residual' | 'evalua
 
 export function ModelLab(props: ModelLabProps) {
   const isMobile = useIsMobile();
-  const [open, setOpen] = useState(false);
+  // Controlled (host owns the trigger) or uncontrolled (self-launching).
+  const controlled = props.open !== undefined;
+  const [openInternal, setOpenInternal] = useState(false);
+  const open = controlled ? !!props.open : openInternal;
+  const setOpen = (v: boolean) => {
+    if (controlled) props.onOpenChange?.(v);
+    else setOpenInternal(v);
+  };
   const [rounds, setRounds] = useState(3);
   const [trialsPerRound, setTrialsPerRound] = useState(48);
   const [trialTicks, setTrialTicks] = useState(120); // ~2s
@@ -264,68 +276,79 @@ export function ModelLab(props: ModelLabProps) {
     </>
   );
 
-  if (isMobile) {
-    // Mobile: small floating launcher button at the top-right (so it
-    // doesn't fight for space with the per-car stat panels). Tapping it
-    // opens a full-width bottom-sheet over a dim backdrop.
-    return (
-      <>
-        <button
-          onClick={() => setOpen(true)}
-          style={{
-            position: 'absolute', top: 8, right: 8, zIndex: 40,
-            background: 'rgba(13, 17, 25, 0.92)', color: '#cdd3de',
-            border: '1px solid #223044', borderRadius: 6,
-            padding: '6px 10px', font: '11px ui-monospace, monospace',
-            cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6,
-          }}
-        >
-          Model Lab
-          {props.hasV2Model && <span style={{ color: '#55dcff' }}>●</span>}
-        </button>
-        {open && (
-          <>
-            <div
-              onClick={() => setOpen(false)}
-              style={{
-                position: 'fixed', inset: 0, background: 'rgba(0, 0, 0, 0.55)',
-                zIndex: 60,
-              }}
-            />
-            <div
-              style={{
-                position: 'fixed', left: 0, right: 0, bottom: 0,
-                maxHeight: '85vh', overflowY: 'auto',
-                background: '#0d1119', color: '#cdd3de',
-                font: '12px ui-monospace, monospace',
-                borderTop: '1px solid #223044',
-                borderTopLeftRadius: 12, borderTopRightRadius: 12,
-                padding: '12px 14px 24px', zIndex: 61,
-                boxShadow: '0 -8px 24px rgba(0, 0, 0, 0.6)',
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-                <div style={{ fontWeight: 700 }}>
-                  Model Lab {props.hasV2Model && <span style={{ color: '#55dcff' }}>● v2 ready</span>}
-                </div>
-                <button onClick={() => setOpen(false)} style={ghostBtnStyle}>Close</button>
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>{panelBody}</div>
-            </div>
-          </>
-        )}
-      </>
-    );
-  }
+  // Drawer geometry: a right-docked panel on desktop/tablet, a bottom sheet
+  // on mobile. Both open over a dim backdrop and are dismissible via the
+  // backdrop, the Close button, or Escape. This replaces the old floating
+  // top-right panel that overlapped the LEARNED metrics readout — the host
+  // toolbar now owns the launcher (controlled mode).
+  const drawerStyle: React.CSSProperties = isMobile
+    ? {
+        position: 'fixed', left: 0, right: 0, bottom: 0,
+        maxHeight: '85vh', overflowY: 'auto',
+        borderTop: '1px solid #223044',
+        borderTopLeftRadius: 12, borderTopRightRadius: 12,
+        padding: '12px 14px 24px',
+        boxShadow: '0 -8px 24px rgba(0, 0, 0, 0.6)',
+      }
+    : {
+        position: 'fixed', top: 0, right: 0, bottom: 0,
+        width: 'min(460px, 100vw)', overflowY: 'auto',
+        borderLeft: '1px solid #223044',
+        padding: '14px 16px 24px',
+        boxShadow: '-8px 0 24px rgba(0, 0, 0, 0.5)',
+      };
+
+  const launcher = !controlled && !open ? (
+    <button
+      onClick={() => setOpen(true)}
+      style={{
+        position: 'absolute', top: 8, right: 8, zIndex: 40,
+        background: 'rgba(13, 17, 25, 0.92)', color: '#cdd3de',
+        border: '1px solid #223044', borderRadius: 6,
+        padding: '6px 10px', font: '11px ui-monospace, monospace',
+        cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6,
+      }}
+    >
+      Model Lab
+      {props.hasV2Model && <span style={{ color: '#55dcff' }}>●</span>}
+    </button>
+  ) : null;
 
   return (
-    <div style={panelOuterStyle(open)}>
-      <button onClick={() => setOpen(!open)} style={panelToggleStyle}>
-        {open ? '▼ Model Lab' : '▲ Model Lab'}
-        {props.hasV2Model && <span style={{ marginLeft: 8, color: '#55dcff' }}>● v2 ready</span>}
-      </button>
-      {open && <div style={panelContentStyle}>{panelBody}</div>}
-    </div>
+    <>
+      {launcher}
+      {open && (
+        <>
+          <div
+            onClick={() => setOpen(false)}
+            style={{ position: 'fixed', inset: 0, background: 'rgba(0, 0, 0, 0.55)', zIndex: 60 }}
+          />
+          <div
+            role="dialog"
+            aria-label="Model Lab"
+            style={{
+              ...drawerStyle,
+              background: '#0d1119', color: '#cdd3de',
+              font: '12px ui-monospace, monospace',
+              zIndex: 61,
+            }}
+            onKeyDown={(e) => { if (e.key === 'Escape') setOpen(false); }}
+          >
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              marginBottom: 12, position: 'sticky', top: 0, background: '#0d1119',
+              paddingBottom: 8, borderBottom: '1px solid #161d2b',
+            }}>
+              <div style={{ fontWeight: 700 }}>
+                Model Lab {props.hasV2Model && <span style={{ color: '#55dcff' }}>● v2 ready</span>}
+              </div>
+              <button onClick={() => setOpen(false)} style={ghostBtnStyle}>Close</button>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>{panelBody}</div>
+          </div>
+        </>
+      )}
+    </>
   );
 }
 
@@ -617,45 +640,6 @@ const selectStyle: React.CSSProperties = {
 
 // ---------------------------------------------------------------------------
 // Small style helpers — keep dependencies minimal (no styled-components etc.)
-
-function panelOuterStyle(open: boolean): React.CSSProperties {
-  return {
-    position: 'absolute',
-    top: 8,
-    right: 8,
-    width: open ? 'min(420px, calc(100vw - 32px))' : 'auto',
-    maxWidth: 'calc(100vw - 32px)',
-    background: 'rgba(10, 13, 20, 0.95)',
-    border: '1px solid #223044',
-    borderRadius: 6,
-    fontFamily: 'ui-monospace, monospace',
-    fontSize: 12,
-    color: '#cdd3de',
-    zIndex: 40,
-    maxHeight: 'calc(100vh - 100px)',
-    overflow: 'auto',
-    boxShadow: open ? '0 6px 24px rgba(0, 0, 0, 0.4)' : 'none',
-  };
-}
-
-const panelToggleStyle: React.CSSProperties = {
-  width: '100%',
-  padding: '8px 12px',
-  background: '#141a26',
-  border: 'none',
-  borderBottom: '1px solid #223044',
-  color: '#cdd3de',
-  font: 'inherit',
-  textAlign: 'left',
-  cursor: 'pointer',
-};
-
-const panelContentStyle: React.CSSProperties = {
-  padding: 12,
-  display: 'flex',
-  flexDirection: 'column',
-  gap: 12,
-};
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (

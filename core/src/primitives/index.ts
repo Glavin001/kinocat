@@ -10,6 +10,7 @@ export {
   characterize,
   crossRuns,
   characterizeVehicle,
+  characterizeVehicleFromState,
   type CharacterizeOptions,
   type CharacterizeRun,
   type CharacterizedPrimitive,

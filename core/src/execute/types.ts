@@ -82,6 +82,38 @@ export interface PurePursuitConfig {
    *  chassis off a tight, clearance-critical earlier part of the path. Default
    *  Infinity (apply whenever headingGain > 0). */
   headingRadius?: number;
+  /**
+   * WS-1 — kill phantom horizon braking. When true, the brake-to-goal term
+   * (`vGoal`) is applied ONLY when the plan genuinely stops at its end
+   * (`stopsAtEnd`). Drive-through horizons (a racing loop whose terminal is
+   * just the current planning window) get `vGoal = ∞`, so the chassis is no
+   * longer permanently decelerating toward a phantom finish line ~20-40 m
+   * ahead that the next replan will extend. Default false (legacy: brake
+   * toward every terminal). Racing enables it; parking leaves it off.
+   */
+  noGoalBrakeOnDriveThrough?: boolean;
+  /**
+   * WS-1 — faithful "floor it" longitudinal law. When true, replace the
+   * proportional throttle (`throttle = Δv/maxAccel`, which commands only 33%
+   * throttle at a 2 m/s deficit and never quite reaches cruise) with a
+   * bang-bang + coast-band law that a human uses: FULL throttle while the
+   * commanded speed exceeds the current speed by more than `coastBand`; brake
+   * (through the braking envelope) while it is below by more than `coastBand`;
+   * and COAST (zero throttle, zero brake) in between. On this near-binary
+   * raycast brake, coasting instead of dithering is a real stability win.
+   * Default false (legacy P-law). Racing enables it; parking keeps the P-law
+   * for its precise terminal approach.
+   */
+  bangBangThrottle?: boolean;
+  /** Accelerate-side hysteresis (m/s) for `bangBangThrottle`: floor the
+   *  throttle only once the speed deficit exceeds this. Default 0.5. Set to 0
+   *  for decisive corner-exit acceleration (tight courses); keep wider to
+   *  drive gently toward the setpoint. */
+  coastBand?: number;
+  /** Brake-side hysteresis (m/s) for `bangBangThrottle`: coast (don't brake)
+   *  when only this far above the commanded speed. Default 0.5. Prevents
+   *  throttle↔brake dither and over-braking wedges. */
+  coastBandBrake?: number;
 }
 
 export interface TrackingCommand {

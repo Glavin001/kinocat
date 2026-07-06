@@ -15,18 +15,26 @@ import {
   kinematicEntry,
   parametricOnlyEntry,
   v2Entry,
+  v3Entry,
   type RaceEntry,
   type RaceResult,
 } from '../app/lib/headless-race';
 import { buildRaceCourse } from '../app/lib/race-primitives-scenarios';
 import { modelFromJson } from '../app/lib/v2-model-file';
 import type { PersistedV2Model } from '../app/lib/v2-model-persistence';
+import { isV3Payload, v3FromJson } from 'kinocat/agent';
 
+/** Route by payload shape: v3 dynamics artifacts carry `kind:
+ *  'v3-dynamics'`; anything else is a persisted v2 model. */
 function loadModelEntry(path: string, displayName?: string): RaceEntry {
   const text = readFileSync(path, 'utf-8');
-  const payload = JSON.parse(text) as PersistedV2Model;
-  const model = modelFromJson(payload);
-  return v2Entry(displayName ?? basename(path).replace(/\.json$/, ''), model);
+  const payload = JSON.parse(text);
+  const name = displayName ?? basename(path).replace(/\.json$/, '');
+  if (isV3Payload(payload)) {
+    return v3Entry(name, v3FromJson(payload));
+  }
+  const model = modelFromJson(payload as PersistedV2Model);
+  return v2Entry(name, model);
 }
 
 function fmt(s: number): string {

@@ -19,3 +19,11 @@ kinocat is a **pnpm monorepo** (Node ≥ 22, pnpm 10.33). Three workspace packag
 ### 3D demo performance in the cloud VM (important)
 - The 3D physics demos (`/carchase`, `/ramp`, `/raceprimitives`, `/parking`, `/dogfight`, `/world3d`, etc.) use three.js + Rapier WASM. The cloud VM has **no GPU** (software WebGL) and 4 CPUs, so these scenes render and run their planning/physics logic correctly but **animate slowly/choppily** — the planner's per-plan expansion time can be 1–2+ s. This is an environment limitation, not a bug; on-screen stats/phase indicators still advance and there are no console errors.
 - The 2D demos (`/playground`, `/curves`, `/primitives`, `/anytime`, etc.) render on a plain 2D canvas and are smooth — prefer `/playground` for a quick, responsive end-to-end check that the core planner works (drag the goal marker; the path replans live).
+
+## Skills
+
+Read the relevant skill file before working on these problem classes:
+
+- `.cursor/skills/headless-race-debugging/SKILL.md` — a car drives badly in a race/parking scenario (slow, stalls, wedges, recoveries): headless runs, speed-coloured trajectory plots, pre-failure ring-buffer dumps, known failure signatures.
+- `.cursor/skills/mppi-diagnosis-and-tuning/SKILL.md` — the MPPI tracker emits weak/wrong controls or a cost change misbehaves: `onDebug`/`scoreSequence` introspection, λ-vs-cost-scale matching, sampling shape, progress-cost pitfalls.
+- `.cursor/skills/model-vs-plant-fidelity/SKILL.md` — attributing a failure to model vs planner vs executor: deterministic model-vs-plant rollout comparison on the headless Rapier harness, attribution decision tree.
