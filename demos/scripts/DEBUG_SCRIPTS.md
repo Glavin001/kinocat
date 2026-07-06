@@ -66,6 +66,11 @@ correctness branch.
   up its capability. Measured: v3 diverges only ~2.3 m over a 42 m maneuver
   (plausible, slightly conservative); v2 diverges ~47 m (engineScale
   under-prediction). This is what justified control feedforward.
+- **`best-config-bench.mts [secsCap] [budgetMs]`** — full one-lap driving-quality
+  stats for each model at its OPTIMAL control-feedforward setting (kinematic OFF,
+  v2 OFF, v3 ON — feedforward only pays off on a model-faithful plan). Reports
+  best lap, mean speed, `predErrRms`, churn, stopped/reversing time, recoveries,
+  g-g utilization, and MPPI solve ms per model.
 - **`feedforward-compare.mts <kin|v2|v3> [secs] [open|technical] [budgetMs]`** —
   WS-1½ control-feedforward A/B. Runs the SAME closed-loop segment twice for one
   model, `controlFeedforward` OFF vs ON, and prints the tracking-fidelity
