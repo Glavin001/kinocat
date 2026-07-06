@@ -1,4 +1,4 @@
-// TEMP — plan STABILITY / churn diagnostic. Not committed.
+// plan STABILITY / churn diagnostic. Not committed.
 //
 // Separates PLANNING error from EXECUTION error, and measures replan churn.
 //   <out>-plans.png  every committed plan overlaid, coloured by replan order
@@ -15,7 +15,7 @@
 // "hits a gate, goal jumps 1 forward, plan overcorrects" hypothesis is
 // measurable, not eyeballed.
 //
-// usage: npx tsx scripts/tmp-plan-plot.mts <kin|v2|v3> [maxSec] [open|technical] <outPrefix>
+// usage: npx tsx scripts/plan-vs-exec.mts <kin|v2|v3> [maxSec] [open|technical] <outPrefix>
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';

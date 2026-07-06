@@ -1,7 +1,7 @@
 // Clean single-plan slalom comparison: the isolated 3-gate slalom (plans in one
 // call, no receding stitch), rendered per model with the fix on. Shows each
 // model's intended line + speed profile through the same corner sequence.
-// usage: KINOCAT_GEN_CONTROLS=1 KINOCAT_ANALYTIC_DT=1 npx tsx scripts/tmp-slalom-plot.mts <kin|v2|v3> [out]
+// usage: KINOCAT_GEN_CONTROLS=1 KINOCAT_ANALYTIC_DT=1 npx tsx scripts/race-line-compare.mts <kin|v2|v3> [out]
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';

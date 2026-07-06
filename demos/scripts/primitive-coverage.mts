@@ -1,4 +1,4 @@
-// TEMP — motion-primitive COVERAGE analyzer (control-set design by dispersion).
+// motion-primitive COVERAGE analyzer (control-set design by dispersion).
 //
 // Judges a primitive library by its OUTPUTS (rolled-out endpoints), not its
 // inputs: enumerates a dense candidate grid of controls, rolls each through the
@@ -12,7 +12,7 @@
 // It then runs farthest-point selection over the dense candidates to a slot
 // budget and reports how much lower the dispersion of a coverage-optimal set is.
 //
-// usage: npx tsx scripts/tmp-primitive-coverage.mts <v2|v3|kin> [startSpeed]
+// usage: npx tsx scripts/primitive-coverage.mts <v2|v3|kin> [startSpeed]
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';

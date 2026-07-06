@@ -14,7 +14,39 @@ these scripts:
 - `.cursor/skills/mppi-diagnosis-and-tuning/SKILL.md`
 - `.cursor/skills/model-vs-plant-fidelity/SKILL.md`
 
-## The current, load-bearing kit
+## Reusable analysis tools (keepers — not `tmp-`)
+
+These are the load-bearing diagnostics from the primitive-coverage / K5 work;
+kept with stable names because they answer recurring questions. All read
+`KINOCAT_GEN_CONTROLS=1` (dispersion-designed control sets + dense buckets) and
+`KINOCAT_ANALYTIC_DT=1` (analytic drive-through repricing) to select the
+correctness branch.
+
+- **`race-line-compare.mts <kin|v2|v3>`** — plans the same 3-gate slalom in one
+  call and renders the intended racing line speed-coloured. Run all three to
+  see each model's worldview (kin over-drives to 30; v2 smooth ~21; v3
+  aggressive ~24 with a sharp dip). Densifies sparse plan endpoints so the
+  plotter's 10 m teleport guard doesn't drop segments.
+- **`primitive-coverage.mts <kin|v2|v3> [speed]`** — control-set coverage by
+  dispersion: dense candidate grid rolled through the model, reports the worst
+  reachable hole, redundancy, extreme-reach, and an FPS-selected set of the
+  same budget. Turns "did we forget an arc?" into a metric.
+- **`plan-cost-breakdown.mts`** — same slalom, four configs (hand/gen ×
+  reprice on/off), full `PlanStats`: expansions, generated, collision checks,
+  heuristic calls, ms. Shows what drives replan cost (reprice = 6× expansions;
+  denser+generated primitives REDUCE expansions).
+- **`plan-vs-exec.mts <kin|v2|v3> [maxSec] [open|technical] <outPrefix>`** —
+  separates planning from execution error: overlays every committed plan
+  coloured by replan order (stable vs thrash) + a plan-vs-exec plot, and
+  reports replan churn split by same-waypoint vs waypoint-advance.
+- **`race-line-compare` / `speed-adaptivity.mts <kin|v2|v3>`** — dumps each
+  bucket's generated set (accel, tightest feasible turn radius, reverse slots)
+  showing the speed-adaptive envelope (min radius 3.8 m at rest → 11.7 m at
+  28 m/s).
+- **`library-feasibility.mts`** — scans a library for the worst |dv/dt|
+  primitive (checks bakes stay within the plant's accel/brake envelope).
+
+## The current, load-bearing kit (`tmp-*`, experimental)
 
 ### `tmp-sweep.mts` — one-knob-per-run tuning + trajectory plot
 ```
