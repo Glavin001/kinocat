@@ -183,6 +183,60 @@ The two cheap precision levers if plan-level timing proves binding:
    needs it anyway). Requires re-baking libraries + duration-per-primitive in
    the cost (already supported — cost reads `prim.duration`).
 
+## Primitive coverage: designing the control set by dispersion (the real K5 fix)
+
+The K5 wedge is really a **coverage hole** in the primitive library: the
+planner takes the mispriced analytic stop-shortcut because its forward
+primitives can't spline a gentle corner at speed. Repricing the analytic shot
+alone just makes the search flail (measured: v2/v3 replans time out ~12 s
+without the crutch). The root fix is to give the planner a primitive set that
+actually *spans the reachable set* — judged by OUTPUTS (rolled-out endpoints),
+not by hand-guessed control values. This is control-set design by dispersion
+(Pivtoraiko & Kelly, "Generating Near-Minimal Spanning Control Sets").
+
+**Analyzer (built): `tmp-primitive-coverage.mts`.** Rolls a dense candidate
+control grid through each model's forward sim and reports, per speed bucket:
+DISPERSION (worst reachable endpoint far from any library primitive = the
+hole), REDUNDANCY (closest library-endpoint pair = wasted slot), EXTREME-REACH
+(library vs reachable max straight / turn / brake), and a farthest-point
+selection of the same slot budget. Measured on the current v3 library:
+
+| bucket | slots | dispersion (hole) | hole = | max\|dh\| lib vs reachable | closest pair | FPS same-size |
+|---|---|---|---|---|---|---|
+| 14 m/s | 10 | **2.97 m** | brake-in-turn | 0.49 / 0.55 | 0.31 m | **1.48 m** |
+| 20 m/s | 13 | **2.51 m** | medium-radius turn | **0.38 / 0.75** | 0.20 m | **1.87 m** |
+
+The 20 m/s row is the K5 hole quantified: the library lets the planner turn
+only **half as hard as the chassis can** (0.38 vs 0.75 rad over the chunk), and
+a same-budget dispersion-optimal set covers ~25–50% better.
+
+**The fix (two parts, both automatable):**
+
+1. **Generate the control set by dispersion, not by hand.** Over a dense
+   candidate grid rolled through the *model's own* forward sim: (a) force-include
+   the extremes (max-speed straight, hardest feasible turn each direction, hard
+   brake, coast) and enforce L/R **symmetry**; (b) fill the remaining slot budget
+   by **farthest-point selection** (each new primitive is the reachable endpoint
+   farthest from those already chosen); (c) stop when dispersion drops below a
+   target or the slot budget is hit. Replaces `low/mid/high/topSpeedV2Controls`
+   with a generator. Per-model sets fall out automatically (v2/v3/kin roll
+   different dynamics → different optimal sets — correct).
+2. **Lock it with a coverage REGRESSION TEST.** Assert per bucket:
+   dispersion < target, no redundant pair < ε, extreme-reach within X% of the
+   reachable envelope, and L/R symmetry. Then a future control-set edit that
+   opens a hole fails CI — the "ensure it on our end automatically" safeguard,
+   instead of discovering the gap by a wedged car three layers downstream.
+
+**Tradeoff to tune (not ignore):** more primitives = higher branching factor =
+slower search. The goal is the *minimal spanning* set — maximal coverage per
+slot — which is exactly what FPS gives; the dispersion target is the knob
+(measure replan expansions vs dispersion). Caveats: the endpoint distance metric
+weights position/heading/speed (expose + validate against plan quality); a few
+"redundant" endpoints may differ in swept footprint (collision) or composability,
+so treat endpoint dispersion as the dominant — not sole — signal; and this
+interacts with variable-duration / interruptible primitives (endpoint depends on
+duration).
+
 ## Layer taxonomy (what each test attributes a failure to)
 
 - **L0 — plant/model ground truth.** What the real Rapier plant can physically
