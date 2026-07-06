@@ -17,7 +17,31 @@ export interface ModeSwitcherProps {
   onDownloadJson: () => void;
   /** Optional toast text shown briefly after a copy. */
   toast?: string | null;
+  /** Ordered list of visibility IDs ('real' + ghost ids). */
+  ghostIds?: string[];
+  /** Current visibility per ID. */
+  visibility?: Record<string, boolean>;
+  /** Toggle a single ID on/off. */
+  onToggleVisibility?: (id: string) => void;
 }
+
+const GHOST_LABELS: Record<string, string> = {
+  'real': 'Real car (white)',
+  'v2-full': 'v2 (parametric + residual)',
+  'v2-default': 'v2-default.json (preloaded)',
+  'v2-trained': 'v2-trained (localStorage)',
+  'parametric': 'parametric-only',
+  'kinematic': 'kinematic',
+};
+
+const GHOST_COLORS: Record<string, string> = {
+  'real': '#ffffff',
+  'v2-full': '#4dd2ff',
+  'v2-default': '#4dd2ff',
+  'v2-trained': '#55ff99',
+  'parametric': '#b47bff',
+  'kinematic': '#ffcc55',
+};
 
 const modes: { id: SimToRealMode; label: string; hint: string }[] = [
   { id: 'playback', label: 'Playback', hint: 'Replay a recorded trial; open-loop model vs Rapier (Gap A)' },
@@ -47,6 +71,20 @@ export function ModeSwitcher(props: ModeSwitcherProps) {
           Reset (R)
         </button>
       </div>
+      {props.ghostIds && props.ghostIds.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, fontSize: 11, marginBottom: 6 }}>
+          {props.ghostIds.map((id) => (
+            <label key={id} style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 3, color: GHOST_COLORS[id] ?? '#e6e9ee' }}>
+              <input
+                type="checkbox"
+                checked={props.visibility?.[id] !== false}
+                onChange={() => props.onToggleVisibility?.(id)}
+              />
+              <span>{GHOST_LABELS[id] ?? id}</span>
+            </label>
+          ))}
+        </div>
+      )}
       <div style={{ display: 'flex', gap: 14, fontSize: 12, opacity: 0.85, marginBottom: 6 }}>
         <Toggle label="Friction circles" v={props.showFriction} onChange={props.onToggleFriction} />
         <Toggle label="Uncertainty cloud" v={props.showUncertainty} onChange={props.onToggleUncertainty} />

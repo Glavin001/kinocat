@@ -38,6 +38,7 @@ import {
   REGION_COLORS,
   createPlanDebugHelper,
 } from 'kinocat/adapters/three';
+import { samplePlanAt } from 'kinocat/vehicle/car';
 import { goalRegions, maintainRegions, compile, stepAutomaton } from 'kinocat/scenario';
 import type { CompiledAutomaton, ProgressSnapshot } from 'kinocat/scenario';
 import { GoalProgressPanel } from '../components/GoalProgressPanel';
@@ -49,7 +50,9 @@ import {
   PARKING_SCENARIOS,
   PARKING_LABELS,
   PARKING_AGENT,
+  PARKING_GOAL_TOL,
   buildParkingScenario,
+  checkParkingGoal,
   parkingLibrary,
   parkingCourse,
   parkingPlannerGoal,
@@ -57,6 +60,7 @@ import {
   evaluateParked,
   type ParkingScenarioId,
   type ParkingScenario,
+  type ParkingGoalCheck,
 } from '../lib/parking-scenarios';
 import {
   createRaceScenario,
@@ -104,7 +108,14 @@ export default function Parking() {
   // agent's value so the slider opens showing the live default; changing it
   // rebuilds the scenario, which re-plans with the new penalty.
   const [switchCost, setSwitchCost] = useState(PARKING_AGENT.directionChangePenalty);
+  const [showGhost, setShowGhost] = useState(true);
   const [hud, setHud] = useState('');
+  // Per-axis goal readout (pos/hdg/spd ✓/✗) + plan-vs-execution divergence.
+  // Complements the coverage-based PARKED verdict with the exact criterion
+  // the goal-check shares with the bench.
+  const [goalHud, setGoalHud] = useState<
+    { check: ParkingGoalCheck; headingSignedDeg: number; ghostDivM: number } | null
+  >(null);
   const [status, setStatus] = useState('initialising...');
   // Rich plan for the 2-D profile strip. Updated only when the committed plan
   // changes (on replan), NOT every frame — the plot is a scalar-vs-arc-length
@@ -120,12 +131,14 @@ export default function Parking() {
   const showPathRef = useRef(showPath);
   const showPlanDebugRef = useRef(showPlanDebug);
   const showFootprintsRef = useRef(showFootprints);
+  const showGhostRef = useRef(showGhost);
   const switchCostRef = useRef(switchCost);
   scenarioIdRef.current = scenarioId;
   pausedRef.current = paused;
   showPathRef.current = showPath;
   showPlanDebugRef.current = showPlanDebug;
   showFootprintsRef.current = showFootprints;
+  showGhostRef.current = showGhost;
   switchCostRef.current = switchCost;
 
   useEffect(() => {
@@ -159,6 +172,12 @@ export default function Parking() {
     let pathLine: THREE.Line | null = null;
     let planDebug: THREE.Group | null = null;
     let carMesh: ReturnType<typeof createCarMeshHelper> | null = null;
+    // "Ghost car" — translucent chassis rendered at the pose the plan PREDICTS
+    // the chassis is in right now (`samplePlanAt(plan, simTime - planStart)`).
+    // Real chassis sitting on the ghost = tracker faithfully executing the
+    // plan; ghost pulling ahead = execution diverging from the plan. Separates
+    // planner-wrong from tracker-wrong bugs visually.
+    let ghostMesh: ReturnType<typeof createCarMeshHelper> | null = null;
     let goalMesh: THREE.Mesh | null = null;
     let raceScenario: RaceScenario | null = null;
     // Live goal-progress automaton (the deterministic scenario-goal visualizer):
@@ -240,6 +259,18 @@ export default function Parking() {
       if (carMesh) {
         scene.remove(carMesh.group);
         carMesh = null;
+      }
+      if (ghostMesh) {
+        scene.remove(ghostMesh.group);
+        // Materials are clones we own — dispose to avoid leaks across rebuilds.
+        ghostMesh.group.traverse((obj) => {
+          if (obj instanceof THREE.Mesh) {
+            const mat = obj.material;
+            if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+            else (mat as THREE.Material).dispose();
+          }
+        });
+        ghostMesh = null;
       }
       if (goalMesh) {
         scene.remove(goalMesh);
@@ -353,6 +384,21 @@ export default function Parking() {
       if (handle) {
         carMesh = createCarMeshHelper({ color: C.ego });
         scene.add(carMesh.group);
+        // Ghost mesh: same geometry, translucent. Clone every material up-front
+        // so dimming the ghost doesn't dim the real car.
+        ghostMesh = createCarMeshHelper({ color: 0xffaa33 });
+        ghostMesh.group.traverse((obj) => {
+          if (obj instanceof THREE.Mesh) {
+            const mat = obj.material as THREE.MeshStandardMaterial;
+            const ghost = mat.clone();
+            ghost.transparent = true;
+            ghost.opacity = 0.35;
+            ghost.depthWrite = false;
+            obj.material = ghost;
+          }
+        });
+        ghostMesh.group.visible = false;
+        scene.add(ghostMesh.group);
       }
       setStatus(`scenario: ${PARKING_LABELS[id]}`);
     }
@@ -398,6 +444,7 @@ export default function Parking() {
     // Animation loop
     let prev = performance.now();
     let tickCarry = 0;
+    let ghostHudCounter = 0;
     function frame() {
       if (cancelled) return;
       const now = performance.now();
@@ -422,6 +469,31 @@ export default function Parking() {
         const s = raceScenario.status()[0];
         if (s && carMesh) {
           syncCarMesh(carMesh.group, s.state);
+          // Ghost car: pose the plan PREDICTS for the chassis right now. If the
+          // plan has been executing for `elapsed` sim seconds, samplePlanAt is
+          // exactly where the plan said the chassis would be — compare to the
+          // real mesh to separate planner-wrong from tracker-wrong.
+          let ghostDivM = NaN;
+          if (ghostMesh) {
+            let ghostState: { x: number; z: number; heading: number; speed: number } | null = null;
+            if (showGhostRef.current && s.plan && s.plan.length >= 2) {
+              const elapsed = Math.max(0, raceScenario.simTime() - s.planStartSimTime);
+              ghostState = samplePlanAt(s.plan, elapsed);
+            }
+            if (ghostState) {
+              ghostMesh.group.visible = true;
+              syncCarMesh(ghostMesh.group, {
+                x: ghostState.x,
+                z: ghostState.z,
+                heading: ghostState.heading,
+                speed: ghostState.speed,
+                t: 0,
+              });
+              ghostDivM = Math.hypot(s.state.x - ghostState.x, s.state.z - ghostState.z);
+            } else {
+              ghostMesh.group.visible = false;
+            }
+          }
           // Advance the goal automaton from the ego trajectory (O(1)/frame) and
           // surface the deterministic progress snapshot to the HUD (~8 Hz).
           if (goalAutomaton) {
@@ -467,6 +539,24 @@ export default function Parking() {
           setHud(
             `v=${s.state.speed.toFixed(2)} m/s · goal=${goalDist.toFixed(2)} m · switches=${switches} · replans=${s.diagnostics.totalReplans} · plan-ms=${s.diagnostics.lastReplanMs.toFixed(0)}`,
           );
+          // Per-axis goal readout, throttled to ~10 Hz. Uses the SAME
+          // `checkParkingGoal` criterion the bench pass condition shares.
+          ghostHudCounter++;
+          if (ghostHudCounter >= 6) {
+            ghostHudCounter = 0;
+            const goal = currentScenario?.goal;
+            if (goal) {
+              const check = checkParkingGoal(s.state, {
+                x: goal.x,
+                z: goal.z,
+                heading: goal.heading,
+              });
+              const headingSignedDeg =
+                ((s.state.heading - goal.heading + Math.PI * 3) % (Math.PI * 2) - Math.PI) *
+                (180 / Math.PI);
+              setGoalHud({ check, headingSignedDeg, ghostDivM });
+            }
+          }
           // Honest PARKED status from the shared `evaluateParked` predicate:
           // the car must actually sit inside the stall silhouette, squared up,
           // and stopped — NOT merely be within arrive-radius of the goal point
@@ -508,6 +598,7 @@ export default function Parking() {
       else if (e.key === 'l' || e.key === 'L') setShowPath((s) => !s);
       else if (e.key === 'd' || e.key === 'D') setShowPlanDebug((s) => !s);
       else if (e.key === 'f' || e.key === 'F') setShowFootprints((s) => !s);
+      else if (e.key === 'g' || e.key === 'G') setShowGhost((s) => !s);
     }
     window.addEventListener('keydown', onKey);
 
@@ -580,6 +671,39 @@ export default function Parking() {
         </div>
         <div>{status}</div>
         <div style={{ opacity: 0.75, marginTop: 4 }}>{hud}</div>
+        {goalHud && (() => {
+          const { posOk, hdgOk, spdOk, passed, posM, spdMS } = goalHud.check;
+          const hdgTolDeg = PARKING_GOAL_TOL.hdgRad * (180 / Math.PI);
+          return (
+            <div style={{ marginTop: 6, fontSize: 11, borderTop: '1px solid #1c2840', paddingTop: 5 }}>
+              <div style={{ color: passed ? '#4ade80' : '#55dcff', fontSize: 10, marginBottom: 3 }}>
+                GOAL {passed ? '— ALL MET' : ''}
+              </div>
+              <div>
+                <span style={{ color: posOk ? '#4ade80' : '#ff6b6b' }}>{posOk ? '✓' : '✗'}</span>
+                {' pos '}{posM.toFixed(2)} m
+                <span style={{ opacity: 0.5 }}> / {PARKING_GOAL_TOL.posM} m</span>
+              </div>
+              <div>
+                <span style={{ color: hdgOk ? '#4ade80' : '#ff6b6b' }}>{hdgOk ? '✓' : '✗'}</span>
+                {' hdg '}{goalHud.headingSignedDeg >= 0 ? '+' : ''}{goalHud.headingSignedDeg.toFixed(1)}&deg;
+                <span style={{ opacity: 0.5 }}> / &plusmn;{hdgTolDeg.toFixed(1)}&deg;</span>
+              </div>
+              <div>
+                <span style={{ color: spdOk ? '#4ade80' : '#ff6b6b' }}>{spdOk ? '✓' : '✗'}</span>
+                {' spd '}{spdMS.toFixed(2)} m/s
+                <span style={{ opacity: 0.5 }}> / {PARKING_GOAL_TOL.speedMS} m/s</span>
+              </div>
+              {showGhost && Number.isFinite(goalHud.ghostDivM) && (
+                <div style={{ marginTop: 2 }}>
+                  <span style={{ color: '#ffaa33' }}>ghost</span>
+                  {' div='}{goalHud.ghostDivM.toFixed(2)} m
+                  <span style={{ opacity: 0.5 }}> (plan vs exec)</span>
+                </div>
+              )}
+            </div>
+          );
+        })()}
         <div style={{ marginTop: 8, opacity: 0.65, fontSize: 11 }}>
           Same `createRaceScenario` runner as the controller-bench CLI:
           identical planner discretisation, multi-cusp segment executor,
@@ -673,6 +797,7 @@ export default function Parking() {
           <button onClick={() => setShowPath((s) => !s)}>{`[l] path ${showPath ? 'on' : 'off'}`}</button>
           <button onClick={() => setShowPlanDebug((s) => !s)}>{`[d] plan-debug ${showPlanDebug ? 'on' : 'off'}`}</button>
           <button onClick={() => setShowFootprints((s) => !s)}>{`[f] footprints ${showFootprints ? 'on' : 'off'}`}</button>
+          <button onClick={() => setShowGhost((s) => !s)}>{`[g] ghost ${showGhost ? 'on' : 'off'}`}</button>
           <button onClick={() => rebuildRef.current?.(scenarioId)}>[r] reset</button>
         </div>
         {showPlanDebug && (
@@ -701,7 +826,11 @@ export default function Parking() {
           </div>
         )}
         <div style={{ marginTop: 6, opacity: 0.5, fontSize: 10 }}>
-          [1] [2] [3] scenarios · [r] reset · [p] pause · [l] path · [f] footprints
+          [1] [2] [3] scenarios · [r] reset · [p] pause · [l] path · [f] footprints · [g] ghost
+        </div>
+        <div style={{ marginTop: 4, opacity: 0.5, fontSize: 10 }}>
+          ghost: <span style={{ color: '#ffaa33' }}>orange</span> = where the plan predicts the car is now.
+          real car on top ⇒ tracker faithful; ghost ahead ⇒ execution diverging.
         </div>
         <div style={{ marginTop: 4, opacity: 0.5, fontSize: 10 }}>
           footprints: <span style={{ color: '#55ff88' }}>green</span> = car collision box ·{' '}

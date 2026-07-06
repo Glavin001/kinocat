@@ -38,6 +38,64 @@ import {
 // this introduces no module cycle (race-scenario does not import this file).
 import type { RaceTuning, RaceScenarioOptions, RaceEntry } from './race-scenario';
 
+// `wrapAngle` is not part of `kinocat/agent`'s public surface — re-derive
+// locally so the goal-check stays zero-dependency. Same behavior as
+// `core/src/internal/math.ts`'s `wrapAngle` (signed in (-pi, pi]).
+function wrapAngleLocal(a: number): number {
+  const TWO_PI = Math.PI * 2;
+  let x = (a + Math.PI) % TWO_PI;
+  if (x <= 0) x += TWO_PI;
+  return x - Math.PI;
+}
+
+/**
+ * Shared "is the chassis parked at the goal pose?" thresholds. Used by
+ * the headless bench's PASS criterion AND the web demo's `GOAL` HUD —
+ * a single source of truth so both views agree on what success means.
+ *
+ *  - `posM`: position radius (m).
+ *  - `hdgRad`: heading tolerance (rad).
+ *  - `speedMS`: how slow counts as "stopped" (m/s).
+ */
+export const PARKING_GOAL_TOL = {
+  posM: 0.6,
+  hdgRad: 0.2,
+  speedMS: 0.15,
+} as const;
+
+export interface ParkingGoalCheck {
+  /** Did position, heading, and speed all clear their tolerances? */
+  passed: boolean;
+  /** Per-axis checks for HUD display. */
+  posOk: boolean;
+  hdgOk: boolean;
+  spdOk: boolean;
+  /** Measured terminal errors (abs). */
+  posM: number;
+  hdgRad: number;
+  spdMS: number;
+}
+
+/**
+ * Check whether `state` is parked at `goal` within `PARKING_GOAL_TOL`.
+ * Both the headless bench and the web demo's HUD call this — diverging
+ * here would mean the CLI claims success while the demo shows failure
+ * (or vice versa).
+ */
+export function checkParkingGoal(
+  state: { x: number; z: number; heading: number; speed: number },
+  goal: { x: number; z: number; heading: number },
+  tol: typeof PARKING_GOAL_TOL = PARKING_GOAL_TOL,
+): ParkingGoalCheck {
+  const posM = Math.hypot(state.x - goal.x, state.z - goal.z);
+  const hdgRad = Math.abs(wrapAngleLocal(state.heading - goal.heading));
+  const spdMS = Math.abs(state.speed);
+  const posOk = posM <= tol.posM;
+  const hdgOk = hdgRad <= tol.hdgRad;
+  const spdOk = spdMS <= tol.speedMS;
+  return { passed: posOk && hdgOk && spdOk, posOk, hdgOk, spdOk, posM, hdgRad, spdMS };
+}
+
 export type ParkingScenarioId =
   | 'forward-pullin'
   | 'reverse-perp'
