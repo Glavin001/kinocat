@@ -349,6 +349,22 @@ export interface RaceTuning {
   mpcWTerminalPosition: number;
   mpcWTerminalSpeed: number;
   /**
+   * WS-3 — MPPI cost mode. `'progress'` is the racing shape: reward
+   * arc-length progress along the plan, penalise leaving a lateral corridor
+   * and exceeding the plan geometry's braking-envelope allowed speed. No
+   * reference to chase — the entry's OWN forward model decides how fast the
+   * chassis can go, which is where model fidelity becomes lap time.
+   * `'track'` is the classic reference-tracking shape (parking / terminal
+   * pose). Racing defaults to `'progress'`; parking overrides to `'track'`.
+   */
+  mpcCostMode?: 'track' | 'progress';
+  /** WS-3 — lateral corridor half-width (m) around the plan for the MPPI
+   *  progress cost. Default 2.5; the technical course's 1.2 m-clearance
+   *  gates may need it tighter. */
+  mpcCorridorHalfWidth?: number;
+  /** WS-3 — progress reward per metre of arc advanced. Default 6. */
+  mpcWProgress?: number;
+  /**
    * Scenario-level tracker / waypoint knobs. These belong in the
    * tuning bundle (not in MPC config alone) because they govern
    * pure-pursuit AND MPPI alike — both controllers need to know
@@ -447,6 +463,11 @@ export interface RaceTuning {
   plannerBudgetMs?: number;
   /** Planner expansion cap. Race=30k; parking=80k. */
   plannerMaxExpansions?: number;
+  /** WS-3 — raw MPPI config overrides, applied LAST over the scenario's
+   *  derived MPC config. The tuning-sweep escape hatch: lets bench scripts
+   *  A/B individual MPPI knobs (λ, noise stds, cost weights…) without
+   *  forking the scenario runner. */
+  mpcOverrides?: Partial<import('kinocat/execute').MPCTrackerConfig>;
   /** Multi-goal planner "gate reached" radius (m). Open course: 1.8
    *  (RACE_PLANNER_GATE_RADIUS). Technical course tightens to 1.2 so the
    *  pure-pursuit corner-cut still lands inside the 2.5 m accept disk. */
@@ -517,6 +538,10 @@ export const DEFAULT_TUNING: RaceTuning = {
   tracker: 'pure-pursuit',
   mpcWTerminalPosition: 0,
   mpcWTerminalSpeed: 0,
+  // WS-3 — when the tracker IS 'mpc', race scenarios run the racing
+  // progress cost (arc-length reward + corridor + braking-envelope
+  // overspeed). Parking overrides to 'track' (reference + terminal pose).
+  mpcCostMode: 'progress',
   // WS-1 — faithful speed execution. Drive-through race horizons no longer
   // brake toward their phantom terminal; the throttle floors it to the
   // planner's commanded speed with a coast band instead of the asymptotic
@@ -613,6 +638,10 @@ export interface RaceCarDiagnostics {
   totalReplans: number;
   /** RMS prediction error at primitive boundary (planned vs actual pose). */
   predErrorRms: number;
+  /** WS-3 A3.4 — mean wall-clock ms per MPPI solve (0 under pure-pursuit). */
+  mpcSolveMsAvg: number;
+  /** Number of MPPI solves performed. */
+  mpcSolveCount: number;
 }
 
 /** Per-car driving-quality accumulators — the "how well is it driving"
@@ -831,6 +860,14 @@ interface CarInternal {
   mpcState: MPCTrackerState | null;
   // Forward model this car's MPPI rolls (per-entry; the fidelity lever).
   mpcForwardSim: ForwardSim<CarKinematicState>;
+  // MPPI control hold: the last solved command is applied for
+  // MPC_TICKS_PER_SOLVE physics ticks (the solver's own stepDt), matching
+  // what the rollouts scored. Counts ticks since the last solve.
+  mpcHold: { cmd: WheeledCarControls; targetSpeed: number } | null;
+  mpcTicksSinceSolve: number;
+  // WS-3 A3.4 — per-solve compute accounting (ms, wall-clock).
+  mpcSolveMsTotal: number;
+  mpcSolveCount: number;
   // Reverse-out recovery state (stuck-against-wall escape maneuver).
   recovering: boolean;
   recoveryEndSimTime: number;
@@ -997,23 +1034,57 @@ export async function createRaceScenario(
   // by the softmax because positive-drive samples track the plan
   // better. Letting reverse stay in the sample distribution costs
   // virtually nothing.
+  // WS-3 — racing MPPI runs the PROGRESS cost (arc-length reward + corridor
+  // + braking-envelope overspeed), a 1.5 s horizon at 0.05 s control
+  // resolution, and 3 model substeps per control step (the model integrates
+  // at its native 1/60 s training resolution). Parking keeps the 'track'
+  // reference cost + terminal-pose weights (mpcCostMode: 'track').
+  const mpcCostMode = tuning.mpcCostMode ?? 'track';
+  const isProgress = mpcCostMode === 'progress';
+  const MPC_HORIZON_STEPS = isProgress ? 30 : MPC_HORIZON;
   const MPC_CONFIG = {
-    horizonSteps: MPC_HORIZON,
+    horizonSteps: MPC_HORIZON_STEPS,
     stepDt: 0.05,
     samples: 64,
     maxSteer: VEHICLE_TUNING.maxSteerAngle ?? 0.6,
     maxDriveForce: ENGINE_FORCE_N,
     maxBrakeForce: BRAKE_FORCE_N,
-    allowReverse: true,
-    lambda: 0.5,
-    steerStd: 0.10,
+    // Racing is forward-only (progress cost never selects reverse anyway —
+    // dropping the reverse half doubles useful drive exploration). Reverse
+    // plan SEGMENTS are still executed: the tracker detects the segment's
+    // gear from its stored speeds and samples the pedal channel in that
+    // gear, capped at the chassis reverse envelope.
+    allowReverse: !isProgress,
+    maxReverseSpeed:
+      tuning.reverseCruiseSpeed ?? Math.abs(RACE_AGENT.maxReverseSpeed ?? 6),
+    // λ must sit at the cost scale of the mode. The progress cost lives in
+    // the tens-to-hundreds (−wProgress·metres over a 1.5 s horizon), so the
+    // track mode's 0.5 collapses the softmax onto the single best sample — a
+    // per-solve argmax that re-picks a different coloured-noise maneuver
+    // every 0.05 s (measured: steering chatter, missed gates, wedges).
+    // λ=10 over-smooths the other way: the launch throttle averages toward
+    // zero across half-braking samples and the stuck detector fires.
+    lambda: isProgress ? 3 : 0.5,
+    // Progress mode needs real steering exploration: recovering a 45°+
+    // heading error (post-gate replan) takes |steer| ≈ 0.5 — unreachable
+    // from a zero prior at std 0.10 (5σ). The softmax + steer-rate cost
+    // keep the EMITTED steer smooth; exploration ≠ chatter.
+    steerStd: isProgress ? 0.28 : 0.10,
     driveStd: 0.5 * ENGINE_FORCE_N,
+    // Progress mode explores braking decisively: the overspeed term needs
+    // real brake samples to find corner-entry braking (the near-binary
+    // raycast brake saturates by ~25% of full force, so 0.10·max is already
+    // a strong probe; the softmax discards the catastrophic ones).
     brakeStd: 0.10 * BRAKE_FORCE_N,
     wLateral: 2,
     wHeading: 3,
     wSpeed: 10,
     wControlRate: 0.15,
-    wSteerRate: 25,
+    // Progress mode: 25 taxed the coloured-noise exploration (adjacent-step
+    // deltas of the SAMPLES, not the emitted control) harder than the
+    // progress reward pays — corners were priced out. The emitted control
+    // is a softmax average, already smooth.
+    wSteerRate: isProgress ? 10 : 25,
     wTerminalPosition: tuning.mpcWTerminalPosition,
     wTerminalSpeed: tuning.mpcWTerminalSpeed,
     goalTolerance: 0.5,
@@ -1022,7 +1093,63 @@ export async function createRaceScenario(
     // racing speed. Without this the tracker inferred cruise from the plan's
     // terminal speed (≈ 0 even on race gates) and crawled to a stall (DNF).
     cruiseSpeed: trackerConfig.cruiseSpeed,
+    costMode: mpcCostMode,
+    // Race gate poses carry speed ≈ 0 from the planner's pose() helper —
+    // declare the terminal a drive-through so the reference extension fires
+    // and the terminal cost never does.
+    noStopAtEnd: isProgress,
+    // Extend past the plan end so the horizon never sees a stop target
+    // (30 steps × 0.05 s × 30 m/s = 45 m of horizon travel at vMax).
+    referenceExtension: isProgress ? 50 : 0,
+    substeps: 3,
+    wProgress: tuning.mpcWProgress ?? 6,
+    wCorridor: 20,
+    corridorHalfWidth: tuning.mpcCorridorHalfWidth ?? 2.5,
+    wCenterline: 0.08,
+    wOverspeed: 4,
+    // Same anticipatory-braking envelope the pure-pursuit preview uses:
+    // conservative decel (the speed-profile budget) + the measured sustained
+    // cornering boundary.
+    envelopeDecel: SPEED_PROFILE_DECEL,
+    envelopeLateralAccel: PURE_PURSUIT_CONFIG.previewLateralAccel,
+    // Consume profiled plan speeds only where the friction-circle pass ran
+    // (technical course). Raw open-course plan speeds are junk as caps:
+    // analytic-shot samples carry maxSpeed (30) and primitive endpoints
+    // near a direction change carry ~1 m/s interior samples — measured: one
+    // 0.9 m/s sample pinned the whole approach to a crawl via the backward
+    // braking envelope.
+    usePlanSpeeds: tuning.enableSpeedProfile ?? false,
+    // Tuning-sweep escape hatch: raw MPPI knob overrides applied last.
+    ...(tuning.mpcOverrides ?? {}),
   };
+  // Cusp-leg MPPI config (progress mode only). A non-final plan segment
+  // ends at a forward↔reverse cusp — a 1–3 m precision shunt, not a racing
+  // stretch. The progress cost is the WRONG shape there: total available
+  // progress reward (wProgress × leg length ≈ 9) is on the order of the
+  // sampling noise, so the softmax dilutes across "creep back" and "hold
+  // brake" and the car barely moves (measured: bestWeightShare 0.07 and
+  // emitted ≈ full brake at every wedge shunt). The `track` cost with
+  // terminal-pose weights is the PARKING shape — proven on the parking
+  // scenarios — and a cusp leg IS a mini parking maneuver: drive this
+  // short leg, stop at the cusp pose. λ, noise and steer-rate go back to
+  // the track-mode values; reverse sampling must be on (shunts reverse).
+  const MPC_CUSP_CONFIG = {
+    ...MPC_CONFIG,
+    noStopAtEnd: false,
+    referenceExtension: 0,
+    // Sharp softmax for the shunt: total progress at stake is ~wProgress ×
+    // leg length ≈ 9 — at the racing λ=3 the weights spread across "creep"
+    // and "hold brake" and the emitted control is a brake-hold (measured:
+    // bestWeightShare 0.07 at every wedge shunt). The maneuver value gap
+    // is small in absolute cost, so committing needs a temperature at THAT
+    // scale.
+    lambda: 0.5,
+  };
+  // Control cadence: MPPI plans piecewise-constant controls at stepDt
+  // resolution; executing means HOLDING each control for stepDt (3 physics
+  // ticks), not re-solving every 1/60 s tick. 3× less compute, and the
+  // executed control matches what the rollouts scored.
+  const MPC_TICKS_PER_SOLVE = Math.max(1, Math.round(0.05 / PHYSICS_DT));
 
   const cars: CarInternal[] = opts.entries.map((entry, i) => {
     // One world per car (matches web demo's split-viewport setup; cars
@@ -1103,6 +1230,8 @@ export async function createRaceScenario(
         successfulReplans: 0,
         totalReplans: 0,
         predErrorRms: 0,
+        mpcSolveMsAvg: 0,
+        mpcSolveCount: 0,
       },
       metrics: emptyMetrics(),
       lastReplanSimTime: -Infinity,
@@ -1118,6 +1247,10 @@ export async function createRaceScenario(
       spawn,
       mpcState: null,
       mpcForwardSim: entry.forwardModel ?? mpcForwardSim,
+      mpcHold: null,
+      mpcTicksSinceSolve: 0,
+      mpcSolveMsTotal: 0,
+      mpcSolveCount: 0,
       recovering: false,
       recoveryEndSimTime: 0,
       recoveryCount: 0,
@@ -1297,6 +1430,13 @@ export async function createRaceScenario(
         });
     const replanMs = performance.now() - tStart;
     c.diagnostics.lastReplanMs = replanMs;
+    // TEMP DEBUG
+    if ((globalThis as Record<string, unknown>).__replanLog) {
+      console.log(
+        `    [replan t=${simTime.toFixed(2)} ${c.entry.name}] found=${res.found} pathLen=${res.path.length} cost=${res.cost.toFixed(2)} ` +
+        `ms=${replanMs.toFixed(0)} exp=${res.stats.expansions} start=(${startState.x.toFixed(1)},${startState.z.toFixed(1)},h${startState.heading.toFixed(2)},v${startState.speed.toFixed(1)}) gates=${gates.map((g) => `(${g.x},${g.z})`).join('')}`,
+      );
+    }
     // A found 1-point path is the planner saying "the start already satisfies
     // the goal" (start-state acceptance) — a SUCCESS with nothing to drive,
     // not a planner failure. Count it as found (so failedReplanRatio stays
@@ -1330,12 +1470,23 @@ export async function createRaceScenario(
       // Expand any analytic Reeds-Shepp shot-to-goal into its real curved,
       // gear-tagged samples BEFORE smoothing — otherwise the multi-cusp
       // back-in / parallel-park swing is a straight chord the chassis can't
-      // track at the planned heading. Only the terminal-pose (parking) branch
-      // needs this: race plans are driven through gates forward-only, and an
-      // analytic shot there may include a reverse sub-segment that the
-      // forward-only race controller can't execute — collapsing it to the
-      // straight chord (res.path) is what keeps racing flowing.
-      const liftedPath = isParking
+      // track at the planned heading.
+      //
+      // Parking always needs this. Racing needs it under the MPPI tracker:
+      // a replan from a wedged pose (post-overshoot, nose off the racing
+      // line) legally returns an RS shot whose real geometry is a
+      // turn-around — collapsed to a chord, the plan claims a straight
+      // drive at a heading the chassis is 150°+ away from, with a hidden
+      // heading flip mid-polyline. Forward progress along that chord is
+      // impossible, "hold still" wins the progress cost's softmax, and the
+      // car wedges until the blind reverse-out recovery fires (measured:
+      // every learned-model wedge dissection showed exactly this shape).
+      // With the lift, the cusped RS curve survives to splitAtGearCusps and
+      // MPPI executes each single-gear segment in its own gear.
+      // Pure-pursuit racing keeps the chord (measured faster there — its
+      // segment machinery predates gear-aware MPPI and the chord keeps it
+      // flowing).
+      const liftedPath = isParking || tuning.tracker === 'mpc'
         ? liftAnalyticPath(
             res,
             (c.entry.agent ?? RACE_AGENT).maxSpeed,
@@ -1527,6 +1678,11 @@ export async function createRaceScenario(
       cadenceUseful = dLat > 0.25 || nearExhaustion || failing;
     }
     if ((cadenceDue && cadenceUseful) || shouldEarlyReplan(c, stateBefore)) {
+      // TEMP DEBUG
+      if ((globalThis as Record<string, unknown>).__replanLog) {
+        const why = cadenceDue && cadenceUseful ? 'cadence' : 'early';
+        console.log(`    [replan-reason t=${simTime.toFixed(2)} ${c.entry.name}] ${why} dLat=${lateralFromPlan(c, stateBefore.x, stateBefore.z).toFixed(2)} segIdx=${c.activeSegIdx}/${c.segments.length} failed=${c.diagnostics.consecutiveFailedReplans}`);
+      }
       replanCar(c);
     }
     // Waypoint advance + lap detection (60Hz so lap times aren't quantized
@@ -1659,9 +1815,26 @@ export async function createRaceScenario(
         const segEnd = seg[seg.length - 1]!;
         const segElapsed = simTime - c.activeSegStartSimTime;
         const dist = Math.hypot(stateBefore.x - segEnd.x, stateBefore.z - segEnd.z);
+        // Cusp-advance radius scales with the segment's own length. A short
+        // recovery leg (a 1.5 m reverse shunt out of a wedge) is ENTIRELY
+        // inside the waypoint arrive radius (2.5 m), so a fixed radius
+        // advanced past it instantly — the gear change was skipped, the car
+        // tried to drive the next forward leg from the un-executed pose,
+        // drifted off it, and the resulting replan produced the same shunt
+        // again, forever (measured: the learned models' wedge-loop at every
+        // slalom gate). Requiring the chassis to consume ≥ 60% of the leg
+        // before advancing executes the shunt for real.
+        let segLen = 0;
+        for (let i = 1; i < seg.length; i++) {
+          segLen += Math.hypot(seg[i]!.x - seg[i - 1]!.x, seg[i]!.z - seg[i - 1]!.z);
+        }
+        const advRadius = Math.min(
+          tuning.arriveRadius ?? RACE_ARRIVE_RADIUS,
+          Math.max(0.3, 0.4 * segLen),
+        );
         if (
           segElapsed >= 0.2 &&
-          dist <= (tuning.arriveRadius ?? RACE_ARRIVE_RADIUS) &&
+          dist <= advRadius &&
           Math.abs(stateBefore.speed) < 0.5
         ) {
           c.activeSegIdx++;
@@ -1679,23 +1852,45 @@ export async function createRaceScenario(
       const live = c.segments[c.activeSegIdx] ?? c.plan;
       if (live.length >= 2) {
         if (tuning.tracker === 'mpc') {
-          // Sampling MPC over the v2 parametric model.
-          if (!c.mpcState) c.mpcState = createMPCTrackerState(MPC_HORIZON);
-          const cmdRaw = mpcTrack(stateBefore, live, c.mpcForwardSim, c.mpcState, MPC_CONFIG);
-          const cmd: WheeledCarControls = {
-            steer: cmdRaw.steer,
-            driveForce: cmdRaw.driveForce,
-            brakeForce: cmdRaw.brakeForce,
-          };
+          // MPPI over this car's OWN forward model. Solved every
+          // MPC_TICKS_PER_SOLVE physics ticks (= the solver's stepDt) and
+          // HELD in between — the executed control is exactly the
+          // piecewise-constant control the rollouts scored.
+          if (!c.mpcState) c.mpcState = createMPCTrackerState(MPC_HORIZON_STEPS);
+          if (c.mpcHold === null || c.mpcTicksSinceSolve >= MPC_TICKS_PER_SOLVE) {
+            // A NON-final segment ends at a forward↔reverse cusp — a short
+            // precision shunt, not a racing stretch. Its terminal is a
+            // genuine stop (no extension) and its softmax runs sharp
+            // (MPC_CUSP_CONFIG) so the small-stakes maneuver still commits.
+            // The final segment is the racing horizon (progress cost,
+            // extension past the plan end).
+            const segIsFinal = c.activeSegIdx >= c.segments.length - 1;
+            const cfg = segIsFinal ? MPC_CONFIG : MPC_CUSP_CONFIG;
+            const tSolve = performance.now();
+            const cmdRaw = mpcTrack(stateBefore, live, c.mpcForwardSim, c.mpcState, cfg);
+            c.mpcSolveMsTotal += performance.now() - tSolve;
+            c.mpcSolveCount += 1;
+            c.mpcHold = {
+              cmd: {
+                steer: cmdRaw.steer,
+                driveForce: cmdRaw.driveForce,
+                brakeForce: cmdRaw.brakeForce,
+              },
+              targetSpeed: cmdRaw.targetSpeed,
+            };
+            c.mpcTicksSinceSolve = 0;
+          }
+          c.mpcTicksSinceSolve += 1;
+          const cmd = c.mpcHold.cmd;
           c.car.applyWheeledControls(cmd);
           c.lastControls = cmd;
           c.metrics.liveControls = {
-            steer: cmdRaw.steer,
+            steer: cmd.steer,
             throttle: cmd.driveForce >= 0
               ? cmd.driveForce / ENGINE_FORCE_N
               : -cmd.driveForce / ENGINE_FORCE_N,
             brake: cmd.brakeForce / BRAKE_FORCE_N,
-            targetSpeed: cmdRaw.targetSpeed,
+            targetSpeed: c.mpcHold.targetSpeed,
           };
         } else {
           // Gate the terminal heading-alignment term on distance to the TRUE
@@ -1888,6 +2083,9 @@ export async function createRaceScenario(
   }
 
   function buildStatus(c: CarInternal): RaceCarStatus {
+    c.diagnostics.mpcSolveCount = c.mpcSolveCount;
+    c.diagnostics.mpcSolveMsAvg =
+      c.mpcSolveCount > 0 ? c.mpcSolveMsTotal / c.mpcSolveCount : 0;
     return {
       name: c.entry.name,
       state: c.car.readState(simTime),
@@ -1939,6 +2137,7 @@ export async function createRaceScenario(
       c.diagnostics = {
         lastReplanMs: 0, lastReplanFound: false, consecutiveFailedReplans: 0,
         planAgeMs: 0, successfulReplans: 0, totalReplans: 0, predErrorRms: 0,
+        mpcSolveMsAvg: 0, mpcSolveCount: 0,
       };
       c.metrics = emptyMetrics();
       c.lastReplanSimTime = -Infinity;
@@ -1963,6 +2162,10 @@ export async function createRaceScenario(
       // the 'mpc' tracker (a stale warm-start sequence would make the second
       // run diverge from a fresh one).
       c.mpcState = null;
+      c.mpcHold = null;
+      c.mpcTicksSinceSolve = 0;
+      c.mpcSolveMsTotal = 0;
+      c.mpcSolveCount = 0;
     }
   }
 

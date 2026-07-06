@@ -88,6 +88,7 @@ export {
   V3_OUTPUT_DIM,
   buildV3Input,
   forwardSimV3,
+  forwardSimV3Rollout,
   predictWithUncertaintyV3,
   v3ToJson,
   v3FromJson,

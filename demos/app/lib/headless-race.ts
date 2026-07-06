@@ -27,7 +27,7 @@ import {
 import {
   buildParametricOnlyModel,
   learnedForwardSimV2,
-  forwardSimV3,
+  forwardSimV3Rollout,
   parametricForwardV2,
   DEFAULT_LEARNED_PARAMS_V2,
   DEFAULT_LEARNABLE_CONFIG,
@@ -176,12 +176,15 @@ export function v2Entry(name: string, model: LearnedVehicleModel): RaceEntry {
 
 /** Build a v3 `RaceEntry` — the purely-learned neural dynamics model. Both
  *  the primitive library and the tracking forward model are the same
- *  network; there is no parametric backbone anywhere in this car's loop. */
+ *  network; there is no parametric backbone anywhere in this car's loop.
+ *  The MPPI `forwardModel` uses the rollout-optimised single-member
+ *  inference (allocation-free; ~10× cheaper per solve) — the library keeps
+ *  the full ensemble mean. */
 export function v3Entry(name: string, model: LearnedVehicleModelV3): RaceEntry {
   return {
     name,
     lib: buildLearnedRaceLibraryV3(model),
-    forwardModel: forwardSimV3(model),
+    forwardModel: forwardSimV3Rollout(model),
   };
 }
 

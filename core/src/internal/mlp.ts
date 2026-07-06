@@ -106,6 +106,43 @@ export function forward(mlp: MLP, input: ReadonlyArray<number> | Float64Array): 
   return { inputs, preActs, postActs, output: postActs[postActs.length - 1]! };
 }
 
+/**
+ * Allocation-free inference closure for hot loops (MPPI rollouts call the
+ * forward model thousands of times per solve; `forward()`'s per-call cache
+ * arrays are backprop bookkeeping that inference never reads and the GC
+ * pays for). Returns a function writing the output into `out`.
+ */
+export function makeMLPInfer(
+  mlp: MLP,
+): (input: ArrayLike<number>, out: Float64Array) => void {
+  let maxDim = mlp.config.inputDim;
+  for (const l of mlp.layers) maxDim = Math.max(maxDim, l.outDim);
+  const bufA = new Float64Array(maxDim);
+  const bufB = new Float64Array(maxDim);
+  const layers = mlp.layers;
+  const last = layers.length - 1;
+  return (input: ArrayLike<number>, out: Float64Array): void => {
+    let src: ArrayLike<number> = input;
+    let scratch = bufA;
+    for (let li = 0; li < layers.length; li++) {
+      const layer = layers[li]!;
+      const isLast = li === last;
+      const dst = isLast ? out : scratch;
+      const weights = layer.weights;
+      const biases = layer.biases;
+      const inDim = layer.inDim;
+      for (let o = 0; o < layer.outDim; o++) {
+        let s = biases[o]!;
+        const row = o * inDim;
+        for (let i = 0; i < inDim; i++) s += weights[row + i]! * (src[i] as number);
+        dst[o] = isLast ? s : s > 0 ? s : 0;
+      }
+      src = dst;
+      scratch = scratch === bufA ? bufB : bufA;
+    }
+  };
+}
+
 /** MSE gradient at the output, propagated back through the layers. Returns
  *  per-layer weight and bias gradients matching the layer shape. */
 export interface Gradients {

@@ -41,6 +41,7 @@ import { wrapAngle } from '../internal/math';
 import {
   type MLP,
   forward as mlpForward,
+  makeMLPInfer,
   serializeMLP,
   deserializeMLP,
 } from '../internal/mlp';
@@ -156,6 +157,57 @@ export function forwardSimV3(model: LearnedVehicleModelV3): ForwardSim<CarKinema
       raw[1] = cur.yawRate ?? 0;
       raw[2] = cur.lateralVelocity ?? 0;
       cur = applyDelta(cur, predictDelta(model, raw), frac, stepDt);
+      remaining -= stepDt;
+    }
+    return cur;
+  };
+}
+
+/**
+ * Rollout-optimised `ForwardSim` for MPPI (thousands of model calls per
+ * solve). Same network, same normalization, same dt decomposition as
+ * `forwardSimV3` — the differences are purely computational:
+ *   - allocation-free MLP inference (`makeMLPInfer`),
+ *   - `members` ensemble members evaluated instead of all of them
+ *     (default 1 — the controller resamples 64× per step and replans at
+ *     20 Hz, so single-member epistemic noise washes out in the softmax;
+ *     the planner's primitive library keeps using the full ensemble mean).
+ *
+ * NOT bit-identical to `forwardSimV3` when `members` < ensemble size.
+ * Deterministic for a fixed model + inputs either way.
+ */
+export function forwardSimV3Rollout(
+  model: LearnedVehicleModelV3,
+  members = 1,
+): ForwardSim<CarKinematicState> {
+  const refDt = model.referenceDt;
+  const { norm } = model;
+  const n = Math.max(1, Math.min(members, model.ensemble.length));
+  const infers = model.ensemble.slice(0, n).map((m) => makeMLPInfer(m));
+  const input = new Float64Array(V3_INPUT_DIM);
+  const outBuf = new Float64Array(V3_OUTPUT_DIM);
+  const mean = new Float64Array(V3_OUTPUT_DIM);
+  return (s: CarKinematicState, controls: number[], dt: number): CarKinematicState => {
+    let cur = s;
+    let remaining = dt;
+    while (remaining > 1e-9) {
+      const frac = Math.min(1, remaining / refDt);
+      const stepDt = refDt * frac;
+      input[0] = (cur.speed - norm.inputMean[0]!) / norm.inputStd[0]!;
+      input[1] = ((cur.yawRate ?? 0) - norm.inputMean[1]!) / norm.inputStd[1]!;
+      input[2] = ((cur.lateralVelocity ?? 0) - norm.inputMean[2]!) / norm.inputStd[2]!;
+      input[3] = ((controls[0] ?? 0) - norm.inputMean[3]!) / norm.inputStd[3]!;
+      input[4] = ((controls[1] ?? 0) - norm.inputMean[4]!) / norm.inputStd[4]!;
+      input[5] = ((controls[2] ?? 0) - norm.inputMean[5]!) / norm.inputStd[5]!;
+      mean.fill(0);
+      for (const infer of infers) {
+        infer(input, outBuf);
+        for (let i = 0; i < V3_OUTPUT_DIM; i++) mean[i]! += outBuf[i]! / n;
+      }
+      for (let i = 0; i < V3_OUTPUT_DIM; i++) {
+        mean[i] = mean[i]! * norm.outputStd[i]! + norm.outputMean[i]!;
+      }
+      cur = applyDelta(cur, mean, frac, stepDt);
       remaining -= stepDt;
     }
     return cur;

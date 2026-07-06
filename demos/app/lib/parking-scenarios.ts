@@ -771,6 +771,10 @@ export const PARKING_RACE_TUNING: Partial<RaceTuning> = {
   plannerMaxExpansions: 80_000,
   mpcWTerminalPosition: 50,
   mpcWTerminalSpeed: 30,
+  // Parking keeps the classic reference-tracking MPPI cost (the WS-3 racing
+  // progress cost is inherited from DEFAULT_TUNING otherwise — it would
+  // reward blowing THROUGH the stall instead of stopping in it).
+  mpcCostMode: 'track',
   // Parking maneuvers are committed multi-cusp sequences (reverse → forward
   // → …), not a per-tick chase. Replan slowly so the segment-advance logic
   // carries the chassis through each forward↔reverse cusp instead of
