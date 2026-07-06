@@ -1595,91 +1595,113 @@ function TopBar({
   debugExportedAt: number;
 }) {
   const justExported = debugExportedAt > 0 && Date.now() - debugExportedAt < 3000;
-  const trackerTag = trackerMode === 'mpc' ? 'MPPI executor' : 'pure-pursuit executor';
-  const subtitle = (v2Active
+  // Subtitle no longer repeats the tracker — the Race Setup selector shows it
+  // explicitly, so duplicating it here only crowded the bar.
+  const subtitle = v2Active
     ? 'kinematic vs offline-trained v2 · online refit off'
-    : 'kinematic vs online-learning · learned car refits each lap') + ` · ${trackerTag}`;
-  const racingStatus = v2Active
-    ? (isMobile ? `racing · v2 · ${trackerMode === 'mpc' ? 'MPPI' : 'PP'}` : `racing… (learned car using v2 library — offline-trained, no online refit · ${trackerTag})`)
-    : (isMobile ? `racing · online · ${trackerMode === 'mpc' ? 'MPPI' : 'PP'}` : `racing… (the learned car refits every lap · ${trackerTag})`);
+    : 'kinematic vs online-learning · learned car refits each lap';
+  const racingStatus = isMobile ? 'racing' : 'racing…';
+  // Two-row header: brand + status/actions on top, Race Setup selectors on a
+  // dedicated row below. Previously everything shared one row and overflowed
+  // (title + long subtitle + 3 selectors + 5 buttons), pushing the action
+  // buttons off the right edge.
   return (
     <div
       style={{
         display: 'flex',
-        flexDirection: isMobile ? 'column' : 'row',
-        alignItems: isMobile ? 'stretch' : 'center',
-        gap: isMobile ? 6 : 12,
+        flexDirection: 'column',
+        gap: isMobile ? 8 : 10,
         padding: isMobile ? '8px 10px' : '10px 14px',
         borderBottom: '1px solid #1f2735',
         background: '#0d1119',
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
-        <div style={{ color: '#7fd6ff', fontWeight: 700, whiteSpace: 'nowrap' }}>race the primitives</div>
-        {!isMobile && (
-          <div style={{ opacity: 0.65, fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            {subtitle}
-          </div>
-        )}
-      </div>
-      {!isMobile && <div style={{ flex: 1 }} />}
-      <RaceSetup
-        trackerMode={trackerMode}
-        onTrackerMode={onTrackerMode}
-        courseVariant={courseVariant}
-        onCourseVariant={onCourseVariant}
-        learnedModel={learnedModel}
-        onLearnedModel={onLearnedModel}
-        canUseV2={canUseV2}
-        isMobile={isMobile}
-      />
+      {/* Row 1 — brand + subtitle (left), status + action buttons (right). */}
       <div
         style={{
           display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          flexWrap: isMobile ? 'wrap' : 'nowrap',
-          overflowX: isMobile ? 'auto' : 'visible',
-          // Prevent flex shrink so buttons stay readable on mobile scroll.
-          minWidth: 0,
+          flexDirection: isMobile ? 'column' : 'row',
+          alignItems: isMobile ? 'stretch' : 'center',
+          gap: isMobile ? 8 : 12,
         }}
       >
-        {phase === 'loading' && <Status>loading…</Status>}
-        {phase === 'learning' && (
-          <Status>
-            {isMobile
-              ? `pre-training ${learnProgress.done}/${learnProgress.total || '?'}`
-              : `pre-training… collecting trials ${learnProgress.done}/${learnProgress.total || '?'}`}
-          </Status>
-        )}
-        {phase === 'ready' && params && (
-          <>
-            <Status>ready{v2Active ? ' · v2' : ''}</Status>
-            <Btn onClick={onStart}>start race</Btn>
-            <Btn onClick={onLearn} secondary>pre-train</Btn>
-            <Btn onClick={onReset} secondary>reset</Btn>
-            <Btn onClick={onClearCache} secondary>clear</Btn>
-          </>
-        )}
-        {phase === 'racing' && (
-          <>
-            <Status>{racingStatus}</Status>
-            <Btn onClick={onStop}>stop</Btn>
-          </>
-        )}
-        {phase === 'finished' && (
-          <>
-            <Status>stopped{v2Active ? ' · v2' : ''}</Status>
-            <Btn onClick={onStart}>race again</Btn>
-            <Btn onClick={onReset} secondary>reset</Btn>
-          </>
-        )}
-        {error && <Status warning>err: {error}</Status>}
-        {/* Export-debug button — always present so diagnosis works in
-            every phase. Shows a brief "copied · saved" confirmation. */}
-        <Btn onClick={onExportDebug} secondary title="Generate Markdown debug report — copied to clipboard and downloaded as .md">
-          {justExported ? '✓ copied · saved' : '🐛 export debug'}
-        </Btn>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0 }}>
+          <div style={{ color: '#7fd6ff', fontWeight: 700, whiteSpace: 'nowrap' }}>race the primitives</div>
+          {!isMobile && (
+            <div style={{ opacity: 0.6, fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {subtitle}
+            </div>
+          )}
+        </div>
+        {!isMobile && <div style={{ flex: 1 }} />}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            flexWrap: 'wrap',
+            minWidth: 0,
+          }}
+        >
+          {phase === 'loading' && <Status>loading…</Status>}
+          {phase === 'learning' && (
+            <Status>
+              {isMobile
+                ? `pre-training ${learnProgress.done}/${learnProgress.total || '?'}`
+                : `pre-training… collecting trials ${learnProgress.done}/${learnProgress.total || '?'}`}
+            </Status>
+          )}
+          {phase === 'ready' && params && (
+            <>
+              <Status>ready{v2Active ? ' · v2' : ''}</Status>
+              <Btn onClick={onStart}>start race</Btn>
+              <Btn onClick={onLearn} secondary>pre-train</Btn>
+              <Btn onClick={onReset} secondary>reset</Btn>
+              <Btn onClick={onClearCache} secondary>clear</Btn>
+            </>
+          )}
+          {phase === 'racing' && (
+            <>
+              <Status>{racingStatus}</Status>
+              <Btn onClick={onStop}>stop</Btn>
+            </>
+          )}
+          {phase === 'finished' && (
+            <>
+              <Status>stopped{v2Active ? ' · v2' : ''}</Status>
+              <Btn onClick={onStart}>race again</Btn>
+              <Btn onClick={onReset} secondary>reset</Btn>
+            </>
+          )}
+          {error && <Status warning>err: {error}</Status>}
+          {/* Export-debug button — always present so diagnosis works in
+              every phase. Shows a brief "copied · saved" confirmation. */}
+          <Btn onClick={onExportDebug} secondary title="Generate Markdown debug report — copied to clipboard and downloaded as .md">
+            {justExported ? '✓ copied · saved' : '🐛 export debug'}
+          </Btn>
+        </div>
+      </div>
+
+      {/* Row 2 — Race Setup selectors on their own line so they never fight
+          the action buttons for horizontal space. */}
+      <div
+        style={{
+          display: 'flex',
+          borderTop: '1px solid #161d2b',
+          paddingTop: isMobile ? 8 : 8,
+          overflowX: isMobile ? 'auto' : 'visible',
+        }}
+      >
+        <RaceSetup
+          trackerMode={trackerMode}
+          onTrackerMode={onTrackerMode}
+          courseVariant={courseVariant}
+          onCourseVariant={onCourseVariant}
+          learnedModel={learnedModel}
+          onLearnedModel={onLearnedModel}
+          canUseV2={canUseV2}
+          isMobile={isMobile}
+        />
       </div>
     </div>
   );
@@ -2558,11 +2580,15 @@ function RaceSetup({
       style={{
         display: 'flex',
         alignItems: 'center',
-        gap: isMobile ? 6 : 10,
+        gap: isMobile ? 10 : 18,
         flexWrap: 'wrap',
-        padding: isMobile ? '4px 0' : '0 4px',
       }}
     >
+      {!isMobile && (
+        <span style={{ fontSize: 10, opacity: 0.45, fontWeight: 700, textTransform: 'uppercase', letterSpacing: 1 }}>
+          setup
+        </span>
+      )}
       <Segmented
         label="tracker"
         value={trackerMode}
