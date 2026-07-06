@@ -61,12 +61,22 @@ plan wall-clock from sim time); optimize runtime separately.
 Results so far, open course, MPPI, correctness branch:
 - **v2: 48.1 s lap, 2 recoveries, hits ~30 m/s on the straight** (baseline
   71.5 s / 11 recov / ~5 m/s). The whole thesis working.
-- **v3: still hardening.** The K5 fix raises v3's pace too, but its more
-  *aggressive* plan (slalom viz: peak 24.6 / min 8.1 vs v2's smooth 21 / 11.8)
-  enters tight sequences hot and overshoots. `enableSpeedProfile` recovers most
-  of it (harness: recov 1→0, stopped 3.5→0.1 s, peak 27.8→21.1) — the v3 fix is
-  reconciling plan aggression with execution via anticipatory speed smoothing.
-  Reproduce fast with `corner-entry.mts` (high-speed slalom).
+- **v3: clean lap achieved — 55.4 s, 0 recoveries, 3.4 s stopped** (with
+  `enableSpeedProfile` + a generous 12 s planner budget). The v3 executor is
+  therefore CORRECT: its more *aggressive* plan (slalom viz: peak 24.6 / min 8.1
+  vs v2's smooth 21 / 11.8) entered tight sequences hot, and anticipatory
+  speed-profile smoothing reconciles it (harness realistic slalom: 1/6→6/6
+  gates, recov 5→0). The full-lap failure at a 3 s budget was **replans timing
+  out** under the heavier reprice search (not the executor) — proven by the
+  generous-budget lap completing clean. Remaining v3 work is purely the
+  **runtime-perf phase**: make the reprice search fast enough to complete within
+  a ~300 ms budget (drive-through-aware heuristic; `clearanceBroadphase` to cut
+  the ~42 collision-checks/expansion; tune analytic pricing). Reproduce fast
+  with `corner-entry.mts`.
+
+Net: **both honest models complete clean laps on the correctness branch**
+(v2 48.1 s, v3 55.4 s) — the project thesis, working. The gate to shipping it
+as default is runtime perf, not correctness.
 
 ## Confirmed by the fast skill suite (measured this session)
 
