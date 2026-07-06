@@ -243,6 +243,17 @@ export interface MPCTrackerState {
    *  the anchor by full search. */
   lastPlan: PlanPath | null;
   lastAnchorIdx: number;
+  /** Longitudinal gear (+1 forward / −1 reverse) of the segment the previous
+   *  solve tracked. When the segment flips gear (a forward↔reverse cusp — the
+   *  planner's reverse escape shunt out of a gate overshoot), the warm-start
+   *  prior still holds the OLD gear's pedal (typically a full brake latched at
+   *  the stop). Around a brake-saturated prior (`priorA ≈ −1`) the correlated
+   *  noise almost never samples sustained throttle in the new gear, so no
+   *  sample discovers the reverse shunt and the car brakes in place forever
+   *  (measured: the learned models wedged at every slalom gate). On a gear
+   *  flip we zero the prior's longitudinal channel so the sampler re-explores
+   *  the pedal from neutral. 0 = uninitialised. */
+  lastGear: number;
 }
 
 /** Create a fresh MPPI tracker state. Deterministic on `seed`. */
@@ -252,6 +263,7 @@ export function createMPCTrackerState(horizonSteps: number, seed = 0x1337): MPCT
     rngState: seed >>> 0 || 1,
     lastPlan: null,
     lastAnchorIdx: 0,
+    lastGear: 0,
   };
 }
 
@@ -871,6 +883,28 @@ export function mpcTrack(
   prior[(H - 1) * 3]! = state.prev[(H - 1) * 3]!;
   prior[(H - 1) * 3 + 1]! = state.prev[(H - 1) * 3 + 1]!;
   prior[(H - 1) * 3 + 2]! = state.prev[(H - 1) * 3 + 2]!;
+
+  // Gear-flip prior seed (progress mode). At a forward↔reverse cusp the
+  // warm-start prior still holds the old gear's pedal — typically the full
+  // brake latched while stopping INTO the cusp. Carried into the new gear it
+  // saturates the pedal channel (`priorA ≈ −1`), and the correlated noise
+  // can't cross to sustained throttle, so no sample discovers the shunt and
+  // the car brakes in place (measured: the learned models' gate wedge). Worse,
+  // a bare zero-seed only COASTS: from a dead stop one 0.05 s step barely
+  // moves, so step-0 brake and step-0 coast score alike and the emitted
+  // step-0 control stays a brake — the car never starts the shunt. So on a
+  // flip we seed a MILD throttle in the NEW gear's direction (drive channel,
+  // zero brake); this biases every sample's pedal toward actually moving along
+  // the plan, and the overspeed/corridor terms temper it in the average.
+  // Steering (already in the right frame) is preserved.
+  if (costMode === 'progress' && state.lastGear !== 0 && gear !== state.lastGear) {
+    const seedDrive = gear * 0.4 * config.maxDriveForce;
+    for (let i = 0; i < H; i++) {
+      prior[i * 3 + 1]! = seedDrive;
+      prior[i * 3 + 2]! = 0;
+    }
+  }
+  state.lastGear = gear;
 
   // Progress-mode geometry: build once per tick (shared by all K samples),
   // and project the CURRENT state to anchor each rollout's progress origin.

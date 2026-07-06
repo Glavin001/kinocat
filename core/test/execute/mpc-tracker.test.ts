@@ -85,6 +85,48 @@ describe('mpcTrack', () => {
     expect(Array.from(state.prev).some((v) => v !== 0)).toBe(true);
   });
 
+  it('commits a reverse shunt after a gear flip instead of braking in place', () => {
+    // Regression for the learned-model gate wedge: at a forward→reverse cusp
+    // the warm-start prior holds the full brake latched while stopping in.
+    // Carried into the reverse gear it saturates the pedal channel and no
+    // sample discovers the shunt, so the car brakes in place forever. The
+    // gear-flip prior reseed must let the tracker actually back up.
+    const sim = buildForwardSim();
+    // Reverse leg: travel tangent points +x (heading 0) but the plan speeds
+    // are negative, so the chassis must move in −x (back up along it).
+    const revPath: CarKinematicState[] = [];
+    for (let i = 0; i < 20; i++) {
+      revPath.push({ x: -0.5 * i, z: 0, heading: 0, speed: -6, t: 0.09 * i });
+    }
+    const cfg = {
+      maxSteer: 0.6,
+      maxDriveForce: 4000,
+      maxBrakeForce: 2000,
+      samples: 48,
+      horizonSteps: 12,
+      costMode: 'progress' as const,
+      cruiseSpeed: 30,
+      maxReverseSpeed: 6,
+      wProgress: 6,
+      corridorHalfWidth: 2.5,
+    };
+    const state = createMPCTrackerState(12, 99);
+    // Simulate having just tracked a FORWARD segment that braked to the cusp:
+    // lastGear forward, warm-start prior a full brake at rest.
+    state.lastGear = 1;
+    for (let i = 0; i < 12; i++) state.prev[i * 3 + 2] = 2000;
+    let s: CarKinematicState = { x: 0, z: 0, heading: 0, speed: 0, t: 0 };
+    for (let i = 0; i < 30; i++) {
+      const cmd = mpcTrack(s, revPath, sim, state, cfg);
+      s = sim(s, [cmd.steer, cmd.driveForce, cmd.brakeForce], 0.05);
+    }
+    // 1.5 s of closed loop: the chassis must have actually backed up along
+    // the reverse leg (not sat braking at the origin).
+    expect(s.x).toBeLessThan(-0.5);
+    expect(s.speed).toBeLessThan(0);
+    expect(state.lastGear).toBe(-1);
+  });
+
   it('deterministic with the same RNG seed', () => {
     const path = straightPath(20, 6);
     const sim = buildForwardSim();

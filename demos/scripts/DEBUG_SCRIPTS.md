@@ -71,6 +71,26 @@ Keeps a rolling ~6 s window of state+controls+segment-structure and dumps it
 whenever a stuck-recovery fires. Shows the causal sequence into each wedge
 (arrive hot → brake to 0 misaligned → reverse shunt → …).
 
+### `tmp-plan-plot.mts` — planning-vs-execution separation + replan churn
+```
+npx tsx scripts/tmp-plan-plot.mts <kin|v2|v3> [maxSec] [open|technical] <outPrefix>
+```
+Runs a race under MPPI and emits two artifacts plus a churn report, to answer
+"planning error or execution error?" without eyeballing:
+- `<out>-plans.png` — every committed plan overlaid, coloured by replan order
+  (blue = early → red = late), waypoint-advance replans drawn bright. Plans
+  stacked on one line = the planner commits/agrees; a fan of colours = thrash.
+- `<out>-exec.png` — executed trajectory (speed-coloured) + committed plans in
+  grey; the gap between grey plan and coloured drive is execution error.
+- console: per-replan churn (mean/max lateral gap vs the previous plan over the
+  near-chassis overlap), split by same-waypoint vs waypoint-advance replans,
+  and the 8 largest-churn replans. Measured finding: churn is present in BOTH
+  the clean kinematic car and the wedging learned cars (≈1 m mean, ~1.5× higher
+  on waypoint advances) — so churn is NOT the differentiator; the honest models
+  wedge because they correctly brake at infeasible slalom kinks. The same
+  churn metric is surfaced in `DrivingQuality.planChurnMean/Max` for asserting
+  plan stability in benchmarks.
+
 ### `tmp-wedge2.mts` — single-wedge dissection with raw planner path
 ```
 npx tsx scripts/tmp-wedge2.mts <v2|v3>

@@ -35,6 +35,10 @@ export interface PlanOverlay {
   /** Sim time the plan was committed (for the caption only). */
   t: number;
   pts: ReadonlyArray<{ x: number; z: number }>;
+  /** Optional explicit stroke (overrides the default grey). Used to colour
+   *  replans by order (time gradient) so plan STABILITY is visible: plans
+   *  stacked on the same line = committed/stable; a fan of colours = thrash. */
+  stroke?: string;
 }
 
 export interface CourseGeometry {
@@ -174,7 +178,7 @@ export function plotTrajectory(
 
   // Planned-path overlays (thin, light — beneath the executed line).
   for (const plan of opts.plans ?? []) {
-    ctx.strokeStyle = 'rgba(120,120,140,0.45)';
+    ctx.strokeStyle = plan.stroke ?? 'rgba(120,120,140,0.45)';
     ctx.lineWidth = 1;
     ctx.beginPath();
     plan.pts.forEach((p, i) => {

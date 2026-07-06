@@ -670,6 +670,13 @@ export interface DrivingQuality {
   longJerkRms: number;
   /** Number of reverse-out recovery maneuvers triggered (stuck escapes). */
   recoveryCount: number;
+  /** Mean replan churn (m): lateral gap between each committed plan and the
+   *  one it replaced, over the near-chassis overlap. A PLANNING-stability
+   *  signal — high = the planner flip-flops between near-equal-cost lines
+   *  instead of committing. Distinct from tracking (execution) error. */
+  planChurnMean: number;
+  /** Worst single-replan churn (m). */
+  planChurnMax: number;
 }
 
 export interface RaceCarStatus {
@@ -850,6 +857,12 @@ interface CarInternal {
   // Stall guard (diagnostics only — no teleport rescue).
   lastMoveSimTime: number;
   lastPos: { x: number; z: number };
+  // Cumulative arc length travelled since the stuck timer was last reset.
+  // A slow reverse shunt out of a gate wedge makes little NET displacement
+  // (it backs up, then the next forward leg returns near the same spot) but
+  // real arc-progress; counting arc keeps the stuck detector from firing
+  // mid-shunt and wiping the maneuver (MPPI racing only).
+  arcSinceMove: number;
   // Whether the chassis was within arena bounds on the previous tick (used to
   // count off-track excursions on the in→out edge — diagnostics only).
   lastInBounds: boolean;
@@ -887,6 +900,14 @@ interface CarInternal {
     jerkN: number;
     prevSpeed: number;
     prevALong: number;
+    // Replan STABILITY: lateral gap (m) between each freshly-committed plan
+    // and the plan it replaced, measured over the near-chassis overlap. High
+    // churn = the planner keeps flip-flopping between near-equal-cost lines
+    // instead of committing — a PLANNING-side signal, distinct from execution
+    // error (how well the tracker follows a given plan). Sampled per replan.
+    churnSum: number;
+    churnN: number;
+    churnMax: number;
   };
 }
 
@@ -899,6 +920,37 @@ interface CarInternal {
  *  contact — the margin makes that hover register as a strike. */
 const WALL_CONTACT_MARGIN = 0.5;
 
+/** Mean lateral gap (m) between a freshly-committed plan `a` and the plan it
+ *  replaced `b`, sampled over the first `arcCap` metres of `a` (the region
+ *  near the chassis that both plans cover). A pure PLANNING-stability signal:
+ *  0 = the planner re-committed the same line; large = it jumped to a
+ *  different near-equal-cost line, which the tracker then has to chase. */
+function planChurn(
+  a: ReadonlyArray<{ x: number; z: number }>,
+  b: ReadonlyArray<{ x: number; z: number }>,
+  arcCap = 18,
+): number {
+  if (a.length < 2 || b.length < 2) return 0;
+  let sum = 0;
+  let n = 0;
+  let arc = 0;
+  for (let i = 0; i < a.length; i++) {
+    if (i > 0) arc += Math.hypot(a[i]!.x - a[i - 1]!.x, a[i]!.z - a[i - 1]!.z);
+    if (arc > arcCap) break;
+    let best = Infinity;
+    for (let j = 1; j < b.length; j++) {
+      const ax = b[j - 1]!.x, az = b[j - 1]!.z;
+      const dx = b[j]!.x - ax, dz = b[j]!.z - az;
+      const L2 = dx * dx + dz * dz;
+      const t = L2 > 1e-9 ? Math.max(0, Math.min(1, ((a[i]!.x - ax) * dx + (a[i]!.z - az) * dz) / L2)) : 0;
+      best = Math.min(best, Math.hypot(a[i]!.x - (ax + t * dx), a[i]!.z - (az + t * dz)));
+    }
+    sum += best;
+    n++;
+  }
+  return n ? sum / n : 0;
+}
+
 /** Stuck detection + recovery (technical course). A chassis that overshoots
  *  into a wall can wedge nose-first; under a tight per-frame replan budget
  *  the planner can't always reverse out in one cycle, so the car would sit
@@ -909,6 +961,10 @@ const WALL_CONTACT_MARGIN = 0.5;
  *  real driver reverses off a wall — NOT a teleport rescue. */
 const STUCK_SPEED = 0.6;
 const STUCK_TIMEOUT_S = 1.5;
+// Backstop timeout while a reverse shunt / gear-change is in progress under
+// MPPI — long enough for the tracker to execute the maneuver, short enough to
+// still recover a genuine permanent wedge.
+const SHUNT_STUCK_TIMEOUT_S = 4.0;
 const RECOVERY_DURATION_S = 1.0;
 const RECOVERY_REVERSE_THROTTLE = 0.6;
 
@@ -1243,6 +1299,7 @@ export async function createRaceScenario(
       lastTouchingWall: false,
       lastMoveSimTime: 0,
       lastPos: { x: spawn.x, z: spawn.z },
+      arcSinceMove: 0,
       lastInBounds: true,
       spawn,
       mpcState: null,
@@ -1258,6 +1315,7 @@ export async function createRaceScenario(
         dist: 0, speedSum: 0, speedN: 0, stopped: 0, reversing: 0,
         ggSum: 0, ggN: 0, ggPeak: 0, jerkSumSq: 0, jerkN: 0,
         prevSpeed: 0, prevALong: 0,
+        churnSum: 0, churnN: 0, churnMax: 0,
       },
     };
   });
@@ -1526,6 +1584,16 @@ export async function createRaceScenario(
       }
       c.diagnostics.successfulReplans += 1;
       c.diagnostics.consecutiveFailedReplans = 0;
+      // Plan-stability metric: how far this freshly-committed plan sits from
+      // the one it replaces (near-chassis overlap). A PLANNING-side signal,
+      // separate from tracking error. Only meaningful once a prior plan
+      // exists (skip the first commit).
+      if (c.plan && c.plan.length > 1) {
+        const churn = planChurn(smoothed, c.plan);
+        c.q.churnSum += churn;
+        c.q.churnN += 1;
+        if (churn > c.q.churnMax) c.q.churnMax = churn;
+      }
       if (commitWindowSec > 0 && c.plan && c.plan.length > 1) {
         // Promote later — keep the current plan active through the
         // commit window. `stepOne` will swap when simTime crosses
@@ -1762,18 +1830,45 @@ export async function createRaceScenario(
           c.recovering = false;
           c.lastMoveSimTime = simTime;
           c.lastPos = { x: stateBefore.x, z: stateBefore.z };
+          c.arcSinceMove = 0;
           c.plan = null;
           c.pendingPlan = null;
           c.segments = [];
           c.activeSegIdx = 0;
         }
-      } else if (
-        Math.abs(stateBefore.speed) < STUCK_SPEED &&
-        simTime - c.lastMoveSimTime > STUCK_TIMEOUT_S
-      ) {
-        c.recovering = true;
-        c.recoveryEndSimTime = simTime + RECOVERY_DURATION_S;
-        c.recoveryCount++;
+      } else {
+        // Under MPPI the planner legally emits short reverse SHUNTS to
+        // escape a gate overshoot: a ~1.5 m back-off followed by a forward
+        // leg. These are slow and low-net-displacement BY DESIGN, so the
+        // blind stuck-recovery kept firing mid-shunt, wiping the committed
+        // maneuver and re-creating the exact wedge it was meant to escape
+        // (measured: the learned models looped this at every slalom gate).
+        // Give the tracker room to execute a shunt before declaring a wedge:
+        // (a) when the active segment is a reverse leg or we just changed
+        // gear (< 1 s ago), extend the timeout; (b) arc-progress already
+        // resets the timer below. A hard backstop timeout still recovers a
+        // genuine permanent wedge. Pure-pursuit keeps the tight timeout so
+        // the pinned technical-course benchmark is untouched.
+        let stuckTimeout = STUCK_TIMEOUT_S;
+        if (tuning.tracker === 'mpc' && c.segments.length > 1) {
+          const activeSeg = c.segments[c.activeSegIdx];
+          let segGear = 1;
+          if (activeSeg && activeSeg.length >= 2) {
+            let sum = 0;
+            for (const s of activeSeg) sum += s.speed;
+            if (sum < -1e-6) segGear = -1;
+          }
+          const nearGearChange = simTime - c.activeSegStartSimTime < 1.0;
+          if (segGear < 0 || nearGearChange) stuckTimeout = SHUNT_STUCK_TIMEOUT_S;
+        }
+        if (
+          Math.abs(stateBefore.speed) < STUCK_SPEED &&
+          simTime - c.lastMoveSimTime > stuckTimeout
+        ) {
+          c.recovering = true;
+          c.recoveryEndSimTime = simTime + RECOVERY_DURATION_S;
+          c.recoveryCount++;
+        }
       }
     }
     // Apply controls.
@@ -2059,9 +2154,17 @@ export async function createRaceScenario(
     // hidden). A stuck car simply stays stuck and the run fails honestly.
     if (!c.holdingForSync) {
       const moved = Math.hypot(after.x - c.lastPos.x, after.z - c.lastPos.z) > 0.5;
-      if (moved) {
+      // Under MPPI racing also credit cumulative ARC length: a reverse shunt
+      // backs up and returns near the same spot (small net displacement) yet
+      // travels real distance, and should NOT read as "stuck". Pure-pursuit
+      // and parking keep the net-displacement-only rule (benchmarks untouched).
+      if (tuning.tracker === 'mpc' && course.waypoints.length > 1) {
+        c.arcSinceMove += Math.hypot(after.x - stateBefore.x, after.z - stateBefore.z);
+      }
+      if (moved || c.arcSinceMove > 0.5) {
         c.lastMoveSimTime = simTime;
         c.lastPos = { x: after.x, z: after.z };
+        c.arcSinceMove = 0;
       }
     }
     // Off-track tracking — diagnostics ONLY, no teleport rescue. We still count
@@ -2118,6 +2221,8 @@ export async function createRaceScenario(
         ggPeakUtil: c.q.ggPeak,
         longJerkRms: c.q.jerkN > 0 ? Math.sqrt(c.q.jerkSumSq / c.q.jerkN) : 0,
         recoveryCount: c.recoveryCount,
+        planChurnMean: c.q.churnN > 0 ? c.q.churnSum / c.q.churnN : 0,
+        planChurnMax: c.q.churnMax,
       },
       diagnostics: c.diagnostics,
       metrics: c.metrics,
@@ -2162,6 +2267,7 @@ export async function createRaceScenario(
       c.lastTouchingWall = false;
       c.lastMoveSimTime = 0;
       c.lastPos = { x: c.spawn.x, z: c.spawn.z };
+      c.arcSinceMove = 0;
       c.lastInBounds = true;
       c.recovering = false;
       c.recoveryEndSimTime = 0;
@@ -2170,6 +2276,7 @@ export async function createRaceScenario(
         dist: 0, speedSum: 0, speedN: 0, stopped: 0, reversing: 0,
         ggSum: 0, ggN: 0, ggPeak: 0, jerkSumSq: 0, jerkN: 0,
         prevSpeed: 0, prevALong: 0,
+        churnSum: 0, churnN: 0, churnMax: 0,
       };
       // Reset the MPPI warm-start + RNG so reset() is bit-reproducible under
       // the 'mpc' tracker (a stale warm-start sequence would make the second
