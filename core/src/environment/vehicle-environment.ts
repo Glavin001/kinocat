@@ -15,6 +15,13 @@ import { NULL_RECORDER, type PerfRecorder } from '../planner/perf';
  *  shot by decel-to-stop time — guards the division when the entry speed is
  *  near rest so the cost stays finite and the maneuver stays selectable. */
 const ANALYTIC_DRIVETHROUGH_VFLOOR = 4;
+/** Fraction of entry speed used as the average traversal speed when pricing a
+ *  drive-through analytic shot (it decelerates to rest, so avg < entry). Lower
+ *  = more punitive (fewer stop-shortcuts, but heavier search); 0.5 = the honest
+ *  cruise-then-brake average. Raising it toward ~0.75 discourages the mispriced
+ *  stop while keeping the analytic shot cheap enough that the search stays
+ *  tractable (fewer expansions). */
+const ANALYTIC_DRIVETHROUGH_AVG_FRAC = 0.7;
 
 export interface VehicleEnvOptions {
   posCell?: number;
@@ -465,7 +472,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     // mispriced analytic stop-shortcut to every drive-through gate instead of
     // carrying speed through a spline (skill K5).
     const vTraverse = this.analyticDriveThrough
-      ? Math.max(a.speed * 0.5, ANALYTIC_DRIVETHROUGH_VFLOOR)
+      ? Math.max(a.speed * ANALYTIC_DRIVETHROUGH_AVG_FRAC, ANALYTIC_DRIVETHROUGH_VFLOOR)
       : this.agent.maxSpeed;
     for (const seg of path.segments) {
       const rev = seg.gear < 0;
