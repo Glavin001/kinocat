@@ -28,7 +28,7 @@ const scenario = await createRaceScenario({
   targetLaps: 2,
   syncHold: false,
   course,
-  tuning: { plannerBudgetMs: Number(process.env.KINOCAT_PLANNER_BUDGET ?? 10000), tracker: 'mpc', mpcOverrides: overrides, analyticDriveThrough: process.env.KINOCAT_ANALYTIC_DT === '1' },
+  tuning: { plannerBudgetMs: Number(process.env.KINOCAT_PLANNER_BUDGET ?? 10000), tracker: 'mpc', mpcOverrides: overrides, analyticDriveThrough: process.env.KINOCAT_ANALYTIC_DT === '1', enableSpeedProfile: process.env.KINOCAT_SPEED_PROFILE === '1' },
 });
 const rec = plotPath ? new TrajectoryRecorder() : null;
 while (scenario.simTime() < maxSec) {
