@@ -175,10 +175,14 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
   private readonly fpScratch: Array<[number, number]>;
   private readonly ghEnabled: boolean;
   private readonly ghWeight: number;
-  private ghGoalX = NaN;
-  private ghGoalZ = NaN;
   private ghRev = -1;
-  private ghLB: ((x: number, z: number, y?: number) => number | null) | null = null;
+  // Obstacle-aware goal lower bound, cached PER GOAL. A multi-goal search
+  // flips the goal between gates as interleaved gateIndex nodes expand; a
+  // single-goal memo would rebuild the (expensive) Dijkstra field on every
+  // flip. Each `buildGoalLowerBound` call returns a closure over its OWN
+  // distance field, so caching the closure per goal means the field is built
+  // once per gate per replan and reused across all flips.
+  private ghLBByGoal = new Map<string, ((x: number, z: number, y?: number) => number | null) | null>();
   private rec: PerfRecorder = NULL_RECORDER;
   private readonly refPath: ReadonlyArray<{ x: number; z: number }>;
   private readonly refWeight: number;
@@ -539,20 +543,20 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
       tRS = Math.max(rs, euclid) / this.agent.maxSpeed;
     }
     if (this.ghEnabled) {
-      // Revision guard: a tile rebuild under a long-lived env must not keep
-      // serving a lower bound computed against the old geometry.
-      if (
-        to.x !== this.ghGoalX ||
-        to.z !== this.ghGoalZ ||
-        this.world.revision !== this.ghRev
-      ) {
-        this.ghGoalX = to.x;
-        this.ghGoalZ = to.z;
+      // Revision guard: a tile rebuild under a long-lived env invalidates every
+      // cached field (they were computed against the old geometry).
+      if (this.world.revision !== this.ghRev) {
         this.ghRev = this.world.revision;
-        this.ghLB = this.world.buildGoalLowerBound!(to.x, to.z);
+        this.ghLBByGoal.clear();
       }
-      if (this.ghLB) {
-        const d = this.ghLB(from.x, from.z);
+      const gkey = `${to.x}:${to.z}`;
+      let lb = this.ghLBByGoal.get(gkey);
+      if (lb === undefined) {
+        lb = this.world.buildGoalLowerBound!(to.x, to.z);
+        this.ghLBByGoal.set(gkey, lb);
+      }
+      if (lb) {
+        const d = lb(from.x, from.z);
         if (d !== null) {
           const tGrid = (d * this.ghWeight) / this.agent.maxSpeed;
           if (tGrid > tRS) return tGrid;

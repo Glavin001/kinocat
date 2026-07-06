@@ -75,6 +75,17 @@ const DEFAULT_ENV_OPTIONS: VehicleEnvOptions = {
   // headingBuckets so the table is sized consistently with the search
   // grid.
   heuristicTable: {},
+  // Clearance broadphase: skip the exact swept-footprint test when a disk of
+  // the circumscribed radius is provably clear (early-accept only, never
+  // rejects, so it cannot change the plan). A no-op on worlds without
+  // `clearanceAt`. Saves the dominant collision cost across open stretches.
+  clearanceBroadphase: true,
+  // NOTE: the obstacle-aware grid heuristic (`gridHeuristic`) was measured to
+  // help <2% here and is intentionally NOT enabled — on this course the
+  // kinodynamic (turning-radius) Reeds-Shepp cost dominates the obstacle-detour
+  // cost, so max(RS, grid) ≈ RS almost everywhere. The per-goal caching that
+  // makes it viable under multi-goal gate-flips lives in VehicleEnvironment for
+  // when a course IS detour-dominated.
 };
 
 const DEFAULT_TIME_OPTIONS: Omit<TimeAwareOptions, 'obstacles' | 'affordances'> = {
