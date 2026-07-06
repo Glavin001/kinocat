@@ -48,6 +48,34 @@ already landed fixes this session: recovery no longer interrupts reverse
 shunts, and the gear-flip prior reseed makes shunts actually execute
 (recoveries 13→5).
 
+## Confirmed by the fast skill suite (measured this session)
+
+The skill tests (committed under `core/test/execute/skills-*.test.ts` and
+`demos/test/skills/`) turned theory into measured fact:
+
+- **The executor is fine given a clean plan.** Driving hand-built straights /
+  arcs through `mpcTrack` + the parametric model, the car floors a straight to
+  >25 m/s (K1) and holds a constant-radius sweeper (K2). So the full-lap crawl
+  is **not** an executor-logic bug — it is planner + wiring.
+- **The dominant planner bug is analytic-shot MISPRICING** (K5). On a *gentle*
+  slalom every model (kin/v2/v3) plans a full STOP at each gate
+  (`minInteriorV = 0`). Root cause, confirmed by `tmp-dump-slalom.mts`: the
+  Reeds-Shepp analytic shot to a gate ends at `speed: 0`
+  (`vehicle-environment.ts:452`) but is time-costed `length / maxSpeed`
+  (`:443`, as if driven at 30 m/s). Forward-only search *does* find a
+  speed-carrying spline (`minInteriorV = 5.6`, cost 5.75) — the planner just
+  prefers the mispriced stop-shortcut (cost 4.27). Same cost gap as reverse: a
+  stop is priced as if free-flowing. **This is the wedge, at the plan level.**
+  Fix is scoped and needs parking validation (parking legitimately wants
+  zero-speed analytic terminals), so it is teed up, not yet landed.
+- **The phantom-curvature guard actually holds** for realistic (smoothed) chord
+  noise (K3 passes) — correcting the earlier theoretical "K3 fails." The crawl
+  near genuine corners is K10 (timid decel), not phantom curvature.
+- **v3's library bakes one physically-impossible speed jump** (~9.7 m/s in a
+  step; K8) — a real v3 model bug; v2 is clean.
+- **K10 landed**: the MPPI anticipatory-brake budget now derives from the
+  vehicle's real deceleration (~13.9 m/s²) instead of the timid hand-set 8.
+
 ## What we established (three findings that shape the skills)
 
 1. **The planner IS time-optimal — but only to the fidelity of the model that
@@ -249,11 +277,17 @@ New `demos/test/skills/` suite (fast tier) + one shared helper
 1. **Land the fast skills suite (tests only).** K2/K3/K4/K5/K6 are expected to
    fail — the failing tests ARE the fast, precise reproductions we've been
    missing. Each failure names its layer. K1/K9 land green as guards.
-2. **K4/K5 — the wedge ENTRY (biggest lever: ~27 s stopped / 100 s).**
-   Planner side: finite `goalHeadingTol` for tight-kink gates (chord-aligned)
-   so committed plans stop carrying infeasible kinks; executor side: sweep
-   `corridorHalfWidth` (1.2–1.5 proven for kin) and gate-kink allowed-speed
-   margin. Gate every change on the K4/K5 tests + K8 feasibility.
+2. **K5/K4 — analytic-shot mispricing (biggest lever; measured: every model
+   stops at every gate).** The scoped fix: price the analytic (Reeds-Shepp)
+   edge honestly when its terminal is a drive-through gate — its `speed:0`
+   terminal means the time cost is ~`length / vEntry` (decel-to-stop), not
+   `length / maxSpeed`. Must NOT change the stop-terminal (parking) case, which
+   legitimately ends at rest — so gate on goal type / an env flag, and validate
+   against the full parking-invariant suite before landing. Alternative if the
+   pricing fix is too invasive: give the forward library the medium-radius arcs
+   to spline gentle corners so the analytic shortcut is never the cheapest path
+   (add k/4, k/8 arcs to the learned control sets; measure search-cost delta).
+   Gate on the K5 `it.fails` target flipping to green.
 3. **K10 — late braking** (second lever, and cheap): derive `envelopeDecel`
    from the measured brake curve instead of the timid 8 — this alone moves
    every brake point ~3× closer to the corner. One constant + named margin,
