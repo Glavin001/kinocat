@@ -11,9 +11,10 @@ import {
 } from '../app/lib/race-primitives-scenarios';
 import { planVehicleMultiGoal } from 'kinocat/planner';
 import { InMemoryNavWorld } from 'kinocat/environment';
-import { v3FromJson } from 'kinocat/agent';
+import { v3FromJson, forwardSimV3, learnedForwardSimV2, kinematicForwardSim } from 'kinocat/agent';
 import { modelFromJson } from '../app/lib/v2-model-file';
 import { plotTrajectory } from './lib/trajectory-plot';
+import type { CarKinematicState } from 'kinocat/agent';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const readModel = (f: string) => JSON.parse(readFileSync(resolve(root, 'demos/public/models', f), 'utf-8'));
@@ -21,10 +22,15 @@ const which = process.argv[2] ?? 'v3';
 const out = process.argv[3] ?? `/tmp/slalom-${which}.png`;
 const gen = process.env.KINOCAT_GEN_CONTROLS === '1';
 const dt = process.env.KINOCAT_ANALYTIC_DT === '1';
-const lib = which === 'v3'
-  ? buildLearnedRaceLibraryV3(v3FromJson(readModel('v3-default.json')), { generatedControls: gen })
-  : which === 'v2'
-    ? buildLearnedRaceLibraryV2(modelFromJson(readModel('v2-default.json')), { generatedControls: gen })
+// Keep BOTH the library (for planning) and the raw forward model (to re-roll
+// primitives at render time for the true per-substep speed along the spline).
+const v3m = which === 'v3' ? v3FromJson(readModel('v3-default.json')) : null;
+const v2m = which === 'v2' ? modelFromJson(readModel('v2-default.json')) : null;
+const forwardSim = which === 'v3' ? forwardSimV3(v3m!)
+  : which === 'v2' ? learnedForwardSimV2(v2m!)
+    : kinematicForwardSim(RACE_AGENT);
+const lib = which === 'v3' ? buildLearnedRaceLibraryV3(v3m!, { generatedControls: gen })
+  : which === 'v2' ? buildLearnedRaceLibraryV2(v2m!, { generatedControls: gen })
     : buildKinematicLibrary();
 
 const bounds = { x0: -50, z0: -25, x1: 30, z1: 25 };
@@ -53,31 +59,46 @@ console.log(`${which} gen=${gen} dt=${dt}: found=${res.found} pts=${path.length}
 // edge replays its primitive's local sweep transformed to world by the parent
 // pose; each Reeds-Shepp edge uses its stored world-frame poses. Speed is
 // interpolated across each segment (substeps carry no speed).
-const primById = new Map<number, { sweep: { x: number; z: number; heading: number }[]; end: { speed: number } }>();
+const primById = new Map<number, { controls: number[]; startSpeed: number; duration: number }>();
 for (const p of lib.primitives) primById.set(p.id, p);
+const SUB = 16; // render substeps per primitive (finer than the 6 baked in)
 const samples: { t: number; x: number; z: number; speed: number }[] = [];
 samples.push({ t: 0, x: path[0]!.x, z: path[0]!.z, speed: Math.abs(path[0]!.speed) });
 const nodes = res.nodes ?? [];
 for (let i = 1; i < path.length; i++) {
   const a = path[i - 1]!, b = path[i]!;
   const edge = nodes[i]?.edge;
-  const v0 = Math.abs(a.speed), v1 = Math.abs(b.speed);
-  let pts: { x: number; z: number }[] = [];
-  if (edge?.kind === 'reeds-shepp') {
-    const poses = (edge.data as { poses?: { x: number; z: number }[] }).poses ?? [];
-    pts = poses.map((p) => ({ x: p.x, z: p.z }));
-  } else if (edge?.kind === 'drive') {
+  if (edge?.kind === 'drive') {
     const primId = (edge.data as { primId?: number }).primId;
     const prim = primId !== undefined ? primById.get(primId) : undefined;
     if (prim) {
+      // Re-roll the primitive's controls through the model — reproduces the
+      // EXACT trajectory + per-substep SPEED the planner projected. Local frame
+      // (start at rest pose, the bucket start speed), then place into the world
+      // at the parent pose.
       const cos = Math.cos(a.heading), sin = Math.sin(a.heading);
-      pts = prim.sweep.map((lp) => ({ x: a.x + lp.x * cos - lp.z * sin, z: a.z + lp.x * sin + lp.z * cos }));
+      let s: CarKinematicState = { x: 0, z: 0, heading: 0, speed: prim.startSpeed, t: 0 };
+      const subDt = prim.duration / SUB;
+      for (let k = 0; k < SUB; k++) {
+        s = forwardSim(s, prim.controls, subDt);
+        samples.push({
+          t: samples.length,
+          x: a.x + s.x * cos - s.z * sin,
+          z: a.z + s.x * sin + s.z * cos,
+          speed: Math.abs(s.speed),
+        });
+      }
+      continue;
     }
   }
-  if (pts.length < 2) pts = [{ x: a.x, z: a.z }, { x: b.x, z: b.z }]; // fallback chord
-  for (let s = 1; s < pts.length; s++) {
-    const u = s / (pts.length - 1);
-    samples.push({ t: samples.length, x: pts[s]!.x, z: pts[s]!.z, speed: v0 + (v1 - v0) * u });
+  // Reeds-Shepp analytic edge (geometric, not a model rollout): use its world
+  // poses; speed decays from entry to the terminal linearly.
+  const v0 = Math.abs(a.speed), v1 = Math.abs(b.speed);
+  const poses = (edge?.data as { poses?: { x: number; z: number }[] } | undefined)?.poses
+    ?? [{ x: a.x, z: a.z }, { x: b.x, z: b.z }];
+  for (let s2 = 1; s2 < poses.length; s2++) {
+    const u = s2 / (poses.length - 1);
+    samples.push({ t: samples.length, x: poses[s2]!.x, z: poses[s2]!.z, speed: v0 + (v1 - v0) * u });
   }
 }
 const png = plotTrajectory(out,
