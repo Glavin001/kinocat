@@ -1,12 +1,12 @@
 {
   "version": 1,
-  "profile": "overnight",
+  "profile": "default",
   "seed": 42,
-  "rounds": 12,
-  "trialsPerRound": 300,
-  "trialTicks": 180,
+  "rounds": 3,
+  "trialsPerRound": 120,
+  "trialTicks": 120,
   "sampleEveryNTicks": 6,
-  "totalTrials": 3600,
+  "totalTrials": 360,
   "sampleDt": 0.1,
   "vehicleOptions": {
     "chassisHalf": {
@@ -23,109 +23,109 @@
     "maxSteerAngle": 0.6,
     "driveTrain": "rwd"
   },
-  "git": "0a0940d",
+  "git": "2955e62",
   "diagnostics": {
     "openLoopDivergence": [
       {
         "tSec": 0.5,
-        "posRms": 0.5143538250260382,
-        "headingRms": 0.07838088406154807,
-        "speedRms": 1.194717185129895
+        "posRms": 0.5520287026980933,
+        "headingRms": 0.07843619044696684,
+        "speedRms": 1.077996998374083
       },
       {
         "tSec": 1,
-        "posRms": 0.968398443111785,
-        "headingRms": 0.26274164328855587,
-        "speedRms": 1.0684714635794401
+        "posRms": 1.093984413420155,
+        "headingRms": 0.2154323805934486,
+        "speedRms": 0.6404215973031715
       },
       {
         "tSec": 1.6,
-        "posRms": 1.3961989423081487,
-        "headingRms": 0.3234743132264222,
-        "speedRms": 0.6482872251363486
+        "posRms": 1.688511328415987,
+        "headingRms": 0.31385201985671235,
+        "speedRms": 1.0970885110124244
       }
     ],
     "perStateRms": [
       {
         "name": "heading",
-        "rms": 0.31427193541115056
+        "rms": 0.27230542009509906
       },
       {
         "name": "speed",
-        "rms": 1.0951354944980773
+        "rms": 1.5367441894448337
       },
       {
         "name": "yawRate",
-        "rms": 0.271161155140793
+        "rms": 0.331688662680047
       },
       {
         "name": "lateralVelocity",
-        "rms": 0.6364829011216089
+        "rms": 0.9160827616777143
       }
     ],
     "baselines": {
       "kinematic": [
         {
           "tSec": 0.5,
-          "posRms": 4.3284503795740905,
-          "headingRms": 0.16691607224055618,
-          "speedRms": 8.214055494257076
+          "posRms": 4.706299866918016,
+          "headingRms": 0.1648306184289748,
+          "speedRms": 8.563256227823462
         },
         {
           "tSec": 1,
-          "posRms": 7.4260691262537675,
-          "headingRms": 0.4616506879046915,
-          "speedRms": 8.7119442314136
+          "posRms": 8.32914762850817,
+          "headingRms": 0.43019581121067996,
+          "speedRms": 9.55819231205271
         },
         {
           "tSec": 1.6,
-          "posRms": 11.62519062184258,
-          "headingRms": 0.5891961527330836,
-          "speedRms": 9.510337449534678
+          "posRms": 13.347906701218088,
+          "headingRms": 0.5729494005387391,
+          "speedRms": 10.600224983171845
         }
       ],
       "legacyV1": [
         {
           "tSec": 0.5,
-          "posRms": 2.657719686663415,
-          "headingRms": 0.1559442406462976,
-          "speedRms": 8.008390464797303
+          "posRms": 2.4423429604360227,
+          "headingRms": 0.13894864331519946,
+          "speedRms": 7.366027608482933
         },
         {
           "tSec": 1,
-          "posRms": 7.147107124389398,
-          "headingRms": 0.44426534578452037,
-          "speedRms": 10.60451067993457
+          "posRms": 6.690398419292629,
+          "headingRms": 0.42318621862176703,
+          "speedRms": 10.126707836766336
         },
         {
           "tSec": 1.6,
-          "posRms": 12.803613978721376,
-          "headingRms": 0.5478167123184209,
-          "speedRms": 9.720906598168568
+          "posRms": 12.340518609162167,
+          "headingRms": 0.5497502582291248,
+          "speedRms": 10.247459697535502
         }
       ],
       "parametricOnly": [
         {
           "tSec": 0.5,
-          "posRms": 2.3261995124660197,
-          "headingRms": 0.1426278286010941,
-          "speedRms": 6.616444063180643
+          "posRms": 1.1844628810595377,
+          "headingRms": 0.10355653607198873,
+          "speedRms": 2.600334062711103
         },
         {
           "tSec": 1,
-          "posRms": 5.8360491547779,
-          "headingRms": 0.4202672672640956,
-          "speedRms": 8.185842581940591
+          "posRms": 2.3401627379099126,
+          "headingRms": 0.36461877808625387,
+          "speedRms": 3.184448691095989
         },
         {
           "tSec": 1.6,
-          "posRms": 9.77684887151362,
-          "headingRms": 0.5230265837886833,
-          "speedRms": 6.674408248735275
+          "posRms": 3.5201655584348686,
+          "headingRms": 0.4810667843801226,
+          "speedRms": 2.3834790907058445
         }
       ]
     }
   },
-  "runtimeMs": 2283388,
-  "createdAt": 1779705113190
+  "runtimeMs": 95787,
+  "createdAt": 1783255041500
 }

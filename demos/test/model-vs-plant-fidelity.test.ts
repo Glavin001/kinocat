@@ -213,10 +213,14 @@ describe('model vs Rapier plant — endpoint fidelity across the speed envelope'
     //    so planner fidelity ≈ model fidelity.
     expect(mean(newGridStats)).toBeLessThan(mean(trainedStats) + 1.0);
 
-    // 5. Absolute regression budgets (measured 2026-07: trained mean
-    //    1.08 m, planner-view mean 1.23 m over one 0.8 s primitive; ~60%
-    //    headroom so re-fits don't flap, real regressions still trip).
-    expect(mean(trainedStats)).toBeLessThan(1.8);
-    expect(mean(newGridStats)).toBeLessThan(2.0);
+    // 5. Absolute regression budgets. RATCHETED DOWN after the
+    //    grip-saturating brake model landed (the brake-in-turn channel was
+    //    the parametric backbone's worst error — a ~10× longitudinal
+    //    under-brake — see vehicle-model.ts). Measured 2026-07 with the
+    //    regenerated in-bounds artifact: trained mean 1.07 m, planner-view
+    //    mean 1.36 m over one 0.8 s primitive. Budgets keep ~30% headroom so
+    //    re-fits don't flap; tighten (never loosen) as fidelity improves.
+    expect(mean(trainedStats)).toBeLessThan(1.4);
+    expect(mean(newGridStats)).toBeLessThan(1.8);
   }, 120_000);
 });

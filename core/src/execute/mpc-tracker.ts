@@ -281,7 +281,15 @@ export function mpcTrack(
   const K = config.samples ?? 64;
   const sStd = config.steerStd ?? 0.10;
   const dStd = config.driveStd ?? 0.4 * config.maxDriveForce;
-  const bStd = config.brakeStd ?? 0.10 * config.maxBrakeForce;
+  // The raycast-vehicle brake is near-binary — even a small brake force locks
+  // the wheels and produces grip-limited deceleration (measured; see the
+  // grip-saturating brake in vehicle-model.ts). Exploring large brake
+  // perturbations therefore mostly generates catastrophic-stop rollouts that
+  // swamp the importance-weighted average and stall acceleration from rest.
+  // Perturb brake gently by default (MPPI modulates speed mainly through
+  // drive force); callers that need decisive braking pass an explicit
+  // `brakeStd`.
+  const bStd = config.brakeStd ?? 0.03 * config.maxBrakeForce;
   const allowReverse = config.allowReverse ?? true;
   const lambda = Math.max(config.lambda ?? 1.0, 1e-6);
   const weights = {

@@ -76,10 +76,41 @@ function pose(x: number, z: number, heading: number): CarKinematicState {
  *  plan goes wrong (overshoot at the slalom, late braking into the 90°) but
  *  remains FEASIBLE — both cars can complete it, the question is who finishes
  *  faster with less tracking error. */
+/** A rectangular wall / building block on the course. Half-extents `hx`/`hz`
+ *  are in world units (XZ plane); `height` is the visual/physical Y extent.
+ *  The planner sees an inflated 2-D footprint (an obstacle hole in the
+ *  navmesh); the physics world gets a matching fixed cuboid collider; the
+ *  demo renders it with `createBuildingHelper`. */
+export interface RaceWallSpec {
+  x: number;
+  z: number;
+  hx: number;
+  hz: number;
+  height: number;
+}
+
+/** Race course variants. `open` is the historical flat pad (no walls) that
+ *  isolates the pure dynamic-model gap. `technical` adds walls, guard blocks
+ *  at the slalom overshoot zones, and a tight thread-the-gate corridor —
+ *  turning corner overshoot into a physical wall strike, so model fidelity
+ *  (honest entry speeds + feasible lines) is finally rewarded with lap time. */
+export type RaceCourseVariant = 'open' | 'technical';
+
+/** Planner sees walls this much larger than their physical extent, so a
+ *  feasible plan keeps a safety margin off the concrete. */
+export const RACE_WALL_INFLATE = 0.5;
+
 export interface RaceCourse {
   bounds: { x0: number; x1: number; z0: number; z1: number };
   polygons: NavPolygon[];
   obstacles: Array<[number, number][]>;
+  /** Wall blocks (empty / absent on the `open` course and on non-race
+   *  courses that reuse this shape, e.g. parking). Physical colliders +
+   *  visual meshes are built from these; `obstacles` are their inflated
+   *  planner footprints. */
+  walls?: RaceWallSpec[];
+  /** Which variant produced this course (absent on non-race courses). */
+  variant?: RaceCourseVariant;
   waypoints: CarKinematicState[];
   spawn: CarKinematicState;
   /** OPTIONAL canonical goal (kinocat/scenario AST). When present, the runtime
@@ -92,7 +123,19 @@ export interface RaceCourse {
   prefer?: CostTerm[];
 }
 
-export function buildRaceCourse(): RaceCourse {
+/** Inflated planner footprint (a hole in the navmesh) for a wall block. */
+function wallObstacle(w: RaceWallSpec): [number, number][] {
+  const hx = w.hx + RACE_WALL_INFLATE;
+  const hz = w.hz + RACE_WALL_INFLATE;
+  return [
+    [w.x - hx, w.z - hz],
+    [w.x + hx, w.z - hz],
+    [w.x + hx, w.z + hz],
+    [w.x - hx, w.z + hz],
+  ];
+}
+
+export function buildRaceCourse(variant: RaceCourseVariant = 'open'): RaceCourse {
   const b = RACE_BOUNDS;
   const polygons: NavPolygon[] = [
     {
@@ -106,8 +149,6 @@ export function buildRaceCourse(): RaceCourse {
       ],
     },
   ];
-  // No physical obstacles — the course is pure dynamics + waypoint chase.
-  const obstacles: Array<[number, number][]> = [];
 
   // Loop: accelerate → TIGHT slalom (alternating ±z gates only 8m apart,
   // demanding tight curvature at speed) → short straight → hard 90° turn →
@@ -130,10 +171,60 @@ export function buildRaceCourse(): RaceCourse {
     pose(-50, -25, 0),  // 10: back to start
   ];
 
+  if (variant === 'open') {
+    // No physical obstacles — the course is pure dynamics + waypoint chase.
+    return {
+      bounds: b,
+      polygons,
+      obstacles: [],
+      walls: [],
+      variant,
+      waypoints,
+      spawn: pose(-55, -20, 0),
+    };
+  }
+
+  // --- Technical variant --------------------------------------------------
+  // Same racing line as `open`, but walls line the OVERSHOOT zones of every
+  // slalom gate and the hard 90° corner, plus a thread-the-gate corridor on
+  // the return leg. A feasible plan (honest entry speeds, containment-safe
+  // radius) stays clear; the kinematic worldview's aggressive-intent line
+  // overshoots into the concrete. Overshoot is no longer free.
+  //
+  // Guard walls sit OFF the racing line (opposite the direction the gate is
+  // approached from), so they never invalidate the intended trajectory —
+  // they only catch a car that ran wide. Wall half-extents are chosen so the
+  // on-line clearance is comfortable (~4 m) while a >3 m overshoot strikes.
+  const H = 3; // wall visual/physical height
+  const walls: RaceWallSpec[] = [
+    // Slalom guard walls: each gate's overshoot side (north for +z gates,
+    // south for −z gates). Racing line passes at |z| = 8; walls start at
+    // |z| = 12 so a clean line clears by 4 m, an overshoot past 12 strikes.
+    { x: -22, z: 16, hx: 6, hz: 3.5, height: H }, // guard N of gate 1
+    { x: -12, z: -16, hx: 6, hz: 3.5, height: H }, // guard S of gate 2
+    { x: -2, z: 16, hx: 6, hz: 3.5, height: H }, // guard N of gate 3
+    { x: 8, z: -16, hx: 6, hz: 3.5, height: H }, // guard S of gate 4
+    { x: 18, z: 16, hx: 6, hz: 3.5, height: H }, // guard N of gate 5
+    // Hard 90° corner (gate 7 at (55,22)): a wall just past the apex on the
+    // east edge punishes braking too late — the delusional line runs wide
+    // into the wall while the clean line brakes early and clips the apex.
+    { x: 63, z: 20, hx: 2, hz: 10, height: H }, // east wall past the corner
+    // Thread-the-gate chicane on the long top straight (gate 7 (55,22) →
+    // gate 8 (-50,25)): staggered walls poke in from the north and south
+    // edges, forcing a decisive S past x = 10 / x = -12 at speed. A car
+    // carrying too much speed (kinematic optimism) runs wide into a wall;
+    // the honest line lifts, threads, and gets back on the throttle.
+    { x: 10, z: 35, hx: 5, hz: 5, height: H }, // chicane wall from the north
+    { x: -12, z: 15, hx: 5, hz: 5, height: H }, // chicane wall from the south
+  ];
+  const obstacles = walls.map(wallObstacle);
+
   return {
     bounds: b,
     polygons,
     obstacles,
+    walls,
+    variant,
     waypoints,
     spawn: pose(-55, -20, 0),
   };
@@ -461,8 +552,17 @@ export const RACE_ARRIVE_RADIUS = 2.5;
  *  Strictly less than RACE_ARRIVE_RADIUS so EVERY valid plan brings the
  *  chassis close enough that pickNextWaypoint will advance — prevents the
  *  "plan says I clipped the gate, real chassis overshot by ε, loopIndex
- *  stays, U-turn back" failure mode. */
+ *  stays, U-turn back" failure mode.
+ *
+ *  The TECHNICAL course tightens this to TECHNICAL_PLANNER_GATE_RADIUS via
+ *  its tuning defaults: near walls the pure-pursuit corner-cut can carry the
+ *  executed pass outside a 1.8 m aim ("just missed the checkpoint, backtrack")
+ *  — aiming at the gate centre keeps the cut inside the 2.5 m accept disk.
+ *  MEASURED: the tighter aim costs pace on the OPEN course (kin 33.0 →
+ *  46.8 s under the expansion cap — more expansions burnt per gate), so it
+ *  stays scoped to the walled variant where it buys smoothness. */
 export const RACE_PLANNER_GATE_RADIUS = 1.8;
+export const TECHNICAL_PLANNER_GATE_RADIUS = 1.2;
 
 export interface RacePlanRequest {
   state: CarKinematicState;

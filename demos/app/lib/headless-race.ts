@@ -21,14 +21,20 @@ import {
 import {
   buildLearnedRaceLibraryV2,
   buildKinematicLibrary,
+  type RaceCourse,
 } from './race-primitives-scenarios';
 import {
   buildParametricOnlyModel,
+  learnedForwardSimV2,
+  parametricForwardV2,
   DEFAULT_LEARNED_PARAMS_V2,
+  DEFAULT_LEARNABLE_CONFIG,
+  KINEMATIC_NATIVE_PARAMS,
   type LearnedVehicleModel,
 } from 'kinocat/agent';
 
-export type { RaceEntry, RaceLap, RaceTuning } from './race-scenario';
+export type { RaceEntry, RaceLap, RaceTuning, DrivingQuality } from './race-scenario';
+import type { DrivingQuality } from './race-scenario';
 export { DEFAULT_TUNING, LEGACY_TUNING } from './race-scenario';
 
 export interface RaceResult {
@@ -46,9 +52,16 @@ export interface RaceResult {
   finished: boolean;
   /** How many times the chassis left the arena / rolled. */
   offTrackEvents: number;
+  /** How many distinct times the chassis struck a course wall (0 on the
+   *  open course; the key model-fidelity signal on the technical course). */
+  wallStrikes: number;
   /** RMS prediction error at primitive boundary (m). The honest
    *  "how accurate is the model the planner uses" metric. */
   predErrorRms: number;
+  /** Driving-quality report: line efficiency (distance/lap), g-g
+   *  utilization, smoothness, hesitation, recoveries. The qualitative
+   *  "how well is it driving" measurement beyond raw lap time. */
+  quality: DrivingQuality;
   /** Total successful + failed replans (planner-quality proxy). */
   totalReplans: number;
   successfulReplans: number;
@@ -69,6 +82,9 @@ export interface RunRaceOptions {
   progressEverySec?: number;
   /** Per-feature toggles for ablation studies. Defaults to all-on. */
   tuning?: Partial<RaceTuning>;
+  /** Course to race on. Defaults to the open course (`buildRaceCourse()`).
+   *  Pass `buildRaceCourse('technical')` for the walled variant. */
+  course?: RaceCourse;
 }
 
 /** Race every entry against each other in independent Rapier worlds
@@ -86,6 +102,7 @@ export async function runHeadlessRace(
     syncHold: opts.syncHold ?? false,
     offTrackRecovery: 'spawn',
     tuning: opts.tuning,
+    course: opts.course,
   });
   let nextProgressAt = progressEvery;
   while (scenario.simTime() < maxSimTime) {
@@ -121,26 +138,46 @@ export async function runHeadlessRace(
       totalSimTime: finalSimTime,
       finished: c.laps.length >= targetLaps,
       offTrackEvents: c.offTrackEvents,
+      wallStrikes: c.wallStrikes,
       predErrorRms: c.diagnostics.predErrorRms,
+      quality: c.quality,
       totalReplans: c.diagnostics.totalReplans,
       successfulReplans: c.diagnostics.successfulReplans,
     };
   });
 }
 
-/** Build a kinematic-baseline `RaceEntry`. */
+/** Build a kinematic-baseline `RaceEntry`. Under the MPPI (`tracker: 'mpc'`)
+ *  executor, this car tracks with the naive idealised-bicycle model
+ *  (`KINEMATIC_NATIVE_PARAMS`) — the native-controls analogue of the
+ *  kinematic library's worldview. Under pure-pursuit the `forwardModel` is
+ *  unused. */
 export function kinematicEntry(name = 'kinematic'): RaceEntry {
-  return { name, lib: buildKinematicLibrary() };
+  return {
+    name,
+    lib: buildKinematicLibrary(),
+    forwardModel: parametricForwardV2(KINEMATIC_NATIVE_PARAMS, DEFAULT_LEARNABLE_CONFIG),
+  };
 }
 
-/** Build a v2 `RaceEntry` from a `LearnedVehicleModel`. */
+/** Build a v2 `RaceEntry` from a `LearnedVehicleModel`. Under MPPI this car
+ *  tracks with its OWN learned model (parametric backbone + residual
+ *  ensemble), so its fidelity reaches the wheels. */
 export function v2Entry(name: string, model: LearnedVehicleModel): RaceEntry {
-  return { name, lib: buildLearnedRaceLibraryV2(model) };
+  return {
+    name,
+    lib: buildLearnedRaceLibraryV2(model),
+    forwardModel: learnedForwardSimV2(model),
+  };
 }
 
 /** Build a parametric-only baseline (no residual ensemble) from the
  *  default params + config. */
 export function parametricOnlyEntry(name = 'parametric-only'): RaceEntry {
   const m = buildParametricOnlyModel(DEFAULT_LEARNED_PARAMS_V2);
-  return { name, lib: buildLearnedRaceLibraryV2(m) };
+  return {
+    name,
+    lib: buildLearnedRaceLibraryV2(m),
+    forwardModel: learnedForwardSimV2(m),
+  };
 }

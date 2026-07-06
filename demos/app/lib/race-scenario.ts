@@ -25,6 +25,7 @@ import RAPIER from '@dimforge/rapier3d-compat';
 import {
   createRaycastVehicle,
   createGroundCollider,
+  createBoxCollider,
   ensureRapier,
   stepRaycastVehicle,
   type CarHandle,
@@ -62,7 +63,7 @@ import { buildPlan, segmentByGear, type Plan } from 'kinocat/plan';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavWorld, AnalyticEdgeData } from 'kinocat/environment';
 import type { PlanResult } from 'kinocat/planner';
-import type { MotionPrimitiveLibrary } from 'kinocat/primitives';
+import type { MotionPrimitiveLibrary, ForwardSim } from 'kinocat/primitives';
 import {
   buildRaceCourse,
   planRaceMultiGoal,
@@ -73,6 +74,7 @@ import {
   RACE_REPLAN_BUDGET_MS,
   RACE_ARRIVE_RADIUS,
   RACE_PLANNER_GATE_RADIUS,
+  TECHNICAL_PLANNER_GATE_RADIUS,
   RACE_MAX_EXPANSIONS,
   emptyMetrics,
   type RaceMetrics,
@@ -168,6 +170,11 @@ const PURE_PURSUIT_CONFIG = {
   // distribution).
   reverseCruiseSpeed: RACE_AGENT.maxReverseSpeed,
 };
+
+/** Friction-circle budget (µ·g, m/s²) used to normalise the g-g driving-
+ *  quality utilization. Same chassis for every entry → same budget. */
+const GG_FRICTION_LIMIT =
+  deriveVehicleCapabilities(DEFAULT_LEARNABLE_CONFIG).maxLateralAccel;
 
 // ---------------------------------------------------------------------------
 // Multi-cusp plan segmentation.
@@ -404,6 +411,10 @@ export interface RaceTuning {
   plannerBudgetMs?: number;
   /** Planner expansion cap. Race=30k; parking=80k. */
   plannerMaxExpansions?: number;
+  /** Multi-goal planner "gate reached" radius (m). Open course: 1.8
+   *  (RACE_PLANNER_GATE_RADIUS). Technical course tightens to 1.2 so the
+   *  pure-pursuit corner-cut still lands inside the 2.5 m accept disk. */
+  plannerGateRadius?: number;
   /**
    * Fixed replan cadence (ms). Defaults to `REPLAN_INTERVAL_MS` (300).
    * Racing wants a brisk cadence so the line stays fresh against the
@@ -500,6 +511,16 @@ export interface RaceEntry {
    *  Defaults to `RACE_AGENT` (race course). Parking entries set
    *  `PARKING_AGENT`. */
   agent?: VehicleAgent;
+  /** Forward dynamics model the MPPI (`tracker: 'mpc'`) tracker rolls for
+   *  this entry — the mechanism that turns model fidelity into control
+   *  quality. Each car's MPPI predicts the plant's response with ITS OWN
+   *  model: the v2 car uses the trained `learnedForwardSimV2`, the kinematic
+   *  car uses a naive idealised-bicycle model. A more accurate model
+   *  commands feasible corner speeds; a delusional one over-drives and
+   *  overshoots. Defaults to the shared v2-default parametric backbone (so
+   *  pure-pursuit-only entries and legacy callers are unaffected). Native
+   *  `[steer, driveForce, brakeForce]` controls. */
+  forwardModel?: ForwardSim<CarKinematicState>;
 }
 
 export interface RaceLap {
@@ -524,6 +545,34 @@ export interface RaceCarDiagnostics {
   predErrorRms: number;
 }
 
+/** Per-car driving-quality accumulators — the "how well is it driving"
+ *  measurement beyond raw lap time. Accumulated every physics tick while the
+ *  car is racing (not holding / finished). All derived from executed chassis
+ *  state, so they compare LIBRARIES (planner intent) through the SAME
+ *  executor honestly. */
+export interface DrivingQuality {
+  /** Total distance the chassis actually travelled (m). Lower per lap =
+   *  tighter, more efficient line (less overshoot/backtracking). */
+  distanceTravelled: number;
+  /** Time-mean of |speed| (m/s). */
+  meanSpeed: number;
+  /** Seconds spent near-stationary (|v| < 0.5 m/s) while racing — hesitation,
+   *  wedges, replan stalls. */
+  timeStopped: number;
+  /** Seconds spent reversing (v < -0.5) — recovery shunts, not racing. */
+  timeReversing: number;
+  /** Mean friction-circle (g-g) utilization fraction: how much of the tire's
+   *  combined accel budget the car actually uses. Timid driving clusters near
+   *  0; at-the-limit driving approaches 1. */
+  ggMeanUtil: number;
+  /** Peak g-g utilization fraction. */
+  ggPeakUtil: number;
+  /** RMS longitudinal jerk (m/s³) — throttle/brake smoothness. */
+  longJerkRms: number;
+  /** Number of reverse-out recovery maneuvers triggered (stuck escapes). */
+  recoveryCount: number;
+}
+
 export interface RaceCarStatus {
   name: string;
   state: CarKinematicState;
@@ -533,6 +582,12 @@ export interface RaceCarStatus {
   finished: boolean;
   holdingForSync: boolean;
   offTrackEvents: number;
+  /** Number of distinct times the chassis footprint touched a course wall
+   *  (rising-edge counted, like `offTrackEvents`). 0 on the open course. */
+  wallStrikes: number;
+  /** Driving-quality accumulators (line efficiency, g-g utilization,
+   *  smoothness, hesitation). */
+  quality: DrivingQuality;
   diagnostics: RaceCarDiagnostics;
   metrics: RaceMetrics;
   /** Latest plan (lifted to a sequence of state samples for visualization). */
@@ -711,6 +766,10 @@ interface CarInternal {
   holdingForSync: boolean;
   finished: boolean;
   offTrackEvents: number;
+  // Wall-strike counter (technical course). Rising-edge counted.
+  wallStrikes: number;
+  // Whether the footprint was touching a wall on the previous tick.
+  lastTouchingWall: boolean;
   // Stall guard (diagnostics only — no teleport rescue).
   lastMoveSimTime: number;
   lastPos: { x: number; z: number };
@@ -722,10 +781,81 @@ interface CarInternal {
   // Persistent MPC tracker state (warm-start sequence + RNG seed) when
   // the tracker is `'mpc'`. Lazily initialised on first MPC tick.
   mpcState: MPCTrackerState | null;
+  // Forward model this car's MPPI rolls (per-entry; the fidelity lever).
+  mpcForwardSim: ForwardSim<CarKinematicState>;
+  // Reverse-out recovery state (stuck-against-wall escape maneuver).
+  recovering: boolean;
+  recoveryEndSimTime: number;
+  // Count of recovery maneuvers triggered (diagnostics).
+  recoveryCount: number;
+  // Driving-quality accumulators (updated every tick while racing).
+  q: {
+    dist: number;
+    speedSum: number;
+    speedN: number;
+    stopped: number;
+    reversing: number;
+    ggSum: number;
+    ggN: number;
+    ggPeak: number;
+    jerkSumSq: number;
+    jerkN: number;
+    prevSpeed: number;
+    prevALong: number;
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Public factory
+
+/** Contact margin (m) added to a wall's physical half-extents when testing
+ *  whether the chassis footprint is touching it. The Rapier collider prevents
+ *  actual penetration, so the footprint hovers just outside the wall on
+ *  contact — the margin makes that hover register as a strike. */
+const WALL_CONTACT_MARGIN = 0.5;
+
+/** Stuck detection + recovery (technical course). A chassis that overshoots
+ *  into a wall can wedge nose-first; under a tight per-frame replan budget
+ *  the planner can't always reverse out in one cycle, so the car would sit
+ *  forever. When the chassis has not moved >0.5 m for `STUCK_TIMEOUT_S` while
+ *  commanded to drive, it enters a bounded reverse-out maneuver for
+ *  `RECOVERY_DURATION_S` (back off the wall + reorient toward the next gate),
+ *  then clears its plan and replans. This is an honest escape maneuver — a
+ *  real driver reverses off a wall — NOT a teleport rescue. */
+const STUCK_SPEED = 0.6;
+const STUCK_TIMEOUT_S = 1.5;
+const RECOVERY_DURATION_S = 1.0;
+const RECOVERY_REVERSE_THROTTLE = 0.6;
+
+/** True iff the (oriented) chassis footprint overlaps any course wall,
+ *  approximated by testing the footprint's world-space corners and its
+ *  center against each wall's axis-aligned box (inflated by the contact
+ *  margin). Cheap and robust enough for a rising-edge strike counter. */
+function footprintTouchesWall(
+  state: CarKinematicState,
+  footprint: ReadonlyArray<readonly [number, number]>,
+  walls: ReadonlyArray<{ x: number; z: number; hx: number; hz: number }>,
+): boolean {
+  if (walls.length === 0) return false;
+  const cosH = Math.cos(state.heading);
+  const sinH = Math.sin(state.heading);
+  // Body frame: x forward, z to the side. World = rotate by heading.
+  const pts: Array<[number, number]> = [[0, 0]];
+  for (const [bx, bz] of footprint) {
+    pts.push([
+      state.x + bx * cosH - bz * sinH,
+      state.z + bx * sinH + bz * cosH,
+    ]);
+  }
+  for (const w of walls) {
+    const hx = w.hx + WALL_CONTACT_MARGIN;
+    const hz = w.hz + WALL_CONTACT_MARGIN;
+    for (const [px, pz] of pts) {
+      if (Math.abs(px - w.x) <= hx && Math.abs(pz - w.z) <= hz) return true;
+    }
+  }
+  return false;
+}
 
 export async function createRaceScenario(
   opts: RaceScenarioOptions,
@@ -742,7 +872,22 @@ export async function createRaceScenario(
   void opts.offTrackRecovery;
   void opts.stallTimeoutMs;
   const spacing = opts.spawnSpacingZ ?? 3;
-  const tuning: RaceTuning = { ...DEFAULT_TUNING, ...(opts.tuning ?? {}) };
+  // Technical-course default: enable curvature feedforward + the
+  // friction-circle speed profile (respectPathSpeed). Near walls the raw
+  // geometry-only pure-pursuit overshoots corners and the chassis wedges
+  // (a failed-replan storm → DNF); the speed profile brakes into corners so
+  // BOTH cars thread the walls cleanly. The open course keeps the leaner
+  // default (measured faster there). Explicit `opts.tuning` still wins.
+  const courseTuningDefaults: Partial<RaceTuning> =
+    course.variant === 'technical'
+      ? {
+          respectPathSpeed: true,
+          curvatureFeedforward: true,
+          enableSpeedProfile: true,
+          plannerGateRadius: TECHNICAL_PLANNER_GATE_RADIUS,
+        }
+      : {};
+  const tuning: RaceTuning = { ...DEFAULT_TUNING, ...courseTuningDefaults, ...(opts.tuning ?? {}) };
   // Tracker config derives from the tuning bundle so a single
   // `createRaceScenario` instance handles racing or parking based on
   // the scenario's per-tuning overrides. Anything not set falls
@@ -833,6 +978,20 @@ export async function createRaceScenario(
       pad: 20,
       friction: 1.5,
     });
+    // Technical-course walls: fixed cuboid colliders so overshoot is a
+    // real physical strike (the plant bounces / stalls), not a free
+    // diagnostic. The planner sees the matching inflated `course.obstacles`
+    // holes; the demo renders `course.walls` with createBuildingHelper.
+    for (const w of course.walls ?? []) {
+      createBoxCollider(world, {
+        x: w.x,
+        y: w.height / 2,
+        z: w.z,
+        hx: w.hx,
+        hy: w.height / 2,
+        hz: w.hz,
+      });
+    }
     const offset = (i - (opts.entries.length - 1) / 2) * spacing;
     const spawn = {
       x: course.spawn.x,
@@ -896,11 +1055,22 @@ export async function createRaceScenario(
       holdingForSync: false,
       finished: false,
       offTrackEvents: 0,
+      wallStrikes: 0,
+      lastTouchingWall: false,
       lastMoveSimTime: 0,
       lastPos: { x: spawn.x, z: spawn.z },
       lastInBounds: true,
       spawn,
       mpcState: null,
+      mpcForwardSim: entry.forwardModel ?? mpcForwardSim,
+      recovering: false,
+      recoveryEndSimTime: 0,
+      recoveryCount: 0,
+      q: {
+        dist: 0, speedSum: 0, speedN: 0, stopped: 0, reversing: 0,
+        ggSum: 0, ggN: 0, ggPeak: 0, jerkSumSq: 0, jerkN: 0,
+        prevSpeed: 0, prevALong: 0,
+      },
     };
   });
 
@@ -1040,7 +1210,7 @@ export async function createRaceScenario(
           obstacles: course.obstacles,
           world: c.navWorld,
           deadlineMs: plannerBudget,
-          gateRadius: RACE_PLANNER_GATE_RADIUS,
+          gateRadius: tuning.plannerGateRadius ?? RACE_PLANNER_GATE_RADIUS,
           referencePath,
           referenceWeight: tuning.consistencyWeight,
           disableHeuristicTable: !tuning.enableHeuristicTable,
@@ -1339,12 +1509,62 @@ export async function createRaceScenario(
         }
       }
     }
+    // Stuck detection + reverse-out recovery. Enter recovery when the chassis
+    // hasn't moved >0.5 m for STUCK_TIMEOUT_S while not holding/finished
+    // (wedged against a technical-course wall); leave it after
+    // RECOVERY_DURATION_S of backing off, then clear the plan so the next
+    // cadence replan starts from the freed pose.
+    //
+    // RACING ONLY (multi-waypoint courses): parking maneuvers STOP on
+    // purpose — cusp dwells and the goal-settle hold exceed the stuck
+    // timeout at rest, and a reverse-out there would wreck a correct
+    // maneuver (measured: all four parking invariants broke when this ran
+    // unscoped).
+    if (!c.holdingForSync && !c.finished && course.waypoints.length > 1) {
+      if (c.recovering) {
+        if (simTime >= c.recoveryEndSimTime) {
+          c.recovering = false;
+          c.lastMoveSimTime = simTime;
+          c.lastPos = { x: stateBefore.x, z: stateBefore.z };
+          c.plan = null;
+          c.pendingPlan = null;
+          c.segments = [];
+          c.activeSegIdx = 0;
+        }
+      } else if (
+        Math.abs(stateBefore.speed) < STUCK_SPEED &&
+        simTime - c.lastMoveSimTime > STUCK_TIMEOUT_S
+      ) {
+        c.recovering = true;
+        c.recoveryEndSimTime = simTime + RECOVERY_DURATION_S;
+        c.recoveryCount++;
+      }
+    }
     // Apply controls.
     if (c.holdingForSync) {
       const cmd = wheeledFromNormalized({ steer: 0, throttle: 0, brake: 1 }, FORCE_TUNING);
       c.car.applyWheeledControls(cmd);
       c.lastControls = cmd;
       c.metrics.liveControls = { steer: 0, throttle: 0, brake: 1, targetSpeed: 0 };
+    } else if (c.recovering) {
+      // Reverse away from the wedge, steering to bring the nose back toward
+      // the next waypoint so the follow-up replan starts from a better pose.
+      const wp = course.waypoints[c.loopIndex % course.waypoints.length]!;
+      let headErr = Math.atan2(wp.z - stateBefore.z, wp.x - stateBefore.x) - stateBefore.heading;
+      while (headErr > Math.PI) headErr -= 2 * Math.PI;
+      while (headErr < -Math.PI) headErr += 2 * Math.PI;
+      // Backing up: front-wheel steer rotates the nose opposite to the forward
+      // sense, so steer with the SAME sign as the heading error to swing the
+      // nose toward the target as the chassis reverses.
+      const maxSteer = tuning.maxSteerAngle ?? VEHICLE_TUNING.maxSteerAngle ?? 0.6;
+      const steer = Math.max(-maxSteer, Math.min(maxSteer, headErr));
+      const cmd = wheeledFromNormalized(
+        { steer, throttle: -RECOVERY_REVERSE_THROTTLE, brake: 0 },
+        FORCE_TUNING,
+      );
+      c.car.applyWheeledControls(cmd);
+      c.lastControls = cmd;
+      c.metrics.liveControls = { steer, throttle: -RECOVERY_REVERSE_THROTTLE, brake: 0, targetSpeed: -3 };
     } else if (c.plan && c.plan.length > 1) {
       // Multi-cusp segment advancement: when the chassis reaches the
       // end of the active segment (within arrive radius AND nearly
@@ -1383,7 +1603,7 @@ export async function createRaceScenario(
         if (tuning.tracker === 'mpc') {
           // Sampling MPC over the v2 parametric model.
           if (!c.mpcState) c.mpcState = createMPCTrackerState(MPC_HORIZON);
-          const cmdRaw = mpcTrack(stateBefore, live, mpcForwardSim, c.mpcState, MPC_CONFIG);
+          const cmdRaw = mpcTrack(stateBefore, live, c.mpcForwardSim, c.mpcState, MPC_CONFIG);
           const cmd: WheeledCarControls = {
             steer: cmdRaw.steer,
             driveForce: cmdRaw.driveForce,
@@ -1476,6 +1696,37 @@ export async function createRaceScenario(
     }
     stepRaycastVehicle(c.world, [c.car], { dt, substeps: VEHICLE_SUBSTEPS });
     const after = c.car.readState(simTime + dt);
+    // Driving-quality accumulation (only while racing — sync holds and the
+    // post-finish brake hold would dilute the means).
+    if (!c.holdingForSync && !c.finished) {
+      const q = c.q;
+      q.dist += Math.hypot(after.x - stateBefore.x, after.z - stateBefore.z);
+      const sp = after.speed;
+      q.speedSum += Math.abs(sp);
+      q.speedN++;
+      if (Math.abs(sp) < 0.5) q.stopped += dt;
+      if (sp < -0.5) q.reversing += dt;
+      // g-g utilization from executed state: aLong from the speed delta,
+      // aLat = v·yawRate (centripetal). Budget = µ·g from the derived
+      // capability envelope (same for both cars — same chassis).
+      const aLong = (sp - q.prevSpeed) / dt;
+      const aLat = sp * (after.yawRate ?? 0);
+      const util = Math.hypot(aLong, aLat) / Math.max(1e-6, GG_FRICTION_LIMIT);
+      // Clamp outliers (contact spikes / recovery jolts would dominate the
+      // mean and misreport "aggression").
+      const utilClamped = Math.min(util, 1.5);
+      q.ggSum += utilClamped;
+      q.ggN++;
+      if (utilClamped > q.ggPeak) q.ggPeak = utilClamped;
+      const jerk = (aLong - q.prevALong) / dt;
+      // Same outlier guard for contact spikes.
+      if (Math.abs(jerk) < 2000) {
+        q.jerkSumSq += jerk * jerk;
+        q.jerkN++;
+      }
+      q.prevSpeed = sp;
+      q.prevALong = aLong;
+    }
     // TRUE goal completion (goal-settle courses): `finished` latches only
     // when the goal predicate has held continuously at rest — the same
     // settle semantics the bench/tests/HUD measure. Until then the goal
@@ -1547,6 +1798,15 @@ export async function createRaceScenario(
       if (wasInBounds && !inBounds) c.offTrackEvents++;
       c.lastInBounds = inBounds;
     }
+    // Wall-strike tracking (technical course) — diagnostics only, no rescue.
+    // Rising-edge counted so a car scraping along a wall for several ticks
+    // registers one strike per contact, not one per frame.
+    const walls = course.walls ?? [];
+    if (walls.length > 0) {
+      const touching = footprintTouchesWall(after, c.entry.agent?.footprint ?? RACE_AGENT.footprint, walls);
+      if (touching && !c.lastTouchingWall) c.wallStrikes++;
+      c.lastTouchingWall = touching;
+    }
   }
 
   function buildStatus(c: CarInternal): RaceCarStatus {
@@ -1559,6 +1819,17 @@ export async function createRaceScenario(
       finished: c.finished,
       holdingForSync: c.holdingForSync,
       offTrackEvents: c.offTrackEvents,
+      wallStrikes: c.wallStrikes,
+      quality: {
+        distanceTravelled: c.q.dist,
+        meanSpeed: c.q.speedN > 0 ? c.q.speedSum / c.q.speedN : 0,
+        timeStopped: c.q.stopped,
+        timeReversing: c.q.reversing,
+        ggMeanUtil: c.q.ggN > 0 ? c.q.ggSum / c.q.ggN : 0,
+        ggPeakUtil: c.q.ggPeak,
+        longJerkRms: c.q.jerkN > 0 ? Math.sqrt(c.q.jerkSumSq / c.q.jerkN) : 0,
+        recoveryCount: c.recoveryCount,
+      },
       diagnostics: c.diagnostics,
       metrics: c.metrics,
       plan: c.plan,
@@ -1609,9 +1880,23 @@ export async function createRaceScenario(
       c.holdingForSync = false;
       c.finished = false;
       c.offTrackEvents = 0;
+      c.wallStrikes = 0;
+      c.lastTouchingWall = false;
       c.lastMoveSimTime = 0;
       c.lastPos = { x: c.spawn.x, z: c.spawn.z };
       c.lastInBounds = true;
+      c.recovering = false;
+      c.recoveryEndSimTime = 0;
+      c.recoveryCount = 0;
+      c.q = {
+        dist: 0, speedSum: 0, speedN: 0, stopped: 0, reversing: 0,
+        ggSum: 0, ggN: 0, ggPeak: 0, jerkSumSq: 0, jerkN: 0,
+        prevSpeed: 0, prevALong: 0,
+      };
+      // Reset the MPPI warm-start + RNG so reset() is bit-reproducible under
+      // the 'mpc' tracker (a stale warm-start sequence would make the second
+      // run diverge from a fresh one).
+      c.mpcState = null;
     }
   }
 
