@@ -27,6 +27,7 @@ const { path: logPath, log } = openRunLog('best-config-bench');
 const readModel = (f: string) => JSON.parse(readFileSync(resolve(root, 'demos/public/models', f), 'utf-8'));
 const secsCap = Number(process.argv[2] ?? 90);
 const budgetMs = Number(process.argv[3] ?? 12000);
+const variant = (process.argv[4] === 'technical' ? 'technical' : 'open') as 'open' | 'technical';
 const dt = process.env.KINOCAT_ANALYTIC_DT === '1';
 const sp = process.env.KINOCAT_SPEED_PROFILE === '1';
 
@@ -50,7 +51,7 @@ for (const cfg of CONFIGS) {
     analyticDriveThrough: dt, enableSpeedProfile: sp, controlFeedforward: cfg.ff,
   };
   const scenario = await createRaceScenario({
-    entries: [cfg.mk()], targetLaps: 3, syncHold: false, course: buildRaceCourse('open'), tuning,
+    entries: [cfg.mk()], targetLaps: 3, syncHold: false, course: buildRaceCourse(variant), tuning,
   });
   const wall0 = performance.now();
   log(`\n[${cfg.label}] running (${cfg.tracker}${cfg.ff ? ' +FF' : ''}, cap ${secsCap}s sim, budget ${budgetMs}ms)…`);
@@ -75,7 +76,7 @@ for (const cfg of CONFIGS) {
   const best = lapDurs.length ? Math.min(...lapDurs) : 0;
   scenario.dispose();
   results.push({ model: cfg.model, label: cfg.label, laps: s.laps.length, best, meanSpeed: q.meanSpeed, predErr: s.diagnostics.predErrorRms });
-  log(`\n=== ${cfg.label} — open course, ${budgetMs}ms budget${dt ? ', reprice' : ''}${sp ? ', speedprofile' : ''} ===`);
+  log(`\n=== ${cfg.label} — ${variant} course, ${budgetMs}ms budget${dt ? ', reprice' : ''}${sp ? ', speedprofile' : ''} ===`);
   log(`  laps completed      ${s.laps.length}   (sim ${secsCap}s cap, wall ${wall.toFixed(0)}s)`);
   log(`  best lap            ${best ? best.toFixed(2) + ' s' : '— (no full lap)'}`);
   log(`  lap durations       ${lapDurs.map((d) => d.toFixed(1)).join(', ') || '—'}`);
@@ -92,7 +93,7 @@ for (const cfg of CONFIGS) {
 
 // Winner per model (fastest completed lap; a config with no full lap loses to
 // any that lapped).
-log(`\n======== BEST CONFIG PER MODEL (open course) ========`);
+log(`\n======== BEST CONFIG PER MODEL (${variant} course) ========`);
 const rank = (r: Result) => (r.laps > 0 && r.best > 0 ? r.best : Infinity);
 for (const model of ['kinematic', 'v2', 'v3']) {
   const cands = results.filter((r) => r.model === model).sort((a, b) => rank(a) - rank(b));
