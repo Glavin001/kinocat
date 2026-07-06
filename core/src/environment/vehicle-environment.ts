@@ -487,7 +487,10 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
       z: b.z,
       heading: b.heading,
       speed: 0,
-      t: a.t + path.length / this.agent.maxSpeed,
+      // Traverse TIME must match the cost's traversal speed, else the plan's
+      // timestamp is too short and the executor sees a fake huge decel across
+      // this segment. Drive-through: honest decel-to-stop average; else maxSpeed.
+      t: a.t + path.length / vTraverse,
     };
     const edge: EdgeRef = {
       cost,

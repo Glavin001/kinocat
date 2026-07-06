@@ -49,20 +49,36 @@ const peak = Math.max(0, ...speeds);
 const minInt = path.length > 2 ? Math.min(...speeds.slice(1, -1)) : 0;
 const dist = path.reduce((a, p, i) => (i === 0 ? 0 : a + Math.hypot(p.x - path[i - 1]!.x, p.z - path[i - 1]!.z)), 0);
 console.log(`${which} gen=${gen} dt=${dt}: found=${res.found} pts=${path.length} dist=${dist.toFixed(0)}m peakV=${peak.toFixed(1)} minInteriorV=${minInt.toFixed(1)} cost=${res.cost.toFixed(1)} exp=${res.stats.expansions} ms=${ms.toFixed(0)}`);
-// Densify: interpolate between sparse plan endpoints (~7-15 m apart) so the
-// plotter's 10 m teleport guard doesn't drop segments.
+// Reconstruct the TRUE swept curve (arcs), not straight chords: each drive
+// edge replays its primitive's local sweep transformed to world by the parent
+// pose; each Reeds-Shepp edge uses its stored world-frame poses. Speed is
+// interpolated across each segment (substeps carry no speed).
+const primById = new Map<number, { sweep: { x: number; z: number; heading: number }[]; end: { speed: number } }>();
+for (const p of lib.primitives) primById.set(p.id, p);
 const samples: { t: number; x: number; z: number; speed: number }[] = [];
-for (let i = 0; i < path.length; i++) {
-  if (i > 0) {
-    const a = path[i - 1]!, b = path[i]!;
-    const d = Math.hypot(b.x - a.x, b.z - a.z);
-    const steps = Math.max(1, Math.ceil(d / 1.0));
-    for (let s = 1; s < steps; s++) {
-      const u = s / steps;
-      samples.push({ t: samples.length, x: a.x + (b.x - a.x) * u, z: a.z + (b.z - a.z) * u, speed: Math.abs(a.speed + (b.speed - a.speed) * u) });
+samples.push({ t: 0, x: path[0]!.x, z: path[0]!.z, speed: Math.abs(path[0]!.speed) });
+const nodes = res.nodes ?? [];
+for (let i = 1; i < path.length; i++) {
+  const a = path[i - 1]!, b = path[i]!;
+  const edge = nodes[i]?.edge;
+  const v0 = Math.abs(a.speed), v1 = Math.abs(b.speed);
+  let pts: { x: number; z: number }[] = [];
+  if (edge?.kind === 'reeds-shepp') {
+    const poses = (edge.data as { poses?: { x: number; z: number }[] }).poses ?? [];
+    pts = poses.map((p) => ({ x: p.x, z: p.z }));
+  } else if (edge?.kind === 'drive') {
+    const primId = (edge.data as { primId?: number }).primId;
+    const prim = primId !== undefined ? primById.get(primId) : undefined;
+    if (prim) {
+      const cos = Math.cos(a.heading), sin = Math.sin(a.heading);
+      pts = prim.sweep.map((lp) => ({ x: a.x + lp.x * cos - lp.z * sin, z: a.z + lp.x * sin + lp.z * cos }));
     }
   }
-  samples.push({ t: samples.length, x: path[i]!.x, z: path[i]!.z, speed: Math.abs(path[i]!.speed) });
+  if (pts.length < 2) pts = [{ x: a.x, z: a.z }, { x: b.x, z: b.z }]; // fallback chord
+  for (let s = 1; s < pts.length; s++) {
+    const u = s / (pts.length - 1);
+    samples.push({ t: samples.length, x: pts[s]!.x, z: pts[s]!.z, speed: v0 + (v1 - v0) * u });
+  }
 }
 const png = plotTrajectory(out,
   { bounds, waypoints: [spawn, ...gates], spawn, arriveRadius: RACE_ARRIVE_RADIUS },
