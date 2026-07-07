@@ -5,7 +5,7 @@
 // (see `kinocat/adapters/rapier`'s `RapierCarBody`) for the full car stack.
 
 export type { CarKinematicState, WheeledCarControls } from './types';
-export { trimPlan, trimCarPlan, samplePlanAt } from './plan-utils';
+export { trimPlan, trimCarPlan, samplePlanAt, expandPlanSweeps } from './plan-utils';
 export {
   keyboardAckermann,
   keysFromSet,

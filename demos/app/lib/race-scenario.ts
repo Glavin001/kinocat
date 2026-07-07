@@ -35,6 +35,7 @@ import {
   wheeledFromNormalized,
   trimPlan,
   samplePlanAt,
+  expandPlanSweeps,
   type CarForceTuning,
   type CarKinematicState,
   type WheeledCarControls,
@@ -841,12 +842,24 @@ export interface RaceCarStatus {
    *  feedforward, dynamic-state slots, and single-gear segment/cusp
    *  structure — for the debug overlay and future controllers. */
   richPlan: Plan | null;
+  /** VISUALIZATION-ONLY dense true-arc plan path (sweep-expanded from the
+   *  planner nodes). Not tracked — renderers prefer this over `plan` for a
+   *  more precise spline; the tracker never sees it. Null until first plan. */
+  vizPlan: CarKinematicState[] | null;
+  /** Sim time at which `vizPlan` was computed (for elapsed-time trimming). */
+  vizPlanStartSimTime: number;
   /** Sim time at which the current plan was committed. */
   planStartSimTime: number;
   /** Most recent predicted state at the first primitive's boundary. */
   predictedEnd: { state: CarKinematicState; dueSimTime: number } | null;
   /** Sim time the most recent waypoint advance happened. */
   lastAdvanceSimTime: number;
+  /** Index of the gear-segment the tracker is currently following. */
+  activeSegmentIndex: number;
+  /** Total number of gear-segments in the current plan. */
+  totalSegments: number;
+  /** Gear of the active segment: 'fwd' | 'rev' | 'unknown'. */
+  activeSegmentGear: 'fwd' | 'rev' | 'unknown';
 }
 
 export interface RaceTickResult {
@@ -1158,6 +1171,16 @@ interface CarInternal {
    * plan commits.
    */
   richPlan: Plan | null;
+  /**
+   * VISUALIZATION-ONLY dense plan path: the planner's node sequence expanded
+   * into per-primitive swept-arc poses (`expandPlanSweeps`), so the rendered
+   * spline hugs where the car actually travels through each primitive rather
+   * than a straight chord between sparse endpoints. NOT tracked — pure-pursuit
+   * / MPPI follow `plan`/`segments` exactly as before, so this never changes
+   * closed-loop behaviour. Null until the first plan commits.
+   */
+  vizPlan: CarKinematicState[] | null;
+  vizPlanStartSimTime: number;
   activeSegIdx: number;
   /** Sim time of the chassis state when the active segment was
    *  entered — used to gate the "segment done, advance" check on
@@ -1311,6 +1334,10 @@ export interface ReplanArtifact {
   trivial: boolean;
   /** Finished post-processed plan to commit, or null (not-found / trivial). */
   smoothed: CarKinematicState[] | null;
+  /** Visualization-only dense true-arc path (expandPlanSweeps of the planner
+   *  node sequence), or null. Never feeds the tracker; carried in the artifact
+   *  so it survives the worker boundary (computed where `res.nodes` lives). */
+  vizPlan: CarKinematicState[] | null;
   /** Sim time the smoothed plan's `t = 0` maps to. */
   planStartSimTime: number;
   /** Raw planner path cost. */
@@ -1415,6 +1442,7 @@ export function computeReplanArtifactPure(
       found,
       trivial,
       smoothed: null,
+      vizPlan: null,
       planStartSimTime,
       cost: res.cost,
       stats: res.stats,
@@ -1499,10 +1527,17 @@ export function computeReplanArtifactPure(
   if (ctx.tuning.controlFeedforward && ctx.tuning.tracker === 'mpc') {
     attachPlanFeedforward(smoothed, res, ctx.lib);
   }
+  // Visualization-only dense true-arc path (main #52). Computed here where the
+  // planner `res.nodes` live, so it also crosses the worker boundary in the
+  // artifact instead of needing the raw nodes main-thread-side.
+  const vizPlan = res.nodes && res.nodes.length > 1
+    ? expandPlanSweeps(res.nodes, ctx.lib.primitives)
+    : smoothed;
   return {
     found,
     trivial: false,
     smoothed,
+    vizPlan,
     planStartSimTime,
     cost: res.cost,
     stats: res.stats,
@@ -1905,6 +1940,8 @@ export async function createRaceScenario(
       pendingTrackResult: null,
       segments: [],
       richPlan: null,
+      vizPlan: null,
+      vizPlanStartSimTime: 0,
       activeSegIdx: 0,
       activeSegStartSimTime: 0,
       predictedEnd: null,
@@ -2196,6 +2233,14 @@ export async function createRaceScenario(
         c.q.churnN += 1;
         if (churn > c.q.churnMax) c.q.churnMax = churn;
       }
+      // Visualization-only: dense true-arc path expanded from the planner's
+      // node sequence. Refreshed on every successful replan, independent of
+      // the tracked plan's commit window — it never feeds the tracker, so it
+      // cannot change closed-loop behaviour. Computed in the offloadable
+      // compute stage (so `res.nodes` is available there / on the worker) and
+      // carried in the artifact; falls back to the tracked plan.
+      c.vizPlan = art.vizPlan ?? smoothed;
+      c.vizPlanStartSimTime = planStartSimTime;
       if (commitWindowSec > 0 && c.plan && c.plan.length > 1) {
         // Promote later — keep the current plan active through the
         // commit window. `stepOne` will swap when simTime crosses
@@ -2865,9 +2910,19 @@ export async function createRaceScenario(
       metrics: c.metrics,
       plan: c.plan,
       richPlan: c.richPlan,
+      vizPlan: c.vizPlan,
+      vizPlanStartSimTime: c.vizPlanStartSimTime,
       planStartSimTime: c.planStartSimTime,
       predictedEnd: c.predictedEnd,
       lastAdvanceSimTime: c.lastMoveSimTime,
+      activeSegmentIndex: c.activeSegIdx,
+      totalSegments: c.segments.length,
+      activeSegmentGear: (() => {
+        const seg = c.segments[c.activeSegIdx];
+        if (!seg || seg.length < 2) return 'unknown' as const;
+        const sample = seg[1];
+        return sample && sample.speed >= 0 ? ('fwd' as const) : ('rev' as const);
+      })(),
     };
   }
 
@@ -2885,6 +2940,8 @@ export async function createRaceScenario(
       c.planStartSimTime = 0;
       c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
       c.richPlan = null;
+      c.vizPlan = null;
+      c.vizPlanStartSimTime = 0;
       c.pendingPlanStartSimTime = 0;
       c.predictedEnd = null;
       c.predErrSumSq = 0;
@@ -2938,6 +2995,7 @@ export async function createRaceScenario(
           c.plan = null;
           c.pendingPlan = null; c.segments = []; c.activeSegIdx = 0;
           c.richPlan = null;
+          c.vizPlan = null;
         }
         // Force an immediate replan so neither car coasts on a stale plan.
         for (const c of cars) replanCar(c);

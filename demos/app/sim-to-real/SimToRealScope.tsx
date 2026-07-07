@@ -133,16 +133,21 @@ export default function SimToRealScope() {
   const [showUncertainty, setShowUncertainty] = useState(true);
   const [matchSubsteps, setMatchSubsteps] = useState(false);
   const [hasModel, setHasModel] = useState(false);
+  /** Which entities ('real' + each ghost id) are currently visible. */
+  const [visibility, setVisibility] = useState<Record<string, boolean>>({});
+  const [ghostIds, setGhostIds] = useState<string[]>([]);
 
   // Mutable refs so the imperative scene loop reads the latest UI state.
   const modeRef = useRef(mode);
   const showFrictionRef = useRef(showFriction);
   const showUncertaintyRef = useRef(showUncertainty);
   const matchSubstepsRef = useRef(matchSubsteps);
+  const visibilityRef = useRef(visibility);
   modeRef.current = mode;
   showFrictionRef.current = showFriction;
   showUncertaintyRef.current = showUncertainty;
   matchSubstepsRef.current = matchSubsteps;
+  visibilityRef.current = visibility;
 
   const resetFnRef = useRef<(() => void) | null>(null);
   const exportFnRef = useRef<((fmt: 'json' | 'md') => string) | null>(null);
@@ -215,6 +220,12 @@ export default function SimToRealScope() {
         resolved = preloaded;
       }
       setHasModel(resolved !== null);
+      // Per-entity visibility: 'real' + each ghost, all shown initially.
+      const ids = ['real', ...GHOSTS.map((g) => g.id)];
+      const initVis: Record<string, boolean> = {};
+      for (const id of ids) initVis[id] = true;
+      setGhostIds(ids);
+      setVisibility(initVis);
       cleanup = setupScene(mount, resolved?.model ?? null);
       setReady(true);
     })();
@@ -674,6 +685,9 @@ export default function SimToRealScope() {
       simTime += PHYSICS_DT;
       syncCarMesh(realCarMesh.group, realAfter);
       realTrail.push(realAfter);
+      const vis = visibilityRef.current;
+      realCarMesh.group.visible = vis['real'] !== false;
+      realTrail.line.visible = vis['real'] !== false;
 
       // ---- step ghosts open-loop with the SAME controls --------------
       // This is the Gap A measurement: same (state_t, controls_t, dt)
@@ -722,6 +736,12 @@ export default function SimToRealScope() {
         ent.last = gap;
         ent.arrow.setFromTo(realAfter, predicted);
 
+        // Per-ghost visibility toggle.
+        const ghostVis = vis[ent.kind.id] !== false;
+        ent.car.group.visible = ghostVis;
+        ent.trail.line.visible = ghostVis;
+        ent.arrow.arrow.visible = ghostVis;
+
         // For Free Drive: schedule a T-second future projection from
         // the CURRENT state with the CURRENT controls; show the polyline
         // and the ghost-at-T position. Every 200ms only.
@@ -736,7 +756,7 @@ export default function SimToRealScope() {
           ent.tracker.schedule(future[future.length - 1]!, simTime, FREE_DRIVE_HORIZON_SEC);
           // Uncertainty ellipsoid at T (v2-full ghost only). predictWithUncertainty
           // takes the v2/wheeled encoding regardless of ghost.kind.id.
-          if (ent.kind.id === 'v2-full' && showUncertaintyRef.current) {
+          if (ent.kind.id === 'v2-full' && showUncertaintyRef.current && ghostVis) {
             const v2CtrlVec = encodeForSim['v2-full'](appliedControls.steer, appliedControls.throttle, appliedControls.brake);
             const pred = predictWithUncertainty(v2Model, realAfter, v2CtrlVec, modelDt);
             const stdSteps = Math.sqrt(FREE_DRIVE_HORIZON_SEC / modelDt);
@@ -749,7 +769,7 @@ export default function SimToRealScope() {
           ent.future.setVisible(false);
           ent.cloud.setVisible(false);
         } else {
-          ent.future.setVisible(true);
+          ent.future.setVisible(ghostVis);
         }
         // Drain matured predictions into rolling RMS so Free Drive's
         // RMS is actually "what we predicted T seconds ago, vs now".
@@ -860,6 +880,9 @@ export default function SimToRealScope() {
         mode={mode}
         onChange={setMode}
         onReset={() => resetFnRef.current?.()}
+        ghostIds={ghostIds}
+        visibility={visibility}
+        onToggleVisibility={(id) => setVisibility((v) => ({ ...v, [id]: v[id] === false }))}
         showFriction={showFriction}
         onToggleFriction={setShowFriction}
         showUncertainty={showUncertainty}
