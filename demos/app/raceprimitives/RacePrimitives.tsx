@@ -163,6 +163,23 @@ async function loadV3ModelFromUrl(): Promise<LearnedVehicleModelV3 | null> {
   }
 }
 
+/** Load the BAKED generated (dispersion-designed, dense-bucket) v3 race
+ *  library. Building it at runtime rolls the v3 MLP through designControlSet
+ *  for 15 speed buckets — ~10 s of synchronous compute that froze the browser
+ *  on v3 select. It's deterministic from the model, so it's baked to an
+ *  artifact (`scripts/bake-v3-lib.mts`) and loaded here instead. Falls back to
+ *  null (the caller then builds the fast hand-picked library) if unreachable. */
+async function loadV3GeneratedLib(): Promise<MotionPrimitiveLibrary | null> {
+  if (typeof window === 'undefined') return null;
+  try {
+    const res = await fetch('/models/v3-generated-lib.json');
+    if (!res.ok) return null;
+    return MotionPrimitiveLibrary.fromJSON(await res.text());
+  } catch {
+    return null;
+  }
+}
+
 /** Path-tracking executor this mount runs. The GUI (top-bar Race Setup) is
  *  the primary control; the `?tracker=mpc` query param only SEEDS the initial
  *  value so a run is shareable/deep-linkable. MPPI runs each car's own forward
@@ -391,6 +408,9 @@ export default function RacePrimitives() {
   // learned car's library + MPPI rollout model to v3. Mutually exclusive with
   // v2 via the RaceSetup handler.
   const [v3Model, setV3Model] = useState<LearnedVehicleModelV3 | null>(null);
+  // Baked generated v3 race library (loaded from an artifact, not built at
+  // runtime — building it froze the UI ~10 s). null until loaded / if missing.
+  const [v3GenLib, setV3GenLib] = useState<MotionPrimitiveLibrary | null>(null);
   const [useV3, setUseV3State] = useState(false);
   const setUseV3 = (v: boolean) => {
     setUseV3State(v);
@@ -477,6 +497,10 @@ export default function RacePrimitives() {
       setV3Model(model);
       if (v3Toggle === '1') setUseV3State(true);
     });
+    void loadV3GeneratedLib().then((lib) => {
+      if (cancelled || !lib) return;
+      setV3GenLib(lib);
+    });
     return () => {
       cancelled = true;
     };
@@ -516,7 +540,7 @@ export default function RacePrimitives() {
         // laps the technical course at a real-time budget (see the realtime
         // profile passed to setupScene below).
         const learnedLibraryOverride = v3Active
-          ? buildLearnedRaceLibraryV3(v3Model!, { generatedControls: true })
+          ? (v3GenLib ?? buildLearnedRaceLibraryV3(v3Model!)) // baked artifact; fall back to fast hand-picked
           : v2Active
             ? buildLearnedRaceLibraryV2(v2Model!)
             : undefined;
@@ -547,7 +571,7 @@ export default function RacePrimitives() {
     };
     // Re-mount when params, v2 toggle, v2 model identity, or a Race Setup
     // selector (tracker / course / feedforward) change — each rebuilds the scenario.
-  }, [params, useV2, v2Model, useV3, v3Model, trackerMode, courseVariant, feedforward, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [params, useV2, v2Model, useV3, v3Model, v3GenLib, trackerMode, courseVariant, feedforward, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function runInlineLearn() {
     setError(null);
