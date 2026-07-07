@@ -752,6 +752,18 @@ export function buildParkingSnapshot(id: ParkingScenarioId): ParkingSnapshot {
  *  terminal-pose weights. Everything else falls through to race defaults so
  *  the same controller code drives both racing and parking. */
 export const PARKING_RACE_TUNING: Partial<RaceTuning> = {
+  // WS-1 race-flooring flags OFF for parking: it needs the proportional
+  // throttle for a precise, gentle terminal approach (bang-bang would slam
+  // the near-binary brake at the stall), and its plans genuinely stop at the
+  // goal, so the brake-to-goal ramp must stay on. These default ON in
+  // DEFAULT_TUNING for racing and are inherited unless disabled here.
+  bangBangThrottle: false,
+  noGoalBrakeOnDriveThrough: false,
+  // Gentle longitudinal caps for the stall approach (race raises these to
+  // 11/12 in DEFAULT_TUNING, which parking inherits and must reset — a higher
+  // maxDecel brakes late and overshoots the silhouette).
+  trackerMaxAccel: 6,
+  trackerMaxDecel: 8,
   cruiseSpeed: 2,
   // Terminal precision. `goalTolerance` is where pure-pursuit brakes to rest
   // relative to the (segment/goal) end; `arriveRadius` is where the multi-cusp
@@ -817,6 +829,10 @@ export const PARKING_RACE_TUNING: Partial<RaceTuning> = {
   plannerMaxExpansions: 80_000,
   mpcWTerminalPosition: 50,
   mpcWTerminalSpeed: 30,
+  // Parking keeps the classic reference-tracking MPPI cost (the WS-3 racing
+  // progress cost is inherited from DEFAULT_TUNING otherwise — it would
+  // reward blowing THROUGH the stall instead of stopping in it).
+  mpcCostMode: 'track',
   // Parking maneuvers are committed multi-cusp sequences (reverse → forward
   // → …), not a per-tick chase. Replan slowly so the segment-advance logic
   // carries the chassis through each forward↔reverse cusp instead of

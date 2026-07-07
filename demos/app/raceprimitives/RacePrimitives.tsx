@@ -12,7 +12,17 @@ import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import RAPIER from '@dimforge/rapier3d-compat';
 import type { LearnedVehicleParams, CarKinematicState } from 'kinocat/agent';
-import { DEFAULT_LEARNED_PARAMS } from 'kinocat/agent';
+import {
+  DEFAULT_LEARNED_PARAMS,
+  DEFAULT_LEARNABLE_CONFIG,
+  KINEMATIC_NATIVE_PARAMS,
+  learnedForwardSimV2,
+  parametricForwardV2,
+  v3FromJson,
+  v3ToJson,
+  forwardSimV3Rollout,
+} from 'kinocat/agent';
+import type { LearnedVehicleModelV3 } from 'kinocat/agent';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import { MotionPrimitiveLibrary } from 'kinocat/primitives';
 import { purePursuit } from 'kinocat/execute';
@@ -32,11 +42,13 @@ import {
   createCarMeshHelper,
   syncCarMesh,
   createGroundPlaneHelper,
+  createBuildingHelper,
 } from 'kinocat/adapters/three';
 import {
   buildKinematicLibrary,
   buildLearnedRaceLibrary,
   buildLearnedRaceLibraryV2,
+  buildLearnedRaceLibraryV3,
   buildRaceCourse,
   emptyMetrics,
   pickNextWaypoint,
@@ -80,6 +92,8 @@ import {
   downloadMarkdown,
 } from '../lib/debug-report';
 import type { LearnedVehicleModel } from 'kinocat/agent';
+import { modelToJson } from '../lib/v2-model-file';
+import type { TrackerForwardModelSpec } from '../lib/race-scenario';
 
 // SINGLE SOURCE OF TRUTH: all race-simulation tunables live in
 // `../lib/race-scenario.ts`. Importing them here (rather than redeclaring
@@ -151,6 +165,111 @@ const _curvMatOrange = new THREE.MeshBasicMaterial({ color: 0xffaa00, transparen
 const _curvMatRed = new THREE.MeshBasicMaterial({ color: 0xff3333, transparent: true, opacity: 0.85 });
 
 type Phase = 'loading' | 'learning' | 'ready' | 'racing' | 'finished';
+
+type TrackerMode = 'pure-pursuit' | 'mpc';
+type CourseVariant = 'open' | 'technical';
+/** Where the per-car heavy compute runs. `main` (default) is the historical
+ *  synchronous main-thread replan + MPPI solve; `worker` offloads BOTH the
+ *  plan compute (`spawnPlanWorker` → `WorkerReplanDispatcher`) and the MPPI
+ *  tracker solve (`spawnTrackerWorker` → `WorkerTrackerDispatcher`) to one Web
+ *  Worker per car per stage. Shared by both cars. */
+type PlannerMode = 'main' | 'worker';
+const PLANNER_KEY = 'kinocat:planner:v1';
+/** Which primitive library / rollout model the LEARNED car drives with.
+ *  'v3' is the purely-learned MLP-ensemble model (highest plant fidelity —
+ *  loaded from the preloaded `/models/v3-default.json`, no online training). */
+type LearnedModelChoice = 'v2' | 'v3' | 'kinematic';
+
+/** Per-car A/B configuration. Each of the two race slots is now independently
+ *  configurable (model / tracker / feedforward) rather than one shared config
+ *  driving both. COURSE stays shared (see `courseVariant`). */
+interface CarConfig { model: LearnedModelChoice; tracker: TrackerMode; ff: boolean; }
+
+const DEFAULT_CAR_A: CarConfig = { model: 'kinematic', tracker: 'pure-pursuit', ff: false };
+const DEFAULT_CAR_B: CarConfig = { model: 'v3', tracker: 'mpc', ff: true };
+const CAR_A_KEY = 'kinocat:carA:v1';
+const CAR_B_KEY = 'kinocat:carB:v1';
+
+/** Compact per-car label (e.g. `A · kinematic · PP` or `B · v3 · MPPI · FF`). */
+function carLabel(side: 'A' | 'B', cfg: CarConfig): string {
+  const model = cfg.model === 'kinematic' ? 'kinematic' : cfg.model;
+  const tracker = cfg.tracker === 'mpc' ? 'MPPI' : 'PP';
+  const ff = cfg.ff && cfg.tracker === 'mpc' ? ' · FF' : '';
+  return `${side} · ${model} · ${tracker}${ff}`;
+}
+
+/** Even more compact per-car chip fragment for the toolbar summary
+ *  (e.g. `A kin·PP` or `B v3·MPPI·FF`). */
+function carChip(side: 'A' | 'B', cfg: CarConfig): string {
+  const model = cfg.model === 'kinematic' ? 'kin' : cfg.model;
+  const parts = [model, cfg.tracker === 'mpc' ? 'MPPI' : 'PP'];
+  if (cfg.ff && cfg.tracker === 'mpc') parts.push('FF');
+  return `${side} ${parts.join('·')}`;
+}
+
+/** Resolve a CarConfig to the control-stack description shown in the HUD. */
+function carStack(cfg: CarConfig): StackInfo {
+  const tracker = cfg.tracker === 'mpc' ? 'MPPI (progress)' : 'pure-pursuit';
+  const library =
+    cfg.model === 'v3' ? 'v3 learned'
+      : cfg.model === 'v2' ? 'v2 learned'
+        : 'kinematic bicycle';
+  return {
+    tracker,
+    library,
+    rolloutModel: cfg.tracker === 'mpc' ? library : undefined,
+  };
+}
+
+/** Load the preloaded v3 model artifact for the browser demo. Returns null if
+ *  it isn't reachable (the page falls back to kinematic/v2). */
+async function loadV3ModelFromUrl(): Promise<LearnedVehicleModelV3 | null> {
+  if (typeof window === 'undefined') return null;
+  try {
+    const res = await fetch('/models/v3-default.json');
+    if (!res.ok) return null;
+    return v3FromJson(await res.json());
+  } catch {
+    return null;
+  }
+}
+
+/** Load the BAKED generated (dispersion-designed, dense-bucket) v3 race
+ *  library. Building it at runtime rolls the v3 MLP through designControlSet
+ *  for 15 speed buckets — ~10 s of synchronous compute that froze the browser
+ *  on v3 select. It's deterministic from the model, so it's baked to an
+ *  artifact (`scripts/bake-v3-lib.mts`) and loaded here instead. Falls back to
+ *  null (the caller then builds the fast hand-picked library) if unreachable. */
+async function loadV3GeneratedLib(): Promise<MotionPrimitiveLibrary | null> {
+  if (typeof window === 'undefined') return null;
+  try {
+    const res = await fetch('/models/v3-generated-lib.json');
+    if (!res.ok) return null;
+    return MotionPrimitiveLibrary.fromJSON(await res.text());
+  } catch {
+    return null;
+  }
+}
+
+/** Course variant seed (GUI-primary; `?course=technical` seeds it). */
+function courseFromUrl(): CourseVariant {
+  if (typeof window === 'undefined') return 'open';
+  return new URLSearchParams(window.location.search).get('course') === 'technical'
+    ? 'technical'
+    : 'open';
+}
+
+/** Reflect a Race Setup choice back into the URL (via replaceState, no
+ *  navigation) so the current configuration stays shareable. The GUI state
+ *  is the source of truth — this is a convenience mirror, not the config
+ *  path. */
+function syncSetupParam(key: string, value: string, isDefault: boolean): void {
+  if (typeof window === 'undefined') return;
+  const url = new URL(window.location.href);
+  if (isDefault) url.searchParams.delete(key);
+  else url.searchParams.set(key, value);
+  window.history.replaceState(null, '', url.toString());
+}
 
 interface CarRuntime {
   id: 'kinematic' | 'learned';
@@ -290,6 +409,55 @@ export default function RacePrimitives() {
     learned: EvalSnapshot | null;
   }>({ kinematic: null, learned: null });
   const [winner, setWinner] = useState<'kinematic' | 'learned' | 'tie' | null>(null);
+  // Model Lab drawer open/close (launched from the toolbar).
+  const [modelLabOpen, setModelLabOpen] = useState(false);
+  // Race Setup (GUI-primary). Executor + course seed from the URL on mount
+  // (so `?tracker=mpc&course=technical` deep-links still work) but the GUI
+  // selectors in the top bar are the source of truth thereafter; changing
+  // one re-mounts the scene (same as the existing v2-library toggle). Read
+  // the URL seeds in an effect, not at render, so SSR + hydration agree.
+  // Per-car A/B config. Car A drives the 'kinematic'-named (left) slot, Car B
+  // the 'learned'-named (right) slot — the internal entry names are unchanged;
+  // only the CONFIG behind each slot is user-selectable. Persisted to
+  // localStorage and seeded in the mount effect below. COURSE is shared.
+  const [carA, setCarAState] = useState<CarConfig>(DEFAULT_CAR_A);
+  const [carB, setCarBState] = useState<CarConfig>(DEFAULT_CAR_B);
+  const [courseVariant, setCourseVariantState] = useState<CourseVariant>('open');
+  // Planner mode (SHARED by both cars). Seeded from localStorage in the mount
+  // effect below (SSR-safe: no localStorage read at render). Changing it
+  // re-mounts the scene like the course selector.
+  const [planner, setPlannerState] = useState<PlannerMode>('main');
+  useEffect(() => {
+    setCourseVariantState(courseFromUrl());
+    if (typeof window !== 'undefined') {
+      try {
+        const raw = window.localStorage.getItem(PLANNER_KEY);
+        if (raw === 'worker' || raw === 'main') setPlannerState(raw);
+      } catch { /* ignore */ }
+    }
+  }, []);
+  const setPlanner = (p: PlannerMode) => {
+    setPlannerState(p);
+    if (typeof window !== 'undefined') {
+      try { window.localStorage.setItem(PLANNER_KEY, p); } catch { /* quota */ }
+    }
+  };
+  const setCarA = (c: CarConfig) => {
+    setCarAState(c);
+    if (typeof window !== 'undefined') {
+      try { window.localStorage.setItem(CAR_A_KEY, JSON.stringify(c)); } catch { /* quota */ }
+    }
+  };
+  const setCarB = (c: CarConfig) => {
+    setCarBState(c);
+    if (typeof window !== 'undefined') {
+      try { window.localStorage.setItem(CAR_B_KEY, JSON.stringify(c)); } catch { /* quota */ }
+    }
+  };
+  const setCourseVariant = (c: CourseVariant) => {
+    setCourseVariantState(c);
+    syncSetupParam('course', c, c === 'open');
+  };
   // v2 model state (Phase-2 addition). When `useV2 && v2Model != null`, the
   // learned car's library is built from v2 instead of legacy.
   const [v2Model, setV2Model] = useState<LearnedVehicleModel | null>(null);
@@ -309,7 +477,21 @@ export default function RacePrimitives() {
       } catch { /* quota; ignore */ }
     }
   };
-  const v2Active = useV2 && v2Model !== null;
+  // v3 model state (the purely-learned MLP ensemble — highest plant fidelity).
+  // Preloaded artifact only (no online training path); selecting it swaps the
+  // learned car's library + MPPI rollout model to v3. Mutually exclusive with
+  // v2 via the RaceSetup handler.
+  const [v3Model, setV3Model] = useState<LearnedVehicleModelV3 | null>(null);
+  // Baked generated v3 race library (loaded from an artifact, not built at
+  // runtime — building it froze the UI ~10 s). null until loaded / if missing.
+  const [v3GenLib, setV3GenLib] = useState<MotionPrimitiveLibrary | null>(null);
+  // Which models are LOADED (and therefore selectable in the A/B configs).
+  const canUseV2 = v2Model !== null;
+  const canUseV3 = v3Model !== null;
+  // The RIGHT ('learned'-named) slot is Car B — the subtitle / LearnerPanel /
+  // debug report describe that slot, so derive v2/v3-active from carB.
+  const v2Active = carB.model === 'v2' && v2Model !== null;
+  const v3Active = carB.model === 'v3' && v3Model !== null;
 
   const sceneRef = useRef<{
     cleanup: () => void;
@@ -326,6 +508,17 @@ export default function RacePrimitives() {
     const p = loadLearnedParams();
     setParams(p ?? DEFAULT_LEARNED_PARAMS);
     setPhase('ready');
+    // Seed the per-car A/B config from localStorage (falls back to the
+    // defaults: Car A = kinematic/PP/off, Car B = v3/MPPI/on). A persisted
+    // model that isn't loaded degrades gracefully to kinematic at resolve time.
+    if (typeof window !== 'undefined') {
+      try {
+        const a = window.localStorage.getItem(CAR_A_KEY);
+        if (a) setCarAState(JSON.parse(a) as CarConfig);
+        const b = window.localStorage.getItem(CAR_B_KEY);
+        if (b) setCarBState(JSON.parse(b) as CarConfig);
+      } catch { /* ignore */ }
+    }
     // Toggle preference: '1' = explicitly on, '0' = explicitly off,
     // null = no explicit choice. When the user has never chosen, v2
     // defaults ON as soon as a trained model is available — otherwise a
@@ -363,6 +556,16 @@ export default function RacePrimitives() {
         if (toggle === null) setUseV2State(true);
       }
     });
+    // Load the preloaded v3 model in the background so the A/B configs can
+    // offer it (Car B defaults to v3 once it's loaded).
+    void loadV3ModelFromUrl().then((model) => {
+      if (cancelled || !model) return;
+      setV3Model(model);
+    });
+    void loadV3GeneratedLib().then((lib) => {
+      if (cancelled || !lib) return;
+      setV3GenLib(lib);
+    });
     return () => {
       cancelled = true;
     };
@@ -379,8 +582,9 @@ export default function RacePrimitives() {
   }
 
   // Mount the Three.js + Rapier scene as soon as initial params are decided.
-  // Also re-mounts when the v2 toggle changes (rebuilds the learned car's
-  // primitive library from the v2 model or back to the legacy path).
+  // Re-mounts when either car's A/B config, the loaded models, or the shared
+  // course change — each rebuilds the scenario (setupScene resolves each
+  // CarConfig to its library / forward model / per-entry tuning).
   useEffect(() => {
     if (!params || phase === 'loading' || phase === 'learning') return;
     const mount = containerRef.current;
@@ -395,9 +599,6 @@ export default function RacePrimitives() {
       try {
         await ensureRapier();
         if (disposed) return;
-        const learnedLibraryOverride = v2Active
-          ? buildLearnedRaceLibraryV2(v2Model!)
-          : undefined;
         const setup = await setupScene(mount, params, {
           onMetrics: (km, lm) => setMetrics({ kinematic: km, learned: lm }),
           onLearner: (snap) => setLearner(snap),
@@ -406,7 +607,7 @@ export default function RacePrimitives() {
             setWinner(w);
             setPhase('finished');
           },
-        }, { learnedLibraryOverride });
+        }, { carA, carB, v2Model, v3Model, v3GenLib, courseVariant, planner });
         sceneRef.current = setup;
         cleanup = setup.cleanup;
       } catch (e) {
@@ -418,8 +619,9 @@ export default function RacePrimitives() {
       cleanup?.();
       sceneRef.current = null;
     };
-    // Re-mount when params, v2 toggle, or v2 model identity change.
-  }, [params, useV2, v2Model, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
+    // Re-mount when params, either car's config, a loaded model, or the shared
+    // course change — each rebuilds the scenario.
+  }, [params, JSON.stringify(carA), JSON.stringify(carB), v2Model, v3Model, v3GenLib, courseVariant, planner, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function runInlineLearn() {
     setError(null);
@@ -606,6 +808,16 @@ export default function RacePrimitives() {
       }}
     >
       <TopBar
+        carA={carA}
+        onCarA={setCarA}
+        carB={carB}
+        onCarB={setCarB}
+        courseVariant={courseVariant}
+        onCourseVariant={setCourseVariant}
+        planner={planner}
+        onPlanner={setPlanner}
+        canUseV2={canUseV2}
+        canUseV3={canUseV3}
         phase={phase}
         learnProgress={learnProgress}
         winner={winner}
@@ -619,6 +831,7 @@ export default function RacePrimitives() {
         onReset={resetRace}
         onClearCache={clearCache}
         onExportDebug={onExportDebug}
+        onOpenModelLab={() => setModelLabOpen(true)}
         debugExportedAt={debugExportedAt}
       />
       <div style={{ flex: 1, position: 'relative' }}>
@@ -637,6 +850,8 @@ export default function RacePrimitives() {
           }}
           rollbackActive={learner?.rollbackActive ?? false}
           bestLapNumber={learner?.bestLapNumber ?? 0}
+          headers={{ kinematic: carLabel('A', carA), learned: carLabel('B', carB) }}
+          stacks={{ kinematic: carStack(carA), learned: carStack(carB) }}
         />
         {(phase === 'racing' || phase === 'finished') && learner && (
           <LearnerPanel snap={learner} v2Active={v2Active} v2Meta={v2Meta} isMobile={isMobile} />
@@ -653,6 +868,8 @@ export default function RacePrimitives() {
           <PretrainOverlay progress={learnProgress} />
         )}
         <ModelLab
+          open={modelLabOpen}
+          onOpenChange={setModelLabOpen}
           onTrained={onV2Trained}
           loadedMeta={v2Meta}
           onClearLoaded={v2Meta ? onV2Clear : undefined}
@@ -796,20 +1013,88 @@ interface LearnerSnapshot {
 }
 
 interface SceneOptions {
-  /** When supplied, overrides the legacy `buildLearnedRaceLibrary(params)`
-   *  for the LEARNED car's primitive library. Used to demo the v2 model
-   *  with the same race pipeline. Online refitting is suppressed while this
-   *  override is active (the v2 model is trained offline; mixing online
-   *  refits of the legacy 5-param model would race a stale v1 library while
-   *  the v2-derived primitive library is what the planner is searching). */
-  learnedLibraryOverride?: MotionPrimitiveLibrary;
+  /** Independent A/B config for each car. `carA` drives the left
+   *  ('kinematic'-named) slot, `carB` the right ('learned'-named) slot.
+   *  Each resolves to its own library + forward model + per-entry tuning. */
+  carA: CarConfig;
+  carB: CarConfig;
+  /** Loaded models a CarConfig may select. When a config names a model that
+   *  isn't loaded, that car degrades gracefully to the kinematic library. */
+  v2Model: LearnedVehicleModel | null;
+  v3Model: LearnedVehicleModelV3 | null;
+  /** Baked generated v3 race library (preferred over building it at runtime). */
+  v3GenLib: MotionPrimitiveLibrary | null;
+  /** Course layout (SHARED by both cars). Chosen in the Race Setup GUI (top
+   *  bar). Defaults to the open flat pad. */
+  courseVariant?: CourseVariant;
+  /** Planner mode (SHARED). `worker` offloads each car's plan compute to a Web
+   *  Worker; `main` (default) keeps the synchronous main-thread replan. */
+  planner?: PlannerMode;
+}
+
+/** Resolve a CarConfig to the primitive library + forward model it drives
+ *  with. Falls back to the kinematic baseline when the selected model isn't
+ *  loaded. `v3` prefers the baked generated library (building it at runtime
+ *  froze the UI ~10 s). */
+function resolveLib(
+  cfg: CarConfig,
+  kinematicLib: MotionPrimitiveLibrary,
+  v2Model: LearnedVehicleModel | null,
+  v3Model: LearnedVehicleModelV3 | null,
+  v3GenLib: MotionPrimitiveLibrary | null,
+): { lib: MotionPrimitiveLibrary; fwd: import('kinocat/primitives').ForwardSim<CarKinematicState> } {
+  if (cfg.model === 'v3' && v3Model) {
+    return { lib: v3GenLib ?? buildLearnedRaceLibraryV3(v3Model), fwd: forwardSimV3Rollout(v3Model) };
+  }
+  if (cfg.model === 'v2' && v2Model) {
+    return { lib: buildLearnedRaceLibraryV2(v2Model), fwd: learnedForwardSimV2(v2Model) };
+  }
+  return { lib: kinematicLib, fwd: parametricForwardV2(KINEMATIC_NATIVE_PARAMS, DEFAULT_LEARNABLE_CONFIG) };
+}
+
+/** Per-car tuning override merged over the scenario base. Carries this car's
+ *  tracker + feedforward choice, plus the real-time v3 profile (analytic
+ *  drive-through reprice + weighted-A*) when this car is v3 — the config that
+ *  laps the technical course inside a real-time planner budget (see
+ *  docs/v3-realtime-performance-plan.md). Feedforward only bites under MPPI. */
+function cfgToTuning(cfg: CarConfig): Partial<import('../lib/race-scenario').RaceTuning> {
+  return {
+    tracker: cfg.tracker,
+    controlFeedforward: cfg.ff && cfg.tracker === 'mpc',
+    ...(cfg.model === 'v3' ? { analyticDriveThrough: true, plannerWeight: 2 } : {}),
+  };
+}
+
+/** Serialise a CarConfig's forward model so a tracker Web Worker can rebuild
+ *  it. Mirrors `resolveLib`'s model → forward-sim mapping: the same model the
+ *  car rolls inline, sent as a spec the worker reconstructs (`modelFromJson` /
+ *  `v3FromJson`). Falls back to kinematic when the selected model isn't loaded,
+ *  matching `resolveLib`'s fallback. The `meta` on the v2 payload is unused for
+ *  the forward-model rebuild — a minimal stub keeps the serializer happy. */
+function cfgToForwardModelSpec(
+  cfg: CarConfig,
+  v2Model: LearnedVehicleModel | null,
+  v3Model: LearnedVehicleModelV3 | null,
+): TrackerForwardModelSpec {
+  if (cfg.model === 'v3' && v3Model) {
+    return { kind: 'v3', modelJson: JSON.stringify(v3ToJson(v3Model)) };
+  }
+  if (cfg.model === 'v2' && v2Model) {
+    return {
+      kind: 'v2',
+      modelJson: JSON.stringify(
+        modelToJson(v2Model, { trialsUsed: 0, openLoopRmsAt1s: 0, createdAt: 0 }),
+      ),
+    };
+  }
+  return { kind: 'kinematic' };
 }
 
 async function setupScene(
   mount: HTMLDivElement,
   params: LearnedVehicleParams,
   cb: SceneCallbacks,
-  options: SceneOptions = {},
+  options: SceneOptions,
 ): Promise<{
   cleanup: () => void;
   start: () => void;
@@ -827,38 +1112,77 @@ async function setupScene(
   mount.appendChild(renderer.domElement);
 
   // ---- Shared course ----
-  const course = buildRaceCourse();
+  // Course variant comes from the Race Setup GUI (top bar). The walled /
+  // chicane / thread-the-gate `technical` layout turns corner overshoot into
+  // a physical wall strike (see race-primitives-scenarios.ts); `open` is the
+  // flat pad. The `?course=` param only seeds the GUI's initial value.
+  const courseVariant: CourseVariant = options.courseVariant ?? courseFromUrl();
+  const course = buildRaceCourse(courseVariant);
   const navWorld = new InMemoryNavWorld(course.polygons, course.obstacles);
   const kinematicLib = buildKinematicLibrary();
   const initialLearnerParams = params ?? DEFAULT_LEARNED_PARAMS;
-  // If pre-train ran (params differs from DEFAULT_LEARNED_PARAMS),
-  // give the learned car its pre-trained library from lap 1 — otherwise
-  // the first 5 online refits would have to rediscover what pre-train
-  // already learned, and pre-train would look like it does nothing. With
-  // no pre-train, both cars start identical (kinematicLib) and the
-  // learned car learns from race data alone.
-  const hasPreTrain =
-    initialLearnerParams !== DEFAULT_LEARNED_PARAMS &&
-    !paramsEqual(initialLearnerParams, DEFAULT_LEARNED_PARAMS);
-  const initialLearnedLib = options.learnedLibraryOverride
-    ?? (hasPreTrain ? buildLearnedRaceLibrary(initialLearnerParams) : kinematicLib);
-  const v2Override = Boolean(options.learnedLibraryOverride);
+
+  // Resolve each car's INDEPENDENT A/B config to its own library + forward
+  // model. Car A drives the left ('kinematic'-named) slot, Car B the right
+  // ('learned'-named) slot — the internal entry names are unchanged; only the
+  // config behind each slot is user-selectable.
+  const rA = resolveLib(options.carA, kinematicLib, options.v2Model, options.v3Model, options.v3GenLib);
+  const rB = resolveLib(options.carB, kinematicLib, options.v2Model, options.v3Model, options.v3GenLib);
+  // Kept for the (dead) full-reset learner branch's lib restore.
+  const initialLearnedLib = rB.lib;
 
   // Build the shared RaceScenario that owns the simulation (per-car
   // Rapier world, planner, pure-pursuit, lap detection, sync hold,
   // stall + off-track recovery). The React component below is purely
   // a renderer — it consumes scenario.status() each frame to update
-  // meshes / trail / lookahead marker. Online learning is intentionally
-  // not part of the scenario: per-lap legacy 5-param refits were
-  // removed in favor of the offline-trained v2 model (see
-  // `pnpm run train` / Model Lab).
+  // meshes / trail / lookahead marker.
+  //
+  // Each entry carries its OWN per-car `tuning` (tracker / feedforward / v3
+  // profile) so the two cars are a fair A/B; the scenario-level `tuning` is
+  // left empty so DEFAULT_TUNING + course defaults form the shared base.
   const scenario = await createRaceScenario({
     entries: [
-      { name: 'kinematic', lib: kinematicLib },
-      { name: 'learned', lib: initialLearnedLib },
+      {
+        name: 'kinematic',
+        lib: rA.lib,
+        forwardModel: rA.fwd,
+        // Worker tracker rebuilds this car's forward model from the spec (the
+        // model instance itself doesn't structure-clone). Inert on the inline
+        // path.
+        forwardModelSpec: cfgToForwardModelSpec(options.carA, options.v2Model, options.v3Model),
+        tuning: cfgToTuning(options.carA),
+      },
+      {
+        name: 'learned',
+        lib: rB.lib,
+        forwardModel: rB.fwd,
+        forwardModelSpec: cfgToForwardModelSpec(options.carB, options.v2Model, options.v3Model),
+        tuning: cfgToTuning(options.carB),
+      },
     ],
     syncHold: true,
     offTrackRecovery: 'waypoint',
+    course,
+    // Off the main thread, a bigger planner budget no longer costs a dropped
+    // frame — so worker mode spends it, letting the harder v3 reprice search
+    // complete far more often (deadline is a MAX; the fast kinematic planner
+    // still returns early). The `hasInflight` gate keeps a still-running search
+    // from being re-queued, so an over-cadence budget just paces replans to
+    // "as fast as the worker finishes". Inline mode keeps the real-time budget.
+    tuning: options.planner === 'worker' ? { plannerBudgetMs: 400 } : {},
+    // Worker mode (opt-in from the Race Setup "Offload" toggle) offloads BOTH
+    // the plan compute AND the MPPI tracker solve to module Web Workers (one
+    // per car per stage) — the full main-loop unblock. Absent ⇒ inline/
+    // synchronous replan + solve (the deterministic default). Browser-only —
+    // headless/tests never pass these.
+    ...(options.planner === 'worker'
+      ? {
+          spawnPlanWorker: () =>
+            new Worker(new URL('./race.worker.ts', import.meta.url), { type: 'module' }),
+          spawnTrackerWorker: () =>
+            new Worker(new URL('./race.tracker.worker.ts', import.meta.url), { type: 'module' }),
+        }
+      : {}),
   });
 
   // ---- Per-car setup ----
@@ -878,6 +1202,17 @@ async function setupScene(
     sun.position.set(40, 100, 20);
     scene.add(sun);
     scene.add(createGroundPlaneHelper({ bounds: RACE_BOUNDS, color: 0x141a26 }));
+    // Technical-course walls (empty on the open course). Rendered as slate
+    // blocks with edge wireframes; these are the same boxes the planner sees
+    // (inflated) as obstacles and the physics world has as colliders.
+    for (const w of course.walls ?? []) {
+      scene.add(
+        createBuildingHelper(
+          { x: w.x, z: w.z, hx: w.hx, hz: w.hz, height: w.height },
+          { color: 0x3a4458, edgeColor: 0x8fa2c0 },
+        ),
+      );
+    }
     // Waypoint cones — shared geometry per car scene.
     for (let i = 0; i < course.waypoints.length; i++) {
       const wp = course.waypoints[i]!;
@@ -988,7 +1323,7 @@ async function setupScene(
     };
   }
 
-  const kinematic = makeCar('kinematic', kinematicLib, C.kinematic, C.kinematicPath, undefined);
+  const kinematic = makeCar('kinematic', rA.lib, C.kinematic, C.kinematicPath, undefined);
   // Learned car starts with the pre-trained library when available, else
   // with the kinematic library. Either way, it refines per-lap online
   // using race data via fitParamsOnline. When the v2 override is active,
@@ -1469,17 +1804,6 @@ async function setupScene(
 // ---------------------------------------------------------------------------
 // Helpers.
 
-function paramsEqual(a: LearnedVehicleParams, b: LearnedVehicleParams): boolean {
-  const EPS = 1e-9;
-  return (
-    Math.abs(a.maxAccel - b.maxAccel) < EPS &&
-    Math.abs(a.maxDecel - b.maxDecel) < EPS &&
-    Math.abs(a.accelTau - b.accelTau) < EPS &&
-    Math.abs(a.understeerGain - b.understeerGain) < EPS &&
-    Math.abs(a.lateralDrag - b.lateralDrag) < EPS
-  );
-}
-
 /** Smoothly move a perspective camera into a chase position behind a
  *  CarKinematicState. The chassis y is unknown to the planner (Y is derived in
  *  kinocat); for the cam we place it ~10m above so the wheels and the
@@ -1524,6 +1848,16 @@ function TopBar({
   params,
   error,
   v2Active,
+  carA,
+  onCarA,
+  carB,
+  onCarB,
+  courseVariant,
+  onCourseVariant,
+  planner,
+  onPlanner,
+  canUseV2,
+  canUseV3,
   isMobile,
   onLearn,
   onStart,
@@ -1531,6 +1865,7 @@ function TopBar({
   onReset,
   onClearCache,
   onExportDebug,
+  onOpenModelLab,
   debugExportedAt,
 }: {
   phase: Phase;
@@ -1544,10 +1879,24 @@ function TopBar({
   winner: 'kinematic' | 'learned' | 'tie' | null;
   params: LearnedVehicleParams | null;
   error: string | null;
-  /** True when the learned car is driving with the offline-trained v2
-   *  library — online refitting is disabled in that mode, so the status
-   *  text changes accordingly. */
+  /** True when Car B (the right 'learned'-named slot) drives the offline-
+   *  trained v2 library — used for the status text. */
   v2Active: boolean;
+  /** Race Setup: independent A/B config for each car. Car A = left slot,
+   *  Car B = right slot. */
+  carA: CarConfig;
+  onCarA: (c: CarConfig) => void;
+  carB: CarConfig;
+  onCarB: (c: CarConfig) => void;
+  /** Race Setup: which course layout (SHARED by both cars). */
+  courseVariant: CourseVariant;
+  onCourseVariant: (c: CourseVariant) => void;
+  /** Race Setup: where the plan compute runs (SHARED by both cars). */
+  planner: PlannerMode;
+  onPlanner: (p: PlannerMode) => void;
+  /** Whether the v2 / v3 models are loaded (and thus selectable per car). */
+  canUseV2: boolean;
+  canUseV3: boolean;
   isMobile: boolean;
   onLearn: () => void;
   onStart: () => void;
@@ -1557,88 +1906,183 @@ function TopBar({
   /** Generate + download + clipboard-copy a Markdown debug report of
    *  the live page state (model, race, libraries, planner config). */
   onExportDebug: () => void;
+  /** Open the Model Lab drawer (train / load / inspect the v2 model). */
+  onOpenModelLab: () => void;
   /** ms-since-epoch the last export fired — used to show a brief
    *  "copied + downloaded" confirmation. */
   debugExportedAt: number;
 }) {
   const justExported = debugExportedAt > 0 && Date.now() - debugExportedAt < 3000;
-  const subtitle = v2Active
-    ? 'kinematic vs offline-trained v2 · online refit off'
-    : 'kinematic vs online-learning · learned car refits each lap';
-  const racingStatus = v2Active
-    ? (isMobile ? 'racing · v2' : 'racing… (learned car using v2 library — offline-trained, no online refit)')
-    : (isMobile ? 'racing · online' : 'racing… (the learned car refits every lap)');
+  const subtitle = 'independent A/B — configure each car separately';
+  // Compact one-glance summary of both cars + the shared course, shown on the
+  // Setup dropdown trigger so the config is visible without opening it.
+  // e.g. `A kin·PP · B v3·MPPI·FF · Tech`.
+  const setupSummary = [
+    carChip('A', carA),
+    carChip('B', carB),
+    courseVariant === 'technical' ? 'Tech' : 'Open',
+    ...(planner === 'worker' ? ['wkr'] : []),
+  ].join(' · ');
+
+  // Single-row toolbar. Everything that used to overflow now lives behind two
+  // dropdowns (Setup + overflow ⋯) and a Model Lab launcher, so the header is
+  // one line at every width. On narrow screens the brand + subtitle collapse
+  // and an overflowX guard keeps it usable.
   return (
     <div
       style={{
         display: 'flex',
-        flexDirection: isMobile ? 'column' : 'row',
-        alignItems: isMobile ? 'stretch' : 'center',
-        gap: isMobile ? 6 : 12,
-        padding: isMobile ? '8px 10px' : '10px 14px',
+        alignItems: 'center',
+        gap: 8,
+        padding: isMobile ? '6px 8px' : '8px 14px',
         borderBottom: '1px solid #1f2735',
         background: '#0d1119',
+        // No overflow clip here: a scroll container (overflow-x:auto forces
+        // overflow-y:auto too) would clip the Setup / overflow dropdown panels
+        // that drop BELOW the bar. The compact dropdown design keeps the row
+        // within ~360px, so clipping is unnecessary.
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
-        <div style={{ color: '#7fd6ff', fontWeight: 700, whiteSpace: 'nowrap' }}>race the primitives</div>
-        {!isMobile && (
-          <div style={{ opacity: 0.65, fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            {subtitle}
+      <div style={{ color: '#7fd6ff', fontWeight: 700, whiteSpace: 'nowrap' }}>
+        {isMobile ? 'race' : 'race the primitives'}
+      </div>
+      {!isMobile && (
+        <div style={{ opacity: 0.5, fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 300, flexShrink: 1 }}>
+          {subtitle}
+        </div>
+      )}
+
+      {/* Setup dropdown — the three run-defining selectors. */}
+      <Popover
+        align="left"
+        triggerTitle="Race setup — configure Car A and Car B independently, shared course"
+        triggerLabel={
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <span aria-hidden>⚙</span>
+            {!isMobile && <span>Setup</span>}
+            <span style={{ opacity: 0.7, color: '#7fd6ff' }}>{setupSummary}</span>
+          </span>
+        }
+      >
+        {() => (
+          <RaceSetup
+            carA={carA}
+            onCarA={onCarA}
+            carB={carB}
+            onCarB={onCarB}
+            courseVariant={courseVariant}
+            onCourseVariant={onCourseVariant}
+            planner={planner}
+            onPlanner={onPlanner}
+            canUseV2={canUseV2}
+            canUseV3={canUseV3}
+          />
+        )}
+      </Popover>
+
+      <div style={{ flex: 1, minWidth: 8 }} />
+
+      {/* Phase status + the single primary action for the current phase. */}
+      {phase === 'loading' && <Status>loading…</Status>}
+      {phase === 'learning' && (
+        <Status>
+          {isMobile
+            ? `pre-train ${learnProgress.done}/${learnProgress.total || '?'}`
+            : `pre-training… ${learnProgress.done}/${learnProgress.total || '?'}`}
+        </Status>
+      )}
+      {phase === 'ready' && params && (
+        <>
+          {!isMobile && <Status>ready{v2Active ? ' · v2' : ''}</Status>}
+          <Btn onClick={onStart}>start race</Btn>
+        </>
+      )}
+      {phase === 'racing' && (
+        <>
+          {!isMobile && <Status>racing…</Status>}
+          <Btn onClick={onStop}>stop</Btn>
+        </>
+      )}
+      {phase === 'finished' && (
+        <>
+          {!isMobile && <Status>stopped{v2Active ? ' · v2' : ''}</Status>}
+          <Btn onClick={onStart}>{isMobile ? 'race' : 'race again'}</Btn>
+        </>
+      )}
+      {error && <Status warning>err</Status>}
+
+      {/* Model Lab launcher — opens the drawer (train / load / inspect the v2
+          model). Replaces the old floating top-right panel that overlapped
+          the LEARNED metrics. */}
+      <Btn onClick={onOpenModelLab} secondary title="Open Model Lab — train, load, or inspect the v2 model">
+        {isMobile ? 'Lab' : 'Model Lab'}
+        {canUseV2 && <span style={{ marginLeft: 6, color: '#55dcff' }}>●</span>}
+      </Btn>
+
+      {/* Overflow menu — secondary actions that don't need to be one click. */}
+      <Popover align="right" triggerLabel={<span aria-hidden style={{ fontSize: 16, lineHeight: 1 }}>⋯</span>} triggerTitle="More actions">
+        {(close) => (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 170 }}>
+            <MenuItem onClick={() => { onLearn(); close(); }} disabled={phase === 'learning'}>Pre-train v2…</MenuItem>
+            <MenuItem onClick={() => { onReset(); close(); }}>Reset race</MenuItem>
+            <MenuItem onClick={() => { onClearCache(); close(); }}>Clear cached model</MenuItem>
+            <div style={{ height: 1, background: '#223044', margin: '2px 0' }} />
+            <MenuItem onClick={() => { onExportDebug(); close(); }}>
+              {justExported ? '✓ copied · saved' : '🐛 Export debug report'}
+            </MenuItem>
           </div>
         )}
-      </div>
-      {!isMobile && <div style={{ flex: 1 }} />}
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          flexWrap: isMobile ? 'wrap' : 'nowrap',
-          overflowX: isMobile ? 'auto' : 'visible',
-          // Prevent flex shrink so buttons stay readable on mobile scroll.
-          minWidth: 0,
-        }}
-      >
-        {phase === 'loading' && <Status>loading…</Status>}
-        {phase === 'learning' && (
-          <Status>
-            {isMobile
-              ? `pre-training ${learnProgress.done}/${learnProgress.total || '?'}`
-              : `pre-training… collecting trials ${learnProgress.done}/${learnProgress.total || '?'}`}
-          </Status>
-        )}
-        {phase === 'ready' && params && (
-          <>
-            <Status>ready{v2Active ? ' · v2' : ''}</Status>
-            <Btn onClick={onStart}>start race</Btn>
-            <Btn onClick={onLearn} secondary>pre-train</Btn>
-            <Btn onClick={onReset} secondary>reset</Btn>
-            <Btn onClick={onClearCache} secondary>clear</Btn>
-          </>
-        )}
-        {phase === 'racing' && (
-          <>
-            <Status>{racingStatus}</Status>
-            <Btn onClick={onStop}>stop</Btn>
-          </>
-        )}
-        {phase === 'finished' && (
-          <>
-            <Status>stopped{v2Active ? ' · v2' : ''}</Status>
-            <Btn onClick={onStart}>race again</Btn>
-            <Btn onClick={onReset} secondary>reset</Btn>
-          </>
-        )}
-        {error && <Status warning>err: {error}</Status>}
-        {/* Export-debug button — always present so diagnosis works in
-            every phase. Shows a brief "copied · saved" confirmation. */}
-        <Btn onClick={onExportDebug} secondary title="Generate Markdown debug report — copied to clipboard and downloaded as .md">
-          {justExported ? '✓ copied · saved' : '🐛 export debug'}
-        </Btn>
-      </div>
+      </Popover>
     </div>
   );
+}
+
+/** A full-width row button used inside the overflow / setup popovers. */
+function MenuItem({
+  children,
+  onClick,
+  disabled,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        textAlign: 'left',
+        padding: '7px 10px',
+        background: 'transparent',
+        border: 'none',
+        borderRadius: 4,
+        color: disabled ? '#4a5364' : '#cdd3de',
+        font: '12px ui-monospace, monospace',
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        whiteSpace: 'nowrap',
+      }}
+      onMouseEnter={(e) => { if (!disabled) e.currentTarget.style.background = '#1b2740'; }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** Human-readable description of each car's live control stack: which
+ *  path tracker executes the plan, and which planning/rollout model the
+ *  car reasons with. Rendered in the HUD so a screenshot of a run is
+ *  never ambiguous about WHAT was being tested. */
+interface StackInfo {
+  /** Path-tracking executor. */
+  tracker: string;
+  /** Planner primitive library (what A* searches). */
+  library: string;
+  /** MPPI rollout model (only meaningful under the mpc tracker). */
+  rolloutModel?: string;
 }
 
 function MetricsOverlay({
@@ -1649,6 +2093,8 @@ function MetricsOverlay({
   lapTimes,
   rollbackActive,
   bestLapNumber,
+  stacks,
+  headers,
 }: {
   metrics: { kinematic: RaceMetrics; learned: RaceMetrics };
   winner: 'kinematic' | 'learned' | 'tie' | null;
@@ -1657,6 +2103,10 @@ function MetricsOverlay({
   lapTimes: { kinematic: number[]; learned: number[] };
   rollbackActive: boolean;
   bestLapNumber: number;
+  stacks: { kinematic: StackInfo; learned: StackInfo };
+  /** Per-side column header, derived from each car's A/B config (the left
+   *  'kinematic'-named slot is Car A, the right 'learned'-named slot Car B). */
+  headers: { kinematic: string; learned: string };
 }) {
   // Mobile: compact stacked summary row at the top of the viewport. Tap a
   // card to expand its full stats (LIVE CONTROLS + tracking error + …).
@@ -1676,22 +2126,24 @@ function MetricsOverlay({
         }}
       >
         <CompactCarCard
-          title="KINEMATIC"
+          title={headers.kinematic}
           color="#ff8aa0"
           m={metrics.kinematic}
           highlight={winner === 'kinematic'}
           holding={holding.kinematic}
           recentLaps={lapTimes.kinematic}
           rollbackBadge={null}
+          stack={stacks.kinematic}
         />
         <CompactCarCard
-          title="LEARNED"
+          title={headers.learned}
           color="#55dcff"
           m={metrics.learned}
           highlight={winner === 'learned'}
           holding={holding.learned}
           recentLaps={lapTimes.learned}
           rollbackBadge={rollbackActive ? `BEST l${bestLapNumber}` : null}
+          stack={stacks.learned}
         />
       </div>
     );
@@ -1700,23 +2152,25 @@ function MetricsOverlay({
     <>
       <SideMetrics
         side="left"
-        title="KINEMATIC (control)"
+        title={headers.kinematic}
         color="#ff8aa0"
         m={metrics.kinematic}
         highlight={winner === 'kinematic'}
         holding={holding.kinematic}
         recentLaps={lapTimes.kinematic}
         rollbackBadge={null}
+        stack={stacks.kinematic}
       />
       <SideMetrics
         side="right"
-        title="LEARNED (online)"
+        title={headers.learned}
         color="#55dcff"
         m={metrics.learned}
         highlight={winner === 'learned'}
         holding={holding.learned}
         recentLaps={lapTimes.learned}
         rollbackBadge={rollbackActive ? `USING BEST (lap ${bestLapNumber})` : null}
+        stack={stacks.learned}
       />
     </>
   );
@@ -1724,10 +2178,11 @@ function MetricsOverlay({
 
 /** Tightly-packed per-car card for mobile. Tap to expand for full stats. */
 function CompactCarCard({
-  title, color, m, highlight, holding, recentLaps, rollbackBadge,
+  title, color, m, highlight, holding, recentLaps, rollbackBadge, stack,
 }: {
   title: string; color: string; m: RaceMetrics; highlight: boolean;
   holding: boolean; recentLaps: number[]; rollbackBadge: string | null;
+  stack: StackInfo;
 }) {
   const [open, setOpen] = useState(false);
   const last5 = recentLaps.slice(-5);
@@ -1761,6 +2216,16 @@ function CompactCarCard({
         <span style={{ textAlign: 'right' }}>{m.laps} · {Number.isFinite(m.bestLapTime) ? `${m.bestLapTime.toFixed(2)}s` : '—'}</span>
         {open && (
           <>
+            <span style={{ opacity: 0.6 }}>tracker</span>
+            <span style={{ textAlign: 'right', color }}>{stack.tracker}</span>
+            <span style={{ opacity: 0.6 }}>lib</span>
+            <span style={{ textAlign: 'right' }}>{stack.library}</span>
+            {stack.rolloutModel && (
+              <>
+                <span style={{ opacity: 0.6 }}>model</span>
+                <span style={{ textAlign: 'right' }}>{stack.rolloutModel}</span>
+              </>
+            )}
             <span style={{ opacity: 0.6 }}>last</span>
             <span style={{ textAlign: 'right' }}>{Number.isFinite(m.lastLapTime) ? `${m.lastLapTime.toFixed(2)}s` : '—'}</span>
             <span style={{ opacity: 0.6 }}>mean5</span>
@@ -1814,6 +2279,7 @@ function SideMetrics({
   holding,
   recentLaps,
   rollbackBadge,
+  stack,
 }: {
   side: 'left' | 'right';
   title: string;
@@ -1823,6 +2289,7 @@ function SideMetrics({
   holding: boolean;
   recentLaps: number[];
   rollbackBadge: string | null;
+  stack: StackInfo;
 }) {
   // Stability over the last 5 laps — low std-dev means the car has
   // settled into a consistent racing line, high means it's still
@@ -1905,6 +2372,15 @@ function SideMetrics({
       />
       <KV k="0.55s pred err (rms)" v={`${m.trackingErrorRms.toFixed(2)} m`} />
       <KV k="peak speed" v={`${m.peakSpeed.toFixed(1)} m/s`} />
+      <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid #1f2735', opacity: 0.85 }}>
+        <div style={{ fontSize: 10, opacity: 0.7, marginBottom: 2 }}>CONTROL STACK</div>
+        <KV k="tracker" v={<span style={{ color }}>{stack.tracker}</span>} />
+        <KV k="plan library" v={stack.library} />
+        {stack.rolloutModel && <KV k="MPPI model" v={stack.rolloutModel} />}
+        {m.mpcSolveCount > 0 && (
+          <KV k="MPPI solve" v={`${m.mpcSolveMsAvg.toFixed(1)} ms · ${m.mpcSolveCount}`} />
+        )}
+      </div>
       <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid #1f2735', opacity: 0.85 }}>
         <div style={{ fontSize: 10, opacity: 0.7, marginBottom: 2 }}>LIVE CONTROLS</div>
         <KV
@@ -2439,6 +2915,274 @@ function KV({ k, v }: { k: string; v: string | React.ReactNode }) {
     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
       <span style={{ opacity: 0.7 }}>{k}</span>
       <span style={{ color: '#cdeaff' }}>{v}</span>
+    </div>
+  );
+}
+
+/** One car's independent A/B column: model / tracker / feedforward selectors.
+ *  Car A drives the left ('kinematic'-named) slot, Car B the right
+ *  ('learned'-named) slot — a fair A/B where each side is configured on its
+ *  own. */
+function CarConfigColumn({
+  side,
+  color,
+  cfg,
+  onChange,
+  canUseV2,
+  canUseV3,
+}: {
+  side: 'A' | 'B';
+  color: string;
+  cfg: CarConfig;
+  onChange: (c: CarConfig) => void;
+  canUseV2: boolean;
+  canUseV3: boolean;
+}) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10, minWidth: 190 }}>
+      <div style={{ color, fontWeight: 700, fontSize: 12, letterSpacing: 0.4 }}>
+        Car {side}
+      </div>
+      <Segmented
+        label="model"
+        value={cfg.model}
+        onChange={(model) => onChange({ ...cfg, model })}
+        options={[
+          { value: 'kinematic', label: 'Kinematic', title: 'Kinematic-bicycle library (the naive baseline).' },
+          {
+            value: 'v2',
+            label: 'v2',
+            title: canUseV2
+              ? 'Offline-trained v2 library + (under MPPI) the v2 rollout model.'
+              : 'Train or load a v2 model first (Model Lab).',
+            disabled: !canUseV2,
+          },
+          {
+            value: 'v3',
+            label: 'v3',
+            title: canUseV3
+              ? 'Purely-learned v3 MLP-ensemble library + rollout model (highest plant fidelity — best paired with MPPI + feedforward).'
+              : 'v3 model unavailable (/models/v3-default.json not reachable).',
+            disabled: !canUseV3,
+          },
+        ]}
+      />
+      <Segmented
+        label="tracker"
+        value={cfg.tracker}
+        onChange={(tracker) => onChange({ ...cfg, tracker })}
+        options={[
+          { value: 'pure-pursuit', label: 'Pure-pursuit', title: 'Geometric path tracker — fast, reactive, no dynamics model.' },
+          { value: 'mpc', label: 'MPPI', title: 'Sampling MPC that rolls this car’s OWN forward model in the loop (model fidelity → control quality).' },
+        ]}
+      />
+      <Segmented
+        label="feedforward"
+        value={cfg.ff ? 'on' : 'off'}
+        onChange={(v) => onChange({ ...cfg, ff: v === 'on' })}
+        options={[
+          { value: 'off', label: 'Off', title: 'MPPI re-derives controls from plan geometry each tick (baseline).' },
+          {
+            value: 'on',
+            label: 'On',
+            title: cfg.tracker === 'mpc'
+              ? 'MPPI warm-starts its prior from the plan’s OWN primitive controls (WS-1½). Best with the v3/learned model.'
+              : 'Feedforward applies under MPPI only — switch this car’s tracker to MPPI to see an effect.',
+            disabled: cfg.tracker !== 'mpc',
+          },
+        ]}
+      />
+    </div>
+  );
+}
+
+/** Race Setup — two INDEPENDENT car columns (a fair A/B) plus the SHARED
+ *  course selector. Car A drives the left ('kinematic'-named) slot, Car B the
+ *  right ('learned'-named) slot; only the config behind each slot is
+ *  user-selectable. Changing any selector re-mounts the scene (resets the
+ *  race). The `?course=` query param only SEEDS the course on first load. */
+function RaceSetup({
+  carA,
+  onCarA,
+  carB,
+  onCarB,
+  courseVariant,
+  onCourseVariant,
+  planner,
+  onPlanner,
+  canUseV2,
+  canUseV3,
+}: {
+  carA: CarConfig;
+  onCarA: (c: CarConfig) => void;
+  carB: CarConfig;
+  onCarB: (c: CarConfig) => void;
+  courseVariant: CourseVariant;
+  onCourseVariant: (c: CourseVariant) => void;
+  planner: PlannerMode;
+  onPlanner: (p: PlannerMode) => void;
+  canUseV2: boolean;
+  canUseV3: boolean;
+}) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ display: 'flex', gap: 18 }}>
+        <CarConfigColumn side="A" color="#ff8aa0" cfg={carA} onChange={onCarA} canUseV2={canUseV2} canUseV3={canUseV3} />
+        <div style={{ width: 1, background: '#223044' }} />
+        <CarConfigColumn side="B" color="#55dcff" cfg={carB} onChange={onCarB} canUseV2={canUseV2} canUseV3={canUseV3} />
+      </div>
+      <div style={{ height: 1, background: '#223044' }} />
+      <Segmented
+        label="course (shared)"
+        value={courseVariant}
+        onChange={onCourseVariant}
+        options={[
+          { value: 'open', label: 'Open', title: 'Flat pad — pure dynamics + waypoint chase.' },
+          { value: 'technical', label: 'Technical', title: 'Walled chicane — corner overshoot becomes a physical wall strike.' },
+        ]}
+      />
+      <Segmented
+        label="offload (shared)"
+        value={planner}
+        onChange={onPlanner}
+        options={[
+          { value: 'main', label: 'Main thread', title: 'Plan compute + MPPI tracker solve run synchronously on the main thread (default).' },
+          { value: 'worker', label: 'Worker', title: 'Offload each car’s plan compute AND MPPI tracker solve to Web Workers (one per car per stage) — the full main-loop unblock.' },
+        ]}
+      />
+      <div style={{ fontSize: 10, opacity: 0.5, lineHeight: 1.4 }}>
+        Changing a setting restarts the race.
+      </div>
+    </div>
+  );
+}
+
+/** Compact segmented (radio-group) selector — a label above a row of
+ *  mutually-exclusive pill buttons. Keyboard + pointer accessible via native
+ *  buttons; fills its container so it reads cleanly inside a dropdown. */
+function Segmented<T extends string>({
+  label,
+  value,
+  onChange,
+  options,
+}: {
+  label: string;
+  value: T;
+  onChange: (v: T) => void;
+  options: Array<{ value: T; label: string; title?: string; disabled?: boolean }>;
+}) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }} role="group" aria-label={label}>
+      <span style={{ fontSize: 10, opacity: 0.6, textTransform: 'uppercase', letterSpacing: 0.4 }}>{label}</span>
+      <div style={{ display: 'flex', border: '1px solid #223044', borderRadius: 5, overflow: 'hidden' }}>
+        {options.map((opt, i) => {
+          const active = opt.value === value;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => !opt.disabled && !active && onChange(opt.value)}
+              disabled={opt.disabled}
+              title={opt.title}
+              aria-pressed={active}
+              style={{
+                flex: 1,
+                padding: '5px 10px',
+                border: 'none',
+                borderLeft: i > 0 ? '1px solid #223044' : 'none',
+                background: active ? '#55dcff' : 'transparent',
+                color: opt.disabled ? '#4a5364' : active ? '#0a0d14' : '#cdd3de',
+                font: '11px ui-monospace, monospace',
+                fontWeight: active ? 700 : 400,
+                cursor: opt.disabled ? 'not-allowed' : active ? 'default' : 'pointer',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/** Lightweight popover: a trigger button + a floating panel that closes on
+ *  outside-click or Escape. No dependency; used for the toolbar's Setup and
+ *  overflow menus so the header stays a single row on every viewport. */
+function Popover({
+  triggerLabel,
+  triggerTitle,
+  align = 'right',
+  badge,
+  children,
+}: {
+  triggerLabel: React.ReactNode;
+  triggerTitle?: string;
+  align?: 'left' | 'right';
+  badge?: React.ReactNode;
+  children: (close: () => void) => React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+  return (
+    <div ref={ref} style={{ position: 'relative', display: 'inline-flex' }}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title={triggerTitle}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        style={{
+          padding: '6px 10px',
+          background: open ? '#1b2740' : 'transparent',
+          border: '1px solid #223044',
+          borderRadius: 4,
+          color: '#cdd3de',
+          font: 'inherit',
+          cursor: 'pointer',
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {triggerLabel}
+        {badge}
+        <span style={{ opacity: 0.6, fontSize: 10 }}>{open ? '▲' : '▼'}</span>
+      </button>
+      {open && (
+        <div
+          role="menu"
+          style={{
+            position: 'absolute',
+            top: 'calc(100% + 6px)',
+            [align]: 0,
+            zIndex: 80,
+            background: '#0d1119',
+            border: '1px solid #223044',
+            borderRadius: 8,
+            padding: 12,
+            boxShadow: '0 8px 24px rgba(0, 0, 0, 0.5)',
+            maxWidth: 'calc(100vw - 24px)',
+          }}
+        >
+          {children(() => setOpen(false))}
+        </div>
+      )}
     </div>
   );
 }

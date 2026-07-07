@@ -139,3 +139,55 @@ export function characterizeVehicle(
   }));
   return new MotionPrimitiveLibrary(primitives, startSpeeds);
 }
+
+/**
+ * WS-2 — DYNAMIC ROLLOUTS. Characterize primitives on the fly from the
+ * chassis's ACTUAL dynamic state (including yaw rate and lateral velocity),
+ * not the zero-slip canonical start states `characterizeVehicle` bakes. The
+ * rollout starts at the local-frame origin (x=0, z=0, heading=0) but carries
+ * the real `speed`/`yawRate`/`lateralVelocity`, so the produced primitives are
+ * rigid-transform-valid in the node's world frame (the forward sim is
+ * translation- and yaw-equivariant — see the CONTRACT in `characterize`).
+ *
+ * The point: the planner's motion library is baked from zero-slip states, so a
+ * car sweeping through a corner (large yaw rate + sideslip) would otherwise
+ * expand as if it were rolling straight with no slip — discarding exactly the
+ * dynamic state the learned v2 model is stateful in. Rolling live from the
+ * true state makes the committed first primitive model-consistent with reality.
+ */
+export function characterizeVehicleFromState(
+  forwardSim: ForwardSim<CarKinematicState>,
+  state: CarKinematicState,
+  controlSets: number[][],
+  duration: number,
+  substeps: number,
+): MotionPrimitive[] {
+  const start: CarKinematicState = {
+    x: 0, z: 0, heading: 0,
+    speed: state.speed,
+    yawRate: state.yawRate ?? 0,
+    lateralVelocity: state.lateralVelocity ?? 0,
+    t: 0,
+  };
+  const rolled = characterize<CarKinematicState, LocalPose>({
+    forwardSim,
+    runs: controlSets.map((controls) => ({ startState: start, controls })),
+    duration,
+    substeps,
+    record: (s) => ({ x: s.x, z: s.z, heading: wrapAngle(s.heading) }),
+  });
+  return rolled.map((r, id) => ({
+    id,
+    startSpeed: r.startState.speed,
+    controls: r.controls,
+    duration,
+    end: {
+      dx: r.endState.x,
+      dz: r.endState.z,
+      dHeading: wrapAngle(r.endState.heading),
+      speed: r.endState.speed,
+    },
+    sweep: [{ x: 0, z: 0, heading: 0 }, ...r.samples],
+    reverse: r.endState.speed < 0 || (r.controls[1] ?? 0) < 0,
+  }));
+}

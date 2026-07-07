@@ -38,10 +38,15 @@ describe('agent capability drift vs derived plant envelope', () => {
     expect(PARKING_AGENT.minTurnRadius).toBeGreaterThanOrEqual(plant.minTurnRadius);
   });
 
-  it('race agent max speed does not exceed the documented chassis ceiling', () => {
-    // 30 m/s is the empirically-measured flat-ground ceiling (no air drag
-    // in Rapier); the capability layer cannot derive it, so pin it here to
-    // catch silent edits of either side.
+  it('race agent max speed is a deliberate policy cap (plant has no intrinsic ceiling)', () => {
+    // CORRECTED (WS-0, plant-envelope.test.ts): 30 m/s is NOT a physical
+    // ceiling. Rapier models no aerodynamic drag, so under full drive force
+    // the chassis keeps accelerating (~11 m/s² even at 28 m/s; terminal
+    // speed in a 12 s launch is ~97 m/s). `RACE_AGENT.maxSpeed` is therefore
+    // a POLICY choice — the planner's action-space ceiling — not a plant
+    // limit. Pinned so raising it is a conscious edit that also extends the
+    // primitive lattice (RACE_START_SPEEDS + control sets), never a silent
+    // drift.
     expect(RACE_AGENT.maxSpeed).toBeLessThanOrEqual(30);
   });
 });

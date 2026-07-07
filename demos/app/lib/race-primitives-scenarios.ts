@@ -25,6 +25,7 @@ import {
   defaultVehicleAgent,
   kinematicForwardSim,
   learnedForwardSimV2,
+  forwardSimV3,
   DEFAULT_LEARNABLE_CONFIG,
   plannerVehicleCapabilities,
 } from 'kinocat/agent';
@@ -36,6 +37,7 @@ import type {
 import {
   characterizeVehicle,
   MotionPrimitiveLibrary,
+  designControlSet,
 } from 'kinocat/primitives';
 import { buildLearnedLibrary } from './learn-primitives';
 
@@ -76,10 +78,41 @@ function pose(x: number, z: number, heading: number): CarKinematicState {
  *  plan goes wrong (overshoot at the slalom, late braking into the 90°) but
  *  remains FEASIBLE — both cars can complete it, the question is who finishes
  *  faster with less tracking error. */
+/** A rectangular wall / building block on the course. Half-extents `hx`/`hz`
+ *  are in world units (XZ plane); `height` is the visual/physical Y extent.
+ *  The planner sees an inflated 2-D footprint (an obstacle hole in the
+ *  navmesh); the physics world gets a matching fixed cuboid collider; the
+ *  demo renders it with `createBuildingHelper`. */
+export interface RaceWallSpec {
+  x: number;
+  z: number;
+  hx: number;
+  hz: number;
+  height: number;
+}
+
+/** Race course variants. `open` is the historical flat pad (no walls) that
+ *  isolates the pure dynamic-model gap. `technical` adds walls, guard blocks
+ *  at the slalom overshoot zones, and a tight thread-the-gate corridor —
+ *  turning corner overshoot into a physical wall strike, so model fidelity
+ *  (honest entry speeds + feasible lines) is finally rewarded with lap time. */
+export type RaceCourseVariant = 'open' | 'technical';
+
+/** Planner sees walls this much larger than their physical extent, so a
+ *  feasible plan keeps a safety margin off the concrete. */
+export const RACE_WALL_INFLATE = 0.5;
+
 export interface RaceCourse {
   bounds: { x0: number; x1: number; z0: number; z1: number };
   polygons: NavPolygon[];
   obstacles: Array<[number, number][]>;
+  /** Wall blocks (empty / absent on the `open` course and on non-race
+   *  courses that reuse this shape, e.g. parking). Physical colliders +
+   *  visual meshes are built from these; `obstacles` are their inflated
+   *  planner footprints. */
+  walls?: RaceWallSpec[];
+  /** Which variant produced this course (absent on non-race courses). */
+  variant?: RaceCourseVariant;
   waypoints: CarKinematicState[];
   spawn: CarKinematicState;
   /** OPTIONAL canonical goal (kinocat/scenario AST). When present, the runtime
@@ -92,7 +125,19 @@ export interface RaceCourse {
   prefer?: CostTerm[];
 }
 
-export function buildRaceCourse(): RaceCourse {
+/** Inflated planner footprint (a hole in the navmesh) for a wall block. */
+function wallObstacle(w: RaceWallSpec): [number, number][] {
+  const hx = w.hx + RACE_WALL_INFLATE;
+  const hz = w.hz + RACE_WALL_INFLATE;
+  return [
+    [w.x - hx, w.z - hz],
+    [w.x + hx, w.z - hz],
+    [w.x + hx, w.z + hz],
+    [w.x - hx, w.z + hz],
+  ];
+}
+
+export function buildRaceCourse(variant: RaceCourseVariant = 'open'): RaceCourse {
   const b = RACE_BOUNDS;
   const polygons: NavPolygon[] = [
     {
@@ -106,8 +151,6 @@ export function buildRaceCourse(): RaceCourse {
       ],
     },
   ];
-  // No physical obstacles — the course is pure dynamics + waypoint chase.
-  const obstacles: Array<[number, number][]> = [];
 
   // Loop: accelerate → TIGHT slalom (alternating ±z gates only 8m apart,
   // demanding tight curvature at speed) → short straight → hard 90° turn →
@@ -130,10 +173,60 @@ export function buildRaceCourse(): RaceCourse {
     pose(-50, -25, 0),  // 10: back to start
   ];
 
+  if (variant === 'open') {
+    // No physical obstacles — the course is pure dynamics + waypoint chase.
+    return {
+      bounds: b,
+      polygons,
+      obstacles: [],
+      walls: [],
+      variant,
+      waypoints,
+      spawn: pose(-55, -20, 0),
+    };
+  }
+
+  // --- Technical variant --------------------------------------------------
+  // Same racing line as `open`, but walls line the OVERSHOOT zones of every
+  // slalom gate and the hard 90° corner, plus a thread-the-gate corridor on
+  // the return leg. A feasible plan (honest entry speeds, containment-safe
+  // radius) stays clear; the kinematic worldview's aggressive-intent line
+  // overshoots into the concrete. Overshoot is no longer free.
+  //
+  // Guard walls sit OFF the racing line (opposite the direction the gate is
+  // approached from), so they never invalidate the intended trajectory —
+  // they only catch a car that ran wide. Wall half-extents are chosen so the
+  // on-line clearance is comfortable (~4 m) while a >3 m overshoot strikes.
+  const H = 3; // wall visual/physical height
+  const walls: RaceWallSpec[] = [
+    // Slalom guard walls: each gate's overshoot side (north for +z gates,
+    // south for −z gates). Racing line passes at |z| = 8; walls start at
+    // |z| = 12 so a clean line clears by 4 m, an overshoot past 12 strikes.
+    { x: -22, z: 16, hx: 6, hz: 3.5, height: H }, // guard N of gate 1
+    { x: -12, z: -16, hx: 6, hz: 3.5, height: H }, // guard S of gate 2
+    { x: -2, z: 16, hx: 6, hz: 3.5, height: H }, // guard N of gate 3
+    { x: 8, z: -16, hx: 6, hz: 3.5, height: H }, // guard S of gate 4
+    { x: 18, z: 16, hx: 6, hz: 3.5, height: H }, // guard N of gate 5
+    // Hard 90° corner (gate 7 at (55,22)): a wall just past the apex on the
+    // east edge punishes braking too late — the delusional line runs wide
+    // into the wall while the clean line brakes early and clips the apex.
+    { x: 63, z: 20, hx: 2, hz: 10, height: H }, // east wall past the corner
+    // Thread-the-gate chicane on the long top straight (gate 7 (55,22) →
+    // gate 8 (-50,25)): staggered walls poke in from the north and south
+    // edges, forcing a decisive S past x = 10 / x = -12 at speed. A car
+    // carrying too much speed (kinematic optimism) runs wide into a wall;
+    // the honest line lifts, threads, and gets back on the throttle.
+    { x: 10, z: 35, hx: 5, hz: 5, height: H }, // chicane wall from the north
+    { x: -12, z: 15, hx: 5, hz: 5, height: H }, // chicane wall from the south
+  ];
+  const obstacles = walls.map(wallObstacle);
+
   return {
     bounds: b,
     polygons,
     obstacles,
+    walls,
+    variant,
     waypoints,
     spawn: pose(-55, -20, 0),
   };
@@ -235,6 +328,15 @@ export function raceControlSets(agent: VehicleAgent = RACE_AGENT): number[][] {
  *  stays nearest-bucket; branching per node is unchanged). */
 export const RACE_START_SPEEDS = [0, 4, 8, 12, 16, 20, 24, 28];
 
+/** Denser 2 m/s start-speed grid (≤ 1 m/s nearest-bucket snap error, half the
+ *  default). Used by the generated-controls correctness branch. Costs ~2x
+ *  one-time baking + memory but ZERO extra per-node search cost — lookup finds
+ *  ONE nearest bucket and returns its primitives, so the branching factor is
+ *  primitives-per-bucket regardless of how many buckets exist. */
+export const RACE_START_SPEEDS_DENSE = [
+  0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28,
+];
+
 export function buildKinematicLibrary(): MotionPrimitiveLibrary {
   return characterizeVehicle({
     forwardSim: kinematicForwardSim(RACE_AGENT),
@@ -283,61 +385,94 @@ export function buildLearnedRaceLibrary(
  *     understands. */
 export function buildLearnedRaceLibraryV2(
   model: import('kinocat/agent').LearnedVehicleModel,
+  opts?: { generatedControls?: boolean },
 ): MotionPrimitiveLibrary {
-  const inner = learnedForwardSimV2(model);
-  const cfg = model.config;
-  // Duration tuned per-regime: enough time for control differences to
-  // produce DISTINGUISHABLE endpoints (so the planner has real choices)
-  // but not so long that the planner can't react to nearby gates.
-  // At v=0 the chassis needs ~1.5 s to accelerate to a speed where turn
-  // dynamics differentiate. At speed, brake-into-corner trajectories need
-  // ~0.8 s to develop (5.5 m/s² brake decel × 0.8 s = 4.4 m/s of speed
-  // change, enough to discriminate plans). The regime → control-set
-  // mapping follows the same physics rationale as the original 4-bucket
-  // layout; the denser RACE_START_SPEEDS grid just samples each regime
-  // at more start speeds so nearest-bucket quantization stays ≤ 2 m/s.
-  // Duration parity with the kinematic library (0.55 s) once the chassis
-  // is moving: the planner's decision cadence is part of the "identical
-  // system" contract, and longer v2 primitives measurably cost agility
-  // in the slalom (fewer direction changes per second available to the
-  // search). Only the launch bucket keeps a longer window — from rest,
-  // 0.55 s of full throttle covers < 1 m and endpoints barely
-  // differentiate.
+  return buildRaceLibraryFromSim(learnedForwardSimV2(model), model.config, opts);
+}
+
+/** v3 race library: same per-bucket durations and speed-aware control sets
+ *  as the v2 builder (those are planner-vocabulary policy, not model
+ *  internals), but every trajectory is rolled by the PURELY learned v3
+ *  neural dynamics model — no parametric backbone anywhere in the loop. */
+export function buildLearnedRaceLibraryV3(
+  model: import('kinocat/agent').LearnedVehicleModelV3,
+  opts?: { generatedControls?: boolean },
+): MotionPrimitiveLibrary {
+  return buildRaceLibraryFromSim(forwardSimV3(model), model.config, opts);
+}
+
+/** Shared bucket layout for learned race libraries (v2 + v3).
+ *
+ *  Duration tuned per-regime: enough time for control differences to
+ *  produce DISTINGUISHABLE endpoints (so the planner has real choices)
+ *  but not so long that the planner can't react to nearby gates.
+ *  At v=0 the chassis needs ~1.5 s to accelerate to a speed where turn
+ *  dynamics differentiate. The regime → control-set mapping follows the
+ *  same physics rationale as the original 4-bucket layout; the denser
+ *  RACE_START_SPEEDS grid just samples each regime at more start speeds
+ *  so nearest-bucket quantization stays ≤ 2 m/s. Duration parity with the
+ *  kinematic library (0.55 s) once the chassis is moving: the planner's
+ *  decision cadence is part of the "identical system" contract, and
+ *  longer primitives measurably cost agility in the slalom. */
+function buildRaceLibraryFromSim(
+  inner: import('kinocat/primitives').ForwardSim<CarKinematicState>,
+  cfg: CfgLike,
+  opts?: { generatedControls?: boolean },
+): MotionPrimitiveLibrary {
+  // Opt-in dispersion-designed control sets (skill K5). Default keeps the
+  // hand-authored tiers; `KINOCAT_GEN_CONTROLS=1` (or the explicit option)
+  // switches to farthest-point spanning sets rolled through THIS model's own
+  // dynamics, so the planner sees the chassis's real cornering envelope.
+  const gen =
+    opts?.generatedControls ??
+    (typeof process !== 'undefined' && process.env?.KINOCAT_GEN_CONTROLS === '1');
   const regimeFor = (v: number): { duration: number; controls: number[][] } => {
-    // Launch bucket keeps 1.5 s: from rest the acceleration phase
-    // dominates and a shorter window collapses the endpoint fan below
-    // the planner-usability floor (primitive-diagnostics asserts
-    // hull ≥ 0.5 m²; 1.0 s measured 0.26 m²).
-    if (v < 2) return { duration: 1.5, controls: lowSpeedV2Controls(cfg) };
-    // 4 m/s bucket needs 0.8 s for a non-degenerate endpoint fan
-    // (0.55 s measured hull 0.19 m² < the 0.5 m² usability floor).
-    // (Launch-style controls here were measured WORSE: 21 failed
-    // replans on the flying lap — the coast/brake options matter.)
-    if (v < 6) return { duration: 0.8, controls: midSpeedV2Controls(cfg) };
-    if (v < 14) return { duration: 0.55, controls: midSpeedV2Controls(cfg) };
-    if (v < 23) return { duration: 0.55, controls: highSpeedV2Controls(cfg) };
-    return { duration: 0.55, controls: topSpeedV2Controls(cfg) };
+    // Launch bucket keeps 1.5 s; 4 m/s bucket 0.8 s; the rest 0.55 s (the
+    // endpoint fan collapses below the usability floor with shorter chunks).
+    const duration = v < 2 ? 1.5 : v < 6 ? 0.8 : 0.55;
+    if (gen) {
+      // Reverse shunts only matter in the low-speed buckets; high-speed buckets
+      // spend the whole budget on forward coverage.
+      const budget = v < 2 ? 18 : 14;
+      const reverseSlots = v < 6 ? 5 : 0;
+      const controls = designControlSet({
+        forwardSim: inner,
+        startSpeed: v,
+        duration,
+        substeps: 6,
+        budget,
+        maxSteer: cfg.maxSteerAngle,
+        maxDrive: cfg.maxDriveForce,
+        maxBrake: cfg.maxBrakeForce,
+        reverseSlots,
+      });
+      return { duration, controls };
+    }
+    if (v < 2) return { duration, controls: lowSpeedV2Controls(cfg) };
+    if (v < 6) return { duration, controls: midSpeedV2Controls(cfg) };
+    if (v < 14) return { duration, controls: midSpeedV2Controls(cfg) };
+    if (v < 23) return { duration, controls: highSpeedV2Controls(cfg) };
+    return { duration, controls: topSpeedV2Controls(cfg) };
   };
-  const buckets: Array<{
-    startSpeed: number;
-    duration: number;
-    controls: number[][];
-  }> = RACE_START_SPEEDS.map((v) => ({ startSpeed: v, ...regimeFor(v) }));
+  // Denser start-speed buckets on the generated (correctness) branch — half
+  // the snap error at zero per-node search cost. Default path unchanged.
+  const startSpeeds = gen ? RACE_START_SPEEDS_DENSE : RACE_START_SPEEDS;
   const all: import('kinocat/primitives').MotionPrimitive[] = [];
   let id = 0;
-  for (const b of buckets) {
+  for (const startSpeed of startSpeeds) {
+    const b = regimeFor(startSpeed);
     const lib = characterizeVehicle({
       forwardSim: inner,
       controlSets: b.controls,
       duration: b.duration,
       substeps: 6,
-      startSpeeds: [b.startSpeed],
+      startSpeeds: [startSpeed],
     });
     for (const p of lib.primitives) {
       all.push({ ...p, id: id++ });
     }
   }
-  return new MotionPrimitiveLibrary(all, RACE_START_SPEEDS);
+  return new MotionPrimitiveLibrary(all, startSpeeds);
 }
 
 type CfgLike = import('kinocat/agent').LearnableVehicleConfig;
@@ -461,8 +596,17 @@ export const RACE_ARRIVE_RADIUS = 2.5;
  *  Strictly less than RACE_ARRIVE_RADIUS so EVERY valid plan brings the
  *  chassis close enough that pickNextWaypoint will advance — prevents the
  *  "plan says I clipped the gate, real chassis overshot by ε, loopIndex
- *  stays, U-turn back" failure mode. */
+ *  stays, U-turn back" failure mode.
+ *
+ *  The TECHNICAL course tightens this to TECHNICAL_PLANNER_GATE_RADIUS via
+ *  its tuning defaults: near walls the pure-pursuit corner-cut can carry the
+ *  executed pass outside a 1.8 m aim ("just missed the checkpoint, backtrack")
+ *  — aiming at the gate centre keeps the cut inside the 2.5 m accept disk.
+ *  MEASURED: the tighter aim costs pace on the OPEN course (kin 33.0 →
+ *  46.8 s under the expansion cap — more expansions burnt per gate), so it
+ *  stays scoped to the walled variant where it buys smoothness. */
 export const RACE_PLANNER_GATE_RADIUS = 1.8;
+export const TECHNICAL_PLANNER_GATE_RADIUS = 1.2;
 
 export interface RacePlanRequest {
   state: CarKinematicState;
@@ -601,6 +745,20 @@ export interface RaceMultiGoalRequest {
    *  by default in `planVehicleMultiGoal`). Used by ablation harnesses
    *  to measure the cache's contribution. */
   disableHeuristicTable?: boolean;
+  /** WS-2 — dynamic rollouts. When set, a search node carrying slip (the
+   *  mid-corner replan root) expands via this live-characterized rollout
+   *  instead of the baked zero-slip library. See VehicleEnvOptions.rootRollout. */
+  rootRollout?: (state: CarKinematicState) => import('kinocat/primitives').MotionPrimitive[];
+  /** K5 — price the analytic (Reeds-Shepp) shot as a drive-through (honest
+   *  decel-to-stop cost) instead of the optimistic length/maxSpeed, so the
+   *  planner carries speed through gates instead of taking a mispriced analytic
+   *  stop to each. Correct for racing; heavier search — behind a flag. */
+  analyticDriveThrough?: boolean;
+  /** Weighted-A* heuristic multiplier (Pohl 1970): `f = g + weight·h`. 1 =
+   *  admissible/optimal (default). weight > 1 is ε-suboptimal but expands far
+   *  fewer nodes (2-10× at 1.5), turning "no plan in the real-time budget" into
+   *  "a good-enough plan fast" — the Tier-1 lever for real-time replanning. */
+  weight?: number;
   /** Agent the planner reasons about — must match the agent the supplied
    *  `lib` was characterised from (see `RacePlanRequest.agent`). Defaults to
    *  `RACE_AGENT`. */
@@ -631,6 +789,14 @@ export function planRaceMultiGoal(req: RaceMultiGoalRequest): PlanResult<CarKine
     envOptions.heuristicTable = false;
     usedEnvOptions = true;
   }
+  if (req.rootRollout) {
+    envOptions.rootRollout = req.rootRollout;
+    usedEnvOptions = true;
+  }
+  if (req.analyticDriveThrough) {
+    envOptions.analyticDriveThrough = true;
+    usedEnvOptions = true;
+  }
   return planVehicleMultiGoal({
     start: req.state,
     gates: req.gates,
@@ -643,6 +809,7 @@ export function planRaceMultiGoal(req: RaceMultiGoalRequest): PlanResult<CarKine
     maxExpansions: req.maxExpansions ?? RACE_MAX_EXPANSIONS * 2,
     gateRadius: req.gateRadius,
     envOptions: usedEnvOptions ? envOptions : undefined,
+    plannerOptions: req.weight && req.weight !== 1 ? { weight: req.weight } : undefined,
   });
 }
 
@@ -807,6 +974,11 @@ export interface RaceMetrics {
     /** Total replan attempts this race. */
     totalReplans: number;
   };
+  /** MPPI executor diagnostics — populated only while the scenario runs
+   *  the `'mpc'` tracker (0 under pure-pursuit). Surfaced in the HUD so
+   *  the active control stack is never ambiguous. */
+  mpcSolveMsAvg: number;
+  mpcSolveCount: number;
 }
 
 export function emptyMetrics(): RaceMetrics {
@@ -828,6 +1000,8 @@ export function emptyMetrics(): RaceMetrics {
       successfulReplans: 0,
       totalReplans: 0,
     },
+    mpcSolveMsAvg: 0,
+    mpcSolveCount: 0,
   };
 }
 

@@ -77,7 +77,9 @@ describe('paramsV2OutOfBounds', () => {
   });
 
   it('flags params outside the current physical-plausibility bounds', () => {
-    const stale = { ...DEFAULT_LEARNED_PARAMS_V2, brakeScale: 3.0, engineScale: 1.15 };
+    // engineScale ceiling is 2.2 (drivenWheelCount × F is the real
+    // propulsion force — the WS-0 envelope corrected the old 1.05 bound).
+    const stale = { ...DEFAULT_LEARNED_PARAMS_V2, brakeScale: 3.0, engineScale: 2.5 };
     const flagged = paramsV2OutOfBounds(stale);
     expect(flagged).toContain('brakeScale');
     expect(flagged).toContain('engineScale');

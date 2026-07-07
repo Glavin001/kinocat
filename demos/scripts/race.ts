@@ -15,17 +15,26 @@ import {
   kinematicEntry,
   parametricOnlyEntry,
   v2Entry,
+  v3Entry,
   type RaceEntry,
   type RaceResult,
 } from '../app/lib/headless-race';
+import { buildRaceCourse } from '../app/lib/race-primitives-scenarios';
 import { modelFromJson } from '../app/lib/v2-model-file';
 import type { PersistedV2Model } from '../app/lib/v2-model-persistence';
+import { isV3Payload, v3FromJson } from 'kinocat/agent';
 
+/** Route by payload shape: v3 dynamics artifacts carry `kind:
+ *  'v3-dynamics'`; anything else is a persisted v2 model. */
 function loadModelEntry(path: string, displayName?: string): RaceEntry {
   const text = readFileSync(path, 'utf-8');
-  const payload = JSON.parse(text) as PersistedV2Model;
-  const model = modelFromJson(payload);
-  return v2Entry(displayName ?? basename(path).replace(/\.json$/, ''), model);
+  const payload = JSON.parse(text);
+  const name = displayName ?? basename(path).replace(/\.json$/, '');
+  if (isV3Payload(payload)) {
+    return v3Entry(name, v3FromJson(payload));
+  }
+  const model = modelFromJson(payload as PersistedV2Model);
+  return v2Entry(name, model);
 }
 
 function fmt(s: number): string {
@@ -52,6 +61,7 @@ async function main(): Promise<void> {
       quick: { type: 'boolean', default: false },
       'no-kinematic': { type: 'boolean', default: false },
       'no-parametric': { type: 'boolean', default: false },
+      course: { type: 'string', default: 'open' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -87,19 +97,22 @@ async function main(): Promise<void> {
   }
 
   const targetLaps = quick ? 1 : laps;
-  process.stdout.write(`race-primitives benchmark — seed=${values.seed} laps=${targetLaps} dt=1/60\n`);
+  const variant = values.course === 'technical' ? 'technical' : 'open';
+  const course = buildRaceCourse(variant);
+  process.stdout.write(`race-primitives benchmark — seed=${values.seed} laps=${targetLaps} course=${variant} dt=1/60\n`);
 
   const results = await runHeadlessRace({
     entries,
     targetLaps,
     maxSimTime,
+    course,
     onProgress: (msg) => process.stdout.write(`  · ${msg}\n`),
     progressEverySec: 10,
   });
 
   // Print table.
-  const widths = [22, 7, 7, 7, 7, 7, 7, 9];
-  const header = ['model', 'status', 'laps', 'lap1', 'lap2', 'lap3', 'best', 'avg'];
+  const widths = [22, 7, 7, 7, 7, 7, 7, 9, 7, 7];
+  const header = ['model', 'status', 'laps', 'lap1', 'lap2', 'lap3', 'best', 'avg', 'wall', 'offTr'];
   process.stdout.write('\n' + tableLine(header, widths) + '\n');
   for (const r of results) {
     const status = r.finished ? 'OK' : 'DNF';
@@ -108,8 +121,37 @@ async function main(): Promise<void> {
     const lap3 = r.laps[2] ? fmt(r.laps[2].duration) : '---';
     process.stdout.write(
       tableLine(
-        [r.name, status, `${r.laps.length}/${targetLaps}`, lap1, lap2, lap3, fmt(r.best), fmt(r.avg)],
+        [r.name, status, `${r.laps.length}/${targetLaps}`, lap1, lap2, lap3, fmt(r.best), fmt(r.avg), r.wallStrikes, r.offTrackEvents],
         widths,
+      ) + '\n',
+    );
+  }
+  process.stdout.write('\n');
+
+  // Driving-quality report — the "how well is it driving" comparison
+  // beyond lap time: line efficiency (m driven per lap), tire utilization
+  // (g-g), smoothness (jerk), hesitation (stopped/reversing time), and
+  // stuck-recovery count.
+  const qWidths = [22, 10, 9, 9, 9, 9, 10, 9];
+  process.stdout.write(
+    tableLine(['model', 'dist/lap', 'meanSpd', 'ggMean', 'ggPeak', 'jerkRms', 'stopped', 'recov'], qWidths) + '\n',
+  );
+  for (const r of results) {
+    const q = r.quality;
+    const perLap = r.laps.length > 0 ? q.distanceTravelled / r.laps.length : NaN;
+    process.stdout.write(
+      tableLine(
+        [
+          r.name,
+          Number.isFinite(perLap) ? `${perLap.toFixed(0)}m` : '---',
+          `${q.meanSpeed.toFixed(1)}m/s`,
+          q.ggMeanUtil.toFixed(3),
+          q.ggPeakUtil.toFixed(2),
+          q.longJerkRms.toFixed(0),
+          `${q.timeStopped.toFixed(1)}s`,
+          q.recoveryCount,
+        ],
+        qWidths,
       ) + '\n',
     );
   }

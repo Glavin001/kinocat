@@ -40,6 +40,13 @@ export type {
 export { runResidualMLPFit, runResidualMLPFitAsync } from './residual-mlp-fit';
 
 export type {
+  DynamicsV3FitOptions,
+  DynamicsV3FitResult,
+  CarTrial,
+} from './dynamics-v3-fit';
+export { runDynamicsV3Fit } from './dynamics-v3-fit';
+
+export type {
   ModelDiagnostics,
   OpenLoopRow,
   CoverageCell,

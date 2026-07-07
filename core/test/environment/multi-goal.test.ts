@@ -117,6 +117,28 @@ describe('MultiGoalEnvironment — wrapper semantics', () => {
     expect(done.h).toBe(0);
   });
 
+  it('succ reuses the base heuristic exactly (fast-wrap == from-scratch h)', () => {
+    // Perf: succ() wraps each base successor by reusing its already-computed
+    // heuristic instead of recomputing (the double-heuristic elimination). This
+    // must be numerically identical to computing the multi-goal heuristic from
+    // scratch for the successor state, or the search geometry changes.
+    const base = buildBase();
+    const gates: R2State[] = [{ x: 5, y: 0 }, { x: 10, y: 5 }, { x: 15, y: 0 }];
+    const env = new MultiGoalEnvironment(base, {
+      gates, reachedGate: (s, g) => reachedR2(s, g, 1),
+    });
+    const parent = env.createNode({ inner: { x: 2, y: 1 }, gateIndex: 0 }, null, null);
+    const succs = env.succ(parent, env.createNode(multiGoalTerminal(gates), null, null));
+    expect(succs.length).toBeGreaterThan(0);
+    for (const sc of succs) {
+      const fromScratch = env.heuristic(sc.state, sc.state);
+      expect(sc.h).toBeCloseTo(fromScratch, 9);
+      expect(sc.f).toBeCloseTo(sc.g + fromScratch, 9);
+      // hash/index still distinguish gateIndex.
+      expect(sc.hash).toContain(`g${sc.state.gateIndex}`);
+    }
+  });
+
   it('finds a plan through gates on the R2 plane', () => {
     const base = buildBase();
     const gates: R2State[] = [{ x: 5, y: 0 }, { x: 5, y: 5 }, { x: 0, y: 5 }];

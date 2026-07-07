@@ -32,7 +32,13 @@ export { smoothTrajectory, type TrajectorySmoothOptions } from './trajectory-smo
 export {
   mpcTrack,
   createMPCTrackerState,
+  extendPlanForTracking,
+  buildProgressGeometry,
+  scoreRolloutProgress,
   type MPCTrackerConfig,
   type MPCTrackerState,
   type MPCCommand,
+  type MPCDebugInfo,
+  type ProgressGeometry,
+  type ProgressWeights,
 } from './mpc-tracker';

@@ -2,6 +2,7 @@ import type { Environment, EdgeRef, Node } from './types';
 import type { NavWorld } from './nav-world';
 import type { VehicleAgent, CarKinematicState } from '../agent/types';
 import type { MotionPrimitiveLibrary } from '../primitives/library';
+import type { MotionPrimitive } from '../primitives/types';
 import { makeNode } from '../planner/node';
 import { pack3 } from '../planner/resolution';
 import { placeFootprintInto } from '../internal/geom';
@@ -9,6 +10,18 @@ import { angleDiff, dist, wrapAngle } from '../internal/math';
 import { reedsSheppShortestPath } from '../curves/reeds-shepp';
 import { sampleCurveWithGear } from '../curves/sample';
 import { NULL_RECORDER, type PerfRecorder } from '../planner/perf';
+
+/** Minimum traversal speed (m/s) used when pricing a drive-through analytic
+ *  shot by decel-to-stop time — guards the division when the entry speed is
+ *  near rest so the cost stays finite and the maneuver stays selectable. */
+const ANALYTIC_DRIVETHROUGH_VFLOOR = 4;
+/** Fraction of entry speed used as the average traversal speed when pricing a
+ *  drive-through analytic shot (it decelerates to rest, so avg < entry). Lower
+ *  = more punitive (fewer stop-shortcuts, but heavier search); 0.5 = the honest
+ *  cruise-then-brake average. Raising it toward ~0.75 discourages the mispriced
+ *  stop while keeping the analytic shot cheap enough that the search stays
+ *  tractable (fewer expansions). */
+const ANALYTIC_DRIVETHROUGH_AVG_FRAC = 0.7;
 
 export interface VehicleEnvOptions {
   posCell?: number;
@@ -32,6 +45,19 @@ export interface VehicleEnvOptions {
    * `{ everyN, step }`) to enable; `false` is the explicit disable.
    */
   analyticExpansion?: false | { everyN?: number; step?: number };
+  /**
+   * Price the analytic (Reeds-Shepp) shot as a DRIVE-THROUGH rather than a
+   * stop. The analytic shot always ends at `speed: 0` and is normally
+   * time-costed `length / maxSpeed` — free-flowing pricing for a maneuver that
+   * actually comes to rest. For a STOP goal (parking) that is correct. For a
+   * drive-through goal (racing gates) it mis-sells the stop as fast, so the
+   * planner takes an analytic stop-shortcut to every gate instead of a
+   * speed-carrying spline. When true, the analytic edge is instead costed by
+   * the honest decel-to-stop time (~`length / (vEntry/2)`), so a stop only wins
+   * where the maneuver genuinely must slow. Default false (parking / single-goal
+   * unchanged). Set by the multi-goal race planner.
+   */
+  analyticDriveThrough?: boolean;
   /**
    * Reeds-Shepp heuristic lookup table (Dolgov et al. Hybrid A*; spec §12.3).
    * The RS shortest-path heuristic is the dominant per-successor cost. Since
@@ -88,6 +114,20 @@ export interface VehicleEnvOptions {
   /** Cost per metre of perpendicular deviation from `referencePath`.
    *  Default 0.1 (s/m if you read the time-cost as seconds). */
   referenceWeight?: number;
+  /**
+   * WS-2 — DYNAMIC ROLLOUTS. When provided, any node whose state carries
+   * meaningful slip (|yawRate| or |lateralVelocity| above a small threshold)
+   * is expanded by rolling THIS function's live-characterized primitives
+   * instead of the baked, zero-slip `lib.lookup(speed)`. Because successors
+   * drop the slip dims, this fires only at the search root (a mid-corner
+   * replan start state), which is exactly where the baked zero-slip library
+   * mis-predicts — the committed first primitive becomes model-consistent
+   * with the chassis's true dynamic state. The callback receives the node
+   * state (with slip) and must return primitives in the node's LOCAL frame
+   * (start at origin, heading 0), as `characterizeVehicleFromState` does.
+   * Pure + deterministic. Omitted ⇒ classic baked-library expansion.
+   */
+  rootRollout?: (state: CarKinematicState) => MotionPrimitive[];
 }
 
 interface DriveEdgeData {
@@ -120,15 +160,13 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
   private readonly analyticEnabled: boolean;
   private readonly analyticEveryN: number;
   private readonly analyticStep: number;
+  private readonly analyticDriveThrough: boolean;
   private succCount = 0;
   private readonly htEnabled: boolean;
   private readonly htPos: number;
   private readonly htHead: number;
   private readonly htSlack: number;
   private readonly hCache = new Map<string, number>();
-  private hGoalX = NaN;
-  private hGoalZ = NaN;
-  private hGoalH = NaN;
   private readonly cbEnabled: boolean;
   private readonly rCirc: number;
   // Scratch buffer reused by every collision-check footprint placement to
@@ -137,13 +175,18 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
   private readonly fpScratch: Array<[number, number]>;
   private readonly ghEnabled: boolean;
   private readonly ghWeight: number;
-  private ghGoalX = NaN;
-  private ghGoalZ = NaN;
   private ghRev = -1;
-  private ghLB: ((x: number, z: number, y?: number) => number | null) | null = null;
+  // Obstacle-aware goal lower bound, cached PER GOAL. A multi-goal search
+  // flips the goal between gates as interleaved gateIndex nodes expand; a
+  // single-goal memo would rebuild the (expensive) Dijkstra field on every
+  // flip. Each `buildGoalLowerBound` call returns a closure over its OWN
+  // distance field, so caching the closure per goal means the field is built
+  // once per gate per replan and reused across all flips.
+  private ghLBByGoal = new Map<string, ((x: number, z: number, y?: number) => number | null) | null>();
   private rec: PerfRecorder = NULL_RECORDER;
   private readonly refPath: ReadonlyArray<{ x: number; z: number }>;
   private readonly refWeight: number;
+  private readonly rootRollout?: (state: CarKinematicState) => MotionPrimitive[];
 
   constructor(
     private readonly world: NavWorld,
@@ -163,6 +206,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     this.analyticEnabled = ae !== undefined && ae !== false;
     this.analyticEveryN = this.analyticEnabled ? ((ae as { everyN?: number }).everyN ?? 6) : 0;
     this.analyticStep = this.analyticEnabled ? ((ae as { step?: number }).step ?? 0.4) : 0;
+    this.analyticDriveThrough = opts.analyticDriveThrough ?? false;
     const ht = opts.heuristicTable; // opt-in: disabled unless provided
     this.htEnabled = ht !== undefined && ht !== false;
     this.htPos = this.htEnabled ? ((ht as { posCell?: number }).posCell ?? this.posCell) : 1;
@@ -190,6 +234,7 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     this.ghWeight = this.ghEnabled ? ((gh as { weight?: number }).weight ?? 1) : 1;
     this.refPath = opts.referencePath ?? [];
     this.refWeight = this.refPath.length >= 2 ? (opts.referenceWeight ?? 0.1) : 0;
+    this.rootRollout = opts.rootRollout;
     this.levels = this.divisors.length;
   }
 
@@ -316,7 +361,18 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
         : undefined;
     const out: Node<CarKinematicState>[] = [];
 
-    for (const prim of this.lib.lookup(st.speed)) {
+    // WS-2: expand from the chassis's true dynamic state when it carries
+    // meaningful slip (the mid-corner replan root), rolling the caller's live
+    // model instead of the baked zero-slip library. Successors drop the slip
+    // dims, so this naturally scopes to the root node.
+    const hasSlip =
+      this.rootRollout !== undefined &&
+      (Math.abs(st.yawRate ?? 0) > 1e-3 || Math.abs(st.lateralVelocity ?? 0) > 1e-3);
+    const prims: readonly MotionPrimitive[] = hasSlip
+      ? this.rootRollout!(st)
+      : this.lib.lookup(st.speed);
+
+    for (const prim of prims) {
       if (!this.sweepClear(st, prim.sweep)) continue;
 
       const ex = st.x + prim.end.dx * c - prim.end.dz * s;
@@ -409,10 +465,20 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     let cost = 0;
     let hasReverse = false;
     let prevReverse = parentReverse;
+    // Speed used to convert analytic path length → time cost. A stop goal
+    // (default) is priced optimistically at maxSpeed — cheap-is-right, you were
+    // stopping anyway. A DRIVE-THROUGH goal must pay the honest decel-to-stop
+    // time: the shot ends at rest (see `next` below), so from entry speed the
+    // average traversal speed is ~vEntry/2. Without this the planner takes a
+    // mispriced analytic stop-shortcut to every drive-through gate instead of
+    // carrying speed through a spline (skill K5).
+    const vTraverse = this.analyticDriveThrough
+      ? Math.max(a.speed * ANALYTIC_DRIVETHROUGH_AVG_FRAC, ANALYTIC_DRIVETHROUGH_VFLOOR)
+      : this.agent.maxSpeed;
     for (const seg of path.segments) {
       const rev = seg.gear < 0;
       hasReverse ||= rev;
-      cost += (seg.length * (rev ? this.agent.reverseCostMultiplier : 1)) / this.agent.maxSpeed;
+      cost += (seg.length * (rev ? this.agent.reverseCostMultiplier : 1)) / vTraverse;
       if (rev !== prevReverse) cost += this.agent.directionChangePenalty;
       prevReverse = rev;
     }
@@ -422,7 +488,10 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
       z: b.z,
       heading: b.heading,
       speed: 0,
-      t: a.t + path.length / this.agent.maxSpeed,
+      // Traverse TIME must match the cost's traversal speed, else the plan's
+      // timestamp is too short and the executor sees a fake huge decel across
+      // this segment. Drive-through: honest decel-to-stop average; else maxSpeed.
+      t: a.t + path.length / vTraverse,
     };
     const edge: EdgeRef = {
       cost,
@@ -441,17 +510,18 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
     const euclid = dist(from.x, from.z, to.x, to.z);
     let tRS: number;
     if (this.htEnabled) {
-      if (to.x !== this.hGoalX || to.z !== this.hGoalZ || to.heading !== this.hGoalH) {
-        this.hCache.clear();
-        this.hGoalX = to.x;
-        this.hGoalZ = to.z;
-        this.hGoalH = to.heading;
-      }
       const cx = Math.round(from.x / this.htPos);
       const cz = Math.round(from.z / this.htPos);
       const stepH = (2 * Math.PI) / this.htHead;
       const ch = Math.round(wrapAngle(from.heading) / stepH);
-      const key = `${cx}:${cz}:${ch}`;
+      // Key on BOTH the source cell AND the goal pose. A multi-goal search
+      // flips the goal between gates as interleaved gateIndex nodes expand;
+      // keying only on the source and clearing the cache on every goal change
+      // (the old behaviour) wiped it on each flip — defeating the table in
+      // exactly the multi-goal case where it's enabled by default. Goals are
+      // few (the gates), so a goal-prefixed key stays small and the RS solves
+      // are reused across flips instead of recomputed.
+      const key = `${to.x}:${to.z}:${to.heading}|${cx}:${cz}:${ch}`;
       let rs = this.hCache.get(key);
       if (rs === undefined) {
         rs = reedsSheppShortestPath(
@@ -473,20 +543,20 @@ export class VehicleEnvironment implements Environment<CarKinematicState> {
       tRS = Math.max(rs, euclid) / this.agent.maxSpeed;
     }
     if (this.ghEnabled) {
-      // Revision guard: a tile rebuild under a long-lived env must not keep
-      // serving a lower bound computed against the old geometry.
-      if (
-        to.x !== this.ghGoalX ||
-        to.z !== this.ghGoalZ ||
-        this.world.revision !== this.ghRev
-      ) {
-        this.ghGoalX = to.x;
-        this.ghGoalZ = to.z;
+      // Revision guard: a tile rebuild under a long-lived env invalidates every
+      // cached field (they were computed against the old geometry).
+      if (this.world.revision !== this.ghRev) {
         this.ghRev = this.world.revision;
-        this.ghLB = this.world.buildGoalLowerBound!(to.x, to.z);
+        this.ghLBByGoal.clear();
       }
-      if (this.ghLB) {
-        const d = this.ghLB(from.x, from.z);
+      const gkey = `${to.x}:${to.z}`;
+      let lb = this.ghLBByGoal.get(gkey);
+      if (lb === undefined) {
+        lb = this.world.buildGoalLowerBound!(to.x, to.z);
+        this.ghLBByGoal.set(gkey, lb);
+      }
+      if (lb) {
+        const d = lb(from.x, from.z);
         if (d !== null) {
           const tGrid = (d * this.ghWeight) / this.agent.maxSpeed;
           if (tGrid > tRS) return tGrid;

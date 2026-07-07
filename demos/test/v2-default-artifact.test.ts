@@ -22,14 +22,12 @@ function loadArtifact(): { params: LearnedVehicleParamsV2; config: LearnableVehi
 }
 
 describe('shipped v2-default.json artifact', () => {
-  // KNOWN STALE: the shipped artifact was fit when PARAMS_V2_HI allowed
-  // brakeScale 3.5 / engineScale 1.2 / steerRatio 1.35; the bounds were
-  // later tightened on physical-plausibility grounds but the artifact
-  // was never re-fit. Loading is still permitted (the residual ensemble
-  // was trained around these exact backbone values, so clamping would
-  // degrade it) — but the artifact should be regenerated. Flip this to
-  // `it` when a re-fit artifact lands.
-  it.fails('params are within the current fit bounds (requires artifact re-fit)', () => {
+  // The artifact is now regenerated reproducibly (fixed seed, current
+  // bounds, grip-saturating brake model) by `pnpm run train` — see the
+  // manifest sidecar for the git SHA / seed / trial count. Its params are
+  // within the current fit bounds, so this is a passing `it` (flipped from
+  // the historical `it.fails` that recorded the stale overnight artifact).
+  it('params are within the current fit bounds', () => {
     const { params } = loadArtifact();
     expect(paramsV2OutOfBounds(params)).toEqual([]);
   });

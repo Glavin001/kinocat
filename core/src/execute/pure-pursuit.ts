@@ -147,9 +147,16 @@ export function purePursuit(
   }
 
   const vCurve = Math.sqrt(config.maxLateralAccel / Math.max(Math.abs(kappa), 1e-3));
-  const vGoal = Math.sqrt(
-    2 * config.maxDecel * Math.max(distToGoal - config.goalTolerance, 0),
-  );
+  // WS-1: phantom horizon braking. The brake-to-goal ramp is correct for a
+  // plan that STOPS at its end (parking), but for a drive-through racing
+  // horizon the "goal" is just the 2-gate replanning window — braking toward
+  // it pins the car in a permanent deceleration toward a finish that doesn't
+  // exist. When `noGoalBrakeOnDriveThrough` is set, drive-through plans get
+  // `vGoal = ∞` so only the real caps (curve/preview/path/cruise) bind.
+  const vGoal =
+    config.noGoalBrakeOnDriveThrough && !stopsAtEnd
+      ? Infinity
+      : Math.sqrt(2 * config.maxDecel * Math.max(distToGoal - config.goalTolerance, 0));
 
   // Optional path-speed cap: consume the plan's per-sample speed intent
   // through the BRAKING ENVELOPE, not a raw window-min. A future planned
@@ -255,20 +262,40 @@ export function purePursuit(
 
   let throttle = 0;
   let brake = 0;
+  const tgtMag = Math.abs(targetSpeed);
+  const curMag = Math.abs(current.speed);
   if (atGoal) {
     brake = 1;
-  } else if (Math.abs(targetSpeed) > Math.abs(current.speed) + 1e-6) {
-    throttle = clamp(
-      (Math.abs(targetSpeed) - Math.abs(current.speed)) / config.maxAccel,
-      0,
-      1,
-    );
-  } else if (Math.abs(targetSpeed) < Math.abs(current.speed) - 1e-6) {
-    brake = clamp(
-      (Math.abs(current.speed) - Math.abs(targetSpeed)) / config.maxDecel,
-      0,
-      1,
-    );
+  } else if (config.bangBangThrottle) {
+    // WS-1: faithful attainment of the planner's commanded speed, with
+    // SEPARATE accelerate- and brake-side hysteresis bands:
+    //   - `accelBand` (config.coastBand): floor the throttle only once the
+    //     deficit exceeds it. A wider band drives more gently toward the
+    //     setpoint (the open course needs this so the kinematic delusion is
+    //     not over-driven into a wedge); a zero band floors it out of every
+    //     corner decisively (the technical course's tight gates need this).
+    //   - `brakeBand` (config.coastBandBrake): coast rather than brake when
+    //     only slightly above the setpoint — prevents throttle↔brake dither
+    //     AND (measured) prevents an over-brake wedge on the technical course.
+    // Between the two bands the chassis COASTS (zero throttle, zero brake) —
+    // the human "lift and glide" that is far gentler than this near-binary
+    // raycast brake. Launch exception: from (near) rest, any positive planned
+    // speed floors it (a slow first corner must still pull away from rest).
+    // NONE of this forces speed — the planner picks the target; the executor
+    // just stops softening it with the old asymptotic P-law.
+    const accelBand = config.coastBand ?? 0.5;
+    const brakeBand = config.coastBandBrake ?? 0.5;
+    const launching = curMag < 0.3 && tgtMag > 0.05;
+    if (tgtMag > curMag + accelBand || launching) {
+      throttle = 1;
+    } else if (tgtMag < curMag - brakeBand) {
+      brake = clamp((curMag - tgtMag) / config.maxDecel, 0, 1);
+    }
+    // else: between the bands — coast (zero throttle, zero brake).
+  } else if (tgtMag > curMag + 1e-6) {
+    throttle = clamp((tgtMag - curMag) / config.maxAccel, 0, 1);
+  } else if (tgtMag < curMag - 1e-6) {
+    brake = clamp((curMag - tgtMag) / config.maxDecel, 0, 1);
   }
 
   return {

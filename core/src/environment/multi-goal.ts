@@ -125,18 +125,44 @@ export class MultiGoalEnvironment<S> implements Environment<MultiGoalState<S>> {
       ? this.base.succ(innerNode, innerGoal, level)
       : this.base.succ(innerNode, innerGoal);
     const out: Node<MultiGoalState<S>>[] = [];
+    const gateIndex = node.state.gateIndex;
+    const tail = this.tailLowerBound[gateIndex] ?? 0;
     for (const inner of innerSuccs) {
       // Greedy gate advance: a single primitive can sweep past multiple
       // gates on a tight loop, so chase them all in one step.
-      let newIdx = node.state.gateIndex;
+      let newIdx = gateIndex;
       while (
         newIdx < this.gates.length &&
         this.reachedGate(inner.state, this.gates[newIdx]!)
       ) {
         newIdx++;
       }
-      const succState: MultiGoalState<S> = { inner: inner.state, gateIndex: newIdx };
-      out.push(this.createNode(succState, node, inner.edge));
+      // Fast wrap: reuse the inner successor node the base env just built —
+      // its `index`, `hash`, and (crucially) its already-computed heuristic
+      // `h = base.heuristic(inner, gates[gateIndex])`. Rebuilding a fresh inner
+      // node via `createNode` here would recompute that Reeds-Shepp solve (the
+      // dominant per-successor cost) a SECOND time and rebuild the index/hash
+      // strings — pure waste. Only when a gate was crossed (newIdx advanced)
+      // does the head gate change, so inner.h no longer matches and we fall
+      // back to the full heuristic.
+      const tag = `g${newIdx}`;
+      const h =
+        newIdx === gateIndex
+          ? inner.h + tail
+          : this.heuristic({ inner: inner.state, gateIndex: newIdx }, node.state);
+      out.push({
+        state: { inner: inner.state, gateIndex: newIdx },
+        g: inner.g,
+        h,
+        f: inner.g + h,
+        parent: node,
+        edge: inner.edge,
+        index: inner.index.map((k) => `${k}|${tag}`),
+        hash: `${inner.hash}|${tag}`,
+        level: 0,
+        active: true,
+        seq: 0,
+      });
     }
     return out;
   }

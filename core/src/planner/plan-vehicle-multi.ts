@@ -61,6 +61,10 @@ const DEFAULT_ENV_OPTIONS: VehicleEnvOptions = {
   goalHeadingTol: Infinity,
   sweepSegmentCheck: false,
   analyticExpansion: { everyN: 6, step: 0.6 },
+  // analyticDriveThrough is left to the caller (default false). It is
+  // theoretically correct for racing (gates are drive-through) but makes the
+  // search work harder, so it ships behind a flag we validate for correctness
+  // first (generous planner budget) and optimize for runtime separately.
   // Reeds-Shepp heuristic lookup table (Dolgov et al. Hybrid A*; spec
   // §12.3). The RS shortest-path heuristic is the dominant per-successor
   // cost in this environment; caching it by quantised source pose turns
@@ -71,6 +75,19 @@ const DEFAULT_ENV_OPTIONS: VehicleEnvOptions = {
   // headingBuckets so the table is sized consistently with the search
   // grid.
   heuristicTable: {},
+  // NOTE: `clearanceBroadphase` is intentionally NOT enabled here. It was
+  // measured to be BOTH unsafe and unhelpful on the walled technical course:
+  // the clearance grid (cell size up to 5 m) over-estimates the distance to a
+  // wall EDGE, so the "provably clear" early-accept admits a swept footprint
+  // that actually clips the wall — the planner then routes a wall-clipping
+  // primitive as clear (measured: v2 went from ≤1 to 4 wall strikes). And on
+  // the tight course there is little clearance to accept anyway. It stays a
+  // per-request opt-in (`envOptions.clearanceBroadphase`) for open worlds with
+  // a fine clearance field.
+  // The obstacle-aware grid heuristic (`gridHeuristic`) is likewise off: it
+  // helped <2% here (kinodynamic Reeds-Shepp cost dominates the obstacle-detour
+  // cost, so max(RS, grid) ≈ RS). Its per-goal caching lives in
+  // VehicleEnvironment for when a course IS detour-dominated.
 };
 
 const DEFAULT_TIME_OPTIONS: Omit<TimeAwareOptions, 'obstacles' | 'affordances'> = {
