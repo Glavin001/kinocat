@@ -729,6 +729,10 @@ export interface RaceEntry {
    *  pure-pursuit-only entries and legacy callers are unaffected). Native
    *  `[steer, driveForce, brakeForce]` controls. */
   forwardModel?: ForwardSim<CarKinematicState>;
+  /** Per-car tuning override, merged OVER the scenario `tuning` for THIS car
+   *  only. Lets one race run two cars with different trackers / planner
+   *  configs (e.g. an A/B: kinematic+pure-pursuit vs v3+MPPI+feedforward). */
+  tuning?: Partial<RaceTuning>;
 }
 
 export interface RaceLap {
@@ -899,11 +903,162 @@ export interface RaceScenario {
 // ---------------------------------------------------------------------------
 // Internal state
 
+/** MPPI horizon length (steps) in `track` cost mode. */
+const MPC_HORIZON = 10;
+
+/** Pure-pursuit tracker config derived from a tuning bundle. Extracted so
+ *  each car can derive its OWN config from its OWN effective tuning (the
+ *  per-car A/B). Anything not set falls through to the chassis-level race
+ *  defaults. Same inputs → byte-identical output as the old shared const. */
+function buildTrackerConfig(tuning: RaceTuning) {
+  return {
+    ...PURE_PURSUIT_CONFIG,
+    maxAccel: tuning.trackerMaxAccel ?? PURE_PURSUIT_CONFIG.maxAccel,
+    maxDecel: tuning.trackerMaxDecel ?? PURE_PURSUIT_CONFIG.maxDecel,
+    cruiseSpeed: tuning.cruiseSpeed ?? PURE_PURSUIT_CONFIG.cruiseSpeed,
+    goalTolerance: tuning.goalTolerance ?? PURE_PURSUIT_CONFIG.goalTolerance,
+    lookaheadMin: tuning.lookaheadMin ?? PURE_PURSUIT_CONFIG.lookaheadMin,
+    lookaheadGain: tuning.lookaheadGain ?? PURE_PURSUIT_CONFIG.lookaheadGain,
+    lookaheadMax: tuning.lookaheadMax ?? PURE_PURSUIT_CONFIG.lookaheadMax,
+    minApproachSpeed: tuning.minApproachSpeed,
+    reverseCruiseSpeed: tuning.reverseCruiseSpeed,
+    minTurnRadius: tuning.trackerMinTurnRadius ?? PURE_PURSUIT_CONFIG.minTurnRadius,
+    curvatureFeedforward: tuning.curvatureFeedforward ?? false,
+    respectPathSpeed: tuning.respectPathSpeed,
+    noGoalBrakeOnDriveThrough: tuning.noGoalBrakeOnDriveThrough ?? false,
+    bangBangThrottle: tuning.bangBangThrottle ?? false,
+    coastBand: tuning.coastBand,
+    previewLateralAccel:
+      tuning.previewLateralAccel ?? PURE_PURSUIT_CONFIG.previewLateralAccel,
+    headingGain: tuning.terminalHeadingGain ?? 0,
+    // The runner gates the heading term on distance to the TRUE goal (see the
+    // controller loop), so pure-pursuit's own per-path-end radius stays open.
+    headingRadius: Infinity,
+  };
+}
+type TrackerConfig = ReturnType<typeof buildTrackerConfig>;
+
+/** MPPI tracker config derived from a tuning bundle + that car's tracker
+ *  config (for cruiseSpeed) + the resolved cost-mode scalars. Extracted from
+ *  the old shared const so it can be built PER-CAR. Same inputs →
+ *  byte-identical output. */
+function buildMpcConfig(
+  tuning: RaceTuning,
+  trackerConfig: TrackerConfig,
+  mpcCostMode: 'track' | 'progress',
+  isProgress: boolean,
+  horizonSteps: number,
+) {
+  return {
+    horizonSteps,
+    stepDt: 0.05,
+    // MPPI sample count — the dominant term in the ~50 ms/solve cost. Halving
+    // it to 32 (even WITH the feedforward prior) was measured to degrade
+    // tracking on the progress cost — predErr 0.31 → 0.46 m and the technical
+    // lap was lost: this progress-cost MPPI needs the exploration to find
+    // corner-entry braking, and feedforward biases the prior but doesn't
+    // replace the search. Kept at 64; the knob stays for deliberate A/B.
+    // See docs/v3-realtime-performance-plan.md.
+    samples: tuning.mpcSamples ?? 64,
+    maxSteer: VEHICLE_TUNING.maxSteerAngle ?? 0.6,
+    maxDriveForce: ENGINE_FORCE_N,
+    maxBrakeForce: BRAKE_FORCE_N,
+    // Racing is forward-only (progress cost never selects reverse anyway —
+    // dropping the reverse half doubles useful drive exploration). Reverse
+    // plan SEGMENTS are still executed: the tracker detects the segment's
+    // gear from its stored speeds and samples the pedal channel in that
+    // gear, capped at the chassis reverse envelope.
+    allowReverse: !isProgress,
+    maxReverseSpeed:
+      tuning.reverseCruiseSpeed ?? Math.abs(RACE_AGENT.maxReverseSpeed ?? 6),
+    // λ must sit at the cost scale of the mode. The progress cost lives in
+    // the tens-to-hundreds (−wProgress·metres over a 1.5 s horizon), so the
+    // track mode's 0.5 collapses the softmax onto the single best sample — a
+    // per-solve argmax that re-picks a different coloured-noise maneuver
+    // every 0.05 s (measured: steering chatter, missed gates, wedges).
+    // λ=10 over-smooths the other way: the launch throttle averages toward
+    // zero across half-braking samples and the stuck detector fires.
+    lambda: isProgress ? 3 : 0.5,
+    // Progress mode needs real steering exploration: recovering a 45°+
+    // heading error (post-gate replan) takes |steer| ≈ 0.5 — unreachable
+    // from a zero prior at std 0.10 (5σ). The softmax + steer-rate cost
+    // keep the EMITTED steer smooth; exploration ≠ chatter.
+    steerStd: isProgress ? 0.28 : 0.10,
+    driveStd: 0.5 * ENGINE_FORCE_N,
+    // Progress mode explores braking decisively: the overspeed term needs
+    // real brake samples to find corner-entry braking (the near-binary
+    // raycast brake saturates by ~25% of full force, so 0.10·max is already
+    // a strong probe; the softmax discards the catastrophic ones).
+    brakeStd: 0.10 * BRAKE_FORCE_N,
+    wLateral: 2,
+    wHeading: 3,
+    wSpeed: 10,
+    wControlRate: 0.15,
+    // Progress mode: 25 taxed the coloured-noise exploration (adjacent-step
+    // deltas of the SAMPLES, not the emitted control) harder than the
+    // progress reward pays — corners were priced out. The emitted control
+    // is a softmax average, already smooth.
+    wSteerRate: isProgress ? 10 : 25,
+    wTerminalPosition: tuning.mpcWTerminalPosition,
+    wTerminalSpeed: tuning.mpcWTerminalSpeed,
+    goalTolerance: 0.5,
+    // Cruise the reference at the SAME speed pure-pursuit uses, so the MPC
+    // reference extends a full horizon ahead and the chassis accelerates to
+    // racing speed. Without this the tracker inferred cruise from the plan's
+    // terminal speed (≈ 0 even on race gates) and crawled to a stall (DNF).
+    cruiseSpeed: trackerConfig.cruiseSpeed,
+    costMode: mpcCostMode,
+    // Race gate poses carry speed ≈ 0 from the planner's pose() helper —
+    // declare the terminal a drive-through so the reference extension fires
+    // and the terminal cost never does.
+    noStopAtEnd: isProgress,
+    // Extend past the plan end so the horizon never sees a stop target
+    // (30 steps × 0.05 s × 30 m/s = 45 m of horizon travel at vMax).
+    referenceExtension: isProgress ? 50 : 0,
+    substeps: 3,
+    wProgress: tuning.mpcWProgress ?? 6,
+    wCorridor: 20,
+    corridorHalfWidth: tuning.mpcCorridorHalfWidth ?? 2.5,
+    wCenterline: 0.08,
+    wOverspeed: 4,
+    // Same anticipatory-braking envelope the pure-pursuit preview uses:
+    // conservative decel (the speed-profile budget) + the measured sustained
+    // cornering boundary.
+    envelopeDecel: MPPI_ENVELOPE_DECEL,
+    envelopeLateralAccel: PURE_PURSUIT_CONFIG.previewLateralAccel,
+    // Consume profiled plan speeds only where the friction-circle pass ran
+    // (technical course). Raw open-course plan speeds are junk as caps:
+    // analytic-shot samples carry maxSpeed (30) and primitive endpoints
+    // near a direction change carry ~1 m/s interior samples — measured: one
+    // 0.9 m/s sample pinned the whole approach to a crawl via the backward
+    // braking envelope.
+    usePlanSpeeds: tuning.enableSpeedProfile ?? false,
+    // WS-1½ — seed the MPPI prior from the plan's own primitive controls (the
+    // plan must be tagged with `ff`, done in the commit block above). Default
+    // off; pinned benchmarks are unaffected.
+    useFeedforward: tuning.controlFeedforward ?? false,
+    // Tuning-sweep escape hatch: raw MPPI knob overrides applied last.
+    ...(tuning.mpcOverrides ?? {}),
+  };
+}
+type MpcConfig = ReturnType<typeof buildMpcConfig>;
+
 interface CarInternal {
   entry: RaceEntry;
   world: RAPIER.World;
   car: CarHandle;
   navWorld: NavWorld;
+  // Per-car effective tuning + config derived from it (scenario `tuning`
+  // merged with the car's own `entry.tuning` override). Lets one race run two
+  // cars with different trackers / planner configs. With no override these
+  // equal what the old shared consts were (byte-identical).
+  tuning: RaceTuning;
+  trackerConfig: TrackerConfig;
+  mpcConfig: MpcConfig;
+  mpcCuspConfig: MpcConfig;
+  mpcHorizonSteps: number;
+  mpcCostMode: 'track' | 'progress';
+  arriveRadius: number;
   // Mutable per-tick state.
   loopIndex: number;
   laps: RaceLap[];
@@ -1146,185 +1301,23 @@ export async function createRaceScenario(
         }
       : {};
   const tuning: RaceTuning = { ...DEFAULT_TUNING, ...courseTuningDefaults, ...(opts.tuning ?? {}) };
-  // Tracker config derives from the tuning bundle so a single
-  // `createRaceScenario` instance handles racing or parking based on
-  // the scenario's per-tuning overrides. Anything not set falls
-  // through to the chassis-level race defaults.
-  const trackerConfig = {
-    ...PURE_PURSUIT_CONFIG,
-    maxAccel: tuning.trackerMaxAccel ?? PURE_PURSUIT_CONFIG.maxAccel,
-    maxDecel: tuning.trackerMaxDecel ?? PURE_PURSUIT_CONFIG.maxDecel,
-    cruiseSpeed: tuning.cruiseSpeed ?? PURE_PURSUIT_CONFIG.cruiseSpeed,
-    goalTolerance: tuning.goalTolerance ?? PURE_PURSUIT_CONFIG.goalTolerance,
-    lookaheadMin: tuning.lookaheadMin ?? PURE_PURSUIT_CONFIG.lookaheadMin,
-    lookaheadGain: tuning.lookaheadGain ?? PURE_PURSUIT_CONFIG.lookaheadGain,
-    lookaheadMax: tuning.lookaheadMax ?? PURE_PURSUIT_CONFIG.lookaheadMax,
-    minApproachSpeed: tuning.minApproachSpeed,
-    reverseCruiseSpeed: tuning.reverseCruiseSpeed,
-    minTurnRadius: tuning.trackerMinTurnRadius ?? PURE_PURSUIT_CONFIG.minTurnRadius,
-    curvatureFeedforward: tuning.curvatureFeedforward ?? false,
-    respectPathSpeed: tuning.respectPathSpeed,
-    noGoalBrakeOnDriveThrough: tuning.noGoalBrakeOnDriveThrough ?? false,
-    bangBangThrottle: tuning.bangBangThrottle ?? false,
-    coastBand: tuning.coastBand,
-    previewLateralAccel:
-      tuning.previewLateralAccel ?? PURE_PURSUIT_CONFIG.previewLateralAccel,
-    headingGain: tuning.terminalHeadingGain ?? 0,
-    // The runner gates the heading term on distance to the TRUE goal (see the
-    // controller loop), so pure-pursuit's own per-path-end radius stays open.
-    headingRadius: Infinity,
-  };
-  const arriveRadius = tuning.arriveRadius ?? RACE_ARRIVE_RADIUS;
 
-  // MPC tracker shared config + forward simulator (constant per scenario).
-  // The dynamics model is the v2 parametric model with default coefficients
-  // — captures the Rapier chassis well enough for the controller to plan
-  // accurate short-horizon rollouts even on cars that don't ship their own
-  // learned model. Per-car: a `MPCTrackerState` holds the warm-start
-  // sequence + deterministic RNG seed.
-  const MPC_HORIZON = 10;
+  // MPC tracker forward simulator (constant per scenario — the shared
+  // default). The dynamics model is the v2 parametric model with default
+  // coefficients — captures the Rapier chassis well enough for the controller
+  // to plan accurate short-horizon rollouts even on cars that don't ship their
+  // own learned model. Per-car MPPI overrides this with `entry.forwardModel`
+  // (see `mpcForwardSim` on each CarInternal). Per-car: a `MPCTrackerState`
+  // holds the warm-start sequence + deterministic RNG seed.
+  //
+  // The tracker/MPPI CONFIG (`trackerConfig`, `mpcConfig`, `mpcCuspConfig`,
+  // horizon steps, cost mode, arrive radius) is derived PER-CAR below from
+  // each car's effective tuning (`{ ...tuning, ...entry.tuning }`), so one
+  // race can run e.g. pure-pursuit+kinematic against MPPI+v3+feedforward.
   const mpcForwardSim = parametricForwardV2(
     DEFAULT_LEARNED_PARAMS_V2,
     DEFAULT_LEARNABLE_CONFIG,
   );
-  // MPPI tracker config. The cost weights work across the entire
-  // racing-to-parking spectrum because the tracker auto-activates the
-  // terminal-pose cost when the plan asks the chassis to stop near a
-  // pose AND the goal is reachable within the horizon (i.e. parking
-  // automatically when the plan structure says so, racing otherwise).
-  //
-  // λ (lambda) is THE key MPPI knob: smaller → more aggressive
-  // (concentrates weight on the lowest-cost samples); larger → more
-  // averaging (smoother but less decisive). 0.5 strikes the bias-
-  // variance balance that handles both modes without retuning.
-  //
-  // Reverse stays ON (the parking workflow needs back-and-forth);
-  // race plans simply won't have samples with negative drive selected
-  // by the softmax because positive-drive samples track the plan
-  // better. Letting reverse stay in the sample distribution costs
-  // virtually nothing.
-  // WS-3 — racing MPPI runs the PROGRESS cost (arc-length reward + corridor
-  // + braking-envelope overspeed), a 1.5 s horizon at 0.05 s control
-  // resolution, and 3 model substeps per control step (the model integrates
-  // at its native 1/60 s training resolution). Parking keeps the 'track'
-  // reference cost + terminal-pose weights (mpcCostMode: 'track').
-  const mpcCostMode = tuning.mpcCostMode ?? 'track';
-  const isProgress = mpcCostMode === 'progress';
-  const MPC_HORIZON_STEPS = isProgress ? 30 : MPC_HORIZON;
-  const MPC_CONFIG = {
-    horizonSteps: MPC_HORIZON_STEPS,
-    stepDt: 0.05,
-    // MPPI sample count — the dominant term in the ~50 ms/solve cost. Halving
-    // it to 32 (even WITH the feedforward prior) was measured to degrade
-    // tracking on the progress cost — predErr 0.31 → 0.46 m and the technical
-    // lap was lost: this progress-cost MPPI needs the exploration to find
-    // corner-entry braking, and feedforward biases the prior but doesn't
-    // replace the search. Kept at 64; the knob stays for deliberate A/B.
-    // See docs/v3-realtime-performance-plan.md.
-    samples: tuning.mpcSamples ?? 64,
-    maxSteer: VEHICLE_TUNING.maxSteerAngle ?? 0.6,
-    maxDriveForce: ENGINE_FORCE_N,
-    maxBrakeForce: BRAKE_FORCE_N,
-    // Racing is forward-only (progress cost never selects reverse anyway —
-    // dropping the reverse half doubles useful drive exploration). Reverse
-    // plan SEGMENTS are still executed: the tracker detects the segment's
-    // gear from its stored speeds and samples the pedal channel in that
-    // gear, capped at the chassis reverse envelope.
-    allowReverse: !isProgress,
-    maxReverseSpeed:
-      tuning.reverseCruiseSpeed ?? Math.abs(RACE_AGENT.maxReverseSpeed ?? 6),
-    // λ must sit at the cost scale of the mode. The progress cost lives in
-    // the tens-to-hundreds (−wProgress·metres over a 1.5 s horizon), so the
-    // track mode's 0.5 collapses the softmax onto the single best sample — a
-    // per-solve argmax that re-picks a different coloured-noise maneuver
-    // every 0.05 s (measured: steering chatter, missed gates, wedges).
-    // λ=10 over-smooths the other way: the launch throttle averages toward
-    // zero across half-braking samples and the stuck detector fires.
-    lambda: isProgress ? 3 : 0.5,
-    // Progress mode needs real steering exploration: recovering a 45°+
-    // heading error (post-gate replan) takes |steer| ≈ 0.5 — unreachable
-    // from a zero prior at std 0.10 (5σ). The softmax + steer-rate cost
-    // keep the EMITTED steer smooth; exploration ≠ chatter.
-    steerStd: isProgress ? 0.28 : 0.10,
-    driveStd: 0.5 * ENGINE_FORCE_N,
-    // Progress mode explores braking decisively: the overspeed term needs
-    // real brake samples to find corner-entry braking (the near-binary
-    // raycast brake saturates by ~25% of full force, so 0.10·max is already
-    // a strong probe; the softmax discards the catastrophic ones).
-    brakeStd: 0.10 * BRAKE_FORCE_N,
-    wLateral: 2,
-    wHeading: 3,
-    wSpeed: 10,
-    wControlRate: 0.15,
-    // Progress mode: 25 taxed the coloured-noise exploration (adjacent-step
-    // deltas of the SAMPLES, not the emitted control) harder than the
-    // progress reward pays — corners were priced out. The emitted control
-    // is a softmax average, already smooth.
-    wSteerRate: isProgress ? 10 : 25,
-    wTerminalPosition: tuning.mpcWTerminalPosition,
-    wTerminalSpeed: tuning.mpcWTerminalSpeed,
-    goalTolerance: 0.5,
-    // Cruise the reference at the SAME speed pure-pursuit uses, so the MPC
-    // reference extends a full horizon ahead and the chassis accelerates to
-    // racing speed. Without this the tracker inferred cruise from the plan's
-    // terminal speed (≈ 0 even on race gates) and crawled to a stall (DNF).
-    cruiseSpeed: trackerConfig.cruiseSpeed,
-    costMode: mpcCostMode,
-    // Race gate poses carry speed ≈ 0 from the planner's pose() helper —
-    // declare the terminal a drive-through so the reference extension fires
-    // and the terminal cost never does.
-    noStopAtEnd: isProgress,
-    // Extend past the plan end so the horizon never sees a stop target
-    // (30 steps × 0.05 s × 30 m/s = 45 m of horizon travel at vMax).
-    referenceExtension: isProgress ? 50 : 0,
-    substeps: 3,
-    wProgress: tuning.mpcWProgress ?? 6,
-    wCorridor: 20,
-    corridorHalfWidth: tuning.mpcCorridorHalfWidth ?? 2.5,
-    wCenterline: 0.08,
-    wOverspeed: 4,
-    // Same anticipatory-braking envelope the pure-pursuit preview uses:
-    // conservative decel (the speed-profile budget) + the measured sustained
-    // cornering boundary.
-    envelopeDecel: MPPI_ENVELOPE_DECEL,
-    envelopeLateralAccel: PURE_PURSUIT_CONFIG.previewLateralAccel,
-    // Consume profiled plan speeds only where the friction-circle pass ran
-    // (technical course). Raw open-course plan speeds are junk as caps:
-    // analytic-shot samples carry maxSpeed (30) and primitive endpoints
-    // near a direction change carry ~1 m/s interior samples — measured: one
-    // 0.9 m/s sample pinned the whole approach to a crawl via the backward
-    // braking envelope.
-    usePlanSpeeds: tuning.enableSpeedProfile ?? false,
-    // WS-1½ — seed the MPPI prior from the plan's own primitive controls (the
-    // plan must be tagged with `ff`, done in the commit block above). Default
-    // off; pinned benchmarks are unaffected.
-    useFeedforward: tuning.controlFeedforward ?? false,
-    // Tuning-sweep escape hatch: raw MPPI knob overrides applied last.
-    ...(tuning.mpcOverrides ?? {}),
-  };
-  // Cusp-leg MPPI config (progress mode only). A non-final plan segment
-  // ends at a forward↔reverse cusp — a 1–3 m precision shunt, not a racing
-  // stretch. The progress cost is the WRONG shape there: total available
-  // progress reward (wProgress × leg length ≈ 9) is on the order of the
-  // sampling noise, so the softmax dilutes across "creep back" and "hold
-  // brake" and the car barely moves (measured: bestWeightShare 0.07 and
-  // emitted ≈ full brake at every wedge shunt). The `track` cost with
-  // terminal-pose weights is the PARKING shape — proven on the parking
-  // scenarios — and a cusp leg IS a mini parking maneuver: drive this
-  // short leg, stop at the cusp pose. λ, noise and steer-rate go back to
-  // the track-mode values; reverse sampling must be on (shunts reverse).
-  const MPC_CUSP_CONFIG = {
-    ...MPC_CONFIG,
-    noStopAtEnd: false,
-    referenceExtension: 0,
-    // Sharp softmax for the shunt: total progress at stake is ~wProgress ×
-    // leg length ≈ 9 — at the racing λ=3 the weights spread across "creep"
-    // and "hold brake" and the emitted control is a brake-hold (measured:
-    // bestWeightShare 0.07 at every wedge shunt). The maneuver value gap
-    // is small in absolute cost, so committing needs a temperature at THAT
-    // scale.
-    lambda: 0.5,
-  };
   // Control cadence: MPPI plans piecewise-constant controls at stepDt
   // resolution; executing means HOLDING each control for stepDt (3 physics
   // ticks), not re-solving every 1/60 s tick. 3× less compute, and the
@@ -1332,6 +1325,52 @@ export async function createRaceScenario(
   const MPC_TICKS_PER_SOLVE = Math.max(1, Math.round(0.05 / PHYSICS_DT));
 
   const cars: CarInternal[] = opts.entries.map((entry, i) => {
+    // Per-car effective tuning: the scenario `tuning` with this car's own
+    // `entry.tuning` override merged OVER it. With no override this is a spread
+    // of nothing, so `carTuning === tuning` behaviourally and every derived
+    // config below is byte-identical to the old shared consts. This is what
+    // lets one race run e.g. pure-pursuit+kinematic against MPPI+v3+ff.
+    const carTuning: RaceTuning = { ...tuning, ...(entry.tuning ?? {}) };
+    // Tracker config derives from the tuning bundle so a single
+    // `createRaceScenario` instance handles racing or parking based on the
+    // per-tuning overrides. Anything not set falls through to the chassis-level
+    // race defaults.
+    const carTrackerConfig = buildTrackerConfig(carTuning);
+    const carArriveRadius = carTuning.arriveRadius ?? RACE_ARRIVE_RADIUS;
+    // WS-3 — racing MPPI runs the PROGRESS cost (arc-length reward + corridor +
+    // braking-envelope overspeed), a 1.5 s horizon at 0.05 s control
+    // resolution, and 3 model substeps per control step. Parking keeps the
+    // 'track' reference cost + terminal-pose weights (mpcCostMode: 'track').
+    const carMpcCostMode: 'track' | 'progress' = carTuning.mpcCostMode ?? 'track';
+    const carIsProgress = carMpcCostMode === 'progress';
+    const carMpcHorizonSteps = carIsProgress ? 30 : MPC_HORIZON;
+    const carMpcConfig = buildMpcConfig(
+      carTuning,
+      carTrackerConfig,
+      carMpcCostMode,
+      carIsProgress,
+      carMpcHorizonSteps,
+    );
+    // Cusp-leg MPPI config (progress mode only). A non-final plan segment ends
+    // at a forward↔reverse cusp — a 1–3 m precision shunt, not a racing
+    // stretch. The progress cost is the WRONG shape there: total available
+    // progress reward (wProgress × leg length ≈ 9) is on the order of the
+    // sampling noise, so the softmax dilutes across "creep back" and "hold
+    // brake" and the car barely moves. The `track` cost with terminal-pose
+    // weights is the PARKING shape, and a cusp leg IS a mini parking maneuver:
+    // drive this short leg, stop at the cusp pose. λ, noise and steer-rate go
+    // back to the track-mode values; reverse sampling must be on.
+    const carMpcCuspConfig: MpcConfig = {
+      ...carMpcConfig,
+      noStopAtEnd: false,
+      referenceExtension: 0,
+      // Sharp softmax for the shunt: total progress at stake is ~wProgress ×
+      // leg length ≈ 9 — at the racing λ=3 the weights spread across "creep"
+      // and "hold brake" and the emitted control is a brake-hold. The maneuver
+      // value gap is small in absolute cost, so committing needs a temperature
+      // at THAT scale.
+      lambda: 0.5,
+    };
     // One world per car (matches web demo's split-viewport setup; cars
     // never physically interact). The headless CLI used to share a world
     // — switching to one world per car eliminates cross-car collisions
@@ -1371,7 +1410,7 @@ export async function createRaceScenario(
       // (0.75 rad -> R ~ 3.44 m) so the PLANT can actually drive the tight
       // arcs the parking planner needs in stall-sized geometry; racing keeps
       // the stable 0.6 rad envelope.
-      maxSteerAngle: tuning.maxSteerAngle ?? VEHICLE_TUNING.maxSteerAngle,
+      maxSteerAngle: carTuning.maxSteerAngle ?? VEHICLE_TUNING.maxSteerAngle,
     });
     const navWorld = new InMemoryNavWorld(course.polygons, course.obstacles);
     return {
@@ -1379,6 +1418,13 @@ export async function createRaceScenario(
       world,
       car,
       navWorld,
+      tuning: carTuning,
+      trackerConfig: carTrackerConfig,
+      mpcConfig: carMpcConfig,
+      mpcCuspConfig: carMpcCuspConfig,
+      mpcHorizonSteps: carMpcHorizonSteps,
+      mpcCostMode: carMpcCostMode,
+      arriveRadius: carArriveRadius,
       loopIndex: 0,
       laps: [],
       currentLapSectors: [],
@@ -1469,7 +1515,7 @@ export async function createRaceScenario(
   function rootRolloutFor(
     c: CarInternal,
   ): ((state: CarKinematicState) => import('kinocat/primitives').MotionPrimitive[]) | undefined {
-    if (!tuning.dynamicRootRollout) return undefined;
+    if (!c.tuning.dynamicRootRollout) return undefined;
     const model = c.entry.forwardModel;
     if (!model) return undefined;
     const lib = c.entry.lib;
@@ -1490,7 +1536,7 @@ export async function createRaceScenario(
     // from the current state — guaranteeing the controller can keep
     // following the existing plan through the commit window without
     // discontinuity. First replan (no plan yet) starts from `now`.
-    const commitWindowSec = tuning.commitWindowMs / 1000;
+    const commitWindowSec = c.tuning.commitWindowMs / 1000;
     let planStartSimTime = simTime;
     let startState: CarKinematicState;
     if (commitWindowSec > 0 && c.plan && c.plan.length > 1) {
@@ -1514,7 +1560,7 @@ export async function createRaceScenario(
     // `pickNextWaypoint`, so this is a planning-only correction.
     let planLoopIndex = c.loopIndex;
     {
-      const advRadiusSq = arriveRadius * arriveRadius;
+      const advRadiusSq = c.arriveRadius * c.arriveRadius;
       for (let i = 0; i < PLAN_LOOKAHEAD_COUNT; i++) {
         const wp = course.waypoints[planLoopIndex % course.waypoints.length]!;
         const dx = startState.x - wp.x;
@@ -1539,7 +1585,7 @@ export async function createRaceScenario(
     // executed (relative to the new search's start time) so reference
     // geometry is only about the future, not the past.
     let referencePath: ReadonlyArray<{ x: number; z: number }> | undefined;
-    if (tuning.consistencyWeight > 0) {
+    if (c.tuning.consistencyWeight > 0) {
       const refPlan = c.pendingPlan ?? c.plan;
       const refStart = c.pendingPlan ? c.pendingPlanStartSimTime : c.planStartSimTime;
       if (refPlan && refPlan.length > 1) {
@@ -1559,8 +1605,8 @@ export async function createRaceScenario(
     // waypoint (the goal pose), so this branch is the natural
     // discriminator — no extra config flag needed.
     const isParking = course.waypoints.length === 1;
-    const plannerBudget = tuning.plannerBudgetMs ?? RACE_REPLAN_BUDGET_MS;
-    const plannerMaxExp = tuning.plannerMaxExpansions ?? RACE_MAX_EXPANSIONS;
+    const plannerBudget = c.tuning.plannerBudgetMs ?? RACE_REPLAN_BUDGET_MS;
+    const plannerMaxExp = c.tuning.plannerMaxExpansions ?? RACE_MAX_EXPANSIONS;
     // Shared single-goal planner params (parking tuning).
     const singleGoalParams = {
       state: startState,
@@ -1571,16 +1617,16 @@ export async function createRaceScenario(
       world: c.navWorld,
       deadlineMs: plannerBudget,
       maxExpansions: plannerMaxExp,
-      posCell: tuning.plannerPosCell,
-      headingBuckets: tuning.plannerHeadingBuckets,
-      goalRadius: tuning.plannerGoalRadius,
-      goalHeadingTol: tuning.plannerGoalHeadingTol,
-      enableHeuristicTable: tuning.enableHeuristicTable,
+      posCell: c.tuning.plannerPosCell,
+      headingBuckets: c.tuning.plannerHeadingBuckets,
+      goalRadius: c.tuning.plannerGoalRadius,
+      goalHeadingTol: c.tuning.plannerGoalHeadingTol,
+      enableHeuristicTable: c.tuning.enableHeuristicTable,
       // Soft hysteresis toward the last committed plan so the multi-cusp
       // parking maneuver stays stable across replans instead of flipping
       // between near-equal-cost back-in alternatives every 300 ms.
       referencePath,
-      referenceWeight: tuning.consistencyWeight,
+      referenceWeight: c.tuning.consistencyWeight,
     };
     const res = isParking
       ? course.goal
@@ -1604,13 +1650,13 @@ export async function createRaceScenario(
           obstacles: course.obstacles,
           world: c.navWorld,
           deadlineMs: plannerBudget,
-          gateRadius: tuning.plannerGateRadius ?? RACE_PLANNER_GATE_RADIUS,
+          gateRadius: c.tuning.plannerGateRadius ?? RACE_PLANNER_GATE_RADIUS,
           referencePath,
-          referenceWeight: tuning.consistencyWeight,
-          disableHeuristicTable: !tuning.enableHeuristicTable,
+          referenceWeight: c.tuning.consistencyWeight,
+          disableHeuristicTable: !c.tuning.enableHeuristicTable,
           rootRollout: rootRolloutFor(c),
-          analyticDriveThrough: tuning.analyticDriveThrough,
-          weight: tuning.plannerWeight,
+          analyticDriveThrough: c.tuning.analyticDriveThrough,
+          weight: c.tuning.plannerWeight,
         });
     const replanMs = performance.now() - tStart;
     c.diagnostics.lastReplanMs = replanMs;
@@ -1672,7 +1718,7 @@ export async function createRaceScenario(
       // Pure-pursuit racing keeps the chord (measured faster there — its
       // segment machinery predates gear-aware MPPI and the chord keeps it
       // flowing).
-      const liftedPath = isParking || tuning.tracker === 'mpc'
+      const liftedPath = isParking || c.tuning.tracker === 'mpc'
         ? liftAnalyticPath(
             res,
             (c.entry.agent ?? RACE_AGENT).maxSpeed,
@@ -1680,8 +1726,8 @@ export async function createRaceScenario(
           )
         : res.path;
       let smoothed = liftedPath;
-      const kRaw = tuning.enableSpeedProfile ? curvaturePerSample(liftedPath) : null;
-      if (tuning.enableTrajectorySmoother) {
+      const kRaw = c.tuning.enableSpeedProfile ? curvaturePerSample(liftedPath) : null;
+      if (c.tuning.enableTrajectorySmoother) {
         smoothed = smoothTrajectory(smoothed, {
           sampleSpacing: 0.4,
           iterations: 4,
@@ -1690,7 +1736,7 @@ export async function createRaceScenario(
           anchorEndpoints: true,
         });
       }
-      if (tuning.enableSpeedProfile && kRaw) {
+      if (c.tuning.enableSpeedProfile && kRaw) {
         const kForProfile = resampleScalarByArcLength(liftedPath, kRaw, smoothed);
         smoothed = smoothSpeedProfile(smoothed, {
           aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel * 0.85,
@@ -1713,7 +1759,7 @@ export async function createRaceScenario(
       // plan's own proven controls. Attach AFTER smoothing + speed profile (the
       // resample maps by arc-length onto the final samples). MPPI-only; the
       // segment splitter's `slice()` preserves the `ff` field for free.
-      if (tuning.controlFeedforward && tuning.tracker === 'mpc') {
+      if (c.tuning.controlFeedforward && c.tuning.tracker === 'mpc') {
         attachPlanFeedforward(smoothed, res, c.entry.lib);
       }
       c.diagnostics.successfulReplans += 1;
@@ -1812,13 +1858,13 @@ export async function createRaceScenario(
    *  consecutive failures (back off — keep retrying until something
    *  takes). */
   function shouldEarlyReplan(c: CarInternal, state: CarKinematicState): boolean {
-    if (!tuning.enableAdaptiveReplan) return false;
+    if (!c.tuning.enableAdaptiveReplan) return false;
     if (c.holdingForSync || c.finished) return false;
     const sinceLastMs = (simTime - c.lastReplanSimTime) * 1000;
     if (sinceLastMs < MIN_TIME_BETWEEN_REPLANS_MS) return false;
     // Trigger: large lateral error from the plan.
     const dLat = lateralFromPlan(c, state.x, state.z);
-    if (dLat > (tuning.lateralErrorReplanM ?? LATERAL_ERROR_REPLAN_M)) return true;
+    if (dLat > (c.tuning.lateralErrorReplanM ?? LATERAL_ERROR_REPLAN_M)) return true;
     // Trigger: consecutive failures — keep trying. Cadence already
     // does this every 300ms but events let us retry earlier.
     if (c.diagnostics.consecutiveFailedReplans >= 2) return true;
@@ -1901,7 +1947,7 @@ export async function createRaceScenario(
         { ...stateBefore, t: 0 },
         course.waypoints,
         c.loopIndex,
-        arriveRadius,
+        c.arriveRadius,
       );
       if (pick.advanced) {
         c.waypointsCleared++;
@@ -1913,7 +1959,7 @@ export async function createRaceScenario(
         // MIN_TIME_BETWEEN_REPLANS rate-limit) instead of waiting up to
         // ~300 ms of cadence — otherwise the controller can chase a plan
         // whose first gate the car has already passed.
-        if (tuning.enableWaypointAdvanceReplan) {
+        if (c.tuning.enableWaypointAdvanceReplan) {
           const sinceLastMs = (simTime - c.lastReplanSimTime) * 1000;
           if (sinceLastMs >= MIN_TIME_BETWEEN_REPLANS_MS) {
             replanCar(c);
@@ -1984,7 +2030,7 @@ export async function createRaceScenario(
         // genuine permanent wedge. Pure-pursuit keeps the tight timeout so
         // the pinned technical-course benchmark is untouched.
         let stuckTimeout = STUCK_TIMEOUT_S;
-        if (tuning.tracker === 'mpc' && c.segments.length > 1) {
+        if (c.tuning.tracker === 'mpc' && c.segments.length > 1) {
           const activeSeg = c.segments[c.activeSegIdx];
           let segGear = 1;
           if (activeSeg && activeSeg.length >= 2) {
@@ -2021,7 +2067,7 @@ export async function createRaceScenario(
       // Backing up: front-wheel steer rotates the nose opposite to the forward
       // sense, so steer with the SAME sign as the heading error to swing the
       // nose toward the target as the chassis reverses.
-      const maxSteer = tuning.maxSteerAngle ?? VEHICLE_TUNING.maxSteerAngle ?? 0.6;
+      const maxSteer = c.tuning.maxSteerAngle ?? VEHICLE_TUNING.maxSteerAngle ?? 0.6;
       const steer = Math.max(-maxSteer, Math.min(maxSteer, headErr));
       const cmd = wheeledFromNormalized(
         { steer, throttle: -RECOVERY_REVERSE_THROTTLE, brake: 0 },
@@ -2061,9 +2107,9 @@ export async function createRaceScenario(
         // course (it stopped striking walls), which is a WS-3 MPPI-only
         // concern — scoping it keeps the pure-pursuit fidelity benchmark
         // (kinematic delusion pays a physical cost) intact.
-        const baseAdvRadius = tuning.arriveRadius ?? RACE_ARRIVE_RADIUS;
+        const baseAdvRadius = c.arriveRadius;
         let advRadius = baseAdvRadius;
-        if (tuning.tracker === 'mpc') {
+        if (c.tuning.tracker === 'mpc') {
           let segLen = 0;
           for (let i = 1; i < seg.length; i++) {
             segLen += Math.hypot(seg[i]!.x - seg[i - 1]!.x, seg[i]!.z - seg[i - 1]!.z);
@@ -2089,21 +2135,21 @@ export async function createRaceScenario(
       // target (the cusp pose or the final goal).
       const live = c.segments[c.activeSegIdx] ?? c.plan;
       if (live.length >= 2) {
-        if (tuning.tracker === 'mpc') {
+        if (c.tuning.tracker === 'mpc') {
           // MPPI over this car's OWN forward model. Solved every
           // MPC_TICKS_PER_SOLVE physics ticks (= the solver's stepDt) and
           // HELD in between — the executed control is exactly the
           // piecewise-constant control the rollouts scored.
-          if (!c.mpcState) c.mpcState = createMPCTrackerState(MPC_HORIZON_STEPS);
+          if (!c.mpcState) c.mpcState = createMPCTrackerState(c.mpcHorizonSteps);
           if (c.mpcHold === null || c.mpcTicksSinceSolve >= MPC_TICKS_PER_SOLVE) {
             // A NON-final segment ends at a forward↔reverse cusp — a short
             // precision shunt, not a racing stretch. Its terminal is a
             // genuine stop (no extension) and its softmax runs sharp
-            // (MPC_CUSP_CONFIG) so the small-stakes maneuver still commits.
+            // (mpcCuspConfig) so the small-stakes maneuver still commits.
             // The final segment is the racing horizon (progress cost,
             // extension past the plan end).
             const segIsFinal = c.activeSegIdx >= c.segments.length - 1;
-            const cfg = segIsFinal ? MPC_CONFIG : MPC_CUSP_CONFIG;
+            const cfg = segIsFinal ? c.mpcConfig : c.mpcCuspConfig;
             const tSolve = performance.now();
             const cmdRaw = mpcTrack(stateBefore, live, c.mpcForwardSim, c.mpcState, cfg);
             c.mpcSolveMsTotal += performance.now() - tSolve;
@@ -2140,12 +2186,12 @@ export async function createRaceScenario(
           // Keying on the real goal engages the term on the terminal approach
           // (whichever segment is near the goal) and nowhere else. `purePursuit`'s
           // own radius is left open (Infinity, above) so this is the sole gate.
-          let trkCfg = trackerConfig;
-          if (trackerConfig.headingGain) {
+          let trkCfg = c.trackerConfig;
+          if (c.trackerConfig.headingGain) {
             const wp = course.waypoints[c.loopIndex % course.waypoints.length]!;
             const dGoal = Math.hypot(stateBefore.x - wp.x, stateBefore.z - wp.z);
-            if (dGoal > (tuning.terminalHeadingRadius ?? Infinity)) {
-              trkCfg = { ...trackerConfig, headingGain: 0 };
+            if (dGoal > (c.tuning.terminalHeadingRadius ?? Infinity)) {
+              trkCfg = { ...c.trackerConfig, headingGain: 0 };
             }
           }
           const trk = purePursuit(stateBefore, live, trkCfg);
@@ -2292,7 +2338,7 @@ export async function createRaceScenario(
       // backs up and returns near the same spot (small net displacement) yet
       // travels real distance, and should NOT read as "stuck". Pure-pursuit
       // and parking keep the net-displacement-only rule (benchmarks untouched).
-      if (tuning.tracker === 'mpc' && course.waypoints.length > 1) {
+      if (c.tuning.tracker === 'mpc' && course.waypoints.length > 1) {
         c.arcSinceMove += Math.hypot(after.x - stateBefore.x, after.z - stateBefore.z);
       }
       if (moved || c.arcSinceMove > 0.5) {
