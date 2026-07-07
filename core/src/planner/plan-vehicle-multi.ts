@@ -75,17 +75,19 @@ const DEFAULT_ENV_OPTIONS: VehicleEnvOptions = {
   // headingBuckets so the table is sized consistently with the search
   // grid.
   heuristicTable: {},
-  // Clearance broadphase: skip the exact swept-footprint test when a disk of
-  // the circumscribed radius is provably clear (early-accept only, never
-  // rejects, so it cannot change the plan). A no-op on worlds without
-  // `clearanceAt`. Saves the dominant collision cost across open stretches.
-  clearanceBroadphase: true,
-  // NOTE: the obstacle-aware grid heuristic (`gridHeuristic`) was measured to
-  // help <2% here and is intentionally NOT enabled — on this course the
-  // kinodynamic (turning-radius) Reeds-Shepp cost dominates the obstacle-detour
-  // cost, so max(RS, grid) ≈ RS almost everywhere. The per-goal caching that
-  // makes it viable under multi-goal gate-flips lives in VehicleEnvironment for
-  // when a course IS detour-dominated.
+  // NOTE: `clearanceBroadphase` is intentionally NOT enabled here. It was
+  // measured to be BOTH unsafe and unhelpful on the walled technical course:
+  // the clearance grid (cell size up to 5 m) over-estimates the distance to a
+  // wall EDGE, so the "provably clear" early-accept admits a swept footprint
+  // that actually clips the wall — the planner then routes a wall-clipping
+  // primitive as clear (measured: v2 went from ≤1 to 4 wall strikes). And on
+  // the tight course there is little clearance to accept anyway. It stays a
+  // per-request opt-in (`envOptions.clearanceBroadphase`) for open worlds with
+  // a fine clearance field.
+  // The obstacle-aware grid heuristic (`gridHeuristic`) is likewise off: it
+  // helped <2% here (kinodynamic Reeds-Shepp cost dominates the obstacle-detour
+  // cost, so max(RS, grid) ≈ RS). Its per-goal caching lives in
+  // VehicleEnvironment for when a course IS detour-dominated.
 };
 
 const DEFAULT_TIME_OPTIONS: Omit<TimeAwareOptions, 'obstacles' | 'affordances'> = {
