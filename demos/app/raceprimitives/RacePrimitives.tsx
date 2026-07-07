@@ -1106,7 +1106,13 @@ async function setupScene(
     syncHold: true,
     offTrackRecovery: 'waypoint',
     course,
-    tuning: {},
+    // Off the main thread, a bigger planner budget no longer costs a dropped
+    // frame — so worker mode spends it, letting the harder v3 reprice search
+    // complete far more often (deadline is a MAX; the fast kinematic planner
+    // still returns early). The `hasInflight` gate keeps a still-running search
+    // from being re-queued, so an over-cadence budget just paces replans to
+    // "as fast as the worker finishes". Inline mode keeps the real-time budget.
+    tuning: options.planner === 'worker' ? { plannerBudgetMs: 400 } : {},
     // Worker planner (opt-in from the Race Setup toggle): offload each car's
     // plan compute to a module Web Worker. Absent ⇒ inline/synchronous replan
     // (the deterministic default). Browser-only — headless/tests never pass it.
