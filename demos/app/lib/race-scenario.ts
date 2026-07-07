@@ -454,6 +454,11 @@ export interface RaceTuning {
   mpcCorridorHalfWidth?: number;
   /** WS-3 — progress reward per metre of arc advanced. Default 6. */
   mpcWProgress?: number;
+  /** MPPI sample count per solve (the dominant term in the per-tick solve
+   *  cost). Default 64, or 32 when control feedforward is on (the feedforward
+   *  prior means the sampler corrects rather than discovers, so fewer samples
+   *  suffice). Lower = cheaper solve, less exploration. */
+  mpcSamples?: number;
   /**
    * WS-1½ — control feedforward (MPPI tracker only). When true, each committed
    * plan carries its generating motion primitives' actuator commands per
@@ -1209,7 +1214,14 @@ export async function createRaceScenario(
   const MPC_CONFIG = {
     horizonSteps: MPC_HORIZON_STEPS,
     stepDt: 0.05,
-    samples: 64,
+    // MPPI sample count — the dominant term in the ~50 ms/solve cost. Halving
+    // it to 32 (even WITH the feedforward prior) was measured to degrade
+    // tracking on the progress cost — predErr 0.31 → 0.46 m and the technical
+    // lap was lost: this progress-cost MPPI needs the exploration to find
+    // corner-entry braking, and feedforward biases the prior but doesn't
+    // replace the search. Kept at 64; the knob stays for deliberate A/B.
+    // See docs/v3-realtime-performance-plan.md.
+    samples: tuning.mpcSamples ?? 64,
     maxSteer: VEHICLE_TUNING.maxSteerAngle ?? 0.6,
     maxDriveForce: ENGINE_FORCE_N,
     maxBrakeForce: BRAKE_FORCE_N,
