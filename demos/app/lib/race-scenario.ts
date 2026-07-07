@@ -60,7 +60,8 @@ import {
 } from 'kinocat/agent';
 import { buildPlan, segmentByGear, type Plan } from 'kinocat/plan';
 import { InMemoryNavWorld } from 'kinocat/environment';
-import type { NavWorld, AnalyticEdgeData } from 'kinocat/environment';
+import type { NavWorld, NavPolygon, AnalyticEdgeData } from 'kinocat/environment';
+import type { Goal, Invariant, CostTerm } from 'kinocat/scenario';
 import type { PlanResult, PlanStats } from 'kinocat/planner';
 import type { MotionPrimitiveLibrary, ForwardSim, MotionPrimitive } from 'kinocat/primitives';
 import { characterizeVehicleFromState } from 'kinocat/primitives';
@@ -80,6 +81,11 @@ import {
   type RaceMetrics,
   type RacePlanRequest,
 } from './race-primitives-scenarios';
+// Worker-backed replan dispatcher (browser opt-in). Imported for its class
+// value only inside `createRaceScenario`; the reverse import (the dispatcher
+// pulls `computeReplanArtifactPure` from here) makes this a benign ES-module
+// cycle — neither module touches the other's binding at load time.
+import { WorkerReplanDispatcher } from '../raceprimitives/workerReplanDispatcher';
 
 // ---------------------------------------------------------------------------
 // Configuration — single source of truth for the racing tunables. Anywhere
@@ -885,6 +891,15 @@ export interface RaceScenarioOptions {
    *  the pre-dispatcher single-shot replan. A worker-backed dispatcher can be
    *  supplied to offload {@link computeReplanArtifact} onto a Web Worker. */
   planDispatcher?: ReplanDispatcher;
+  /**
+   * Optional Web Worker factory. When present (and no explicit
+   * `planDispatcher`), the scenario builds a {@link WorkerReplanDispatcher} that
+   * offloads the per-car plan compute onto one worker per car. ONLY the browser
+   * passes this — headless/tests never do, so they stay inline/synchronous and
+   * fully deterministic. The default (absent) path is byte-identical to the
+   * pre-worker inline replan.
+   */
+  spawnPlanWorker?: () => Worker;
 }
 
 export interface RaceScenario {
@@ -1275,6 +1290,195 @@ export interface ReplanArtifact {
   replanMs: number;
 }
 
+/**
+ * Everything {@link computeReplanArtifactPure} needs, decoupled from the live
+ * `CarInternal`. Both the inline (main-thread) path and a Web Worker build this
+ * from the SAME stable data (library, agent, an `InMemoryNavWorld` over the
+ * course geometry, the compute-relevant tuning flags, and the course polygons /
+ * obstacles), so the compute is byte-identical wherever it runs.
+ */
+export interface ReplanComputeCtx {
+  lib: MotionPrimitiveLibrary;
+  agent: VehicleAgent | undefined;
+  /** `InMemoryNavWorld` on both sides — the collision/navigation query world. */
+  world: NavWorld;
+  tuning: Pick<
+    RaceTuning,
+    'tracker' | 'enableSpeedProfile' | 'enableTrajectorySmoother' | 'controlFeedforward' | 'consistencyWeight'
+  >;
+  course: {
+    goal?: Goal;
+    invariants?: Invariant[];
+    prefer?: CostTerm[];
+    polygons: NavPolygon[];
+    obstacles: [number, number][][];
+  };
+}
+
+/**
+ * The OFFLOADABLE compute unit as a module-level PURE function: run the planner
+ * + the full post-process pipeline (lift → smooth → speed profile →
+ * feedforward) and return the finished plan + metadata. Reads only its `ctx`
+ * argument — no closure over live car state — so it runs identically on the main
+ * thread (via the thin `computeReplanArtifact` wrapper below) or inside a Web
+ * Worker (see `raceprimitives/race.worker.ts`). Must not mutate anything.
+ */
+export function computeReplanArtifactPure(
+  req: ReplanRequest,
+  ctx: ReplanComputeCtx,
+): ReplanArtifact {
+  const startState = req.start;
+  const gates = req.gates;
+  const planStartSimTime = req.planStartSimTime;
+  const isParking = req.isParking;
+  const tStart = performance.now();
+  const res = isParking
+    ? ctx.course.goal
+      ? // NEW: plan toward the canonical Scenario goal through the
+        // ScenarioEnvironment bridge (the goal is described in the
+        // kinocat/scenario layer and read by both planner + visualizer).
+        planRaceScenario({
+          ...req.singleGoalParams!,
+          goal: ctx.course.goal,
+          invariants: ctx.course.invariants,
+          prefer: ctx.course.prefer,
+        })
+      : // Legacy fallback: single goal pose.
+        planRace({ ...req.singleGoalParams!, goal: gates[0]! })
+    : planRaceMultiGoal({
+        state: startState,
+        gates,
+        lib: ctx.lib,
+        agent: ctx.agent,
+        polygons: ctx.course.polygons,
+        obstacles: ctx.course.obstacles,
+        world: ctx.world,
+        deadlineMs: req.deadlineMs,
+        gateRadius: req.gateRadius,
+        referencePath: req.referencePath,
+        referenceWeight: ctx.tuning.consistencyWeight,
+        disableHeuristicTable: req.disableHeuristicTable,
+        rootRollout: req.rootRollout,
+        analyticDriveThrough: req.analyticDriveThrough,
+        weight: req.weight,
+      });
+  const replanMs = performance.now() - tStart;
+  // Opt-in replan trace (diagnostics only; inert unless a debug script sets
+  // `globalThis.__replanLog = true`). Used by demos/scripts/tmp-solve-probe.mts
+  // to correlate wedge moments with the planner output that produced them.
+  if ((globalThis as Record<string, unknown>).__replanLog) {
+    console.log(
+      `    [replan t=${req.simTime.toFixed(2)}] found=${res.found} pathLen=${res.path.length} cost=${res.cost.toFixed(2)} ` +
+      `ms=${replanMs.toFixed(0)} exp=${res.stats.expansions} start=(${startState.x.toFixed(1)},${startState.z.toFixed(1)},h${startState.heading.toFixed(2)},v${startState.speed.toFixed(1)}) gates=${gates.map((g) => `(${g.x},${g.z})`).join('')}`,
+    );
+  }
+  // A found 1-point path is the planner saying "the start already satisfies
+  // the goal" (start-state acceptance) — a SUCCESS with nothing to drive,
+  // not a planner failure. Count it as found (so failedReplanRatio stays
+  // honest) but skip the commit: the degenerate-plan brake-hold keeps the
+  // chassis at rest and the settle latch finishes the course.
+  const trivial = res.found && res.path.length === 1 && res.cost === 0;
+  const found = res.found && (res.path.length > 1 || trivial);
+  if (trivial || !found) {
+    return {
+      found,
+      trivial,
+      smoothed: null,
+      planStartSimTime,
+      cost: res.cost,
+      stats: res.stats,
+      replanMs,
+    };
+  }
+  // Two-stage post-process pipeline (Apollo / Autoware shape), each
+  // stage individually toggleable for ablation:
+  //  (a) Geometric trajectory smoother — turns the sparse, sharp-
+  //      seamed motion-primitive polyline into a dense (~0.4m
+  //      spacing), C¹-continuous reference. Without this the
+  //      prediction/visualisation/lookahead all sample on a
+  //      piecewise-linear interpolation of primitive endpoints.
+  //  (b) Friction-circle speed-profile pass — assigns a
+  //      curvature- and brake-distance-aware speed at every sample.
+  // Two-stage plan post-process: smoother (sparse → dense C¹) +
+  // friction-circle speed pass (curvature-aware speeds the chassis
+  // can physically achieve). Speed profile uses ORIGINAL primitive
+  // curvature, resampled onto the smoothed samples by arc-length,
+  // so the smoother's geometric rounding doesn't fool the speed
+  // pass into commanding impossible speeds.
+  // Expand any analytic Reeds-Shepp shot-to-goal into its real curved,
+  // gear-tagged samples BEFORE smoothing — otherwise the multi-cusp
+  // back-in / parallel-park swing is a straight chord the chassis can't
+  // track at the planned heading.
+  //
+  // Parking always needs this. Racing needs it under the MPPI tracker:
+  // a replan from a wedged pose (post-overshoot, nose off the racing
+  // line) legally returns an RS shot whose real geometry is a
+  // turn-around — collapsed to a chord, the plan claims a straight
+  // drive at a heading the chassis is 150°+ away from, with a hidden
+  // heading flip mid-polyline. Forward progress along that chord is
+  // impossible, "hold still" wins the progress cost's softmax, and the
+  // car wedges until the blind reverse-out recovery fires (measured:
+  // every learned-model wedge dissection showed exactly this shape).
+  // With the lift, the cusped RS curve survives to splitAtGearCusps and
+  // MPPI executes each single-gear segment in its own gear.
+  // Pure-pursuit racing keeps the chord (measured faster there — its
+  // segment machinery predates gear-aware MPPI and the chord keeps it
+  // flowing).
+  const liftedPath = isParking || ctx.tuning.tracker === 'mpc'
+    ? liftAnalyticPath(
+        res,
+        (ctx.agent ?? RACE_AGENT).maxSpeed,
+        (ctx.agent ?? RACE_AGENT).maxReverseSpeed ?? (ctx.agent ?? RACE_AGENT).maxSpeed,
+      )
+    : res.path;
+  let smoothed = liftedPath;
+  const kRaw = ctx.tuning.enableSpeedProfile ? curvaturePerSample(liftedPath) : null;
+  if (ctx.tuning.enableTrajectorySmoother) {
+    smoothed = smoothTrajectory(smoothed, {
+      sampleSpacing: 0.4,
+      iterations: 4,
+      dataWeight: 0.7,
+      smoothWeight: 0.15,
+      anchorEndpoints: true,
+    });
+  }
+  if (ctx.tuning.enableSpeedProfile && kRaw) {
+    const kForProfile = resampleScalarByArcLength(liftedPath, kRaw, smoothed);
+    smoothed = smoothSpeedProfile(smoothed, {
+      aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel * 0.85,
+      // WS-1: the speed profile is a CONSERVATIVE corner-entry safety
+      // pre-pass — keep its longitudinal budget at the pre-WS-1 values
+      // (6/8) rather than the executor's raised brake/accel caps. Feeding
+      // the raised caps here made it assign hotter corner-entry speeds
+      // that overshot the technical course's tight 1.2 m gates into the
+      // walls (measured: both cars cascaded into 750+ failed replans).
+      aLonMaxAccel: SPEED_PROFILE_ACCEL,
+      aLonMaxDecel: SPEED_PROFILE_DECEL,
+      maxSpeed: PURE_PURSUIT_CONFIG.cruiseSpeed,
+      minSpeed: 0.5,
+      honorEntrySpeed: true,
+      curvatureOverride: kForProfile,
+    });
+  }
+  // WS-1½ — control feedforward: tag the smoothed plan with the generating
+  // primitives' actuator commands so the MPPI tracker warm-starts from the
+  // plan's own proven controls. Attach AFTER smoothing + speed profile (the
+  // resample maps by arc-length onto the final samples). MPPI-only; the
+  // segment splitter's `slice()` preserves the `ff` field for free.
+  if (ctx.tuning.controlFeedforward && ctx.tuning.tracker === 'mpc') {
+    attachPlanFeedforward(smoothed, res, ctx.lib);
+  }
+  return {
+    found,
+    trivial: false,
+    smoothed,
+    planStartSimTime,
+    cost: res.cost,
+    stats: res.stats,
+    replanMs,
+  };
+}
+
 /** Routes a {@link ReplanRequest} to the compute stage. Default is inline
  *  (synchronous); a worker-backed implementation can offload the compute. */
 export interface ReplanDispatcher {
@@ -1284,6 +1488,9 @@ export interface ReplanDispatcher {
   poll(c: CarInternal): ReplanArtifact | null;
   /** Whether a request is still in flight for this car. */
   hasInflight(c: CarInternal): boolean;
+  /** Release any held resources (e.g. terminate workers). Optional — the
+   *  inline dispatcher holds nothing. */
+  dispose?(): void;
 }
 
 /** Compute-stage signature (bound to the scenario closure for `course`/etc.). */
@@ -1643,7 +1850,20 @@ export async function createRaceScenario(
   // can inject a worker-backed dispatcher via `opts.planDispatcher` to offload
   // the compute stage. `computeReplanArtifact` is a hoisted inner function.
   const dispatcher: ReplanDispatcher =
-    opts.planDispatcher ?? new InlineDispatcher(computeReplanArtifact);
+    opts.planDispatcher ??
+    (opts.spawnPlanWorker
+      ? new WorkerReplanDispatcher({
+          spawnWorker: opts.spawnPlanWorker,
+          cars: cars.map((c) => ({
+            id: c.entry.name,
+            libJSON: c.entry.lib.toJSON(),
+            agent: c.entry.agent,
+            tuning: c.tuning,
+            polygons: course.polygons,
+            obstacles: course.obstacles,
+          })),
+        })
+      : new InlineDispatcher(computeReplanArtifact));
 
   // WS-2 — dynamic rollouts. Build a root-expansion closure for a car when the
   // feature is enabled and the entry carries its own forward model. The
@@ -1790,162 +2010,19 @@ export async function createRaceScenario(
     };
   }
 
-  // The OFFLOADABLE unit: run the planner + the full post-process pipeline
-  // (lift → smooth → speed profile → feedforward) and return the finished plan
-  // + metadata. Reads only stable car fields (`c.entry.lib/agent`,
-  // `c.navWorld`, `course`, `c.tuning`); it MUST NOT mutate `c`. A worker
-  // dispatcher would run this off the main thread.
+  // The OFFLOADABLE unit — a thin wrapper that binds the module-level pure
+  // compute (`computeReplanArtifactPure`) to this car's stable data. The inline
+  // dispatcher runs it synchronously; a worker dispatcher runs the SAME pure
+  // function off the main thread over an equivalent `ReplanComputeCtx`. Reads
+  // only stable car fields; MUST NOT mutate `c`.
   function computeReplanArtifact(req: ReplanRequest, c: CarInternal): ReplanArtifact {
-    const startState = req.start;
-    const gates = req.gates;
-    const planStartSimTime = req.planStartSimTime;
-    const isParking = req.isParking;
-    const tStart = performance.now();
-    const res = isParking
-      ? course.goal
-        ? // NEW: plan toward the canonical Scenario goal through the
-          // ScenarioEnvironment bridge (the goal is described in the
-          // kinocat/scenario layer and read by both planner + visualizer).
-          planRaceScenario({
-            ...req.singleGoalParams!,
-            goal: course.goal,
-            invariants: course.invariants,
-            prefer: course.prefer,
-          })
-        : // Legacy fallback: single goal pose.
-          planRace({ ...req.singleGoalParams!, goal: gates[0]! })
-      : planRaceMultiGoal({
-          state: startState,
-          gates,
-          lib: c.entry.lib,
-          agent: c.entry.agent,
-          polygons: course.polygons,
-          obstacles: course.obstacles,
-          world: c.navWorld,
-          deadlineMs: req.deadlineMs,
-          gateRadius: req.gateRadius,
-          referencePath: req.referencePath,
-          referenceWeight: c.tuning.consistencyWeight,
-          disableHeuristicTable: req.disableHeuristicTable,
-          rootRollout: req.rootRollout,
-          analyticDriveThrough: req.analyticDriveThrough,
-          weight: req.weight,
-        });
-    const replanMs = performance.now() - tStart;
-    // Opt-in replan trace (diagnostics only; inert unless a debug script sets
-    // `globalThis.__replanLog = true`). Used by demos/scripts/tmp-solve-probe.mts
-    // to correlate wedge moments with the planner output that produced them.
-    if ((globalThis as Record<string, unknown>).__replanLog) {
-      console.log(
-        `    [replan t=${req.simTime.toFixed(2)} ${c.entry.name}] found=${res.found} pathLen=${res.path.length} cost=${res.cost.toFixed(2)} ` +
-        `ms=${replanMs.toFixed(0)} exp=${res.stats.expansions} start=(${startState.x.toFixed(1)},${startState.z.toFixed(1)},h${startState.heading.toFixed(2)},v${startState.speed.toFixed(1)}) gates=${gates.map((g) => `(${g.x},${g.z})`).join('')}`,
-      );
-    }
-    // A found 1-point path is the planner saying "the start already satisfies
-    // the goal" (start-state acceptance) — a SUCCESS with nothing to drive,
-    // not a planner failure. Count it as found (so failedReplanRatio stays
-    // honest) but skip the commit: the degenerate-plan brake-hold keeps the
-    // chassis at rest and the settle latch finishes the course.
-    const trivial = res.found && res.path.length === 1 && res.cost === 0;
-    const found = res.found && (res.path.length > 1 || trivial);
-    if (trivial || !found) {
-      return {
-        found,
-        trivial,
-        smoothed: null,
-        planStartSimTime,
-        cost: res.cost,
-        stats: res.stats,
-        replanMs,
-      };
-    }
-    // Two-stage post-process pipeline (Apollo / Autoware shape), each
-    // stage individually toggleable for ablation:
-    //  (a) Geometric trajectory smoother — turns the sparse, sharp-
-    //      seamed motion-primitive polyline into a dense (~0.4m
-    //      spacing), C¹-continuous reference. Without this the
-    //      prediction/visualisation/lookahead all sample on a
-    //      piecewise-linear interpolation of primitive endpoints.
-    //  (b) Friction-circle speed-profile pass — assigns a
-    //      curvature- and brake-distance-aware speed at every sample.
-    // Two-stage plan post-process: smoother (sparse → dense C¹) +
-    // friction-circle speed pass (curvature-aware speeds the chassis
-    // can physically achieve). Speed profile uses ORIGINAL primitive
-    // curvature, resampled onto the smoothed samples by arc-length,
-    // so the smoother's geometric rounding doesn't fool the speed
-    // pass into commanding impossible speeds.
-    // Expand any analytic Reeds-Shepp shot-to-goal into its real curved,
-    // gear-tagged samples BEFORE smoothing — otherwise the multi-cusp
-    // back-in / parallel-park swing is a straight chord the chassis can't
-    // track at the planned heading.
-    //
-    // Parking always needs this. Racing needs it under the MPPI tracker:
-    // a replan from a wedged pose (post-overshoot, nose off the racing
-    // line) legally returns an RS shot whose real geometry is a
-    // turn-around — collapsed to a chord, the plan claims a straight
-    // drive at a heading the chassis is 150°+ away from, with a hidden
-    // heading flip mid-polyline. Forward progress along that chord is
-    // impossible, "hold still" wins the progress cost's softmax, and the
-    // car wedges until the blind reverse-out recovery fires (measured:
-    // every learned-model wedge dissection showed exactly this shape).
-    // With the lift, the cusped RS curve survives to splitAtGearCusps and
-    // MPPI executes each single-gear segment in its own gear.
-    // Pure-pursuit racing keeps the chord (measured faster there — its
-    // segment machinery predates gear-aware MPPI and the chord keeps it
-    // flowing).
-    const liftedPath = isParking || c.tuning.tracker === 'mpc'
-      ? liftAnalyticPath(
-          res,
-          (c.entry.agent ?? RACE_AGENT).maxSpeed,
-          (c.entry.agent ?? RACE_AGENT).maxReverseSpeed ?? (c.entry.agent ?? RACE_AGENT).maxSpeed,
-        )
-      : res.path;
-    let smoothed = liftedPath;
-    const kRaw = c.tuning.enableSpeedProfile ? curvaturePerSample(liftedPath) : null;
-    if (c.tuning.enableTrajectorySmoother) {
-      smoothed = smoothTrajectory(smoothed, {
-        sampleSpacing: 0.4,
-        iterations: 4,
-        dataWeight: 0.7,
-        smoothWeight: 0.15,
-        anchorEndpoints: true,
-      });
-    }
-    if (c.tuning.enableSpeedProfile && kRaw) {
-      const kForProfile = resampleScalarByArcLength(liftedPath, kRaw, smoothed);
-      smoothed = smoothSpeedProfile(smoothed, {
-        aLatMax: PURE_PURSUIT_CONFIG.maxLateralAccel * 0.85,
-        // WS-1: the speed profile is a CONSERVATIVE corner-entry safety
-        // pre-pass — keep its longitudinal budget at the pre-WS-1 values
-        // (6/8) rather than the executor's raised brake/accel caps. Feeding
-        // the raised caps here made it assign hotter corner-entry speeds
-        // that overshot the technical course's tight 1.2 m gates into the
-        // walls (measured: both cars cascaded into 750+ failed replans).
-        aLonMaxAccel: SPEED_PROFILE_ACCEL,
-        aLonMaxDecel: SPEED_PROFILE_DECEL,
-        maxSpeed: PURE_PURSUIT_CONFIG.cruiseSpeed,
-        minSpeed: 0.5,
-        honorEntrySpeed: true,
-        curvatureOverride: kForProfile,
-      });
-    }
-    // WS-1½ — control feedforward: tag the smoothed plan with the generating
-    // primitives' actuator commands so the MPPI tracker warm-starts from the
-    // plan's own proven controls. Attach AFTER smoothing + speed profile (the
-    // resample maps by arc-length onto the final samples). MPPI-only; the
-    // segment splitter's `slice()` preserves the `ff` field for free.
-    if (c.tuning.controlFeedforward && c.tuning.tracker === 'mpc') {
-      attachPlanFeedforward(smoothed, res, c.entry.lib);
-    }
-    return {
-      found,
-      trivial: false,
-      smoothed,
-      planStartSimTime,
-      cost: res.cost,
-      stats: res.stats,
-      replanMs,
-    };
+    return computeReplanArtifactPure(req, {
+      lib: c.entry.lib,
+      agent: c.entry.agent,
+      world: c.navWorld,
+      tuning: c.tuning,
+      course,
+    });
   }
 
   // The commit stage: fold a finished artifact into live car state (churn
@@ -2267,6 +2344,16 @@ export async function createRaceScenario(
           c.recoveryCount++;
         }
       }
+    }
+    // Worker-dispatcher poll: a plan computed off the main thread becomes ready
+    // some ticks after its `dispatch`, so poll every tick and commit it as soon
+    // as it lands — the car keeps driving its committed `plan`/`segments`
+    // meanwhile. For the INLINE dispatcher this is a harmless no-op: `replanCar`
+    // already polled and cleared the artifact this tick, so `poll` returns null
+    // here and nothing is applied (behaviour byte-identical to before).
+    {
+      const art = dispatcher.poll(c);
+      if (art) applyReplanArtifact(c, art);
     }
     // Apply controls.
     if (c.holdingForSync) {
@@ -2723,7 +2810,9 @@ export async function createRaceScenario(
     },
     reset,
     dispose() {
-      // Rapier worlds are GC-ed; nothing to release.
+      // Rapier worlds are GC-ed; only the worker-backed dispatcher (if any)
+      // holds OS resources (the plan workers) that must be terminated.
+      dispatcher.dispose?.();
     },
   };
 }

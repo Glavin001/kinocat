@@ -145,6 +145,11 @@ type Phase = 'loading' | 'learning' | 'ready' | 'racing' | 'finished';
 
 type TrackerMode = 'pure-pursuit' | 'mpc';
 type CourseVariant = 'open' | 'technical';
+/** Where the per-car plan compute runs. `main` (default) is the historical
+ *  synchronous main-thread replan; `worker` offloads it to one Web Worker per
+ *  car via `spawnPlanWorker` → `WorkerReplanDispatcher`. Shared by both cars. */
+type PlannerMode = 'main' | 'worker';
+const PLANNER_KEY = 'kinocat:planner:v1';
 /** Which primitive library / rollout model the LEARNED car drives with.
  *  'v3' is the purely-learned MLP-ensemble model (highest plant fidelity —
  *  loaded from the preloaded `/models/v3-default.json`, no online training). */
@@ -391,9 +396,25 @@ export default function RacePrimitives() {
   const [carA, setCarAState] = useState<CarConfig>(DEFAULT_CAR_A);
   const [carB, setCarBState] = useState<CarConfig>(DEFAULT_CAR_B);
   const [courseVariant, setCourseVariantState] = useState<CourseVariant>('open');
+  // Planner mode (SHARED by both cars). Seeded from localStorage in the mount
+  // effect below (SSR-safe: no localStorage read at render). Changing it
+  // re-mounts the scene like the course selector.
+  const [planner, setPlannerState] = useState<PlannerMode>('main');
   useEffect(() => {
     setCourseVariantState(courseFromUrl());
+    if (typeof window !== 'undefined') {
+      try {
+        const raw = window.localStorage.getItem(PLANNER_KEY);
+        if (raw === 'worker' || raw === 'main') setPlannerState(raw);
+      } catch { /* ignore */ }
+    }
   }, []);
+  const setPlanner = (p: PlannerMode) => {
+    setPlannerState(p);
+    if (typeof window !== 'undefined') {
+      try { window.localStorage.setItem(PLANNER_KEY, p); } catch { /* quota */ }
+    }
+  };
   const setCarA = (c: CarConfig) => {
     setCarAState(c);
     if (typeof window !== 'undefined') {
@@ -559,7 +580,7 @@ export default function RacePrimitives() {
             setWinner(w);
             setPhase('finished');
           },
-        }, { carA, carB, v2Model, v3Model, v3GenLib, courseVariant });
+        }, { carA, carB, v2Model, v3Model, v3GenLib, courseVariant, planner });
         sceneRef.current = setup;
         cleanup = setup.cleanup;
       } catch (e) {
@@ -573,7 +594,7 @@ export default function RacePrimitives() {
     };
     // Re-mount when params, either car's config, a loaded model, or the shared
     // course change — each rebuilds the scenario.
-  }, [params, JSON.stringify(carA), JSON.stringify(carB), v2Model, v3Model, v3GenLib, courseVariant, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [params, JSON.stringify(carA), JSON.stringify(carB), v2Model, v3Model, v3GenLib, courseVariant, planner, phase === 'learning' ? 'pending' : 'mounted']); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function runInlineLearn() {
     setError(null);
@@ -766,6 +787,8 @@ export default function RacePrimitives() {
         onCarB={setCarB}
         courseVariant={courseVariant}
         onCourseVariant={setCourseVariant}
+        planner={planner}
+        onPlanner={setPlanner}
         canUseV2={canUseV2}
         canUseV3={canUseV3}
         phase={phase}
@@ -977,6 +1000,9 @@ interface SceneOptions {
   /** Course layout (SHARED by both cars). Chosen in the Race Setup GUI (top
    *  bar). Defaults to the open flat pad. */
   courseVariant?: CourseVariant;
+  /** Planner mode (SHARED). `worker` offloads each car's plan compute to a Web
+   *  Worker; `main` (default) keeps the synchronous main-thread replan. */
+  planner?: PlannerMode;
 }
 
 /** Resolve a CarConfig to the primitive library + forward model it drives
@@ -1081,6 +1107,15 @@ async function setupScene(
     offTrackRecovery: 'waypoint',
     course,
     tuning: {},
+    // Worker planner (opt-in from the Race Setup toggle): offload each car's
+    // plan compute to a module Web Worker. Absent ⇒ inline/synchronous replan
+    // (the deterministic default). Browser-only — headless/tests never pass it.
+    ...(options.planner === 'worker'
+      ? {
+          spawnPlanWorker: () =>
+            new Worker(new URL('./race.worker.ts', import.meta.url), { type: 'module' }),
+        }
+      : {}),
   });
 
   // ---- Per-car setup ----
@@ -1661,6 +1696,8 @@ function TopBar({
   onCarB,
   courseVariant,
   onCourseVariant,
+  planner,
+  onPlanner,
   canUseV2,
   canUseV3,
   isMobile,
@@ -1696,6 +1733,9 @@ function TopBar({
   /** Race Setup: which course layout (SHARED by both cars). */
   courseVariant: CourseVariant;
   onCourseVariant: (c: CourseVariant) => void;
+  /** Race Setup: where the plan compute runs (SHARED by both cars). */
+  planner: PlannerMode;
+  onPlanner: (p: PlannerMode) => void;
   /** Whether the v2 / v3 models are loaded (and thus selectable per car). */
   canUseV2: boolean;
   canUseV3: boolean;
@@ -1723,6 +1763,7 @@ function TopBar({
     carChip('A', carA),
     carChip('B', carB),
     courseVariant === 'technical' ? 'Tech' : 'Open',
+    ...(planner === 'worker' ? ['wkr'] : []),
   ].join(' · ');
 
   // Single-row toolbar. Everything that used to overflow now lives behind two
@@ -1773,6 +1814,8 @@ function TopBar({
             onCarB={onCarB}
             courseVariant={courseVariant}
             onCourseVariant={onCourseVariant}
+            planner={planner}
+            onPlanner={onPlanner}
             canUseV2={canUseV2}
             canUseV3={canUseV3}
           />
@@ -2807,6 +2850,8 @@ function RaceSetup({
   onCarB,
   courseVariant,
   onCourseVariant,
+  planner,
+  onPlanner,
   canUseV2,
   canUseV3,
 }: {
@@ -2816,6 +2861,8 @@ function RaceSetup({
   onCarB: (c: CarConfig) => void;
   courseVariant: CourseVariant;
   onCourseVariant: (c: CourseVariant) => void;
+  planner: PlannerMode;
+  onPlanner: (p: PlannerMode) => void;
   canUseV2: boolean;
   canUseV3: boolean;
 }) {
@@ -2834,6 +2881,15 @@ function RaceSetup({
         options={[
           { value: 'open', label: 'Open', title: 'Flat pad — pure dynamics + waypoint chase.' },
           { value: 'technical', label: 'Technical', title: 'Walled chicane — corner overshoot becomes a physical wall strike.' },
+        ]}
+      />
+      <Segmented
+        label="planner (shared)"
+        value={planner}
+        onChange={onPlanner}
+        options={[
+          { value: 'main', label: 'Main thread', title: 'Plan compute runs synchronously on the main thread (default).' },
+          { value: 'worker', label: 'Worker', title: 'Offload each car’s plan compute to a Web Worker (one per car).' },
         ]}
       />
       <div style={{ fontSize: 10, opacity: 0.5, lineHeight: 1.4 }}>
