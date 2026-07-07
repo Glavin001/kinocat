@@ -19,6 +19,7 @@ import {
   learnedForwardSimV2,
   parametricForwardV2,
   v3FromJson,
+  v3ToJson,
   forwardSimV3Rollout,
 } from 'kinocat/agent';
 import type { LearnedVehicleModelV3 } from 'kinocat/agent';
@@ -91,6 +92,8 @@ import {
   downloadMarkdown,
 } from '../lib/debug-report';
 import type { LearnedVehicleModel } from 'kinocat/agent';
+import { modelToJson } from '../lib/v2-model-file';
+import type { TrackerForwardModelSpec } from '../lib/race-scenario';
 
 // SINGLE SOURCE OF TRUTH: all race-simulation tunables live in
 // `../lib/race-scenario.ts`. Importing them here (rather than redeclaring
@@ -145,9 +148,11 @@ type Phase = 'loading' | 'learning' | 'ready' | 'racing' | 'finished';
 
 type TrackerMode = 'pure-pursuit' | 'mpc';
 type CourseVariant = 'open' | 'technical';
-/** Where the per-car plan compute runs. `main` (default) is the historical
- *  synchronous main-thread replan; `worker` offloads it to one Web Worker per
- *  car via `spawnPlanWorker` → `WorkerReplanDispatcher`. Shared by both cars. */
+/** Where the per-car heavy compute runs. `main` (default) is the historical
+ *  synchronous main-thread replan + MPPI solve; `worker` offloads BOTH the
+ *  plan compute (`spawnPlanWorker` → `WorkerReplanDispatcher`) and the MPPI
+ *  tracker solve (`spawnTrackerWorker` → `WorkerTrackerDispatcher`) to one Web
+ *  Worker per car per stage. Shared by both cars. */
 type PlannerMode = 'main' | 'worker';
 const PLANNER_KEY = 'kinocat:planner:v1';
 /** Which primitive library / rollout model the LEARNED car drives with.
@@ -1038,6 +1043,31 @@ function cfgToTuning(cfg: CarConfig): Partial<import('../lib/race-scenario').Rac
   };
 }
 
+/** Serialise a CarConfig's forward model so a tracker Web Worker can rebuild
+ *  it. Mirrors `resolveLib`'s model → forward-sim mapping: the same model the
+ *  car rolls inline, sent as a spec the worker reconstructs (`modelFromJson` /
+ *  `v3FromJson`). Falls back to kinematic when the selected model isn't loaded,
+ *  matching `resolveLib`'s fallback. The `meta` on the v2 payload is unused for
+ *  the forward-model rebuild — a minimal stub keeps the serializer happy. */
+function cfgToForwardModelSpec(
+  cfg: CarConfig,
+  v2Model: LearnedVehicleModel | null,
+  v3Model: LearnedVehicleModelV3 | null,
+): TrackerForwardModelSpec {
+  if (cfg.model === 'v3' && v3Model) {
+    return { kind: 'v3', modelJson: JSON.stringify(v3ToJson(v3Model)) };
+  }
+  if (cfg.model === 'v2' && v2Model) {
+    return {
+      kind: 'v2',
+      modelJson: JSON.stringify(
+        modelToJson(v2Model, { trialsUsed: 0, openLoopRmsAt1s: 0, createdAt: 0 }),
+      ),
+    };
+  }
+  return { kind: 'kinematic' };
+}
+
 async function setupScene(
   mount: HTMLDivElement,
   params: LearnedVehicleParams,
@@ -1094,12 +1124,17 @@ async function setupScene(
         name: 'kinematic',
         lib: rA.lib,
         forwardModel: rA.fwd,
+        // Worker tracker rebuilds this car's forward model from the spec (the
+        // model instance itself doesn't structure-clone). Inert on the inline
+        // path.
+        forwardModelSpec: cfgToForwardModelSpec(options.carA, options.v2Model, options.v3Model),
         tuning: cfgToTuning(options.carA),
       },
       {
         name: 'learned',
         lib: rB.lib,
         forwardModel: rB.fwd,
+        forwardModelSpec: cfgToForwardModelSpec(options.carB, options.v2Model, options.v3Model),
         tuning: cfgToTuning(options.carB),
       },
     ],
@@ -1113,13 +1148,17 @@ async function setupScene(
     // from being re-queued, so an over-cadence budget just paces replans to
     // "as fast as the worker finishes". Inline mode keeps the real-time budget.
     tuning: options.planner === 'worker' ? { plannerBudgetMs: 400 } : {},
-    // Worker planner (opt-in from the Race Setup toggle): offload each car's
-    // plan compute to a module Web Worker. Absent ⇒ inline/synchronous replan
-    // (the deterministic default). Browser-only — headless/tests never pass it.
+    // Worker mode (opt-in from the Race Setup "Offload" toggle) offloads BOTH
+    // the plan compute AND the MPPI tracker solve to module Web Workers (one
+    // per car per stage) — the full main-loop unblock. Absent ⇒ inline/
+    // synchronous replan + solve (the deterministic default). Browser-only —
+    // headless/tests never pass these.
     ...(options.planner === 'worker'
       ? {
           spawnPlanWorker: () =>
             new Worker(new URL('./race.worker.ts', import.meta.url), { type: 'module' }),
+          spawnTrackerWorker: () =>
+            new Worker(new URL('./race.tracker.worker.ts', import.meta.url), { type: 'module' }),
         }
       : {}),
   });
@@ -2890,12 +2929,12 @@ function RaceSetup({
         ]}
       />
       <Segmented
-        label="planner (shared)"
+        label="offload (shared)"
         value={planner}
         onChange={onPlanner}
         options={[
-          { value: 'main', label: 'Main thread', title: 'Plan compute runs synchronously on the main thread (default).' },
-          { value: 'worker', label: 'Worker', title: 'Offload each car’s plan compute to a Web Worker (one per car).' },
+          { value: 'main', label: 'Main thread', title: 'Plan compute + MPPI tracker solve run synchronously on the main thread (default).' },
+          { value: 'worker', label: 'Worker', title: 'Offload each car’s plan compute AND MPPI tracker solve to Web Workers (one per car per stage) — the full main-loop unblock.' },
         ]}
       />
       <div style={{ fontSize: 10, opacity: 0.5, lineHeight: 1.4 }}>

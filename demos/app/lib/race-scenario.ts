@@ -86,6 +86,10 @@ import {
 // pulls `computeReplanArtifactPure` from here) makes this a benign ES-module
 // cycle — neither module touches the other's binding at load time.
 import { WorkerReplanDispatcher } from '../raceprimitives/workerReplanDispatcher';
+// Worker-backed MPPI tracker dispatcher (browser opt-in). Same ES-module-cycle
+// arrangement as the replan dispatcher above — value import used only inside
+// `createRaceScenario`; the reverse import pulls the tracker types from here.
+import { WorkerTrackerDispatcher } from '../raceprimitives/trackerWorkerHost';
 
 // ---------------------------------------------------------------------------
 // Configuration — single source of truth for the racing tunables. Anywhere
@@ -100,6 +104,11 @@ export const TRACKER_MAX_LATERAL_ACCEL = 12;
 export const STALL_TIMEOUT_MS = 4000;
 export const ENGINE_FORCE_N = 4000;
 export const BRAKE_FORCE_N = 2000;
+/** Light coast brake (N) applied under the 'mpc' tracker before the very
+ *  first solve lands — worker path only (the inline solve fills `mpcHold` on
+ *  the same tick, so this is never reached inline). Keeps a just-spawned car
+ *  planted at rest without hard-braking a car that is already rolling. */
+export const MPC_COAST_BRAKE_N = 0.1 * BRAKE_FORCE_N;
 export const WHEEL_BASE = 1.6;
 /**
  * Plan-stitching commit window. The controller is guaranteed to follow the
@@ -736,6 +745,12 @@ export interface RaceEntry {
    *  pure-pursuit-only entries and legacy callers are unaffected). Native
    *  `[steer, driveForce, brakeForce]` controls. */
   forwardModel?: ForwardSim<CarKinematicState>;
+  /** Spec for rebuilding {@link forwardModel} inside a tracker Web Worker
+   *  (browser opt-in). The model instance itself does not structure-clone, so
+   *  the worker path sends this spec and reconstructs the forward sim worker-
+   *  side. Optional and inert on the inline path — headless/tests never set
+   *  it. See {@link TrackerForwardModelSpec}. */
+  forwardModelSpec?: TrackerForwardModelSpec;
   /** Per-car tuning override, merged OVER the scenario `tuning` for THIS car
    *  only. Lets one race run two cars with different trackers / planner
    *  configs (e.g. an A/B: kinematic+pure-pursuit vs v3+MPPI+feedforward). */
@@ -900,6 +915,15 @@ export interface RaceScenarioOptions {
    * pre-worker inline replan.
    */
   spawnPlanWorker?: () => Worker;
+  /**
+   * Optional Web Worker factory for the MPPI tracker solve. When present the
+   * scenario builds a {@link WorkerTrackerDispatcher} that offloads each car's
+   * `mpcTrack` solve onto one worker per car, keeping the "hold the latest
+   * command between solves" cadence. ONLY the browser passes this — headless/
+   * tests never do, so they stay on the deterministic inline solve. Each car's
+   * `entry.forwardModelSpec` tells its worker which forward model to rebuild.
+   */
+  spawnTrackerWorker?: () => Worker;
 }
 
 export interface RaceScenario {
@@ -1106,6 +1130,13 @@ interface CarInternal {
    * leave it null until the worker responds. Not part of committed plan state.
    */
   pendingArtifact: ReplanArtifact | null;
+  /**
+   * MPPI solve result stashed by a {@link TrackerDispatcher}. The inline
+   * dispatcher computes it synchronously during `solve` and clears it on the
+   * very next `poll` (same tick). A worker dispatcher leaves it null and
+   * delivers via its own ready slot. Not part of committed plan state.
+   */
+  pendingTrackResult: TrackSolveResult | null;
   /**
    * Plan split into single-gear segments at forward↔reverse cusps.
    * Pure-pursuit's geometric tracking assumes monotonic forward (or
@@ -1519,6 +1550,96 @@ export class InlineDispatcher implements ReplanDispatcher {
 }
 
 // ---------------------------------------------------------------------------
+// Tracker (MPPI solve) dispatch — mirrors the replan dispatcher above.
+//
+// The MPPI SOLVE (`mpcTrack`) is the ~50 ms/tick cost the racing demo wants
+// off the main loop. The seam is identical in spirit to the replan
+// dispatcher: a request captured from the live car (`TrackSolveRequest`), a
+// compute stage (`mpcTrack`), and a result committed back (`TrackSolveResult`
+// → `c.mpcHold`). The default `InlineTrackerDispatcher` runs the solve
+// synchronously so the same tick that dispatches also polls the result —
+// byte-identical to the pre-dispatcher inline MPPI. A worker-backed
+// implementation offloads the solve; the "hold the latest command between
+// solves" cadence is preserved unchanged (no horizon-forward application).
+
+/** Everything the MPPI solve reads from the live car for one solve. All
+ *  fields structure-clone cleanly so a worker dispatcher can post them. */
+export interface TrackSolveRequest {
+  /** Chassis state the rollouts start from (`stateBefore`). */
+  state: CarKinematicState;
+  /** The single-gear plan segment being tracked (`live`). */
+  plan: CarKinematicState[];
+  /** True when the tracked segment is a NON-final cusp leg (uses the sharp
+   *  `mpcCuspConfig`); false for the final racing segment (`mpcConfig`). */
+  cusp: boolean;
+}
+
+/** The command the tracker holds until the next solve lands. */
+export interface TrackSolveResult {
+  cmd: { steer: number; driveForce: number; brakeForce: number };
+  targetSpeed: number;
+}
+
+/** Which forward dynamics model a worker tracker should rebuild for a car.
+ *  Optional on `RaceEntry`: only the browser worker path sets it (the model
+ *  instance itself is not structure-cloneable, so it is sent as a spec the
+ *  worker reconstructs). Mirrors `resolveLib`'s model → forward-sim mapping. */
+export interface TrackerForwardModelSpec {
+  kind: 'kinematic' | 'v2' | 'v3';
+  /** Serialised model payload for `v2` (`modelToJson`) / `v3` (`v3ToJson`).
+   *  Absent for `kinematic` (rebuilt from the fixed native params). */
+  modelJson?: string;
+}
+
+/** Routes a {@link TrackSolveRequest} to the MPPI solve. Default is inline
+ *  (synchronous); a worker-backed implementation offloads the solve. */
+export interface TrackerDispatcher {
+  /** Compute now (inline) or post to a worker. */
+  solve(c: CarInternal, req: TrackSolveRequest): void;
+  /** Latest ready result (consumed), or null if still solving. */
+  poll(c: CarInternal): TrackSolveResult | null;
+  /** Whether a solve is still in flight for this car. */
+  hasInflight(c: CarInternal): boolean;
+  /** Release any held resources (e.g. terminate workers). Optional. */
+  dispose?(): void;
+}
+
+/**
+ * Default tracker dispatcher: run the MPPI solve synchronously on the car's
+ * own forward model + warm-start state, and stash the result so the same tick
+ * polls and applies it. Keeps the inline control flow (and the per-solve
+ * compute accounting) byte-identical to the pre-dispatcher MPPI.
+ * `hasInflight` is always false — nothing is ever pending across ticks.
+ */
+export class InlineTrackerDispatcher implements TrackerDispatcher {
+  solve(c: CarInternal, req: TrackSolveRequest): void {
+    // A non-final segment (cusp leg) uses the sharp cusp config; the final
+    // segment uses the racing config. Mirrors the pre-dispatcher branch.
+    const cfg = req.cusp ? c.mpcCuspConfig : c.mpcConfig;
+    const tSolve = performance.now();
+    const cmdRaw = mpcTrack(req.state, req.plan, c.mpcForwardSim, c.mpcState!, cfg);
+    c.mpcSolveMsTotal += performance.now() - tSolve;
+    c.mpcSolveCount += 1;
+    c.pendingTrackResult = {
+      cmd: {
+        steer: cmdRaw.steer,
+        driveForce: cmdRaw.driveForce,
+        brakeForce: cmdRaw.brakeForce,
+      },
+      targetSpeed: cmdRaw.targetSpeed,
+    };
+  }
+  poll(c: CarInternal): TrackSolveResult | null {
+    const r = c.pendingTrackResult;
+    c.pendingTrackResult = null;
+    return r;
+  }
+  hasInflight(_c: CarInternal): boolean {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Public factory
 
 /** Contact margin (m) added to a wall's physical half-extents when testing
@@ -1781,6 +1902,7 @@ export async function createRaceScenario(
       pendingPlan: null,
       pendingPlanStartSimTime: 0,
       pendingArtifact: null,
+      pendingTrackResult: null,
       segments: [],
       richPlan: null,
       activeSegIdx: 0,
@@ -1864,6 +1986,25 @@ export async function createRaceScenario(
           })),
         })
       : new InlineDispatcher(computeReplanArtifact));
+
+  // MPPI tracker (solve) dispatcher. Defaults to the inline (synchronous)
+  // solve so the default path is byte-identical to the pre-dispatcher MPPI; a
+  // browser caller can pass `opts.spawnTrackerWorker` to offload each car's
+  // `mpcTrack` solve onto one worker per car. The per-car config / cusp config
+  // / horizon are plain objects sent once at init; each car's forward model is
+  // rebuilt worker-side from `entry.forwardModelSpec`.
+  const trackerDispatcher: TrackerDispatcher = opts.spawnTrackerWorker
+    ? new WorkerTrackerDispatcher({
+        spawnWorker: opts.spawnTrackerWorker,
+        cars: cars.map((c) => ({
+          id: c.entry.name,
+          config: c.mpcConfig,
+          cuspConfig: c.mpcCuspConfig,
+          horizonSteps: c.mpcHorizonSteps,
+          forwardModelSpec: c.entry.forwardModelSpec,
+        })),
+      })
+    : new InlineTrackerDispatcher();
 
   // WS-2 — dynamic rollouts. Build a root-expansion closure for a car when the
   // feature is enabled and the entry carries its own forward model. The
@@ -2443,9 +2584,18 @@ export async function createRaceScenario(
           // MPPI over this car's OWN forward model. Solved every
           // MPC_TICKS_PER_SOLVE physics ticks (= the solver's stepDt) and
           // HELD in between — the executed control is exactly the
-          // piecewise-constant control the rollouts scored.
+          // piecewise-constant control the rollouts scored. The solve is
+          // routed through `trackerDispatcher`: the inline dispatcher runs
+          // `mpcTrack` synchronously so `solve` + `poll` land the result THIS
+          // tick (byte-identical to the pre-dispatcher MPPI); a worker
+          // dispatcher posts the solve off-thread and `poll` returns null
+          // until it lands — the car keeps HOLDING the previous command, and
+          // coasts (below) only before the very first solve.
           if (!c.mpcState) c.mpcState = createMPCTrackerState(c.mpcHorizonSteps);
-          if (c.mpcHold === null || c.mpcTicksSinceSolve >= MPC_TICKS_PER_SOLVE) {
+          if (
+            (c.mpcHold === null || c.mpcTicksSinceSolve >= MPC_TICKS_PER_SOLVE) &&
+            !trackerDispatcher.hasInflight(c)
+          ) {
             // A NON-final segment ends at a forward↔reverse cusp — a short
             // precision shunt, not a racing stretch. Its terminal is a
             // genuine stop (no extension) and its softmax runs sharp
@@ -2453,23 +2603,26 @@ export async function createRaceScenario(
             // The final segment is the racing horizon (progress cost,
             // extension past the plan end).
             const segIsFinal = c.activeSegIdx >= c.segments.length - 1;
-            const cfg = segIsFinal ? c.mpcConfig : c.mpcCuspConfig;
-            const tSolve = performance.now();
-            const cmdRaw = mpcTrack(stateBefore, live, c.mpcForwardSim, c.mpcState, cfg);
-            c.mpcSolveMsTotal += performance.now() - tSolve;
-            c.mpcSolveCount += 1;
-            c.mpcHold = {
-              cmd: {
-                steer: cmdRaw.steer,
-                driveForce: cmdRaw.driveForce,
-                brakeForce: cmdRaw.brakeForce,
-              },
-              targetSpeed: cmdRaw.targetSpeed,
-            };
+            trackerDispatcher.solve(c, {
+              state: stateBefore,
+              plan: live,
+              cusp: !segIsFinal,
+            });
             c.mpcTicksSinceSolve = 0;
           }
           c.mpcTicksSinceSolve += 1;
-          const cmd = c.mpcHold.cmd;
+          const solved = trackerDispatcher.poll(c);
+          if (solved) c.mpcHold = solved;
+          // HOLD the latest solved command; before the first solve lands
+          // (worker path only) coast — zero throttle, light brake — so the
+          // chassis stays planted instead of driving on a stale/absent
+          // command. The inline path always has `mpcHold` set by the poll
+          // above on the same tick, so this fallback is never taken there.
+          const cmd = c.mpcHold?.cmd ?? {
+            steer: 0,
+            driveForce: 0,
+            brakeForce: MPC_COAST_BRAKE_N,
+          };
           c.car.applyWheeledControls(cmd);
           c.lastControls = cmd;
           c.metrics.liveControls = {
@@ -2478,7 +2631,7 @@ export async function createRaceScenario(
               ? cmd.driveForce / ENGINE_FORCE_N
               : -cmd.driveForce / ENGINE_FORCE_N,
             brake: cmd.brakeForce / BRAKE_FORCE_N,
-            targetSpeed: c.mpcHold.targetSpeed,
+            targetSpeed: c.mpcHold?.targetSpeed ?? 0,
           };
         } else {
           // Gate the terminal heading-alignment term on distance to the TRUE
@@ -2770,6 +2923,7 @@ export async function createRaceScenario(
       c.mpcTicksSinceSolve = 0;
       c.mpcSolveMsTotal = 0;
       c.mpcSolveCount = 0;
+      c.pendingTrackResult = null;
     }
   }
 
@@ -2810,9 +2964,10 @@ export async function createRaceScenario(
     },
     reset,
     dispose() {
-      // Rapier worlds are GC-ed; only the worker-backed dispatcher (if any)
-      // holds OS resources (the plan workers) that must be terminated.
+      // Rapier worlds are GC-ed; only the worker-backed dispatchers (if any)
+      // hold OS resources (the plan / tracker workers) that must be terminated.
       dispatcher.dispose?.();
+      trackerDispatcher.dispose?.();
     },
   };
 }
