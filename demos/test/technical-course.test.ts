@@ -11,6 +11,7 @@ import {
   DEFAULT_LEARNABLE_CONFIG,
 } from 'kinocat/agent';
 import { InMemoryNavWorld } from 'kinocat/environment';
+import { hashGoal } from 'kinocat/scenario';
 import {
   buildRaceCourse,
   buildKinematicLibrary,
@@ -26,8 +27,23 @@ describe('technical race course geometry', () => {
     expect(open.variant).toBe('open');
     expect(open.walls).toEqual([]);
     expect(open.obstacles).toEqual([]);
-    // Default arg matches explicit 'open'.
-    expect(buildRaceCourse('open')).toEqual(open);
+    // Default arg matches explicit 'open'. The authored scenario planes
+    // (goal / invariants / prefer) carry Region CLOSURES, which are
+    // reference-unequal across two builds by nature — compare those
+    // STRUCTURALLY (hashGoal / region keys / cost-term identity) and
+    // everything else (geometry, waypoints, spawn) by deep equality.
+    const again = buildRaceCourse('open');
+    const { goal: gA, invariants: iA, prefer: pA, ...restA } = again;
+    const { goal: gO, invariants: iO, prefer: pO, ...restO } = open;
+    expect(restA).toEqual(restO);
+    expect(gA).toBeDefined();
+    expect(hashGoal(gA!)).toBe(hashGoal(gO!));
+    expect(iA!.map((inv) => `${inv.kind}:${inv.region.key}`)).toEqual(
+      iO!.map((inv) => `${inv.kind}:${inv.region.key}`),
+    );
+    expect(pA!.map((c) => `${c.name}:${c.weight}`)).toEqual(
+      pO!.map((c) => `${c.name}:${c.weight}`),
+    );
   });
 
   it('technical variant adds walls, mirrored as inflated planner obstacles', () => {
