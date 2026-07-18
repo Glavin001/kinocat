@@ -62,7 +62,8 @@ import {
 import { buildPlan, segmentByGear, type Plan } from 'kinocat/plan';
 import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavWorld, NavPolygon, AnalyticEdgeData } from 'kinocat/environment';
-import type { Goal, Invariant, CostTerm } from 'kinocat/scenario';
+import type { Goal, Invariant, CostTerm, CompiledAutomaton, ProgressSnapshot } from 'kinocat/scenario';
+import { compile as compileGoal, stepAutomaton } from 'kinocat/scenario';
 import type { PlanResult, PlanStats } from 'kinocat/planner';
 import type { MotionPrimitiveLibrary, ForwardSim, MotionPrimitive } from 'kinocat/primitives';
 import { characterizeVehicleFromState } from 'kinocat/primitives';
@@ -860,6 +861,15 @@ export interface RaceCarStatus {
   totalSegments: number;
   /** Gear of the active segment: 'fwd' | 'rev' | 'unknown'. */
   activeSegmentGear: 'fwd' | 'rev' | 'unknown';
+  /** Live goal-automaton progress of the EXECUTED trajectory through the
+   *  course's canonical scenario goal (`course.goal`), advanced incrementally
+   *  each physics tick via `stepAutomaton` — the same greedy guard advance
+   *  `evaluateProgress` replays, so this always matches a batch replay of the
+   *  executed states. Null when the course carries no authored goal. This is
+   *  a READ-ONLY viewer channel: nothing in the planner or tracker consumes
+   *  it. `trace` is left empty (the per-sample trace would grow unboundedly
+   *  over a live race and no consumer reads it). */
+  goalProgress: ProgressSnapshot | null;
 }
 
 export interface RaceTickResult {
@@ -944,6 +954,11 @@ export interface RaceScenario {
   tick(dt?: number): RaceTickResult;
   /** Read the current per-car status without advancing. */
   status(): RaceCarStatus[];
+  /** Compiled automaton of the course's canonical scenario goal
+   *  (`course.goal`), or null when the course carries none. Static per
+   *  scenario — pair it with each car's `status().goalProgress` snapshot to
+   *  render the live objective state (e.g. `GoalProgressPanel`). */
+  goalAutomaton(): CompiledAutomaton | null;
   /** Underlying Rapier world for the named entry (web-only — used to mount
    *  visual colliders alongside the chassis). */
   getWorld(name: string): RAPIER.World | null;
@@ -1231,6 +1246,13 @@ interface CarInternal {
   // WS-3 A3.4 — per-solve compute accounting (ms, wall-clock).
   mpcSolveMsTotal: number;
   mpcSolveCount: number;
+  // Live goal-automaton progress (viewer channel — see RaceCarStatus.
+  // goalProgress). Advanced incrementally from the executed state each tick
+  // so the per-call cost is O(transitions), not O(trajectory length).
+  goalQ: number;
+  goalDepth: number;
+  goalLaps: number;
+  goalPrev: CarKinematicState | null;
   // Reverse-out recovery state (stuck-against-wall escape maneuver).
   recovering: boolean;
   recoveryEndSimTime: number;
@@ -1797,6 +1819,17 @@ export async function createRaceScenario(
       : {};
   const tuning: RaceTuning = { ...DEFAULT_TUNING, ...courseTuningDefaults, ...(opts.tuning ?? {}) };
 
+  // Compiled goal automaton for the LIVE progress viewer (read-only channel —
+  // see RaceCarStatus.goalProgress). The race planner does NOT consume
+  // `course.goal` on multi-waypoint courses (it plans through
+  // `planRaceMultiGoal`); compiling here only powers the per-tick incremental
+  // `stepAutomaton` advance + the `goalAutomaton()` accessor the HUD renders.
+  const goalAutomaton = course.goal ? compileGoal(course.goal) : null;
+  const goalMaxDepth = goalAutomaton
+    ? goalAutomaton.states.reduce((m, s) => Math.max(m, s.depth), 0)
+    : 0;
+  const goalAccepting = goalAutomaton ? new Set(goalAutomaton.accepting) : null;
+
   // MPC tracker forward simulator (constant per scenario — the shared
   // default). The dynamics model is the v2 parametric model with default
   // coefficients — captures the Rapier chassis well enough for the controller
@@ -1977,6 +2010,10 @@ export async function createRaceScenario(
       mpcTicksSinceSolve: 0,
       mpcSolveMsTotal: 0,
       mpcSolveCount: 0,
+      goalQ: goalAutomaton?.start ?? 0,
+      goalDepth: goalAutomaton ? (goalAutomaton.states[goalAutomaton.start]?.depth ?? 0) : 0,
+      goalLaps: 0,
+      goalPrev: null,
       recovering: false,
       recoveryEndSimTime: 0,
       recoveryCount: 0,
@@ -2755,6 +2792,24 @@ export async function createRaceScenario(
     }
     stepRaycastVehicle(c.world, [c.car], { dt, substeps: VEHICLE_SUBSTEPS });
     const after = c.car.readState(simTime + dt);
+    // Live goal-automaton progress: advance the automaton over the executed
+    // motion (previous sample -> this sample) with the SAME greedy guard
+    // advance `evaluateProgress` uses, so the incremental state always equals
+    // a batch replay of the executed trajectory. A depth DECREASE marks a
+    // `repeat` back-edge — one lap of the objective completed.
+    if (goalAutomaton) {
+      const s: CarKinematicState = {
+        x: after.x, z: after.z, heading: after.heading, speed: after.speed,
+        t: simTime + dt,
+      };
+      if (c.goalPrev) {
+        c.goalQ = stepAutomaton(goalAutomaton, c.goalQ, c.goalPrev, s);
+        const d = goalAutomaton.states[c.goalQ]?.depth ?? 0;
+        if (d < c.goalDepth) c.goalLaps++;
+        c.goalDepth = d;
+      }
+      c.goalPrev = s;
+    }
     // Driving-quality accumulation (only while racing — sync holds and the
     // post-finish brake hold would dilute the means).
     if (!c.holdingForSync && !c.finished) {
@@ -2923,6 +2978,16 @@ export async function createRaceScenario(
         const sample = seg[1];
         return sample && sample.speed >= 0 ? ('fwd' as const) : ('rev' as const);
       })(),
+      goalProgress: goalAutomaton
+        ? {
+            q: c.goalQ,
+            depth: c.goalDepth,
+            maxDepth: goalMaxDepth,
+            done: goalAccepting!.has(c.goalQ),
+            laps: c.goalLaps,
+            trace: [],
+          }
+        : null,
     };
   }
 
@@ -2981,6 +3046,12 @@ export async function createRaceScenario(
       c.mpcSolveMsTotal = 0;
       c.mpcSolveCount = 0;
       c.pendingTrackResult = null;
+      c.goalQ = goalAutomaton?.start ?? 0;
+      c.goalDepth = goalAutomaton
+        ? (goalAutomaton.states[goalAutomaton.start]?.depth ?? 0)
+        : 0;
+      c.goalLaps = 0;
+      c.goalPrev = null;
     }
   }
 
@@ -3010,6 +3081,9 @@ export async function createRaceScenario(
     },
     status() {
       return cars.map(buildStatus);
+    },
+    goalAutomaton() {
+      return goalAutomaton;
     },
     getWorld(name) {
       return cars.find((c) => c.entry.name === name)?.world ?? null;

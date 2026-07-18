@@ -75,6 +75,8 @@ import {
 } from '../lib/learn-primitives';
 import { ModelLab } from '../components/ModelLab';
 import { EvalHUD } from '../components/EvalHUD';
+import { GoalProgressPanel } from '../components/GoalProgressPanel';
+import type { CompiledAutomaton, ProgressSnapshot } from 'kinocat/scenario';
 import { createEvalProbe, type EvalSnapshot } from '../lib/eval-probe';
 import { limitsFromAgent } from 'kinocat/eval';
 import { useIsMobile } from '../lib/use-is-mobile';
@@ -403,6 +405,14 @@ export default function RacePrimitives() {
     kinematic: RaceMetrics;
     learned: RaceMetrics;
   }>({ kinematic: emptyMetrics(), learned: emptyMetrics() });
+  // Live goal-automaton progress (course.goal viewer channel): the compiled
+  // automaton is static per scenario; the per-car snapshots advance as the
+  // EXECUTED trajectory satisfies the authored gate guards.
+  const [goalProg, setGoalProg] = useState<{
+    automaton: CompiledAutomaton | null;
+    kinematic: ProgressSnapshot | null;
+    learned: ProgressSnapshot | null;
+  }>({ automaton: null, kinematic: null, learned: null });
   const [learner, setLearner] = useState<LearnerSnapshot | null>(null);
   const [evalSnap, setEvalSnap] = useState<{
     kinematic: EvalSnapshot | null;
@@ -601,6 +611,8 @@ export default function RacePrimitives() {
         if (disposed) return;
         const setup = await setupScene(mount, params, {
           onMetrics: (km, lm) => setMetrics({ kinematic: km, learned: lm }),
+          onGoalProgress: (automaton, k, l) =>
+            setGoalProg({ automaton, kinematic: k, learned: l }),
           onLearner: (snap) => setLearner(snap),
           onEval: (k, l) => setEvalSnap({ kinematic: k, learned: l }),
           onFinish: (w) => {
@@ -852,6 +864,7 @@ export default function RacePrimitives() {
           bestLapNumber={learner?.bestLapNumber ?? 0}
           headers={{ kinematic: carLabel('A', carA), learned: carLabel('B', carB) }}
           stacks={{ kinematic: carStack(carA), learned: carStack(carB) }}
+          goals={goalProg}
         />
         {(phase === 'racing' || phase === 'finished') && learner && (
           <LearnerPanel snap={learner} v2Active={v2Active} v2Meta={v2Meta} isMobile={isMobile} />
@@ -976,6 +989,15 @@ function PretrainOverlay({
 
 interface SceneCallbacks {
   onMetrics: (k: RaceMetrics, l: RaceMetrics) => void;
+  /** Live goal-automaton progress (throttled to ~5 Hz — the snapshot only
+   *  changes when a gate guard is satisfied, so per-tick emission would be
+   *  pure setState churn). `automaton` is the scenario's compiled
+   *  `course.goal`; null when the course carries no authored goal. */
+  onGoalProgress: (
+    automaton: CompiledAutomaton | null,
+    k: ProgressSnapshot | null,
+    l: ProgressSnapshot | null,
+  ) => void;
   onLearner: (state: LearnerSnapshot) => void;
   onEval: (k: EvalSnapshot, l: EvalSnapshot) => void;
   onFinish: (w: 'kinematic' | 'learned' | 'tie') => void;
@@ -1659,6 +1681,10 @@ async function setupScene(
   let stopped = false;
   let lastWall = performance.now();
   let lastLearnerEmit = 0;
+  let lastGoalEmit = 0;
+  // Static per scenario — the compiled `course.goal` automaton the live
+  // progress snapshots index into.
+  const goalAutomaton = scenario.goalAutomaton();
   function tick() {
     if (stopped) return;
     requestAnimationFrame(tick);
@@ -1683,6 +1709,16 @@ async function setupScene(
       // so the probe's finite differences must use it, not a fixed 1/60.
       kProbe.sample(r.cars[0]!, dt);
       lProbe.sample(r.cars[1]!, dt);
+      // Goal-automaton progress (read-only viewer channel). ~5 Hz: the
+      // snapshot only changes when a gate guard fires.
+      if (goalAutomaton && now - lastGoalEmit > 200) {
+        lastGoalEmit = now;
+        cb.onGoalProgress(
+          goalAutomaton,
+          r.cars[0]!.goalProgress,
+          r.cars[1]!.goalProgress,
+        );
+      }
       // Emit the comparison snapshot in BOTH modes (legacy + v2). The lap-
       // times / sector-deltas are universal; only the per-coef refit fields
       // are legacy-only and get safe defaults when v2 is driving.
@@ -2095,6 +2131,7 @@ function MetricsOverlay({
   bestLapNumber,
   stacks,
   headers,
+  goals,
 }: {
   metrics: { kinematic: RaceMetrics; learned: RaceMetrics };
   winner: 'kinematic' | 'learned' | 'tie' | null;
@@ -2107,6 +2144,13 @@ function MetricsOverlay({
   /** Per-side column header, derived from each car's A/B config (the left
    *  'kinematic'-named slot is Car A, the right 'learned'-named slot Car B). */
   headers: { kinematic: string; learned: string };
+  /** Live goal-automaton progress (the course's authored scenario goal).
+   *  Desktop-only render — the compact mobile cards skip it for space. */
+  goals: {
+    automaton: CompiledAutomaton | null;
+    kinematic: ProgressSnapshot | null;
+    learned: ProgressSnapshot | null;
+  };
 }) {
   // Mobile: compact stacked summary row at the top of the viewport. Tap a
   // card to expand its full stats (LIVE CONTROLS + tracking error + …).
@@ -2160,6 +2204,11 @@ function MetricsOverlay({
         recentLaps={lapTimes.kinematic}
         rollbackBadge={null}
         stack={stacks.kinematic}
+        goal={
+          goals.automaton && goals.kinematic
+            ? { automaton: goals.automaton, snapshot: goals.kinematic }
+            : null
+        }
       />
       <SideMetrics
         side="right"
@@ -2171,6 +2220,11 @@ function MetricsOverlay({
         recentLaps={lapTimes.learned}
         rollbackBadge={rollbackActive ? `USING BEST (lap ${bestLapNumber})` : null}
         stack={stacks.learned}
+        goal={
+          goals.automaton && goals.learned
+            ? { automaton: goals.automaton, snapshot: goals.learned }
+            : null
+        }
       />
     </>
   );
@@ -2280,6 +2334,7 @@ function SideMetrics({
   recentLaps,
   rollbackBadge,
   stack,
+  goal,
 }: {
   side: 'left' | 'right';
   title: string;
@@ -2290,6 +2345,9 @@ function SideMetrics({
   recentLaps: number[];
   rollbackBadge: string | null;
   stack: StackInfo;
+  /** Live goal-automaton progress of THIS car's executed trajectory through
+   *  the course's authored scenario goal (null when the course has none). */
+  goal?: { automaton: CompiledAutomaton; snapshot: ProgressSnapshot } | null;
 }) {
   // Stability over the last 5 laps — low std-dev means the car has
   // settled into a consistent racing line, high means it's still
@@ -2432,6 +2490,16 @@ function SideMetrics({
           );
         })()}
       </div>
+      {goal && (
+        <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid #1f2735', opacity: 0.85 }}>
+          <div style={{ fontSize: 10, opacity: 0.7, marginBottom: 2 }}>GOAL (scenario DSL)</div>
+          <GoalProgressPanel
+            automaton={goal.automaton}
+            snapshot={goal.snapshot}
+            maxRows={4}
+          />
+        </div>
+      )}
     </div>
   );
 }

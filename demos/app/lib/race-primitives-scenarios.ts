@@ -22,6 +22,17 @@ import { InMemoryNavWorld } from 'kinocat/environment';
 import type { NavPolygon, NavWorld } from 'kinocat/environment';
 import type { Goal, Invariant, CostTerm } from 'kinocat/scenario';
 import {
+  reach,
+  near,
+  seq,
+  repeat,
+  maxProgress,
+  stayInside,
+  avoid,
+  inside,
+  deg,
+} from 'kinocat/scenario';
+import {
   defaultVehicleAgent,
   kinematicForwardSim,
   learnedForwardSimV2,
@@ -137,6 +148,67 @@ function wallObstacle(w: RaceWallSpec): [number, number][] {
   ];
 }
 
+/** Half-width (rad) of the chord-aligned heading band on each authored gate.
+ *  This is the DSL expression of the "gate-heading prior" from
+ *  docs/max-pace-roadmap.md: arrival at gate i should roughly face gate i+1
+ *  (the racing line), and a pass more than ~100° off the outgoing chord —
+ *  i.e. backwards or sideways through the disk — does not count as clearing
+ *  the gate. Deliberately WIDE: at the slalom the executed heading lags the
+ *  outgoing chord by up to ~60° at the apex, and the live viewer replays the
+ *  EXECUTED trajectory through these guards — a tight band would desync the
+ *  automaton from the race's own waypoint bookkeeping on a legitimate pass. */
+export const GATE_HEADING_BAND = deg(100);
+
+/** Author the canonical scenario planes (goal / invariants / prefer) for a
+ *  waypoint loop. The objective is the circuit itself — `repeat(seq(reach
+ *  gate_0 … gate_N))` — with each gate a capture DISK (no speed constraint,
+ *  drive-through) plus the chord-aligned heading band above. Gate radius is
+ *  the runner's ARRIVE radius (2.5 m), not the tighter planner aim radius:
+ *  the authored goal describes what counts as CLEARING a gate, and that is
+ *  `pickNextWaypoint`'s advance rule — using the planner's 1.2–1.8 m aim
+ *  disk would make the viewer's automaton miss passes the race itself counts.
+ *
+ *  NOTE (planner-inert by construction): the race runtime only routes
+ *  `course.goal` into the planner on SINGLE-waypoint courses (the parking
+ *  branch of `computeReplanArtifactPure`); multi-waypoint racing always plans
+ *  through `planRaceMultiGoal`. So populating these fields changes no race
+ *  plan — they are the canonical *description* of the objective, consumed by
+ *  the live goal-progress viewer (and by `planRaceScenario` in tests). */
+export function authorRaceCoursePlanes(
+  waypoints: CarKinematicState[],
+  bounds: { x0: number; x1: number; z0: number; z1: number },
+  obstacles: Array<[number, number][]>,
+  gateRadius = RACE_ARRIVE_RADIUS,
+): Required<Pick<RaceCourse, 'goal' | 'invariants' | 'prefer'>> {
+  const boundsRing: [number, number][] = [
+    [bounds.x0, bounds.z0],
+    [bounds.x1, bounds.z0],
+    [bounds.x1, bounds.z1],
+    [bounds.x0, bounds.z1],
+  ];
+  const goal = repeat(
+    seq(
+      ...waypoints.map((w, i) => {
+        const nxt = waypoints[(i + 1) % waypoints.length]!;
+        // Outgoing chord bearing (heading 0 = +X, positive toward +Z — the
+        // same XZ convention as CarKinematicState.heading).
+        const chord = Math.atan2(nxt.z - w.z, nxt.x - w.x);
+        return reach(near({ x: w.x, z: w.z }, gateRadius), {
+          heading: { min: chord - GATE_HEADING_BAND, max: chord + GATE_HEADING_BAND },
+        });
+      }),
+    ),
+  );
+  return {
+    goal,
+    invariants: [
+      stayInside(boundsRing),
+      ...obstacles.map((o) => avoid(inside(o))),
+    ],
+    prefer: [maxProgress(1)],
+  };
+}
+
 export function buildRaceCourse(variant: RaceCourseVariant = 'open'): RaceCourse {
   const b = RACE_BOUNDS;
   const polygons: NavPolygon[] = [
@@ -183,6 +255,7 @@ export function buildRaceCourse(variant: RaceCourseVariant = 'open'): RaceCourse
       variant,
       waypoints,
       spawn: pose(-55, -20, 0),
+      ...authorRaceCoursePlanes(waypoints, b, []),
     };
   }
 
@@ -229,6 +302,7 @@ export function buildRaceCourse(variant: RaceCourseVariant = 'open'): RaceCourse
     variant,
     waypoints,
     spawn: pose(-55, -20, 0),
+    ...authorRaceCoursePlanes(waypoints, b, obstacles),
   };
 }
 
